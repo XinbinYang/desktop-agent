@@ -1,11 +1,8 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, globalShortcut, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
-const Store = require('electron-store');
 
-const store = new Store();
 let mainWindow;
-let tray = null;
 let backendProcess = null;
 
 const isDev = process.argv.includes('--dev');
@@ -13,9 +10,11 @@ const isPackaged = app.isPackaged;
 
 function startBackend() {
   if (isDev) {
+    // 开发模式：假设后端已手动启动
     return Promise.resolve();
   }
 
+  // 生产模式：启动打包好的后端exe
   const backendExe = isPackaged
     ? path.join(process.resourcesPath, 'backend', 'desktop-agent-backend.exe')
     : path.join(__dirname, '..', '..', 'backend', 'venv', 'Scripts', 'python.exe');
@@ -33,7 +32,7 @@ function startBackend() {
   return new Promise((resolve, reject) => {
     backendProcess = spawn(backendExe, backendArgs, {
       cwd: backendCwd,
-      windowsHide: true,
+      windowsHide: true, // 隐藏黑窗口
       detached: false,
     });
 
@@ -54,6 +53,7 @@ function startBackend() {
       reject(err);
     });
 
+    // 5秒超时兜底
     setTimeout(() => resolve(true), 5000);
   });
 }
@@ -68,17 +68,12 @@ function stopBackend() {
 }
 
 function createWindow() {
-  const { x, y, width, height } = store.get('windowBounds', { width: 1400, height: 900 });
-
   mainWindow = new BrowserWindow({
-    width,
-    height,
-    x: x !== undefined ? x : undefined,
-    y: y !== undefined ? y : undefined,
+    width: 1400,
+    height: 900,
     minWidth: 1000,
     minHeight: 600,
     titleBarStyle: 'hiddenInset',
-    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -94,101 +89,19 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
-    if (store.get('windowMaximized')) {
-      mainWindow.maximize();
-    }
-  });
-
-  // 保存窗口状态
-  const saveBounds = () => {
-    if (mainWindow.isMaximized()) {
-      store.set('windowMaximized', true);
-    } else {
-      store.set('windowMaximized', false);
-      store.set('windowBounds', mainWindow.getBounds());
-    }
-  };
-
-  mainWindow.on('resize', saveBounds);
-  mainWindow.on('move', saveBounds);
-  mainWindow.on('maximize', saveBounds);
-  mainWindow.on('unmaximize', saveBounds);
-
-  mainWindow.on('close', (event) => {
-    if (process.platform === 'darwin') return;
-    event.preventDefault();
-    mainWindow.hide();
-  });
-
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 }
 
-function createTray() {
-  if (tray) return;
-  const fs = require('fs');
-  const trayIcon = path.join(__dirname, '../public/favicon.ico');
-  if (!fs.existsSync(trayIcon)) {
-    console.log('[Tray] No icon found, skipping tray creation');
-    return;
-  }
-  tray = new Tray(trayIcon);
-  tray.setToolTip('Desktop Agent');
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: '显示窗口',
-      click: () => {
-        if (mainWindow) {
-          mainWindow.show();
-          mainWindow.focus();
-        } else {
-          createWindow();
-        }
-      },
-    },
-    { type: 'separator' },
-    {
-      label: '退出',
-      click: () => {
-        stopBackend();
-        app.quit();
-      },
-    },
-  ]);
-  tray.setContextMenu(contextMenu);
-  tray.on('click', () => {
-    if (mainWindow) {
-      mainWindow.isVisible() ? mainWindow.hide() : mainWindow.show();
-    } else {
-      createWindow();
-    }
-  });
-}
-
-function createMenu() {
+function buildMenu() {
   const template = [
     {
       label: '文件',
       submenu: [
-        {
-          label: '新建会话',
-          accelerator: 'CmdOrCtrl+N',
-          click: () => {
-            mainWindow?.webContents.send('menu-new-session');
-          },
-        },
+        { label: '新建会话', accelerator: 'CmdOrCtrl+N', click: () => mainWindow?.webContents.send('menu-new-session') },
         { type: 'separator' },
-        {
-          label: '退出',
-          accelerator: process.platform === 'darwin' ? 'Cmd+Q' : 'Alt+F4',
-          click: () => {
-            stopBackend();
-            app.quit();
-          },
-        },
+        { role: 'quit', label: '退出' },
       ],
     },
     {
@@ -206,29 +119,15 @@ function createMenu() {
     {
       label: '视图',
       submenu: [
-        {
-          label: '刷新',
-          accelerator: 'CmdOrCtrl+R',
-          click: () => mainWindow?.webContents.reload(),
-        },
-        {
-          label: '切换开发者工具',
-          accelerator: 'F12',
-          click: () => mainWindow?.webContents.toggleDevTools(),
-        },
+        { role: 'reload', label: '刷新' },
+        { role: 'forcereload', label: '强制刷新' },
+        { role: 'toggledevtools', label: '开发者工具' },
         { type: 'separator' },
-        {
-          label: '全屏',
-          accelerator: 'F11',
-          click: () => {
-            const isFullScreen = mainWindow?.isFullScreen();
-            mainWindow?.setFullScreen(!isFullScreen);
-          },
-        },
-        { type: 'separator' },
-        { role: 'resetzoom', label: '重置缩放' },
+        { role: 'resetzoom', label: '实际大小' },
         { role: 'zoomin', label: '放大' },
         { role: 'zoomout', label: '缩小' },
+        { type: 'separator' },
+        { role: 'togglefullscreen', label: '全屏' },
       ],
     },
     {
@@ -236,47 +135,40 @@ function createMenu() {
       submenu: [
         { role: 'minimize', label: '最小化' },
         { role: 'close', label: '关闭' },
-        { type: 'separator' },
-        { role: 'front', label: '前置全部窗口' },
       ],
     },
     {
       label: '帮助',
       submenu: [
-        {
-          label: '关于 Desktop Agent',
-          click: () => {
-            dialog.showMessageBox(mainWindow, {
-              type: 'info',
-              title: '关于',
-              message: 'Desktop Agent',
-              detail: `版本: ${app.getVersion()}\n基于 Electron + React + FastAPI 构建`,
-            });
-          },
-        },
-        {
-          label: 'GitHub 仓库',
-          click: () => shell.openExternal('https://github.com/XinbinYang/desktop-agent'),
-        },
+        { label: '关于 Desktop Agent', click: () => dialog.showMessageBox(mainWindow, { type: 'info', title: '关于', message: `Desktop Agent v${app.getVersion()}` }) },
       ],
     },
   ];
 
-  const menu = Menu.buildFromTemplate(template);
-  Menu.setApplicationMenu(menu);
+  // macOS: 第一个菜单项应该是应用名
+  if (process.platform === 'darwin') {
+    template.unshift({
+      label: app.getName(),
+      submenu: [
+        { role: 'about', label: '关于' },
+        { type: 'separator' },
+        { role: 'hide', label: '隐藏' },
+        { role: 'hideothers', label: '隐藏其他' },
+        { role: 'unhide', label: '显示全部' },
+        { type: 'separator' },
+        { role: 'quit', label: '退出' },
+      ],
+    });
+  }
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 app.whenReady().then(async () => {
   try {
     await startBackend();
     createWindow();
-    createMenu();
-    createTray();
-
-    // 全局快捷键
-    globalShortcut.register('F5', () => {
-      mainWindow?.webContents.reload();
-    });
+    buildMenu();
   } catch (e) {
     dialog.showErrorBox('启动失败', '后端服务启动失败: ' + e.message);
     app.quit();
@@ -284,9 +176,8 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    // Windows/Linux: 保持托盘运行
-  }
+  stopBackend();
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
@@ -294,15 +185,7 @@ app.on('before-quit', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
-  } else {
-    mainWindow?.show();
-  }
-});
-
-app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
 // IPC

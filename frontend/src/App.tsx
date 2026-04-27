@@ -90,11 +90,11 @@ export default function App() {
 
   // 监听 Electron 菜单事件
   useEffect(() => {
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.onMenuNewSession) {
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.onNewSession) {
       const handler = () => newSession();
-      (window as any).electronAPI.onMenuNewSession(handler);
+      (window as any).electronAPI.onNewSession(handler);
       return () => {
-        (window as any).electronAPI.offMenuNewSession?.(handler);
+        (window as any).electronAPI.removeAllListeners('menu-new-session');
       };
     }
   }, []);

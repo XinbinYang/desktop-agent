@@ -12,7 +12,6 @@
     "dist": "vite build && electron-builder"
   },
   "dependencies": {
-    "electron-store": "^11.0.2",
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -27,7 +26,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",
     "autoprefixer": "^10.4.20",
-    "electron": "^33.2.0",
+    "electron": "^30.0.0",
     "electron-builder": "^25.1.8",
     "jsdom": "^29.0.2",
     "postcss": "^8.4.49",
