@@ -88,6 +88,17 @@ export default function App() {
     };
   }, [connectWS]);
 
+  // 监听 Electron 菜单事件
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.onMenuNewSession) {
+      const handler = () => newSession();
+      (window as any).electronAPI.onMenuNewSession(handler);
+      return () => {
+        (window as any).electronAPI.offMenuNewSession?.(handler);
+      };
+    }
+  }, []);
+
   const switchSession = (newSessionId: string) => {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     wsRef.current?.close();

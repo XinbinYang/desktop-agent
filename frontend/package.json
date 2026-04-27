@@ -8,9 +8,11 @@
     "dev:electron": "electron . --dev",
     "build": "vite build",
     "build:renderer": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dist": "vite build && electron-builder"
   },
   "dependencies": {
+    "electron-store": "^11.0.2",
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
