@@ -294,7 +294,7 @@ export default function App() {
         {/* 右侧 Tab 面板（工具调用 / 预览） */}
         <div
           className="border-l border-gray-700 bg-gray-800/50 flex flex-col relative"
-          style={{ width: rightWidth, minWidth: 200, maxWidth: 900 }}
+          style={{ width: rightWidth, minWidth: 200, maxWidth: 1400 }}
         >
           {/* 拖拽分隔条 */}
           <div
