@@ -2,10 +2,17 @@
 import asyncio
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from app.tools.base import BaseTool, ToolResult
 from app.worker import WorkerSession, WORKER_PROFILES
+
+_worker_event_callback: Optional[Callable] = None
+
+
+def set_worker_event_callback(cb: Optional[Callable]) -> None:
+    global _worker_event_callback
+    _worker_event_callback = cb
 
 
 class DispatchWorkerTool(BaseTool):
@@ -58,6 +65,8 @@ class DispatchWorkerTool(BaseTool):
 
         async for event in worker.run():
             events.append(event)
+            if _worker_event_callback:
+                _worker_event_callback(event)
             if event["type"] == "worker_done":
                 final_result = event["data"].get("result", "")
 
@@ -124,6 +133,8 @@ class DispatchParallelTool(BaseTool):
             final = ""
             async for event in worker.run():
                 events.append(event)
+                if _worker_event_callback:
+                    _worker_event_callback(event)
                 if event["type"] == "worker_done":
                     final = event["data"].get("result", "")
             return {
