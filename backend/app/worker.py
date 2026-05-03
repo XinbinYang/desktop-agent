@@ -190,6 +190,7 @@ class WorkerSession:
                         "name": tool_name,
                         "args": {},
                         "result": result_text,
+                        "duration_ms": 0,
                     }}
                     tool_results.append({
                         "tool_call_id": tool_id,
@@ -206,6 +207,7 @@ class WorkerSession:
                         "name": tool_name,
                         "args": tool_args,
                         "result": result_text,
+                        "duration_ms": 0,
                     }}
                     tool_results.append({
                         "tool_call_id": tool_id,
@@ -236,6 +238,7 @@ class WorkerSession:
                         "name": tool_name,
                         "args": tool_args,
                         "result": result_text,
+                        "duration_ms": 0,
                     }}
 
                 tool_results.append({
