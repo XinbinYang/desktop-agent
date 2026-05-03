@@ -1,4 +1,5 @@
 """Lightweight Worker agent for sub-task execution."""
+import inspect
 import json
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ class WorkerSession:
         self._cancelled = False
         self._context_files = context_files or []
         self._stale_count = 0
+        self._started_at = time.time()
+        self._tool_schemas_cache = self._build_tool_schemas()
         self._build_system_prompt()
         self._add_task_message()
 
@@ -104,7 +107,7 @@ class WorkerSession:
                     "status": "cancelled",
                     "result": "[Worker cancelled]",
                     "iterations": self.iteration,
-                    "duration_ms": 0,
+                    "duration_ms": round((time.time() - self._started_at) * 1000),
                 }}
                 return
 
@@ -113,7 +116,7 @@ class WorkerSession:
             try:
                 response = await self.router.chat_completion_non_stream(
                     messages=self.messages,
-                    tools=self._get_worker_tool_schemas(),
+                    tools=self._tool_schemas_cache,
                     temperature=0.5,
                     max_tokens=4096,
                 )
@@ -123,7 +126,7 @@ class WorkerSession:
                     "status": "failed",
                     "result": f"[Worker model error: {e}]",
                     "iterations": self.iteration,
-                    "duration_ms": 0,
+                    "duration_ms": round((time.time() - self._started_at) * 1000),
                 }}
                 return
 
@@ -149,7 +152,7 @@ class WorkerSession:
                         "status": "failed",
                         "result": "[Worker stalled: no output for 3 iterations]",
                         "iterations": self.iteration,
-                        "duration_ms": 0,
+                        "duration_ms": round((time.time() - self._started_at) * 1000),
                     }}
                     return
             else:
@@ -168,7 +171,7 @@ class WorkerSession:
                     "status": "completed",
                     "result": content,
                     "iterations": self.iteration,
-                    "duration_ms": 0,
+                    "duration_ms": round((time.time() - self._started_at) * 1000),
                 }}
                 return
 
@@ -219,6 +222,8 @@ class WorkerSession:
 
                 try:
                     tool = get_static_tool(tool_name)
+                    if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
+                        tool_args["session_id"] = self.worker_id
                     started_at = time.time()
                     result = await tool.execute(**tool_args)
                     result_text = result.to_text()
@@ -256,7 +261,7 @@ class WorkerSession:
             "status": "max_iterations_reached",
             "result": f"[Worker stopped: max {self.profile.max_iterations} iterations]",
             "iterations": self.iteration,
-            "duration_ms": 0,
+            "duration_ms": round((time.time() - self._started_at) * 1000),
         }}
 
     def _trim_messages(self):
@@ -291,7 +296,7 @@ class WorkerSession:
 
         self.messages = [system_msg] + [msg for group in selected for msg in group]
 
-    def _get_worker_tool_schemas(self) -> List[Dict[str, Any]]:
+    def _build_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = []
         for name in self.profile.tools:
             if name in list_static_tool_names():
