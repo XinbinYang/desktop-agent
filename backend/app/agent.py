@@ -14,6 +14,7 @@ from app.tools import get_tool, get_tool_schemas, list_tool_names, DynamicToolRe
 from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
 from app.tools.workflow_tool import get_recorder
+from app.message_utils import trim_messages
 
 SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
@@ -87,60 +88,12 @@ class AgentSession:
 
     def _trim_messages(self):
         """Trim history without splitting assistant tool_calls from their tool results."""
-        system_msg = (
-            self.messages[0]
-            if self.messages and self.messages[0].get("role") == "system"
-            else {"role": "system", "content": self._build_system_prompt()}
+        self.messages = trim_messages(
+            self.messages,
+            self.MAX_HISTORY_MESSAGES,
+            build_system_prompt_fn=self._build_system_prompt,
+            validate_tool_ids=True,
         )
-        body = self.messages[1:] if self.messages and self.messages[0].get("role") == "system" else self.messages
-
-        groups: List[List[Dict[str, Any]]] = []
-        i = 0
-        while i < len(body):
-            msg = body[i]
-            role = msg.get("role")
-
-            if role == "tool":
-                i += 1
-                continue
-
-            if role == "assistant" and msg.get("tool_calls"):
-                group = [msg]
-                expected_ids = {
-                    tc.get("id", "")
-                    for tc in msg.get("tool_calls", [])
-                    if tc.get("id")
-                }
-                seen_ids: set[str] = set()
-                i += 1
-                while i < len(body) and body[i].get("role") == "tool":
-                    tool_msg = body[i]
-                    tool_call_id = tool_msg.get("tool_call_id", "")
-                    if not expected_ids or tool_call_id in expected_ids:
-                        group.append(tool_msg)
-                        if tool_call_id:
-                            seen_ids.add(tool_call_id)
-                    i += 1
-
-                if expected_ids and seen_ids != expected_ids:
-                    sanitized = dict(msg)
-                    sanitized.pop("tool_calls", None)
-                    group = [sanitized]
-                groups.append(group)
-                continue
-
-            groups.append([msg])
-            i += 1
-
-        selected: List[List[Dict[str, Any]]] = []
-        count = 0
-        for group in reversed(groups):
-            if selected and count + len(group) > self.MAX_HISTORY_MESSAGES:
-                break
-            selected.insert(0, group)
-            count += len(group)
-
-        self.messages = [system_msg] + [msg for group in selected for msg in group]
 
     async def run(
         self,

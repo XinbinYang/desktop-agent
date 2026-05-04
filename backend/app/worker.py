@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.models import ModelRouter
-from app.tools import get_static_tool, list_static_tool_names
+from app.message_utils import trim_messages
 
 WORKER_PROFILES: Dict[str, "WorkerProfile"] = {}
 
@@ -65,6 +65,7 @@ class WorkerSession:
         self._add_task_message()
 
     def _build_system_prompt(self):
+        from app.tools import get_static_tool, list_static_tool_names
         tool_names = self.profile.tools
         tools_desc_lines = []
         for name in tool_names:
@@ -221,6 +222,7 @@ class WorkerSession:
                     continue
 
                 try:
+                    from app.tools import get_static_tool
                     tool = get_static_tool(tool_name)
                     if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
                         tool_args["session_id"] = self.worker_id
@@ -265,38 +267,10 @@ class WorkerSession:
         }}
 
     def _trim_messages(self):
-        system_msg = self.messages[0] if self.messages and self.messages[0].get("role") == "system" else {"role": "system", "content": ""}
-        body = self.messages[1:] if self.messages and self.messages[0].get("role") == "system" else self.messages
-        groups = []
-        i = 0
-        while i < len(body):
-            msg = body[i]
-            role = msg.get("role")
-            if role == "tool":
-                i += 1
-                continue
-            if role == "assistant" and msg.get("tool_calls"):
-                group = [msg]
-                i += 1
-                while i < len(body) and body[i].get("role") == "tool":
-                    group.append(body[i])
-                    i += 1
-                groups.append(group)
-                continue
-            groups.append([msg])
-            i += 1
-
-        selected = []
-        count = 0
-        for group in reversed(groups):
-            if selected and count + len(group) > self.MAX_HISTORY_MESSAGES:
-                break
-            selected.insert(0, group)
-            count += len(group)
-
-        self.messages = [system_msg] + [msg for group in selected for msg in group]
+        self.messages = trim_messages(self.messages, self.MAX_HISTORY_MESSAGES)
 
     def _build_tool_schemas(self) -> List[Dict[str, Any]]:
+        from app.tools import get_static_tool, list_static_tool_names
         schemas = []
         for name in self.profile.tools:
             if name in list_static_tool_names():
