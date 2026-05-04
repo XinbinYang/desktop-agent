@@ -6,16 +6,24 @@
   "scripts": {
     "dev:renderer": "vite",
     "dev:electron": "electron . --dev",
+    "build:backend": "powershell -ExecutionPolicy Bypass -File ../backend/build-backend-exe.ps1",
+    "check:backend": "powershell -ExecutionPolicy Bypass -File ../backend/build-backend-exe.ps1 -CheckOnly",
     "build": "vite build",
     "build:renderer": "vite build",
     "preview": "vite preview",
-    "dist": "vite build && electron-builder"
+    "dist": "npm run build:backend && vite build && electron-builder"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "idb": "^8.0.3",
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-hotkeys-hook": "^5.3.0",
     "react-markdown": "^9.0.1",
+    "react-syntax-highlighter": "^16.1.1",
+
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
@@ -28,6 +36,7 @@
     "autoprefixer": "^10.4.20",
     "electron": "^30.0.0",
     "electron-builder": "^25.1.8",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.0.2",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
@@ -44,6 +53,15 @@
     "files": [
       "dist/**/*",
       "src-main/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "desktop-agent-backend.exe"
+        ]
+      }
     ]
   }
 }

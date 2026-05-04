@@ -82,17 +82,13 @@ export default function App() {
 
     const loadModels = async () => {
       try {
-        console.log('[App] Fetching models from', `${API_BASE}/api/models`);
         const res = await fetch(`${API_BASE}/api/models`);
-        console.log('[App] Models response status:', res.status);
         const data = await res.json();
-        console.log('[App] Models data:', data);
         if (!cancelled) {
           const modelsList = data.models || [];
           setModels(modelsList);
           const defaultModel = data.default || modelsList[0]?.id || '';
           setCurrentModel(defaultModel);
-          console.log('[App] Set current model to:', defaultModel);
         }
       } catch (err) {
         console.error('[App] Failed to load models:', err);
@@ -101,11 +97,8 @@ export default function App() {
 
     const loadRolesData = async () => {
       try {
-        console.log('[App] Fetching roles from', `${API_BASE}/api/roles`);
         const res = await fetch(`${API_BASE}/api/roles`);
-        console.log('[App] Roles response status:', res.status);
         const data = await res.json();
-        console.log('[App] Roles data:', data);
         const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
           id: r.id,
           name: r.name,
@@ -148,7 +141,6 @@ export default function App() {
     const retryTimer = setTimeout(() => {
       setModels((prevModels) => {
         if (prevModels.length === 0 && !cancelled) {
-          console.log('[App] Models still empty after 2s, retrying...');
           doLoad();
         }
         return prevModels;

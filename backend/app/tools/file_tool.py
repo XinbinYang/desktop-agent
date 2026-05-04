@@ -1,31 +1,58 @@
 import os
 import aiofiles
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
+from app.project_manager import ProjectManager
+from app.security import resolve_under_base
+
+# æ–‡ä»¶æ“ä½œæ²™ç®±ï¼šé™åˆ¶åœ¨é¡¹ç›®æ ¹ç›®å½•å†…
+_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
+
+
+def _get_base_path(project_relative: bool = False) -> Path:
+    """èŽ·å–æ–‡ä»¶æ“ä½œçš„åŸºç¡€è·¯å¾„"""
+    if project_relative:
+        project = ProjectManager.get_current()
+        if project:
+            return Path(project["path"]).resolve()
+    return _PROJECT_ROOT
+
+
+def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Optional[str]]:
+    """éªŒè¯è·¯å¾„æ˜¯å¦åœ¨æ²™ç®±å†…ã€‚è¿”å›ž (resolved_path, error_message)ã€‚"""
+    base = _get_base_path(project_relative)
+    p, err = resolve_under_base(path, base, allow_relative=project_relative)
+    if err:
+        scope = "current project" if project_relative else "backend root"
+        return p, f"路径越界: {err}. Only {scope} files under {base} are allowed."
+    return p, None
 
 class FileReadTool(BaseTool):
     name = "file_read"
-    description = "读取本地文件内容。支持文本文件，对大文件会自动截断。"
+    description = "è¯»å–æœ¬åœ°æ–‡ä»¶å†…å®¹ã€‚æ”¯æŒæ–‡æœ¬æ–‡ä»¶ï¼Œå¯¹å¤§æ–‡ä»¶ä¼šè‡ªåŠ¨æˆªæ–­ã€‚å½“ project_relative=true æ—¶ï¼Œpath ç›¸å¯¹äºŽå½“å‰æ‰“å¼€çš„é¡¹ç›®ç›®å½•è§£æžã€‚"
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "文件的绝对路径"},
-            "offset": {"type": "integer", "description": "起始行号，从0开始", "default": 0},
-            "limit": {"type": "integer", "description": "读取最大行数", "default": 200}
+            "path": {"type": "string", "description": "æ–‡ä»¶è·¯å¾„ã€‚ç»å¯¹è·¯å¾„æˆ–ç›¸å¯¹äºŽé¡¹ç›®çš„ç›¸å¯¹è·¯å¾„ï¼ˆå½“ project_relative=true æ—¶ï¼‰"},
+            "offset": {"type": "integer", "description": "èµ·å§‹è¡Œå·ï¼Œä»Ž0å¼€å§‹", "default": 0},
+            "limit": {"type": "integer", "description": "è¯»å–æœ€å¤§è¡Œæ•°", "default": 200},
+            "project_relative": {"type": "boolean", "description": "æ˜¯å¦å°†è·¯å¾„è§£æžä¸ºç›¸å¯¹äºŽå½“å‰é¡¹ç›®ç›®å½•", "default": False}
         },
         "required": ["path"]
     }
     
-    async def execute(self, path: str, offset: int = 0, limit: int = 200) -> ToolResult:
+    async def execute(self, path: str, offset: int = 0, limit: int = 200, project_relative: bool = False) -> ToolResult:
+        p, err = _validate_path(path, project_relative)
+        if err:
+            return ToolResult(error=err)
         try:
-            p = Path(path).resolve()
             if not p.exists():
                 return ToolResult(error=f"文件不存在: {path}")
             if not p.is_file():
                 return ToolResult(error=f"路径不是文件: {path}")
             
-            # 安全限制：避免读取超大文件
+            # å®‰å…¨é™åˆ¶ï¼šé¿å…è¯»å–è¶…å¤§æ–‡ä»¶
             size = p.stat().st_size
             if size > 10 * 1024 * 1024:  # 10MB
                 return ToolResult(error=f"文件过大 ({size} bytes)，拒绝读取")
@@ -42,19 +69,22 @@ class FileReadTool(BaseTool):
 
 class FileWriteTool(BaseTool):
     name = "file_write"
-    description = "写入或覆盖文件内容。如果目录不存在会自动创建。"
+    description = "å†™å…¥æˆ–è¦†ç›–æ–‡ä»¶å†…å®¹ã€‚å¦‚æžœç›®å½•ä¸å­˜åœ¨ä¼šè‡ªåŠ¨åˆ›å»ºã€‚å½“ project_relative=true æ—¶ï¼Œpath ç›¸å¯¹äºŽå½“å‰æ‰“å¼€çš„é¡¹ç›®ç›®å½•è§£æžã€‚"
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "文件的绝对路径"},
-            "content": {"type": "string", "description": "要写入的内容"}
+            "path": {"type": "string", "description": "æ–‡ä»¶è·¯å¾„ã€‚ç»å¯¹è·¯å¾„æˆ–ç›¸å¯¹äºŽé¡¹ç›®çš„ç›¸å¯¹è·¯å¾„ï¼ˆå½“ project_relative=true æ—¶ï¼‰"},
+            "content": {"type": "string", "description": "è¦å†™å…¥çš„å†…å®¹"},
+            "project_relative": {"type": "boolean", "description": "æ˜¯å¦å°†è·¯å¾„è§£æžä¸ºç›¸å¯¹äºŽå½“å‰é¡¹ç›®ç›®å½•", "default": False}
         },
         "required": ["path", "content"]
     }
     
-    async def execute(self, path: str, content: str) -> ToolResult:
+    async def execute(self, path: str, content: str, project_relative: bool = False) -> ToolResult:
+        p, err = _validate_path(path, project_relative)
+        if err:
+            return ToolResult(error=err)
         try:
-            p = Path(path).resolve()
             p.parent.mkdir(parents=True, exist_ok=True)
             async with aiofiles.open(p, "w", encoding="utf-8") as f:
                 await f.write(content)
@@ -64,19 +94,22 @@ class FileWriteTool(BaseTool):
 
 class FileListTool(BaseTool):
     name = "file_list"
-    description = "列出指定目录下的文件和文件夹。"
+    description = "åˆ—å‡ºæŒ‡å®šç›®å½•ä¸‹çš„æ–‡ä»¶å’Œæ–‡ä»¶å¤¹ã€‚å½“ project_relative=true æ—¶ï¼Œpath ç›¸å¯¹äºŽå½“å‰æ‰“å¼€çš„é¡¹ç›®ç›®å½•è§£æžã€‚"
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "目录的绝对路径，默认为当前工作目录"},
-            "recursive": {"type": "boolean", "description": "是否递归列出", "default": False}
+            "path": {"type": "string", "description": "ç›®å½•è·¯å¾„ã€‚ç»å¯¹è·¯å¾„æˆ–ç›¸å¯¹äºŽé¡¹ç›®çš„ç›¸å¯¹è·¯å¾„ï¼ˆå½“ project_relative=true æ—¶ï¼‰"},
+            "recursive": {"type": "boolean", "description": "æ˜¯å¦é€’å½’åˆ—å‡º", "default": False},
+            "project_relative": {"type": "boolean", "description": "æ˜¯å¦å°†è·¯å¾„è§£æžä¸ºç›¸å¯¹äºŽå½“å‰é¡¹ç›®ç›®å½•", "default": False}
         },
         "required": ["path"]
     }
     
-    async def execute(self, path: str, recursive: bool = False) -> ToolResult:
+    async def execute(self, path: str, recursive: bool = False, project_relative: bool = False) -> ToolResult:
+        p, err = _validate_path(path, project_relative)
+        if err:
+            return ToolResult(error=err)
         try:
-            p = Path(path).resolve()
             if not p.exists():
                 return ToolResult(error=f"目录不存在: {path}")
             
@@ -84,11 +117,11 @@ class FileListTool(BaseTool):
             if recursive:
                 for item in p.rglob("*"):
                     rel = item.relative_to(p)
-                    marker = "📁" if item.is_dir() else "📄"
+                    marker = "ðŸ“" if item.is_dir() else "ðŸ“„"
                     lines.append(f"{marker} {rel}")
             else:
                 for item in p.iterdir():
-                    marker = "📁" if item.is_dir() else "📄"
+                    marker = "ðŸ“" if item.is_dir() else "ðŸ“„"
                     lines.append(f"{marker} {item.name}")
             
             return ToolResult(output="\n".join(lines) if lines else "（空目录）")
@@ -97,19 +130,22 @@ class FileListTool(BaseTool):
 
 class FileSearchTool(BaseTool):
     name = "file_search"
-    description = "在指定目录下搜索文件名包含关键字的文件。"
+    description = "åœ¨æŒ‡å®šç›®å½•ä¸‹æœç´¢æ–‡ä»¶ååŒ…å«å…³é”®å­—çš„æ–‡ä»¶ã€‚å½“ project_relative=true æ—¶ï¼Œpath ç›¸å¯¹äºŽå½“å‰æ‰“å¼€çš„é¡¹ç›®ç›®å½•è§£æžã€‚"
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "搜索根目录"},
-            "keyword": {"type": "string", "description": "文件名关键字"}
+            "path": {"type": "string", "description": "æœç´¢æ ¹ç›®å½•è·¯å¾„ã€‚ç»å¯¹è·¯å¾„æˆ–ç›¸å¯¹äºŽé¡¹ç›®çš„ç›¸å¯¹è·¯å¾„ï¼ˆå½“ project_relative=true æ—¶ï¼‰"},
+            "keyword": {"type": "string", "description": "æ–‡ä»¶åå…³é”®å­—"},
+            "project_relative": {"type": "boolean", "description": "æ˜¯å¦å°†è·¯å¾„è§£æžä¸ºç›¸å¯¹äºŽå½“å‰é¡¹ç›®ç›®å½•", "default": False}
         },
         "required": ["path", "keyword"]
     }
     
-    async def execute(self, path: str, keyword: str) -> ToolResult:
+    async def execute(self, path: str, keyword: str, project_relative: bool = False) -> ToolResult:
+        p, err = _validate_path(path, project_relative)
+        if err:
+            return ToolResult(error=err)
         try:
-            p = Path(path).resolve()
             matches = []
             for item in p.rglob(f"*{keyword}*"):
                 matches.append(str(item.relative_to(p)))
@@ -119,18 +155,21 @@ class FileSearchTool(BaseTool):
 
 class FileDeleteTool(BaseTool):
     name = "file_delete"
-    description = "删除指定文件。"
+    description = "åˆ é™¤æŒ‡å®šæ–‡ä»¶ã€‚å½“ project_relative=true æ—¶ï¼Œpath ç›¸å¯¹äºŽå½“å‰æ‰“å¼€çš„é¡¹ç›®ç›®å½•è§£æžã€‚"
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "要删除的文件路径"}
+            "path": {"type": "string", "description": "è¦åˆ é™¤çš„æ–‡ä»¶è·¯å¾„ã€‚ç»å¯¹è·¯å¾„æˆ–ç›¸å¯¹äºŽé¡¹ç›®çš„ç›¸å¯¹è·¯å¾„ï¼ˆå½“ project_relative=true æ—¶ï¼‰"},
+            "project_relative": {"type": "boolean", "description": "æ˜¯å¦å°†è·¯å¾„è§£æžä¸ºç›¸å¯¹äºŽå½“å‰é¡¹ç›®ç›®å½•", "default": False}
         },
         "required": ["path"]
     }
     
-    async def execute(self, path: str) -> ToolResult:
+    async def execute(self, path: str, project_relative: bool = False) -> ToolResult:
+        p, err = _validate_path(path, project_relative)
+        if err:
+            return ToolResult(error=err)
         try:
-            p = Path(path).resolve()
             if p.is_file():
                 p.unlink()
                 return ToolResult(output=f"已删除: {p}")
