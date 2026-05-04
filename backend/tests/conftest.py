@@ -76,7 +76,47 @@ def reset_config_cache():
     config._config = None
 
 
+@pytest.fixture(autouse=True)
+def clean_sessions(monkeypatch):
+    """Lightweight: clear in-memory sessions without importing litellm cascade."""
+    # Delay import to avoid triggering app.models -> litellm at fixture evaluation
+    from app.agent import _sessions
+    _sessions.clear()
+    yield
+    _sessions.clear()
+
+
 @pytest.fixture
-def temp_dir(tmp_path):
-    """Provide a temporary directory for file tool tests"""
-    return tmp_path
+def isolate_projects(tmp_path, monkeypatch):
+    """Isolate project/credential directories for tests that need them."""
+    from app.credential_manager import CredentialManager
+    from app.project_manager import ProjectManager
+    import app.credential_manager as credential_manager
+    import app.project_manager as project_manager
+
+    runtime_dir = tmp_path / "runtime"
+    projects_dir = runtime_dir / "projects"
+    projects_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(project_manager, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(project_manager, "RECENT_FILE", projects_dir / "recent.json")
+    monkeypatch.setattr(credential_manager, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(credential_manager, "CREDENTIALS_FILE", projects_dir / "credentials.json")
+
+    ProjectManager._current_project = None
+    CredentialManager._credentials_cache = None
+
+    yield
+
+    ProjectManager._current_project = None
+    CredentialManager._credentials_cache = None
+
+
+@pytest.fixture
+def temp_dir():
+    """Provide a temporary directory inside the project root for file tool tests"""
+    test_dir = BACKEND_ROOT / "tests" / "tmp"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=str(test_dir)) as d:
+        yield Path(d)
