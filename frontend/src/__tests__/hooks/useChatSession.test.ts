@@ -1,0 +1,308 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { renderHook, act, waitFor } from '@testing-library/react'
+import { useChatSession } from '../../hooks/useChatSession'
+import type { WS_EVENT } from '../../types'
+
+// Mock useWebSocket
+vi.mock('../../hooks/useWebSocket', () => ({
+  useWebSocket: vi.fn(() => ({
+    isConnected: true,
+    send: vi.fn(),
+    disconnect: vi.fn(),
+  })),
+}))
+
+// Mock idb
+vi.mock('../../lib/db', () => ({
+  saveSession: vi.fn(),
+  loadSession: vi.fn(() => Promise.resolve(undefined)),
+  deleteSessionData: vi.fn(),
+  saveDraft: vi.fn(),
+  loadDraft: vi.fn(() => Promise.resolve(undefined)),
+  deleteDraft: vi.fn(),
+}))
+
+import { useWebSocket } from '../../hooks/useWebSocket'
+
+const mockedUseWebSocket = vi.mocked(useWebSocket)
+
+describe('useChatSession', () => {
+  const mockSend = vi.fn()
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockedUseWebSocket.mockReturnValue({
+      isConnected: true,
+      send: mockSend,
+      disconnect: vi.fn(),
+    })
+  })
+
+  it('initializes with empty state', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+    expect(result.current.messages).toEqual([])
+    expect(result.current.toolCalls).toEqual([])
+    expect(result.current.isRunning).toBe(false)
+  })
+
+  it('sends message and adds user message', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('hello')
+    })
+
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].role).toBe('user')
+    expect(result.current.messages[0].content).toBe('hello')
+    expect(result.current.isRunning).toBe(true)
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'chat',
+      text: 'hello',
+      model_id: 'gpt-4o',
+      role_id: 'desktop-agent',
+      image_base64: undefined,
+    })
+  })
+
+  it('stops running when websocket send fails', () => {
+    mockSend.mockReturnValueOnce(false)
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('hello')
+    })
+
+    expect(result.current.isRunning).toBe(false)
+    expect(result.current.terminalLogs.some((line) => line.includes('WebSocket'))).toBe(true)
+  })
+
+  it('handles content event by appending to assistant message', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    // First content event creates assistant message
+    act(() => {
+      messageHandler?.({ type: 'content', data: { text: 'Hello' } })
+    })
+
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].content).toBe('Hello')
+
+    // Second content event appends
+    act(() => {
+      messageHandler?.({ type: 'content', data: { text: ' world' } })
+    })
+
+    expect(result.current.messages[0].content).toBe('Hello world')
+  })
+
+  it('handles tool_call event', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'tool_call',
+        data: {
+          name: 'file_read',
+          args: { path: 'test.txt' },
+          result: 'file content',
+          run_id: 'run-1',
+          tool_call_id: 'call-1',
+          duration_ms: 12,
+        },
+      })
+    })
+
+    expect(result.current.toolCalls).toHaveLength(1)
+    expect(result.current.toolCalls[0].name).toBe('file_read')
+    expect(result.current.toolCalls[0].runId).toBe('run-1')
+    expect(result.current.toolCalls[0].toolCallId).toBe('call-1')
+    expect(result.current.toolCalls[0].durationMs).toBe(12)
+    expect(result.current.messages).toHaveLength(0)
+  })
+
+  it('handles tool_result event', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'tool_result',
+        data: {
+          name: 'get_screen_size',
+          args: {},
+          output: '1920x1080',
+          error: '',
+        },
+      })
+    })
+
+    expect(result.current.toolCalls).toHaveLength(1)
+    expect(result.current.toolCalls[0].name).toBe('get_screen_size')
+    expect(result.current.toolCalls[0].result).toBe('1920x1080')
+  })
+
+  it('handles tool_result image event', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'tool_result',
+        data: {
+          name: 'screenshot',
+          args: {},
+          output: '',
+          error: '',
+          image: 'abc123',
+        },
+      })
+    })
+
+    expect(result.current.toolCalls).toHaveLength(1)
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].imageBase64).toBe('abc123')
+  })
+
+  it('handles error event and stops running', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('test')
+    })
+    expect(result.current.isRunning).toBe(true)
+
+    act(() => {
+      messageHandler?.({
+        type: 'error',
+        data: { message: 'Something went wrong' },
+      })
+    })
+
+    expect(result.current.isRunning).toBe(false)
+    expect(result.current.messages.some((m) => m.role === 'system')).toBe(true)
+  })
+
+  it('handles worker events by attaching to dispatch tool call', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() =>
+      useChatSession('test', 'gpt-4o', 'code-expert')
+    )
+
+    // First, trigger a dispatch_worker tool_call
+    act(() => {
+      messageHandler?.({
+        type: 'tool_call',
+        data: {
+          name: 'dispatch_worker',
+          args: { task: 'Test', profile: 'code' },
+          result: 'Working...',
+        },
+      })
+    })
+
+    // Verify tool call was recorded
+    expect(result.current.toolCalls.length).toBeGreaterThanOrEqual(1)
+
+    // Then trigger worker_start
+    act(() => {
+      messageHandler?.({
+        type: 'worker_start',
+        data: { worker_id: 'w1' },
+      })
+    })
+
+    expect(result.current.toolCalls[0].workerEvents).toHaveLength(1)
+    expect(result.current.toolCalls[0].workerEvents![0].type).toBe('worker_start')
+
+    // Trigger worker_done
+    act(() => {
+      messageHandler?.({
+        type: 'worker_done',
+        data: {
+          worker_id: 'w1',
+          status: 'completed',
+          result: 'All done',
+          iterations: 3,
+          duration_ms: 5000,
+        },
+      })
+    })
+
+    expect(result.current.toolCalls[0].workerEvents).toHaveLength(2)
+    expect(result.current.toolCalls[0].workerEvents![1].status).toBe('completed')
+  })
+
+  it('resets session state', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('test')
+    })
+
+    act(() => {
+      result.current.resetSession()
+    })
+
+    expect(result.current.messages).toEqual([])
+    expect(result.current.toolCalls).toEqual([])
+    expect(result.current.isRunning).toBe(false)
+  })
+})
