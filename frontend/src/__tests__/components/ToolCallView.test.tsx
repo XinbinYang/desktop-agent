@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { ToolCallView } from '../../components/ToolCallView'
-import type { ToolCall } from '../../types'
+import type { ToolCall, WorkerEvent } from '../../types'
 
 describe('ToolCallView', () => {
   it('renders tool call name', () => {
@@ -73,7 +73,7 @@ describe('ToolCallView', () => {
           workerId: 'w1', type: 'worker_done',
           status: 'completed', result: 'All done', iterations: 3, durationMs: 5000,
         },
-      ],
+      ] as WorkerEvent[],
     };
     render(<ToolCallView toolCall={toolCall} />);
     fireEvent.click(screen.getByLabelText('展开工具调用详情'));
@@ -92,7 +92,7 @@ describe('ToolCallView', () => {
       workerEvents: [
         { workerId: 'w1', type: 'worker_done', status: 'completed', result: 'Done A' },
         { workerId: 'w2', type: 'worker_done', status: 'completed', result: 'Done B' },
-      ],
+      ] as WorkerEvent[],
     };
     render(<ToolCallView toolCall={toolCall} />);
     expect(screen.getByText('2 worker(s)')).toBeInTheDocument();
@@ -106,7 +106,7 @@ describe('ToolCallView', () => {
       timestamp: Date.now(),
       workerEvents: [
         { workerId: 'w1', type: 'worker_done', status: 'failed', result: 'Error occurred' },
-      ],
+      ] as WorkerEvent[],
     };
     render(<ToolCallView toolCall={toolCall} />);
     fireEvent.click(screen.getByLabelText('展开工具调用详情'));
