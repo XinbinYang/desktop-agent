@@ -1,0 +1,136 @@
+"""Tests for dispatch_worker and dispatch_parallel tools."""
+import pytest
+from unittest.mock import MagicMock, patch
+
+from app.tools.worker_tool import DispatchWorkerTool, DispatchParallelTool
+from app.worker import WorkerSession
+
+
+class TestDispatchWorkerTool:
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_basic(self, mock_litellm):
+        mock_litellm.return_value.model_dump.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "Done: file created.",
+                    "role": "assistant",
+                }
+            }]
+        }
+        tool = DispatchWorkerTool()
+        result = await tool.execute(
+            task="Write hello.py", profile="code", model_id="gpt-4o",
+        )
+        assert "Worker worker_" in result.output
+        assert "completed" in result.output
+        assert "Done: file created" in result.output
+
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_with_tool_calls(self, mock_litellm_with_tool_call):
+        mock_litellm_with_tool_call.return_value.model_dump.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_screen_size",
+                            "arguments": "{}",
+                        }
+                    }]
+                }
+            }]
+        }
+        tool = DispatchWorkerTool()
+        result = await tool.execute(
+            task="Check screen size", profile="general", model_id="gpt-4o",
+        )
+        assert "get_screen_size" in result.output
+
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_invalid_profile(self, mock_litellm):
+        mock_litellm.return_value.model_dump.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "Done.",
+                    "role": "assistant",
+                }
+            }]
+        }
+        tool = DispatchWorkerTool()
+        result = await tool.execute(
+            task="Test", profile="nonexistent", model_id="gpt-4o",
+        )
+        # Should fall back to 'general' profile
+        assert "Worker" in result.output
+
+
+class TestDispatchParallelTool:
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_two_tasks(self, mock_litellm):
+        mock_litellm.return_value.model_dump.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "Task done.",
+                    "role": "assistant",
+                }
+            }]
+        }
+        tool = DispatchParallelTool()
+        result = await tool.execute(
+            tasks=[
+                {"task": "Task A", "profile": "code"},
+                {"task": "Task B", "profile": "code"},
+            ],
+            model_id="gpt-4o",
+        )
+        assert "2 succeeded" in result.output
+        assert "0 failed" in result.output
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_partial_failure(self):
+        """When a worker crashes with an unhandled exception, the parallel
+        dispatcher counts it as a failure and reports successes separately."""
+
+        call_count = [0]
+
+        async def replacement_run(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First worker: yields done event then crashes
+                yield {"type": "worker_done", "data": {
+                    "worker_id": self.worker_id,
+                    "status": "failed",
+                    "result": "[Worker crashed]",
+                    "iterations": 0,
+                    "duration_ms": 0,
+                }}
+                raise RuntimeError("Worker crashed unexpectedly")
+            else:
+                # Second worker: completes normally
+                yield {"type": "worker_done", "data": {
+                    "worker_id": self.worker_id,
+                    "status": "completed",
+                    "result": "Task completed successfully.",
+                    "iterations": 1,
+                    "duration_ms": 10,
+                }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(tasks=[
+                {"task": "Task A", "profile": "code"},
+                {"task": "Task B", "profile": "code"},
+            ])
+
+        assert "1 succeeded" in result.output
+        assert "1 failed" in result.output
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_empty_tasks(self, mock_litellm):
+        tool = DispatchParallelTool()
+        result = await tool.execute(tasks=[])
+        if result.output:
+            assert "0 succeeded" in result.output
