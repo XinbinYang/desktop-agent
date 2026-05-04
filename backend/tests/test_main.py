@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 import pytest
 
@@ -22,6 +23,24 @@ class TestAPIRoutes:
         assert len(data["tools"]) > 0
         assert "name" in data["tools"][0]
         assert "description" in data["tools"][0]
+
+    def test_get_roles(self, client):
+        """GET /api/roles returns builtin role list"""
+        response = client.get("/api/roles")
+        assert response.status_code == 200
+        data = response.json()
+        assert "roles" in data
+        assert len(data["roles"]) >= 4
+        role_ids = [r["id"] for r in data["roles"]]
+        assert "desktop-agent" in role_ids
+        assert "general-assistant" in role_ids
+        assert "quant-analyst" in role_ids
+        assert "code-expert" in role_ids
+        for r in data["roles"]:
+            assert "id" in r
+            assert "name" in r
+            assert "description" in r
+            assert "is_builtin" in r
 
     def test_chat_endpoint(self, client, mock_litellm):
         """POST /api/chat returns events"""
@@ -107,3 +126,206 @@ class TestWebSocket:
             })
             msg = ws.receive_json()
             assert msg["type"] == "error"
+
+    def test_websocket_tool_direct_reports_execution_error(self, client):
+        """WebSocket tool_direct returns tool_result errors instead of closing."""
+        with client.websocket_connect("/ws/test_tool_error") as ws:
+            ws.send_json({
+                "type": "tool_direct",
+                "tool_name": "file_read",
+                "args": {}
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "tool_result"
+            assert msg["data"]["name"] == "file_read"
+            assert "Tool execution failed" in msg["data"]["error"]
+
+
+class TestProjectAPI:
+    def test_get_projects_empty(self, client):
+        """GET /api/projects returns empty when no project open"""
+        response = client.get("/api/projects")
+        assert response.status_code == 200
+        data = response.json()
+        assert "projects" in data
+        assert "current" in data
+        assert data["current"] is None
+
+    def test_create_project(self, client, temp_dir):
+        """POST /api/projects/create creates a new project"""
+        response = client.post("/api/projects/create", json={
+            "parent_path": str(temp_dir),
+            "name": "test-proj",
+            "template": "empty"
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "test-proj"
+        assert data["path"] == str(temp_dir / "test-proj")
+
+    def test_create_project_duplicate(self, client, temp_dir):
+        """Creating duplicate project returns error"""
+        client.post("/api/projects/create", json={
+            "parent_path": str(temp_dir),
+            "name": "dup-proj",
+            "template": "empty"
+        })
+        response = client.post("/api/projects/create", json={
+            "parent_path": str(temp_dir),
+            "name": "dup-proj",
+            "template": "empty"
+        })
+        assert response.status_code == 200
+        assert "error" in response.json()
+
+    def test_open_and_close_project(self, client, temp_dir):
+        """POST /api/projects/open and /close lifecycle"""
+        proj_dir = temp_dir / "openme"
+        proj_dir.mkdir()
+        # Open
+        response = client.post("/api/projects/open", json={"path": str(proj_dir)})
+        assert response.status_code == 200
+        assert response.json()["name"] == "openme"
+        # Current
+        response = client.get("/api/projects/current")
+        assert response.status_code == 200
+        assert response.json()["name"] == "openme"
+        # Close
+        response = client.post("/api/projects/close")
+        assert response.status_code == 200
+        assert response.json()["status"] == "closed"
+        response = client.get("/api/projects/current")
+        assert response.json() is None
+
+    def test_get_project_tree(self, client, temp_dir):
+        """GET /api/projects/tree returns file tree"""
+        proj_dir = temp_dir / "treeproj"
+        proj_dir.mkdir()
+        (proj_dir / "src").mkdir()
+        (proj_dir / "src" / "main.py").write_text("x")
+        (proj_dir / "README.md").write_text("x")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+        response = client.get("/api/projects/tree")
+        assert response.status_code == 200
+        data = response.json()
+        assert "nodes" in data
+        names = [n["name"] for n in data["nodes"]]
+        assert "README.md" in names
+        assert "src" in names
+
+    def test_get_project_tree_blocks_path_escape(self, client, temp_dir):
+        """GET /api/projects/tree rejects sibling prefix/path traversal escapes."""
+        proj_dir = temp_dir / "treeproj"
+        sibling = temp_dir / "treeproj_evil"
+        proj_dir.mkdir()
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("secret", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        response = client.get("/api/projects/tree", params={"path": "../treeproj_evil"})
+
+        assert response.status_code == 200
+        assert response.json()["nodes"] == []
+
+    def test_file_read_write_are_limited_to_current_project(self, client, temp_dir):
+        """Editor file API can write/read current project files only."""
+        proj_dir = temp_dir / "editorproj"
+        sibling = temp_dir / "editorproj_evil"
+        proj_dir.mkdir()
+        sibling.mkdir()
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        write_response = client.post("/api/file/write", json={
+            "path": "notes.txt",
+            "content": "hello",
+        })
+        assert write_response.status_code == 200
+        assert write_response.json()["status"] == "ok"
+        assert (proj_dir / "notes.txt").read_text(encoding="utf-8") == "hello"
+
+        read_response = client.get("/api/file/read", params={"path": str(proj_dir / "notes.txt")})
+        assert read_response.status_code == 200
+        assert read_response.json()["content"] == "hello"
+
+        escape_response = client.get("/api/file/read", params={"path": str(sibling / "secret.txt")})
+        assert escape_response.status_code == 200
+        assert "error" in escape_response.json()
+
+    def test_clone_project_api_opens_cloned_repo(self, client, temp_dir):
+        """POST /api/projects/clone clones a local repo and opens the target."""
+        if subprocess.run(["git", "--version"], capture_output=True).returncode != 0:
+            pytest.skip("git is not available")
+
+        source = temp_dir / "source"
+        target = temp_dir / "cloned"
+        source.mkdir()
+        subprocess.run(["git", "init"], cwd=source, check=True, capture_output=True)
+        (source / "README.md").write_text("# Source\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=source, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+        )
+
+        response = client.post("/api/projects/clone", json={"url": str(source), "path": str(target)})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["path"] == str(target)
+        assert (target / "README.md").exists()
+
+    def test_open_nonexistent(self, client):
+        """Opening nonexistent path returns error"""
+        response = client.post("/api/projects/open", json={"path": "/nonexistent/path"})
+        assert response.status_code == 200
+        assert "error" in response.json()
+
+
+class TestSkillsAPI:
+    def test_list_skills(self, client):
+        """GET /api/skills returns available skills"""
+        response = client.get("/api/skills")
+        assert response.status_code == 200
+        data = response.json()
+        assert "skills" in data
+        assert len(data["skills"]) > 0
+        names = [s["name"] for s in data["skills"]]
+        assert "using-superpowers" in names
+        assert "brainstorming" in names
+
+
+@pytest.mark.usefixtures("isolate_projects")
+class TestCredentialsAPI:
+    def test_list_credentials_empty(self, client):
+        """GET /api/credentials returns empty initially"""
+        response = client.get("/api/credentials")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["hosts"] == []
+
+    def test_store_and_list_credentials(self, client):
+        """POST /api/credentials stores token"""
+        response = client.post("/api/credentials", json={
+            "host": "github.com",
+            "username": "testuser",
+            "token": "ghp_12345"
+        })
+        assert response.status_code == 200
+        assert response.json()["status"] == "stored"
+        # List
+        response = client.get("/api/credentials")
+        assert "github.com" in response.json()["hosts"]
+
+    def test_delete_credentials(self, client):
+        """DELETE /api/credentials/{host} removes token"""
+        client.post("/api/credentials", json={
+            "host": "gitlab.com",
+            "username": "u",
+            "token": "t"
+        })
+        response = client.delete("/api/credentials/gitlab.com")
+        assert response.status_code == 200
+        response = client.get("/api/credentials")
+        assert "gitlab.com" not in response.json()["hosts"]
