@@ -65,6 +65,21 @@ class AgentSession:
                 if skill_prompt:
                     system_msg += f"\n\n## Active Skills\n{skill_prompt}\n"
 
+        # Auto-inject RAG context if knowledge base has indexed documents
+        try:
+            from app.rag.engine import get_rag_engine
+            rag = get_rag_engine()
+            docs = rag.list_docs()
+            if docs and self._last_user_message:
+                results = rag.search(self._last_user_message, top_k=3)
+                if results:
+                    rag_ctx = "\n\n## Relevant Knowledge Base Context\n"
+                    for r in results:
+                        rag_ctx += f"\n### {r.source_path} (score: {r.score:.2f})\n{r.content[:800]}\n"
+                    system_msg += rag_ctx
+        except Exception:
+            pass
+
         return system_msg
 
     def _setup_system_prompt(self):
@@ -270,7 +285,7 @@ class AgentSession:
                     "tool_call_id": tool_id,
                     "role": "tool",
                     "name": tool_name,
-                    "content": result_text
+                    "content": tc_result.result_text,
                 })
 
             self.messages.extend(tool_results)
