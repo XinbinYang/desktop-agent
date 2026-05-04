@@ -1,12 +1,10 @@
 """Lightweight Worker agent for sub-task execution."""
-import inspect
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.models import ModelRouter
-from app.message_utils import trim_messages
+from app.message_utils import trim_messages, parse_tool_args, execute_tool
 
 WORKER_PROFILES: Dict[str, "WorkerProfile"] = {}
 
@@ -177,82 +175,48 @@ class WorkerSession:
                 return
 
             tool_results = []
+            from app.tools import get_static_tool
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
                 raw_args = func.get("arguments") or "{}"
                 tool_id = tc.get("id", "")
 
-                try:
-                    tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(tool_args, dict):
-                        raise ValueError("tool arguments must be a JSON object")
-                except (TypeError, ValueError, json.JSONDecodeError) as e:
-                    result_text = f"[ERROR] Tool argument parse failed: {e}"
+                tool_args, parse_error = parse_tool_args(raw_args)
+                if parse_error:
                     yield {"type": "worker_tool_call", "data": {
                         "worker_id": self.worker_id,
                         "name": tool_name,
                         "args": {},
-                        "result": result_text,
+                        "result": parse_error,
                         "duration_ms": 0,
                     }}
                     tool_results.append({
                         "tool_call_id": tool_id,
                         "role": "tool",
                         "name": tool_name,
-                        "content": result_text,
+                        "content": parse_error,
                     })
                     continue
 
-                if tool_name not in self.profile.tools:
-                    result_text = f"[ERROR] Tool not available to worker: {tool_name}"
-                    yield {"type": "worker_tool_call", "data": {
-                        "worker_id": self.worker_id,
-                        "name": tool_name,
-                        "args": tool_args,
-                        "result": result_text,
-                        "duration_ms": 0,
-                    }}
-                    tool_results.append({
-                        "tool_call_id": tool_id,
-                        "role": "tool",
-                        "name": tool_name,
-                        "content": result_text,
-                    })
-                    continue
+                tc_result = await execute_tool(
+                    tool_name, tool_args, self.profile.tools, self.worker_id,
+                    get_tool_fn=get_static_tool,
+                )
 
-                try:
-                    from app.tools import get_static_tool
-                    tool = get_static_tool(tool_name)
-                    if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
-                        tool_args["session_id"] = self.worker_id
-                    started_at = time.time()
-                    result = await tool.execute(**tool_args)
-                    result_text = result.to_text()
-                    duration_ms = round((time.time() - started_at) * 1000)
-
-                    yield {"type": "worker_tool_call", "data": {
-                        "worker_id": self.worker_id,
-                        "name": tool_name,
-                        "args": tool_args,
-                        "result": result_text,
-                        "duration_ms": duration_ms,
-                    }}
-                except Exception as e:
-                    result_text = f"[ERROR] Tool execution failed: {e}"
-                    yield {"type": "worker_tool_call", "data": {
-                        "worker_id": self.worker_id,
-                        "name": tool_name,
-                        "args": tool_args,
-                        "result": result_text,
-                        "duration_ms": 0,
-                    }}
+                yield {"type": "worker_tool_call", "data": {
+                    "worker_id": self.worker_id,
+                    "name": tool_name,
+                    "args": tool_args,
+                    "result": tc_result.result_text,
+                    "duration_ms": tc_result.duration_ms,
+                }}
 
                 tool_results.append({
                     "tool_call_id": tool_id,
                     "role": "tool",
                     "name": tool_name,
-                    "content": result_text,
+                    "content": tc_result.result_text,
                 })
 
             self.messages.extend(tool_results)

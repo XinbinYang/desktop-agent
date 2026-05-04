@@ -1,5 +1,9 @@
 """Shared message utilities for AgentSession and WorkerSession."""
-from typing import Any, Callable, Dict, List, Optional
+import inspect
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def trim_messages(
@@ -89,3 +93,94 @@ def trim_messages(
         return [system_msg] + [msg for group in selected for msg in group]
     else:
         return [msg for group in selected for msg in group]
+
+
+@dataclass
+class ToolCallResult:
+    """Result of executing a single tool call."""
+    tool_name: str = ""
+    tool_args: dict = field(default_factory=dict)
+    tool_call_id: str = ""
+    result_text: str = ""
+    duration_ms: int = 0
+    error: Optional[str] = None
+    base64_image: Optional[str] = None
+
+
+def parse_tool_args(raw_args: Any) -> Tuple[dict, Optional[str]]:
+    """Parse tool call arguments from JSON string or dict.
+
+    Returns:
+        (parsed_args, error_text). error_text is None on success.
+    """
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        if not isinstance(args, dict):
+            raise ValueError("tool arguments must be a JSON object")
+        return args, None
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        return {}, f"[ERROR] Tool argument parse failed: {e}"
+
+
+async def execute_tool(
+    tool_name: str,
+    tool_args: dict,
+    allowed_tools: List[str],
+    session_id: str = "",
+    get_tool_fn: Callable = None,
+) -> ToolCallResult:
+    """Execute a single tool call with validation and timing.
+
+    Args:
+        tool_name: Name of the tool to execute.
+        tool_args: Parsed arguments for the tool.
+        allowed_tools: List of allowed tool names. If tool_name is not in this list, returns an error.
+        session_id: If provided, injected into tool_args if the tool accepts it.
+        get_tool_fn: Function to retrieve a tool by name. Defaults to app.tools.get_tool.
+
+    Returns:
+        ToolCallResult with execution output.
+    """
+    if get_tool_fn is None:
+        from app.tools import get_tool
+        get_tool_fn = get_tool
+
+    if tool_name not in allowed_tools:
+        return ToolCallResult(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result_text=f"[ERROR] Unknown tool: {tool_name}",
+            error=f"Unknown tool: {tool_name}",
+        )
+
+    try:
+        tool = get_tool_fn(tool_name)
+    except (KeyError, Exception):
+        return ToolCallResult(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result_text=f"[ERROR] Unknown tool: {tool_name}",
+            error=f"Unknown tool: {tool_name}",
+        )
+
+    if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
+        tool_args["session_id"] = session_id
+
+    try:
+        started_at = time.time()
+        result = await tool.execute(**tool_args)
+        duration_ms = round((time.time() - started_at) * 1000)
+        return ToolCallResult(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result_text=result.to_text(),
+            duration_ms=duration_ms,
+            base64_image=result.base64_image,
+        )
+    except Exception as e:
+        return ToolCallResult(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result_text=f"[ERROR] Tool execution failed: {e}",
+            error=str(e),
+        )

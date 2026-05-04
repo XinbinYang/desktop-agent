@@ -86,7 +86,7 @@ class TestWorkerSession:
             events.append(event)
         tool_events = [e for e in events if e["type"] == "worker_tool_call"]
         assert len(tool_events) > 0
-        assert "not available" in tool_events[0]["data"]["result"]
+        assert "Unknown tool" in tool_events[0]["data"]["result"]
 
     @pytest.mark.asyncio
     async def test_worker_stale_detection(self, mock_litellm):

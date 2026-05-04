@@ -1,4 +1,3 @@
-import inspect
 import json
 import time
 import uuid
@@ -14,7 +13,7 @@ from app.tools import get_tool, get_tool_schemas, list_tool_names, DynamicToolRe
 from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
 from app.tools.workflow_tool import get_recorder
-from app.message_utils import trim_messages
+from app.message_utils import trim_messages, parse_tool_args, execute_tool
 
 SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
@@ -217,84 +216,55 @@ class AgentSession:
                 break
 
             tool_results = []
+            allowed_names = list_tool_names(self.dynamic_registry)
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
                 raw_args = func.get("arguments") or "{}"
                 tool_id = tc.get("id", "")
 
-                try:
-                    tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(tool_args, dict):
-                        raise ValueError("tool arguments must be a JSON object")
-                except (TypeError, ValueError, json.JSONDecodeError) as e:
-                    result_text = f"[ERROR] Tool argument parse failed: {e}"
+                tool_args, parse_error = parse_tool_args(raw_args)
+                if parse_error:
                     yield self._event(
                         "tool_call",
-                        {"name": tool_name, "args": {}, "result": result_text, "tool_call_id": tool_id},
+                        {"name": tool_name, "args": {}, "result": parse_error, "tool_call_id": tool_id},
                         run_id,
                     )
                     tool_results.append({
                         "tool_call_id": tool_id,
                         "role": "tool",
                         "name": tool_name,
-                        "content": result_text
-                    })
-                    continue
-
-                if tool_name not in list_tool_names(self.dynamic_registry):
-                    result_text = f"[ERROR] Unknown tool: {tool_name}"
-                    yield self._event(
-                        "tool_call",
-                        {"name": tool_name, "args": tool_args, "result": result_text, "tool_call_id": tool_id},
-                        run_id,
-                    )
-                    tool_results.append({
-                        "tool_call_id": tool_id,
-                        "role": "tool",
-                        "name": tool_name,
-                        "content": result_text
+                        "content": parse_error,
                     })
                     continue
 
                 yield self._event("status", {"status": "executing", "tool": tool_name, "tool_call_id": tool_id}, run_id)
 
-                tool = get_tool(tool_name, self.dynamic_registry)
                 set_browser_session(self.session_id)
-                try:
-                    if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
-                        tool_args["session_id"] = self.session_id
-                    started_at = time.time()
-                    result = await tool.execute(**tool_args)
-                    result_text = result.to_text()
-                    duration_ms = round((time.time() - started_at) * 1000)
+                tc_result = await execute_tool(
+                    tool_name, tool_args, allowed_names, self.session_id,
+                    get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
+                )
 
-                    if result.base64_image:
-                        yield self._event("image", {"base64": result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
+                if tc_result.base64_image:
+                    yield self._event("image", {"base64": tc_result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
 
-                    # 录制工作流步骤
-                    recorder = get_recorder(self.session_id)
-                    if recorder and recorder.is_recording():
-                        recorder.record_step(tool_name, tool_args)
+                # 录制工作流步骤
+                recorder = get_recorder(self.session_id)
+                if recorder and recorder.is_recording() and not tc_result.error:
+                    recorder.record_step(tool_name, tool_args)
 
-                    yield self._event(
-                        "tool_call",
-                        {
-                            "name": tool_name,
-                            "args": tool_args,
-                            "result": result_text,
-                            "tool_call_id": tool_id,
-                            "duration_ms": duration_ms,
-                        },
-                        run_id,
-                    )
-                except Exception as e:
-                    result_text = f"[ERROR] Tool execution failed: {e}"
-                    yield self._event(
-                        "tool_call",
-                        {"name": tool_name, "args": tool_args, "result": result_text, "tool_call_id": tool_id},
-                        run_id,
-                    )
+                yield self._event(
+                    "tool_call",
+                    {
+                        "name": tool_name,
+                        "args": tool_args,
+                        "result": tc_result.result_text,
+                        "tool_call_id": tool_id,
+                        "duration_ms": tc_result.duration_ms,
+                    },
+                    run_id,
+                )
 
                 tool_results.append({
                     "tool_call_id": tool_id,
