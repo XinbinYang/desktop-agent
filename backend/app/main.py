@@ -9,8 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.config import list_all_models, load_config, mask_api_key, save_config, reload_config
-from app.config import Settings, ProviderConfig, ModelInfo
+from app.config import list_all_models, load_config
 from app.agent import get_or_create_session, clear_session, SESSIONS_DIR
 from app.roles import RoleManager
 from app.project_manager import ProjectManager
@@ -49,62 +48,34 @@ PREVIEW_DIR = Path(__file__).parent.parent / "preview"
 PREVIEW_DIR.mkdir(exist_ok=True)
 app.mount("/preview", StaticFiles(directory=str(PREVIEW_DIR)), name="preview")
 
+# Route modules
+from app.routes.settings import router as settings_router
+from app.routes.projects import router as projects_router
+from app.routes.knowledge import router as knowledge_router
+from app.routes.workflows import router as workflows_router
+
+app.include_router(settings_router)
+app.include_router(projects_router)
+app.include_router(knowledge_router)
+app.include_router(workflows_router)
+
 
 # ====== REST API ======
 
 class ChatRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
-    
+
     message: str
     session_id: str = "default"
     model_id: Optional[str] = None
     role_id: Optional[str] = None
     image_base64: Optional[str] = None
 
-class OpenProjectRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    path: str
-
-class CreateProjectRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    parent_path: str
-    name: str
-    template: str = "empty"
-
-class CloneProjectRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    url: str
-    path: Optional[str] = None
-    token: Optional[str] = None
-
 class StoreCredentialRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     host: str
     username: str
     token: str
-
-# ====== Settings API models ======
-
-class SettingsUpdateRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    default_model: Optional[str] = None
-    default_provider: Optional[str] = None
-    max_iterations: Optional[int] = None
-    auto_approve: Optional[bool] = None
-    screenshot_on_step: Optional[bool] = None
-
-class ProviderUpdateRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    base_url: str
-    api_key: str
-    models: list[dict]
-
-class NewProviderRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    name: str
-    base_url: str
-    api_key: str
-    models: list[dict] = []
 
 @app.get("/api/models")
 def get_models():
@@ -119,92 +90,6 @@ def health_check():
         "tools": len(list_tool_names()),
         "preview_dir": str(PREVIEW_DIR),
     }
-
-# ====== Settings API ======
-
-@app.get("/api/settings")
-def get_settings():
-    """返回所有 Provider（含脱敏 API Key）+ 全局设置"""
-    cfg = load_config()
-    providers = {}
-    for pname, p in cfg.providers.items():
-        raw_key = getattr(p, '_raw_api_key', '') or p.api_key
-        providers[pname] = {
-            "name": pname,
-            "base_url": p.base_url,
-            "api_key_masked": mask_api_key(raw_key),
-            "models": [m.model_dump() for m in p.models],
-        }
-    return {
-        "providers": providers,
-        "settings": cfg.settings.model_dump(),
-    }
-
-
-@app.put("/api/settings")
-def update_settings(req: SettingsUpdateRequest):
-    """部分更新全局设置"""
-    cfg = load_config()
-    update = req.model_dump(exclude_none=True)
-    current = cfg.settings.model_dump()
-    current.update(update)
-    cfg.settings = Settings(**current)
-    save_config(cfg)
-    return {"status": "ok"}
-
-
-@app.put("/api/providers/{provider_name}")
-def update_provider(provider_name: str, req: ProviderUpdateRequest):
-    """更新指定 Provider 的配置"""
-    cfg = load_config()
-    old_raw = getattr(cfg.providers.get(provider_name, None), '_raw_api_key', '') if provider_name in cfg.providers else ''
-    # 如果请求中的 api_key 与被脱敏前的值不同，说明用户改了 key
-    cfg.providers[provider_name] = ProviderConfig(
-        base_url=req.base_url,
-        api_key=req.api_key,
-        models=[ModelInfo(**m) for m in req.models],
-    )
-    # 如果用户输入了新的 api_key（非空），则使用新值；否则保留旧值（支持 env var 语法）
-    cfg.providers[provider_name]._raw_api_key = req.api_key if req.api_key else old_raw
-    save_config(cfg)
-    return {"status": "ok"}
-
-
-@app.post("/api/providers")
-def create_provider(req: NewProviderRequest):
-    """创建新的 Provider"""
-    cfg = load_config()
-    if req.name in cfg.providers:
-        raise HTTPException(status_code=409, detail=f"Provider '{req.name}' already exists")
-    cfg.providers[req.name] = ProviderConfig(
-        base_url=req.base_url,
-        api_key=req.api_key,
-        models=[ModelInfo(**m) for m in req.models],
-    )
-    cfg.providers[req.name]._raw_api_key = req.api_key
-    save_config(cfg)
-    return {"status": "ok"}
-
-
-@app.delete("/api/providers/{provider_name}")
-def delete_provider(provider_name: str):
-    """删除 Provider（拒绝删除 default_provider）"""
-    cfg = load_config()
-    if provider_name not in cfg.providers:
-        raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
-    if cfg.settings.default_provider == provider_name:
-        raise HTTPException(status_code=400, detail="Cannot delete the default provider. Change the default first.")
-    del cfg.providers[provider_name]
-    save_config(cfg)
-    return {"status": "ok"}
-
-
-@app.post("/api/config/reload")
-def force_config_reload():
-    """强制刷新后端配置缓存"""
-    cfg = reload_config()
-    return {"status": "ok", "default_model": cfg.settings.default_model}
-
 
 @app.get("/api/tools")
 def get_tools():
@@ -223,11 +108,11 @@ async def chat(req: ChatRequest):
     model_id = req.model_id or load_config().settings.default_model
     role_id = req.role_id or "desktop-agent"
     session = get_or_create_session(req.session_id, model_id, role_id)
-    
+
     results = []
     async for event in session.run(req.message, req.image_base64):
         results.append(event)
-    
+
     return {"events": results}
 
 @app.get("/api/sessions")
@@ -282,12 +167,12 @@ async def transcribe(file: UploadFile = File(...)):
         content = await file.read()
         if not content:
             return {"text": "", "error": "空音频文件"}
-        
+
         # 根据文件名推断后缀
         suffix = Path(file.filename).suffix if file.filename else ".webm"
         if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac"}:
             suffix = ".webm"
-        
+
         text = await transcribe_audio(content, language="zh", suffix=suffix)
         return {"text": text, "filename": file.filename}
     except Exception as e:
@@ -298,98 +183,27 @@ def transcribe_info():
     """获取 Whisper 模型状态。"""
     return get_model_info()
 
-# ====== 项目管理 API ======
-
-@app.get("/api/projects")
-def list_projects():
-    """获取最近项目列表和当前项目"""
-    return {
-        "projects": ProjectManager.list_recent(),
-        "current": ProjectManager.get_current()
-    }
-
-@app.get("/api/projects/current")
-def get_current_project():
-    """获取当前打开的项目"""
-    return ProjectManager.get_current()
-
-@app.post("/api/projects/open")
-def open_project(req: OpenProjectRequest):
-    """打开一个项目目录"""
-    try:
-        project = ProjectManager.open_project(req.path)
-        # 配置 GCM
-        CredentialManager.configure_gcm(req.path)
-        return project
-    except ValueError as e:
-        return {"error": str(e)}
-
-@app.post("/api/projects/clone")
-async def clone_project(req: CloneProjectRequest):
-    """Clone a Git repository and open it as the current project."""
-    from app.tools.git_tool import GitCloneTool
-
-    try:
-        if req.path:
-            target = Path(req.path).resolve()
-        else:
-            repo_name = req.url.rstrip("/").split("/")[-1].replace(".git", "")
-            current = ProjectManager.get_current()
-            target = (Path(current["path"]).parent if current else Path.cwd()) / repo_name
-            target = target.resolve()
-
-        result = await GitCloneTool().execute(req.url, str(target), req.token)
-        if result.error:
-            return {"error": result.error}
-
-        project = ProjectManager.open_project(str(target))
-        CredentialManager.configure_gcm(str(target))
-        project["message"] = result.output
-        return project
-    except ValueError as e:
-        return {"error": str(e)}
-
-@app.post("/api/projects/close")
-def close_project():
-    """关闭当前项目"""
-    ProjectManager.close_project()
-    return {"status": "closed"}
-
-@app.post("/api/projects/create")
-def create_project(req: CreateProjectRequest):
-    """创建新项目"""
-    try:
-        return ProjectManager.create_project(req.parent_path, req.name, req.template)
-    except ValueError as e:
-        return {"error": str(e)}
-
-@app.get("/api/projects/tree")
-def get_project_tree(path: str = ""):
-    """获取项目文件树"""
-    return {"nodes": ProjectManager.get_tree(path)}
-
-
 # ====== 文件读取 API ======
 
 @app.get("/api/file/read")
 async def read_file_api(path: str):
     """读取文件内容，用于编辑器预览。path 为绝对路径。"""
     import aiofiles
-    
+
     p, err = resolve_current_project_file(path)
     if err:
         return {"error": err}
-    
+
     if not p.exists():
         return {"error": f"文件不存在: {path}"}
     if not p.is_file():
         return {"error": f"路径不是文件: {path}"}
-    
+
     # 安全限制：避免读取超大文件
     size = p.stat().st_size
     if size > 10 * 1024 * 1024:  # 10MB
         return {"error": f"文件过大 ({size} bytes)，拒绝读取"}
-    
+
     try:
         async with aiofiles.open(p, "r", encoding="utf-8", errors="ignore") as f:
             content = await f.read()
@@ -409,7 +223,7 @@ class WriteFileRequest(BaseModel):
 async def write_file_api(req: WriteFileRequest):
     """写入文件内容，用于编辑器保存。path 为绝对路径。"""
     import aiofiles
-    
+
     p, err = resolve_current_project_file(req.path)
     if err:
         return {"error": err}
@@ -417,7 +231,7 @@ async def write_file_api(req: WriteFileRequest):
         return {"error": f"Path is not a file: {req.path}"}
     if not p.parent.exists():
         return {"error": f"父目录不存在: {p.parent}"}
-    
+
     try:
         async with aiofiles.open(p, "w", encoding="utf-8") as f:
             await f.write(req.content)
@@ -432,106 +246,6 @@ async def write_file_api(req: WriteFileRequest):
 def list_skills():
     """获取所有可用的 Superpowers skills"""
     return {"skills": SkillManager.list_skills()}
-
-
-# ====== 知识库 API ======
-
-class KnowledgeIndexRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    path: str
-    recursive: bool = True
-
-class KnowledgeSearchRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    query: str
-    top_k: int = 5
-    source_filter: Optional[str] = None
-
-@app.get("/api/knowledge/docs")
-def list_knowledge_docs():
-    from app.rag.engine import get_rag_engine
-    return {"docs": get_rag_engine().list_docs()}
-
-@app.post("/api/knowledge/index")
-async def index_knowledge(req: KnowledgeIndexRequest):
-    from app.rag.engine import get_rag_engine
-    result = get_rag_engine().index_file(req.path, recursive=req.recursive)
-    if "error" in result:
-        return {"error": result["error"]}
-    return result
-
-@app.delete("/api/knowledge/docs")
-def delete_knowledge_doc(path: str):
-    from app.rag.engine import get_rag_engine
-    return get_rag_engine().delete_doc(path)
-
-@app.post("/api/knowledge/search")
-async def search_knowledge(req: KnowledgeSearchRequest):
-    from app.rag.engine import get_rag_engine
-    results = get_rag_engine().search(req.query, top_k=req.top_k, source_filter=req.source_filter)
-    return {"results": [r.model_dump() for r in results]}
-
-
-# ====== 工作流 API ======
-
-class WorkflowCreateRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    name: str
-    description: str = ""
-    steps: list = []
-    variables: list = []
-
-class WorkflowRunRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    variables: dict = {}
-
-@app.get("/api/workflows")
-def list_workflows_api():
-    from app.workflow.engine import get_all_workflows
-    return {"workflows": [w.model_dump() for w in get_all_workflows()]}
-
-@app.get("/api/workflows/{workflow_id}")
-def get_workflow_api(workflow_id: str):
-    from app.workflow.engine import get_workflow
-    wf = get_workflow(workflow_id)
-    if not wf:
-        return {"error": "Workflow not found"}
-    return wf.model_dump()
-
-@app.post("/api/workflows")
-def create_workflow_api(req: WorkflowCreateRequest):
-    import uuid
-    from datetime import datetime, timezone
-    from app.workflow.models import Workflow
-    from app.workflow.storage import save_workflow
-    wf = Workflow(
-        id=f"wf-{uuid.uuid4().hex[:12]}",
-        name=req.name,
-        description=req.description,
-        created_at=datetime.now(timezone.utc).isoformat(),
-        steps=req.steps,
-        variables=req.variables,
-    )
-    save_workflow(wf)
-    return wf.model_dump()
-
-@app.delete("/api/workflows/{workflow_id}")
-def delete_workflow_api(workflow_id: str):
-    from app.workflow.engine import remove_workflow
-    success = remove_workflow(workflow_id)
-    return {"status": "deleted" if success else "not_found"}
-
-@app.post("/api/workflows/{workflow_id}/run")
-async def run_workflow_api(workflow_id: str, req: WorkflowRunRequest):
-    from app.workflow.engine import get_workflow, WorkflowExecutor
-    wf = get_workflow(workflow_id)
-    if not wf:
-        return {"error": "Workflow not found"}
-    executor = WorkflowExecutor(wf)
-    events = []
-    async for event in executor.run(variables=req.variables):
-        events.append(event)
-    return {"events": events}
 
 
 # ====== MCP API ======
@@ -639,7 +353,7 @@ def delete_credential(host: str):
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     current_model = load_config().settings.default_model
-    
+
     # 发送历史会话消息（如果有）
     session = get_or_create_session(session_id, current_model)
     current_model = session.model_id  # 恢复已保存的 model
@@ -648,22 +362,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         for event in history_events:
             await websocket.send_json(event)
         await websocket.send_json({"type": "status", "data": {"status": "history_loaded", "count": len(history_events)}})
-    
+
     try:
         while True:
             # 接收前端消息
             data = await websocket.receive_text()
             msg = json.loads(data)
-            
+
             msg_type = msg.get("type", "chat")
-            
+
             if msg_type == "chat":
                 user_text = msg.get("text", "")
                 model_id = msg.get("model_id", current_model)
                 role_id = msg.get("role_id", "desktop-agent")
                 image_b64 = msg.get("image_base64")
                 current_model = model_id
-                
+
                 session = get_or_create_session(session_id, model_id, role_id)
                 set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
 
@@ -675,16 +389,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 set_worker_event_callback(None)
                 # 发送结束标记
                 await websocket.send_json({"type": "done"})
-            
+
             elif msg_type == "clear":
                 clear_session(session_id)
                 await websocket.send_json({"type": "cleared"})
-            
+
             elif msg_type == "stop":
                 session = get_or_create_session(session_id, current_model)
                 session.cancel()
                 await websocket.send_json({"type": "interrupted", "data": {"message": "已收到停止请求"}})
-            
+
             elif msg_type == "retry":
                 model_id = msg.get("model_id", current_model)
                 role_id = msg.get("role_id", "desktop-agent")
@@ -699,13 +413,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_json({"type": "done"})
                 else:
                     await websocket.send_json({"type": "error", "data": {"message": "没有可重试的消息"}})
-            
+
             elif msg_type == "switch_role":
                 role_id = msg.get("role_id", "desktop-agent")
                 session = get_or_create_session(session_id, current_model, role_id)
                 session.switch_role(role_id)
                 await websocket.send_json({"type": "status", "data": {"status": "role_switched", "role_id": role_id}})
-            
+
             elif msg_type == "switch_project":
                 project_path = msg.get("path")
                 if project_path:
@@ -718,7 +432,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 else:
                     ProjectManager.close_project()
                     await websocket.send_json({"type": "project_changed", "data": {"project": None}})
-            
+
             elif msg_type == "tool_direct":
                 # 前端直接调用工具（用于测试或快捷操作）
                 tool_name = msg.get("tool_name")
@@ -739,7 +453,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
                 else:
                     await websocket.send_json({"type": "error", "data": {"message": f"Unknown tool: {tool_name}"}})
-    
+
     except WebSocketDisconnect:
         print(f"[WS] Client disconnected: {session_id}")
     except Exception as e:
