@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from app.models import ModelRouter
+from app.models import ModelRouter, _safe_message_summary
 
 
 class TestModelRouter:
@@ -93,3 +93,16 @@ settings:
 
         with pytest.raises(ValueError, match="Unknown model"):
             ModelRouter("nonexistent-model")
+
+    def test_safe_message_summary_does_not_include_content(self):
+        summary = _safe_message_summary([
+            {"role": "user", "content": "secret prompt"},
+            {"role": "assistant", "content": [{"type": "text", "text": "secret answer"}]},
+            {"role": "tool", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "secret result"}]},
+        ])
+
+        rendered = repr(summary)
+        assert "secret prompt" not in rendered
+        assert "secret answer" not in rendered
+        assert "secret result" not in rendered
+        assert "length" in rendered

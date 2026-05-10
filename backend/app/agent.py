@@ -1,22 +1,26 @@
 import json
+import logging
 import time
 import uuid
-from pathlib import Path
+from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.config import load_config
 from app.models import ModelRouter
 from app.project_manager import ProjectManager
 from app.roles import RoleManager
+from app.runtime_paths import runtime_dir
 from app.skills import SkillManager
-from app.tools import get_tool, get_tool_schemas, list_tool_names, DynamicToolRegistry
+from app.tools import build_tools_description, get_tool, get_tool_schemas, list_tool_names, DynamicToolRegistry
 from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
+from app.tools.worker_tool import cancel_workers_for_session
 from app.tools.workflow_tool import get_recorder
 from app.message_utils import trim_messages, parse_tool_args, execute_tool
 
-SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
-SESSIONS_DIR.mkdir(exist_ok=True)
+logger = logging.getLogger(__name__)
+
+SESSIONS_DIR = runtime_dir("sessions")
 
 
 class AgentSession:
@@ -38,11 +42,7 @@ class AgentSession:
         self._setup_system_prompt()
 
     def _build_system_prompt(self) -> str:
-        all_schemas = get_tool_schemas(self.dynamic_registry)
-        tools_desc = "\n".join([
-            f"- {t['function']['name']}: {t['function']['description']}"
-            for t in all_schemas
-        ])
+        tools_desc = build_tools_description(self.dynamic_registry)
         system_msg = RoleManager.render_prompt(self.role_id, tools_desc)
 
         project = ProjectManager.get_current()
@@ -65,20 +65,39 @@ class AgentSession:
                 if skill_prompt:
                     system_msg += f"\n\n## Active Skills\n{skill_prompt}\n"
 
-        # Auto-inject RAG context if knowledge base has indexed documents
+        # Auto-inject RAG context if knowledge base has indexed documents.
+        # Skip trivial / non-knowledge utterances to avoid wasteful vector search.
+        _RAG_SKIP_PATTERNS = [
+            r"^(你好|hi|hello|hey)[\s!！。.]*$",
+            r"^(截图|screenshot|screen)[\s!！。.]*$",
+            r"^(打开|open|浏览|browse)\s",
+            r"^(点击|click|输入|type|按下|press)\s",
+            r"^(现在几点|what time|当前时间)[\s!！。.。]*$",
+            r"^(谢谢|thanks|thank you|好的|ok|okay|明白了|知道了)[\s!！。.]*$",
+            r"^(运行|run|执行|execute)\s",
+            r"^(新建|创建|create|new)\s+(session|会话)",
+            r"^(切换|switch|change)\s+(role|角色|model|模型)",
+        ]
         try:
             from app.rag.engine import get_rag_engine
-            rag = get_rag_engine()
-            docs = rag.list_docs()
-            if docs and self._last_user_message:
-                results = rag.search(self._last_user_message, top_k=3)
-                if results:
-                    rag_ctx = "\n\n## Relevant Knowledge Base Context\n"
-                    for r in results:
-                        rag_ctx += f"\n### {r.source_path} (score: {r.score:.2f})\n{r.content[:800]}\n"
-                    system_msg += rag_ctx
-        except Exception:
-            pass
+            import re
+            should_skip = any(
+                re.match(p, self._last_user_message.strip(), re.IGNORECASE)
+                for p in _RAG_SKIP_PATTERNS
+            )
+            if not should_skip:
+                rag = get_rag_engine()
+                docs = rag.list_docs()
+                if docs and self._last_user_message:
+                    results = rag.search(self._last_user_message, top_k=3)
+                    relevant = [r for r in results if r.score >= 0.3]
+                    if relevant:
+                        rag_ctx = "\n\n## Relevant Knowledge Base Context\n"
+                        for r in relevant:
+                            rag_ctx += f"\n### {r.source_path} (score: {r.score:.2f})\n{r.content[:800]}\n"
+                        system_msg += rag_ctx
+        except Exception as e:
+            logger.warning("RAG auto-retrieval failed: %s", e)
 
         return system_msg
 
@@ -258,11 +277,18 @@ class AgentSession:
                 set_browser_session(self.session_id)
                 tc_result = await execute_tool(
                     tool_name, tool_args, allowed_names, self.session_id,
+                    run_id=run_id,
+                    tool_call_id=tool_id,
                     get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
                 )
 
                 if tc_result.base64_image:
                     yield self._event("image", {"base64": tc_result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
+
+                if tc_result.metadata.get("file_edit"):
+                    file_edit = dict(tc_result.metadata["file_edit"])
+                    file_edit.setdefault("tool_call_id", tool_id)
+                    yield self._event("file_edit", file_edit, run_id)
 
                 # 录制工作流步骤
                 recorder = get_recorder(self.session_id)
@@ -281,11 +307,16 @@ class AgentSession:
                     run_id,
                 )
 
+                # 限制单条 tool_result 长度，避免消息历史爆炸导致 API 400
+                result_text = tc_result.result_text
+                max_tool_result_len = 8000
+                if len(result_text) > max_tool_result_len:
+                    result_text = result_text[:max_tool_result_len] + f"\n\n[输出过长，已截断。原长度 {len(tc_result.result_text)} 字符]"
                 tool_results.append({
                     "tool_call_id": tool_id,
                     "role": "tool",
                     "name": tool_name,
-                    "content": tc_result.result_text,
+                    "content": result_text,
                 })
 
             self.messages.extend(tool_results)
@@ -309,6 +340,7 @@ class AgentSession:
 
     def cancel(self):
         self._cancelled = True
+        cancel_workers_for_session(self.session_id)
         for worker in self._active_workers:
             try:
                 worker.cancel()
@@ -388,6 +420,7 @@ class AgentSession:
             session.iteration = 0
             session._trim_messages()
             session._refresh_system_prompt()
+            session.refresh_mcp_tools()
             return session
         except (OSError, json.JSONDecodeError):
             return None
@@ -430,20 +463,49 @@ class AgentSession:
         return events
 
 
-_sessions: Dict[str, AgentSession] = {}
+MAX_LIVE_SESSIONS = 32
+
+# LRU of in-memory sessions. Eviction does NOT delete the on-disk JSON; the
+# next access falls through to AgentSession.load and rehydrates state.
+_sessions: "OrderedDict[str, AgentSession]" = OrderedDict()
+
+
+def _touch(session_id: str) -> None:
+    _sessions.move_to_end(session_id)
+
+
+def _evict_if_needed() -> None:
+    while len(_sessions) > MAX_LIVE_SESSIONS:
+        _sessions.popitem(last=False)
 
 
 def get_or_create_session(session_id: str, model_id: str, role_id: str = "desktop-agent") -> AgentSession:
-    if session_id not in _sessions:
+    existing = _sessions.get(session_id)
+    if existing is None:
         loaded = AgentSession.load(session_id)
         if loaded and loaded.model_id == model_id:
             _sessions[session_id] = loaded
+            if loaded.role_id != role_id:
+                loaded.switch_role(role_id)
         else:
             _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id)
-    else:
-        if _sessions[session_id].model_id != model_id:
-            _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id)
+            _sessions[session_id].refresh_mcp_tools()
+    elif existing.model_id != model_id or existing.role_id != role_id:
+        _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id)
+        _sessions[session_id].refresh_mcp_tools()
+
+    _touch(session_id)
+    _evict_if_needed()
     return _sessions[session_id]
+
+
+def refresh_all_sessions_mcp_tools():
+    """通知所有活跃会话刷新 MCP 工具。"""
+    for session in _sessions.values():
+        try:
+            session.refresh_mcp_tools()
+        except Exception:
+            pass
 
 
 def clear_session(session_id: str):

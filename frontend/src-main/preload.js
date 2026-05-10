@@ -4,6 +4,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFolder: () => ipcRenderer.invoke('select-folder'),
   selectFile: () => ipcRenderer.invoke('select-file'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
-  onNewSession: (cb) => ipcRenderer.on('menu-new-session', cb),
-  removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel),
+  getAuthToken: () => ipcRenderer.invoke('get-auth-token'),
+  onNewSession: (cb) => {
+    ipcRenderer.on('menu-new-session', cb);
+    // 返回 unsubscribe 函数
+    return () => {
+      ipcRenderer.off('menu-new-session', cb);
+    };
+  },
 });

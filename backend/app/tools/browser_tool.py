@@ -1,7 +1,7 @@
 import base64
 from typing import Optional
 import contextvars
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, async_playwright
 from app.tools.base import BaseTool, ToolResult
 
 # 按 session 隔离的 playwright 实例管理
@@ -46,9 +46,9 @@ class BrowserNavigateTool(BaseTool):
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             title = await page.title()
             return ToolResult(output=f"已打开: {title} ({url})")
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")
 
 class BrowserClickTool(BaseTool):
@@ -71,9 +71,9 @@ class BrowserClickTool(BaseTool):
             else:
                 await page.click(selector, timeout=10000)
             return ToolResult(output=f"已点击: {selector or text}")
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")
 
 class BrowserTypeTool(BaseTool):
@@ -96,9 +96,9 @@ class BrowserTypeTool(BaseTool):
             if submit:
                 await page.press(selector, "Enter")
             return ToolResult(output=f"已在 {selector} 输入文字")
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")
 
 class BrowserScreenshotTool(BaseTool):
@@ -116,9 +116,9 @@ class BrowserScreenshotTool(BaseTool):
             screenshot = await page.screenshot(type="png")
             b64 = base64.b64encode(screenshot).decode("utf-8")
             return ToolResult(output="浏览器截图已捕获", base64_image=b64)
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")
 
 class BrowserEvaluateTool(BaseTool):
@@ -137,9 +137,9 @@ class BrowserEvaluateTool(BaseTool):
             page = await _ensure_browser()
             result = await page.evaluate(script)
             return ToolResult(output=str(result))
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")
 
 class BrowserCloseTool(BaseTool):
@@ -156,8 +156,10 @@ class BrowserCloseTool(BaseTool):
                     await sess["page"].close()
                 if sess.get("browser"):
                     await sess["browser"].close()
+                if sess.get("playwright"):
+                    await sess["playwright"].stop()
             return ToolResult(output="浏览器已关闭")
-        except TimeoutError:
+        except PlaywrightTimeoutError:
             return ToolResult(error="浏览器操作超时")
-        except ConnectionError as e:
+        except PlaywrightError as e:
             return ToolResult(error=f"浏览器连接错误: {e}")

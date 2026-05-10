@@ -1,16 +1,23 @@
-import React, { useState } from 'react';
-import { 
-  Trash2, Terminal, Zap, Monitor, MousePointer, 
-  Globe, FolderOpen, Command, Play, Square, Plus, MessageSquare, X
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import {
+  Trash2, Zap, Monitor,
+  Globe, Plus, MessageSquare, X,
+  UserCog, Settings, BookOpen, Sun, Moon, Laptop
 } from 'lucide-react';
-import { ModelInfo } from '../types';
+import { RoleInfo, ProjectInfo, FileNode, SidebarSection } from '../types';
+import { ProjectPanel } from './ProjectPanel';
+import { useTheme } from '../hooks/useTheme';
 
 interface SidebarProps {
-  models: ModelInfo[];
-  currentModel: string;
-  onModelChange: (model: string) => void;
+  activeSection: SidebarSection;
+  onSectionChange: (section: SidebarSection) => void;
+  roles: RoleInfo[];
+  currentRole: string;
+  onRoleChange: (role: string) => void;
+  onOpenRoleEditor: () => void;
+  onOpenSettings: () => void;
   onClear: () => void;
-  onToggleTerminal: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
   sessions?: {id: string; model_id: string; message_count: number}[];
@@ -18,22 +25,35 @@ interface SidebarProps {
   onNewSession?: () => void;
   onSwitchSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
+  // 项目相关
+  currentProject?: ProjectInfo | null;
+  fileTree?: FileNode[];
+  expandedPaths?: Set<string>;
+  onTogglePath?: (path: string) => void;
+  onSelectFile?: (path: string, type: 'file' | 'dir') => void;
+  onOpenFolder?: () => void;
+  onOpenProjectModal?: () => void;
+  onCloseProject?: () => void;
+  onRefreshTree?: () => void;
 }
 
 const QUICK_TOOLS = [
-  { name: 'screenshot', icon: Monitor, label: '截图' },
-  { name: 'get_screen_size', icon: Monitor, label: '屏幕尺寸' },
-  { name: 'browser_navigate', icon: Globe, label: '打开浏览器', defaultArgs: { url: 'https://www.google.com' } },
-  { name: 'browser_screenshot', icon: Globe, label: '网页截图' },
-  { name: 'app_list_windows', icon: Monitor, label: '列出窗口' },
+  { name: 'screenshot', icon: Monitor, label: 'Screenshot' },
+  { name: 'get_screen_size', icon: Monitor, label: 'Screen Size' },
+  { name: 'browser_navigate', icon: Globe, label: 'Open Browser', defaultArgs: { url: 'https://www.google.com' } },
+  { name: 'browser_screenshot', icon: Globe, label: 'Web Screenshot' },
+  { name: 'app_list_windows', icon: Monitor, label: 'List Windows' },
 ];
 
 export const Sidebar: React.FC<SidebarProps> = ({
-  models,
-  currentModel,
-  onModelChange,
+  activeSection,
+  onSectionChange,
+  roles,
+  currentRole,
+  onRoleChange,
+  onOpenRoleEditor,
+  onOpenSettings,
   onClear,
-  onToggleTerminal,
   onExecuteTool,
   isConnected,
   sessions = [],
@@ -41,54 +61,49 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onNewSession,
   onSwitchSession,
   onDeleteSession,
+  // 项目
+  currentProject,
+  fileTree = [],
+  expandedPaths = new Set(),
+  onTogglePath,
+  onSelectFile,
+  onOpenFolder,
+  onOpenProjectModal,
+  onCloseProject,
+  onRefreshTree,
 }) => {
-  const [activeSection, setActiveSection] = useState<'tools' | 'settings' | 'sessions'>('tools');
+  const { theme, setTheme } = useTheme();
+  const { t, i18n } = useTranslation();
+
+  const changeLanguage = (lng: string) => {
+    i18n.changeLanguage(lng);
+    try { localStorage.setItem('desktop-agent-locale', lng); } catch { /* ignore */ }
+  };
 
   return (
-    <div className="w-56 bg-gray-800 border-r border-gray-700 flex flex-col">
-      {/* Logo / 状态 */}
-      <div className="p-4 border-b border-gray-700">
+    <div className="w-56 bg-surface border-r border-border flex flex-col">
+      {/* Logo / Status */}
+      <div className="p-4 border-b border-border">
         <div className="flex items-center gap-2 mb-2">
-          <Zap className="w-5 h-5 text-agent-400" />
+          <Zap className="w-5 h-5 text-accent" />
           <span className="font-bold text-sm">Agent Control</span>
         </div>
-        <div className="text-xs text-gray-400">
-          状态: {isConnected ? <span className="text-green-400">已连接</span> : <span className="text-red-400">未连接</span>}
+        <div className="text-xs text-fg-muted">
+          Status: {isConnected ? <span className="text-success">Connected</span> : <span className="text-danger">Disconnected</span>}
         </div>
       </div>
 
-      {/* 导航标签 */}
-      <div className="flex border-b border-gray-700">
-        <button
-          onClick={() => setActiveSection('tools')}
-          className={`flex-1 py-2 text-xs font-medium ${activeSection === 'tools' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'}`}
-        >
-          快捷工具
-        </button>
-        <button
-          onClick={() => setActiveSection('sessions')}
-          className={`flex-1 py-2 text-xs font-medium ${activeSection === 'sessions' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'}`}
-        >
-          会话
-        </button>
-        <button
-          onClick={() => setActiveSection('settings')}
-          className={`flex-1 py-2 text-xs font-medium ${activeSection === 'settings' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'}`}
-        >
-          设置
-        </button>
-      </div>
-
-      {/* 内容区 */}
+      {/* 内容区 — section switching controlled by ActivityBar */}
       <div className="flex-1 overflow-y-auto p-3">
         {activeSection === 'tools' && (
           <div className="space-y-1">
-            <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">桌面操控</div>
+            <div className="text-xs text-fg-muted uppercase tracking-wider mb-2">Desktop Control</div>
             {QUICK_TOOLS.map(tool => (
               <button
                 key={tool.name}
+                type="button"
                 onClick={() => onExecuteTool(tool.name, tool.defaultArgs || {})}
-                className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-gray-300 hover:bg-gray-700 transition-colors"
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <tool.icon className="w-3.5 h-3.5" />
                 {tool.label}
@@ -97,24 +112,40 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
 
+        {activeSection === 'project' && (
+          <div className="h-full flex flex-col">
+            <ProjectPanel
+              currentProject={currentProject || null}
+              fileTree={fileTree}
+              expandedPaths={expandedPaths}
+              onTogglePath={onTogglePath || (() => {})}
+              onSelectFile={onSelectFile || (() => {})}
+              onOpenFolder={onOpenFolder || (() => {})}
+              onOpenModal={onOpenProjectModal || (() => {})}
+              onCloseProject={onCloseProject || (() => {})}
+              onRefreshTree={onRefreshTree || (() => {})}
+            />
+          </div>
+        )}
+
         {activeSection === 'sessions' && (
           <div className="space-y-2">
             <button
               onClick={onNewSession}
-              className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-agent-700/30 text-agent-300 hover:bg-agent-700/50 transition-colors"
+              className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
-              新建会话
+              New Session
             </button>
-            <div className="text-xs text-gray-500 uppercase tracking-wider mt-2">历史会话</div>
+            <div className="text-xs text-fg-muted uppercase tracking-wider mt-2">History</div>
             {sessions.length === 0 && (
-              <div className="text-xs text-gray-500 text-center py-4">暂无历史会话</div>
+              <div className="text-xs text-fg-muted text-center py-4">No sessions yet</div>
             )}
             {sessions.map(s => (
               <div
                 key={s.id}
                 className={`flex items-center justify-between px-2 py-1.5 rounded text-xs cursor-pointer ${
-                  s.id === currentSession ? 'bg-gray-700 text-white' : 'text-gray-300 hover:bg-gray-700'
+                  s.id === currentSession ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:bg-surface-hover'
                 }`}
               >
                 <div className="flex items-center gap-2 flex-1 min-w-0" onClick={() => onSwitchSession?.(s.id)}>
@@ -122,8 +153,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <span className="truncate">{s.id.replace('session_', '')}</span>
                 </div>
                 <button
+                  type="button"
                   onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id); }}
-                  className="text-gray-500 hover:text-red-400 ml-1"
+                  className="text-fg-muted hover:text-danger ml-1"
+                  aria-label="Delete session"
+                  title="Delete session"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -132,53 +166,124 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
 
+        {activeSection === 'knowledge' && (
+          <div className="space-y-3">
+            <div className="text-xs text-fg-muted uppercase tracking-wider">Knowledge Base</div>
+            <button
+              type="button"
+              onClick={() => onExecuteTool('knowledge_list', {})}
+              className="w-full flex items-center justify-center gap-2 py-2 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              View All Documents
+            </button>
+            <div className="text-[10px] text-fg-muted text-center">
+              Browse and search your indexed knowledge base documents.
+            </div>
+          </div>
+        )}
+
         {activeSection === 'settings' && (
           <div className="space-y-4">
             <div>
-              <label className="text-xs text-gray-400 block mb-1">模型</label>
-              <select
-                value={currentModel}
-                onChange={(e) => onModelChange(e.target.value)}
-                className="w-full text-xs bg-gray-700 border border-gray-600 rounded px-2 py-1.5 outline-none"
-              >
-                {models.map(m => (
-                  <option key={m.id} value={m.id}>{m.name}</option>
+              <label className="text-xs text-fg-secondary block mb-1">Role</label>
+              <div className="flex gap-1">
+                <select
+                  value={currentRole}
+                  onChange={(e) => onRoleChange(e.target.value)}
+                  className="flex-1 text-xs bg-surface-input border border-border rounded px-2 py-1.5 outline-none text-fg"
+                  aria-label="Select role"
+                >
+                  {roles.map(r => (
+                    <option key={r.id} value={r.id}>{r.name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={onOpenRoleEditor}
+                  className="px-2 py-1.5 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
+                  title="Custom roles"
+                >
+                  <UserCog className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <div className="text-[10px] text-fg-muted mt-1">
+                {roles.find(r => r.id === currentRole)?.description || ''}
+              </div>
+            </div>
+
+            <div>
+              <label className="text-xs text-fg-secondary block mb-1.5">{t('sidebar.theme')}</label>
+              <div className="flex bg-surface-hover rounded p-0.5">
+                {(['dark', 'light', 'system'] as const).map((themeOpt) => (
+                  <button
+                    key={themeOpt}
+                    type="button"
+                    onClick={() => setTheme(themeOpt)}
+                    className={`flex-1 flex items-center justify-center gap-1 py-1 rounded text-[10px] transition-colors ${
+                      theme === themeOpt
+                        ? 'bg-surface text-fg shadow-sm'
+                        : 'text-fg-muted hover:text-fg-secondary'
+                    }`}
+                  >
+                    {themeOpt === 'dark' ? <Moon className="w-3 h-3" /> : themeOpt === 'light' ? <Sun className="w-3 h-3" /> : <Laptop className="w-3 h-3" />}
+                    {themeOpt === 'dark' ? t('sidebar.dark') : themeOpt === 'light' ? t('sidebar.light') : t('sidebar.system')}
+                  </button>
                 ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="text-xs text-gray-400 block mb-1">提供商</label>
-              <div className="text-xs text-gray-300">
-                {models.find(m => m.id === currentModel)?.provider || '-'}
               </div>
             </div>
 
             <div>
-              <label className="text-xs text-gray-400 block mb-1">视觉支持</label>
-              <div className="text-xs text-gray-300">
-                {models.find(m => m.id === currentModel)?.vision ? '✅ 支持' : '❌ 不支持'}
+              <label className="text-xs text-fg-secondary block mb-1.5">Language / 语言</label>
+              <div className="flex bg-surface-hover rounded p-0.5">
+                {(['zh', 'en'] as const).map((lng) => (
+                  <button
+                    key={lng}
+                    type="button"
+                    onClick={() => changeLanguage(lng)}
+                    className={`flex-1 flex items-center justify-center gap-1 py-1 rounded text-[10px] transition-colors ${
+                      i18n.language === lng
+                        ? 'bg-surface text-fg shadow-sm'
+                        : 'text-fg-muted hover:text-fg-secondary'
+                    }`}
+                  >
+                    <Globe className="w-3 h-3" />
+                    {lng === 'zh' ? '中文' : 'English'}
+                  </button>
+                ))}
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={() => onExecuteTool('knowledge_list', {})}
+              className="w-full flex items-center justify-center gap-2 py-2 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              View Knowledge Base
+            </button>
+
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="w-full flex items-center justify-center gap-2 py-2 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
+            >
+              <Settings className="w-3.5 h-3.5" />
+              Open Full Settings
+            </button>
           </div>
         )}
       </div>
 
-      {/* 底部操作 */}
-      <div className="p-3 border-t border-gray-700 space-y-1">
+      {/* Bottom actions */}
+      <div className="p-3 border-t border-border">
         <button
-          onClick={onToggleTerminal}
-          className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-gray-300 hover:bg-gray-700 transition-colors"
-        >
-          <Terminal className="w-3.5 h-3.5" />
-          切换终端面板
-        </button>
-        <button
+          type="button"
           onClick={onClear}
-          className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-red-400 hover:bg-gray-700 transition-colors"
+          className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-danger hover:bg-surface-hover transition-colors"
         >
           <Trash2 className="w-3.5 h-3.5" />
-          清空会话
+          Clear Session
         </button>
       </div>
     </div>

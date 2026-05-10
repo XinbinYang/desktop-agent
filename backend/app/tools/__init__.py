@@ -25,11 +25,11 @@ from app.tools.backtest_tool import (
 )
 from app.tools.wind_sync_tool import WindSyncTool
 from app.tools.git_tool import (
-    GitCloneTool, GitStatusTool, GitCommitTool,
+    GitCloneTool, GitStatusTool, GitDiffTool, GitCommitTool,
     GitPullTool, GitPushTool, GitBranchTool, GitRemoteTool
 )
 from app.tools.knowledge_tool import (
-    KnowledgeIndexTool, KnowledgeSearchTool, KnowledgeListTool
+    KnowledgeIndexTool, KnowledgeSearchTool, KnowledgeListTool, KnowledgeClearTool
 )
 from app.tools.workflow_tool import (
     WorkflowRecordTool, WorkflowStopTool, WorkflowListTool, WorkflowRunTool
@@ -83,6 +83,7 @@ ALL_TOOLS: list[BaseTool] = [
     # Git 工具
     GitCloneTool(),
     GitStatusTool(),
+    GitDiffTool(),
     GitCommitTool(),
     GitPullTool(),
     GitPushTool(),
@@ -92,6 +93,7 @@ ALL_TOOLS: list[BaseTool] = [
     KnowledgeIndexTool(),
     KnowledgeSearchTool(),
     KnowledgeListTool(),
+    KnowledgeClearTool(),
     # 工作流工具
     WorkflowRecordTool(),
     WorkflowStopTool(),
@@ -103,6 +105,77 @@ ALL_TOOLS: list[BaseTool] = [
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
+
+# Tools the frontend may invoke via WebSocket `tool_direct`. Restricted to
+# read-only or user-visible actions that match the Sidebar QUICK_TOOLS list,
+# so a compromised renderer (or any process on localhost in dev mode) cannot
+# call shell_execute / file_write / etc. without going through the agent.
+SAFE_DIRECT_TOOLS: set[str] = {
+    "screenshot",
+    "get_screen_size",
+    "browser_navigate",
+    "browser_screenshot",
+    "app_list_windows",
+    "git_status",
+    "knowledge_list",
+}
+
+# Tool categories for grouped presentation in the system prompt.
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "文件工具": ["file_read", "file_write", "file_list", "file_search", "file_delete"],
+    "终端工具": ["shell_execute", "shell_start"],
+    "浏览器工具": [
+        "browser_navigate", "browser_click", "browser_type",
+        "browser_screenshot", "browser_evaluate", "browser_close",
+    ],
+    "桌面操控": [
+        "screenshot", "mouse_click", "mouse_move", "type_text",
+        "press_key", "scroll", "get_screen_size",
+    ],
+    "应用控制": ["app_open", "app_list_windows", "app_find_window", "app_click", "app_type"],
+    "Git 版本控制": [
+        "git_clone", "git_status", "git_diff", "git_commit",
+        "git_pull", "git_push", "git_branch", "git_remote",
+    ],
+    "知识库": ["knowledge_index", "knowledge_search", "knowledge_list", "knowledge_clear"],
+    "WIND 金融数据": ["wind_wsd", "wind_wss", "wind_wset", "wind_edb", "wind_tdays", "wind_sync"],
+    "策略回测": ["strategy_list", "backtest_run", "backtest_report"],
+    "工作流": ["workflow_record", "workflow_stop", "workflow_list", "workflow_run"],
+    "Worker 派发": ["dispatch_worker", "dispatch_parallel"],
+}
+
+
+def build_tools_description(dynamic_registry: "DynamicToolRegistry | None" = None) -> str:
+    """构建按类别分组的工具描述文本。"""
+    categorized: dict[str, list[str]] = {cat: [] for cat in TOOL_CATEGORIES}
+    uncategorized: list[str] = []
+    handled: set[str] = set()
+
+    all_schemas = get_tool_schemas(dynamic_registry)
+    for t in all_schemas:
+        name = t["function"]["name"]
+        desc = t["function"]["description"]
+        line = f"- {name}: {desc}"
+        placed = False
+        for cat, names in TOOL_CATEGORIES.items():
+            if name in names:
+                categorized[cat].append(line)
+                handled.add(name)
+                placed = True
+                break
+        if not placed:
+            uncategorized.append(line)
+
+    parts = []
+    for cat, lines in categorized.items():
+        if lines:
+            parts.append(f"### {cat}\n" + "\n".join(lines))
+
+    if uncategorized:
+        prefix = "### MCP 外部工具\n" if dynamic_registry else "### 其他工具\n"
+        parts.append(prefix + "\n".join(uncategorized))
+
+    return "\n\n".join(parts)
 
 
 class DynamicToolRegistry:

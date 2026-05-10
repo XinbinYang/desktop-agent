@@ -1,0 +1,39 @@
+# Force LF line endings for source files to prevent CRLF pollution on Windows.
+# Without this, `git status` shows "LF will be replaced by CRLF" warnings and
+# Windows checkouts can silently introduce CRLF that breaks shell scripts and
+# corrupts diffs.
+
+* text=auto eol=lf
+
+# Source code
+*.py     text eol=lf
+*.ts     text eol=lf
+*.tsx    text eol=lf
+*.js     text eol=lf
+*.jsx    text eol=lf
+*.json   text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+*.html   text eol=lf
+*.css    text eol=lf
+
+# PowerShell / batch must keep CRLF on Windows
+*.ps1    text eol=crlf
+*.psm1   text eol=crlf
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# Binary files
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.exe    binary
+*.dll    binary
+*.sqlite binary
+*.db     binary

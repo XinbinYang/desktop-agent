@@ -1,4 +1,12 @@
 import '@testing-library/jest-dom'
+import '../i18n'
+
+// Mock ResizeObserver for react-resizable-panels
+global.ResizeObserver = class MockResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+} as any
 
 // Mock WebSocket for tests
 global.WebSocket = class MockWebSocket {
@@ -18,3 +26,6 @@ global.WebSocket = class MockWebSocket {
   send(data: string | ArrayBufferLike | Blob | ArrayBufferView) {}
   close(code?: number, reason?: string) {}
 } as any
+
+// Use fake-indexeddb for tests
+import 'fake-indexeddb/auto'

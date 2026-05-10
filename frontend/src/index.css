@@ -1,10 +1,12 @@
+@import './styles/tokens.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   body {
-    @apply bg-gray-900 text-gray-100;
+    @apply bg-app text-fg;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   }
   ::-webkit-scrollbar {
@@ -12,27 +14,294 @@
     height: 8px;
   }
   ::-webkit-scrollbar-track {
-    @apply bg-gray-800;
+    background: var(--scrollbar-track);
   }
   ::-webkit-scrollbar-thumb {
-    @apply bg-gray-600 rounded-full;
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-gray-500;
+    background: var(--scrollbar-thumb-hover);
   }
 }
 
 @layer components {
   .code-block {
-    @apply bg-gray-950 rounded-lg p-3 overflow-x-auto text-sm font-mono;
+    @apply bg-surface border border-border rounded-lg p-3 overflow-x-auto text-sm font-mono;
   }
   .tool-call-box {
-    @apply border border-gray-700 rounded-lg bg-gray-800/50 my-2 overflow-hidden;
+    @apply border border-border rounded-lg bg-surface/50 my-2 overflow-hidden;
   }
   .tool-call-header {
-    @apply px-3 py-1.5 bg-gray-800 text-xs font-mono text-agent-400 flex items-center gap-2;
+    @apply px-3 py-1.5 bg-surface text-xs font-mono text-accent flex items-center gap-2;
   }
   .tool-call-body {
-    @apply px-3 py-2 text-sm text-gray-300 whitespace-pre-wrap;
+    @apply px-3 py-2 text-sm text-fg-secondary whitespace-pre-wrap;
+  }
+}
+
+/* Typography plugin overrides */
+.prose {
+  --tw-prose-body: var(--text-secondary);
+  --tw-prose-headings: var(--text-primary);
+  --tw-prose-bold: var(--text-primary);
+  --tw-prose-links: var(--text-link);
+  --tw-prose-code: var(--text-secondary);
+  --tw-prose-pre-bg: var(--bg-surface);
+  --tw-prose-pre-code: var(--text-secondary);
+  --tw-prose-quotes: var(--text-secondary);
+  --tw-prose-quote-borders: rgb(var(--accent-rgb));
+  --tw-prose-counters: var(--text-muted);
+  --tw-prose-bullets: var(--text-muted);
+  --tw-prose-hr: var(--border-default);
+  --tw-prose-th-borders: var(--border-default);
+  --tw-prose-td-borders: var(--border-subtle);
+}
+
+.prose h1 { font-size: 1.25rem; }
+.prose h2 {
+  font-size: 1.125rem;
+  border-bottom: 1px solid var(--border-default);
+  padding-bottom: 0.25rem;
+  margin-top: 1.25em;
+  margin-bottom: 0.75em;
+}
+.prose h3 { font-size: 1rem; margin-top: 1em; margin-bottom: 0.5em; }
+.prose p { margin-top: 0.5em; margin-bottom: 0.5em; }
+.prose li { margin-top: 0.125em; margin-bottom: 0.125em; }
+.prose ul, .prose ol { margin-top: 0.5em; margin-bottom: 0.5em; }
+.prose blockquote {
+  border-left-width: 3px;
+  border-left-color: rgb(var(--accent-rgb));
+  background-color: rgb(var(--accent-rgb) / 0.07);
+  border-radius: 0 0.25rem 0.25rem 0;
+  padding: 0.75rem 1rem;
+  font-style: normal;
+  color: var(--text-secondary);
+}
+.prose strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.prose thead { background-color: var(--bg-surface); }
+.prose th {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-default);
+}
+.prose td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.prose tbody tr:hover { background-color: var(--bg-surface-hover); }
+.prose tbody tr:last-child td { border-bottom: 0; }
+.prose code:not(pre code) {
+  background-color: var(--bg-surface);
+  color: var(--text-secondary);
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-size: 0.8125rem;
+  font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', 'Fira Code', Menlo, Monaco, monospace;
+}
+.prose a {
+  color: var(--text-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose a:hover { color: rgb(var(--accent-rgb)); }
+
+/* ─────────────────────────────────────────────────
+   Chat Density Design Token System
+   ─────────────────────────────────────────────────
+   Compact terminal-style output (like Claude Code).
+   Tokens remapped per [data-density] on container.
+   Components consume via Tailwind arbitrary values
+   (spacing) or .chat-text-* utilities (font).
+   Old .chat-density-* classes mapped for compat.
+   ───────────────────────────────────────────────── */
+
+/* ── Density font utilities ── */
+@layer components {
+  .chat-text-xs { font-size: var(--chat-font-xs); }
+  .chat-text-sm { font-size: var(--chat-font-sm); }
+  .chat-text-md { font-size: var(--chat-font-md); }
+  .chat-text-lg { font-size: var(--chat-font-lg); }
+}
+
+/* ── Default (balanced) tokens ── */
+:root {
+  --chat-space-xs: 2px;
+  --chat-space-sm: 4px;
+  --chat-space-md: 6px;
+  --chat-space-lg: 8px;
+  --chat-space-xl: 12px;
+  --chat-font-xs: 11px;
+  --chat-font-sm: 12px;
+  --chat-font-md: 13px;
+  --chat-font-lg: 14px;
+  --chat-line-height: 1.5;
+  --chat-timeline-indent: 18px;
+  --chat-bubble-px: 10px;
+  --chat-bubble-py: 4px;
+  --chat-block-gap: 2px;
+  --chat-message-gap: 6px;
+}
+
+/* ── Compact tokens ── */
+[data-density="compact"] {
+  --chat-space-xs: 1px;
+  --chat-space-sm: 2px;
+  --chat-space-md: 4px;
+  --chat-space-lg: 6px;
+  --chat-space-xl: 8px;
+  --chat-font-xs: 10px;
+  --chat-font-sm: 11px;
+  --chat-font-md: 12px;
+  --chat-font-lg: 13px;
+  --chat-line-height: 1.4;
+  --chat-timeline-indent: 14px;
+  --chat-bubble-px: 8px;
+  --chat-bubble-py: 3px;
+  --chat-block-gap: 1px;
+  --chat-message-gap: 4px;
+}
+
+/* ── Compact prose overrides ── */
+[data-density="compact"] .chat-prose {
+  line-height: var(--chat-line-height);
+}
+[data-density="compact"] .chat-prose p {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+[data-density="compact"] .chat-prose ul,
+[data-density="compact"] .chat-prose ol {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+[data-density="compact"] .chat-prose li {
+  margin-top: 0.05em;
+  margin-bottom: 0.05em;
+}
+[data-density="compact"] .chat-prose h1 { font-size: 1.1rem; }
+[data-density="compact"] .chat-prose h2 {
+  font-size: 1rem;
+  margin-top: 0.75em;
+  margin-bottom: 0.4em;
+}
+[data-density="compact"] .chat-prose h3 {
+  font-size: 0.9rem;
+  margin-top: 0.5em;
+  margin-bottom: 0.25em;
+}
+[data-density="compact"] .chat-prose blockquote {
+  padding: 0.5rem 0.75rem;
+}
+[data-density="compact"] .chat-prose code:not(pre code) {
+  padding: 0.0625rem 0.25rem;
+  font-size: var(--chat-font-sm);
+}
+
+/* ── Balanced prose overrides ── */
+[data-density="balanced"] .chat-prose {
+  line-height: var(--chat-line-height);
+}
+[data-density="balanced"] .chat-prose p {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+[data-density="balanced"] .chat-prose ul,
+[data-density="balanced"] .chat-prose ol {
+  margin-top: 0.45em;
+  margin-bottom: 0.45em;
+}
+
+/* ── Comfortable prose overrides ── */
+[data-density="comfortable"] .chat-prose {
+  line-height: 1.75;
+}
+[data-density="comfortable"] .chat-prose p {
+  margin-top: 0.65em;
+  margin-bottom: 0.65em;
+}
+[data-density="comfortable"] .chat-prose ul,
+[data-density="comfortable"] .chat-prose ol {
+  margin-top: 0.6em;
+  margin-bottom: 0.6em;
+}
+
+/* ── Backward-compat: old .chat-density-* classes → data-density ── */
+.chat-density-compact  { --chat-space-xs: 1px; --chat-space-sm: 2px; --chat-space-md: 4px; --chat-space-lg: 6px; --chat-space-xl: 8px; --chat-font-xs: 10px; --chat-font-sm: 11px; --chat-font-md: 12px; --chat-font-lg: 13px; --chat-line-height: 1.4; --chat-timeline-indent: 14px; --chat-bubble-px: 8px; --chat-bubble-py: 3px; --chat-block-gap: 1px; --chat-message-gap: 4px; }
+.chat-density-balanced { /* :root already provides balanced defaults */ }
+.chat-density-comfortable { --chat-space-xs: 4px; --chat-space-sm: 6px; --chat-space-md: 8px; --chat-space-lg: 12px; --chat-space-xl: 16px; --chat-font-xs: 11px; --chat-font-sm: 13px; --chat-font-md: 14px; --chat-font-lg: 16px; --chat-line-height: 1.625; --chat-timeline-indent: 22px; --chat-bubble-px: 12px; --chat-bubble-py: 6px; --chat-block-gap: 4px; --chat-message-gap: 10px; }
+
+/* Chat-prose base — brighter text for assistant output */
+.chat-prose {
+  --tw-prose-body: var(--text-primary);
+  --tw-prose-headings: var(--text-primary);
+  --tw-prose-bold: var(--text-primary);
+  --tw-prose-code: var(--text-primary);
+  --tw-prose-pre-code: var(--text-primary);
+}
+
+/* Old class prose overrides (mapped via data-density above) */
+.chat-density-compact .chat-prose {
+  line-height: var(--chat-line-height);
+}
+.chat-density-compact .chat-prose p {
+  margin-top: 0.25em; margin-bottom: 0.25em;
+}
+.chat-density-compact .chat-prose ul,
+.chat-density-compact .chat-prose ol {
+  margin-top: 0.25em; margin-bottom: 0.25em;
+}
+.chat-density-compact .chat-prose li {
+  margin-top: 0.05em; margin-bottom: 0.05em;
+}
+.chat-density-compact .chat-prose h1 { font-size: 1.1rem; }
+.chat-density-compact .chat-prose h2 { font-size: 1rem; margin-top: 0.75em; margin-bottom: 0.4em; }
+.chat-density-compact .chat-prose h3 { font-size: 0.9rem; margin-top: 0.5em; margin-bottom: 0.25em; }
+.chat-density-compact .chat-prose blockquote { padding: 0.5rem 0.75rem; }
+.chat-density-compact .chat-prose code:not(pre code) { padding: 0.0625rem 0.25rem; font-size: var(--chat-font-sm); }
+
+.chat-density-balanced .chat-prose {
+  line-height: 1.6;
+}
+.chat-density-balanced .chat-prose p {
+  margin-top: 0.5em; margin-bottom: 0.5em;
+}
+.chat-density-balanced .chat-prose ul,
+.chat-density-balanced .chat-prose ol {
+  margin-top: 0.45em; margin-bottom: 0.45em;
+}
+
+.chat-density-comfortable .chat-prose {
+  line-height: 1.75;
+}
+.chat-density-comfortable .chat-prose p {
+  margin-top: 0.65em; margin-bottom: 0.65em;
+}
+.chat-density-comfortable .chat-prose ul,
+.chat-density-comfortable .chat-prose ol {
+  margin-top: 0.6em; margin-bottom: 0.6em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

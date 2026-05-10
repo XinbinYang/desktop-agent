@@ -2,17 +2,58 @@
 import asyncio
 import time
 import uuid
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, List, Optional
 
 from app.tools.base import BaseTool, ToolResult
 from app.worker import WorkerSession, WORKER_PROFILES
 
-_worker_event_callback: Optional[Callable] = None
+_worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
+    "worker_event_callback",
+    default=None,
+)
+_active_workers: Dict[str, Dict[str, tuple[WorkerSession, Optional[Callable[[Dict[str, Any]], Any]]]]] = {}
 
 
-def set_worker_event_callback(cb: Optional[Callable]) -> None:
-    global _worker_event_callback
-    _worker_event_callback = cb
+def set_worker_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
+    return _worker_event_callback_var.set(cb)
+
+
+def reset_worker_event_callback(token: Token) -> None:
+    _worker_event_callback_var.reset(token)
+
+
+def _emit_worker_event(event: Dict[str, Any]) -> None:
+    cb = _worker_event_callback_var.get()
+    if cb:
+        cb(event)
+
+
+def _register_worker(session_id: str, worker: WorkerSession) -> None:
+    if not session_id:
+        return
+    _active_workers.setdefault(session_id, {})[worker.worker_id] = (
+        worker,
+        _worker_event_callback_var.get(),
+    )
+
+
+def _unregister_worker(session_id: str, worker_id: str) -> None:
+    workers = _active_workers.get(session_id)
+    if not workers:
+        return
+    workers.pop(worker_id, None)
+    if not workers:
+        _active_workers.pop(session_id, None)
+
+
+def cancel_workers_for_session(session_id: str) -> None:
+    workers = list(_active_workers.get(session_id, {}).values())
+    for worker, cb in workers:
+        worker.cancel()
+        event = worker.cancel_event()
+        if event and cb:
+            cb(event)
 
 
 class DispatchWorkerTool(BaseTool):
@@ -44,8 +85,16 @@ class DispatchWorkerTool(BaseTool):
         "required": ["task"],
     }
 
-    async def execute(self, task: str, profile: str = "code", model_id: str = "",
-                      context_files: Optional[List[str]] = None) -> ToolResult:
+    async def execute(
+        self,
+        task: str,
+        profile: str = "code",
+        model_id: str = "",
+        context_files: Optional[List[str]] = None,
+        session_id: str = "",
+        run_id: str = "",
+        tool_call_id: str = "",
+    ) -> ToolResult:
         from app.config import load_config
         if not model_id:
             model_id = load_config().settings.default_model
@@ -57,18 +106,23 @@ class DispatchWorkerTool(BaseTool):
             profile_name=profile,
             model_id=model_id,
             context_files=context_files,
+            run_id=run_id,
+            parent_tool_call_id=tool_call_id,
         )
 
         started_at = time.time()
         events: List[Dict[str, Any]] = []
         final_result = ""
 
-        async for event in worker.run():
-            events.append(event)
-            if _worker_event_callback:
-                _worker_event_callback(event)
-            if event["type"] == "worker_done":
-                final_result = event["data"].get("result", "")
+        _register_worker(session_id, worker)
+        try:
+            async for event in worker.run():
+                events.append(event)
+                _emit_worker_event(event)
+                if event["type"] == "worker_done":
+                    final_result = event["data"].get("result", "")
+        finally:
+            _unregister_worker(session_id, worker.worker_id)
 
         duration_ms = round((time.time() - started_at) * 1000)
 
@@ -113,7 +167,14 @@ class DispatchParallelTool(BaseTool):
         "required": ["tasks"],
     }
 
-    async def execute(self, tasks: List[Dict[str, str]], model_id: str = "") -> ToolResult:
+    async def execute(
+        self,
+        tasks: List[Dict[str, str]],
+        model_id: str = "",
+        session_id: str = "",
+        run_id: str = "",
+        tool_call_id: str = "",
+    ) -> ToolResult:
         from app.config import load_config
         if not model_id:
             model_id = load_config().settings.default_model
@@ -128,15 +189,20 @@ class DispatchParallelTool(BaseTool):
                 task=task_spec["task"],
                 profile_name=profile_name,
                 model_id=model_id,
+                run_id=run_id,
+                parent_tool_call_id=tool_call_id,
             )
             events: List[Dict[str, Any]] = []
             final = ""
-            async for event in worker.run():
-                events.append(event)
-                if _worker_event_callback:
-                    _worker_event_callback(event)
-                if event["type"] == "worker_done":
-                    final = event["data"].get("result", "")
+            _register_worker(session_id, worker)
+            try:
+                async for event in worker.run():
+                    events.append(event)
+                    _emit_worker_event(event)
+                    if event["type"] == "worker_done":
+                        final = event["data"].get("result", "")
+            finally:
+                _unregister_worker(session_id, worker.worker_id)
             return {
                 "worker_id": worker_id,
                 "profile": profile_name,
@@ -157,11 +223,12 @@ class DispatchParallelTool(BaseTool):
         success_count = 0
         fail_count = 0
 
-        for i, result in enumerate(all_results):
-            if isinstance(result, Exception):
+        for i, result_raw in enumerate(all_results):
+            if isinstance(result_raw, Exception):
                 fail_count += 1
-                output_parts.append(f"  Worker {i}: FAILED - {result}")
+                output_parts.append(f"  Worker {i}: FAILED - {result_raw}")
             else:
+                result: Dict[str, Any] = result_raw  # type: ignore[assignment]
                 success_count += 1
                 output_parts.append(
                     f"  {result['worker_id']} ({result['profile']}): "

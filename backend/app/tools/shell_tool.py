@@ -31,11 +31,22 @@ class ShellExecuteTool(BaseTool):
         r":\(\)\{\s*:\|:&\s*\};:",  # fork bomb
         r"shutdown\s+-[hrt]",
         r"rd\s+/s\s+/q",
+        r"git\s+push\s+(--force|-f)\b",
+        r"git\s+push\s+.*\s+(--force|-f)\b",
+        r"git\s+reset\s+--hard\b",
+        r"git\s+checkout\s+\.\s*$",
+        r"git\s+checkout\s+--\s+\.",
+        r"git\s+clean\s+-[fdx]+",
+        r"git\s+branch\s+-[dD]\b",
     ]
     DANGEROUS_LITERALS = [
         "rm -rf /", "rm -rf ~", "rm -rf /*",
         "del /q /s /f c:\\", "format c:",
         "> /dev/sda", "dd if=/dev/zero of=/dev/sda",
+        "git push --force", "git push -f",
+        "git reset --hard",
+        "git clean -fd", "git clean -fdx",
+        "git branch -D",
     ]
 
     def _is_dangerous(self, cmd: str) -> bool:
@@ -50,7 +61,7 @@ class ShellExecuteTool(BaseTool):
     
     async def execute(self, command: str, cwd: str = "", timeout: int = 60) -> ToolResult:
         if self._is_dangerous(command):
-            return ToolResult(error=f"检测到危险命令，已拒绝执行: {command}")
+            return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
         
         work_dir = cwd if cwd else os.getcwd()
         

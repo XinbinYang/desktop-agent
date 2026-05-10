@@ -1,25 +1,49 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useHotkeys } from 'react-hotkeys-hook';
+import { Panel, Group, Separator } from 'react-resizable-panels';
+import type { PanelImperativeHandle } from 'react-resizable-panels';
+import { AnimatePresence, motion } from 'framer-motion';
+import { useTranslation } from 'react-i18next';
 import { Sidebar } from './components/Sidebar';
 import { ChatPanel } from './components/ChatPanel';
 import { TerminalPanel } from './components/TerminalPanel';
 import { ToolCallView } from './components/ToolCallView';
 import { ArtifactPanel } from './components/ArtifactPanel/ArtifactPanel';
+import { ChangesPanel } from './components/ChangesPanel';
 import { KnowledgePanel } from './components/KnowledgePanel';
 import { WorkflowPanel } from './components/WorkflowPanel';
 import { McpPanel } from './components/McpPanel';
-import { ModelInfo, RoleInfo, ToolCall, ArtifactItem, ProjectInfo, FileNode, OpenFile, EditorGroup } from './types';
+import { ModelInfo, RoleInfo, ToolCall, ArtifactItem, ProjectInfo, FileNode, OpenFile, EditorGroup, SettingsResponse, FileEdit } from './types';
 import { API_BASE } from './config';
 import { useChatSession } from './hooks/useChatSession';
+import { useLayoutState } from './hooks/useLayoutState';
 import { loadRoles } from './lib/db';
 import { getLangFromFilename } from './lib/language';
-import { Settings } from 'lucide-react';
+import { Settings, ChevronDown, ChevronUp, ChevronLeft } from 'lucide-react';
 import { RoleEditor } from './components/RoleEditor';
 import { ProjectModal } from './components/ProjectModal';
 import { EditorPanel } from './components/EditorPanel/EditorPanel';
 import { SettingsModal } from './components/SettingsModal';
+import { ActivityBar } from './components/ActivityBar';
+import { WindowControls } from './components/WindowControls';
+
+function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
+  if (!settings?.settings || !settings.providers) return false;
+  const defaultProvider = settings.providers[settings.settings.default_provider];
+  if (!defaultProvider) return true;
+  if (typeof defaultProvider.api_key_configured === 'boolean') {
+    return !defaultProvider.api_key_configured;
+  }
+  const masked = defaultProvider.api_key_masked || '';
+  return !masked || (masked.startsWith('${') && masked.endsWith('}'));
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, '/').toLowerCase();
+}
 
 export default function App() {
+  const { t } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [currentModel, setCurrentModel] = useState<string>('');
   const [roles, setRoles] = useState<RoleInfo[]>([]);
@@ -36,12 +60,8 @@ export default function App() {
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [showProjectModal, setShowProjectModal] = useState(false);
 
-  // 布局状态
-  const [showTerminal, setShowTerminal] = useState(true);
-  const [rightTab, setRightTab] = useState<'tools' | 'artifacts' | 'editor' | 'knowledge' | 'workflow' | 'mcp'>('tools');
-  const [rightWidth, setRightWidth] = useState(320);
-  const [terminalHeight, setTerminalHeight] = useState(192);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // 布局状态 — centralized hook
+  const layout = useLayoutState();
 
   // 成果状态
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
@@ -53,12 +73,36 @@ export default function App() {
   ]);
   const [activeEditorGroup, setActiveEditorGroup] = useState('main');
 
-  const isResizingRight = useRef(false);
-  const isResizingBottom = useRef(false);
+  const didPromptModelSetup = React.useRef(false);
+  const rightPanelRef = useRef<PanelImperativeHandle>(null);
+  const terminalPanelRef = useRef<PanelImperativeHandle>(null);
+
+  // Sync right panel collapse/expand with layout state
+  useEffect(() => {
+    const panel = rightPanelRef.current;
+    if (!panel) return;
+    if (layout.rightPanelVisible && panel.isCollapsed()) {
+      panel.expand();
+    } else if (!layout.rightPanelVisible && !panel.isCollapsed()) {
+      panel.collapse();
+    }
+  }, [layout.rightPanelVisible]);
+
+  // Sync terminal collapse/expand with layout state
+  useEffect(() => {
+    const panel = terminalPanelRef.current;
+    if (!panel) return;
+    if (layout.showTerminal && panel.isCollapsed()) {
+      panel.expand();
+    } else if (!layout.showTerminal && !panel.isCollapsed()) {
+      panel.collapse();
+    }
+  }, [layout.showTerminal]);
 
   const {
     messages,
     toolCalls,
+    fileEdits,
     terminalLogs,
     isRunning,
     isConnected,
@@ -70,6 +114,8 @@ export default function App() {
     resetSession,
     addTerminalLog,
     onToolCallRef,
+    onFileEditRef,
+    recordFileEdit,
     saveInputDraft,
     loadInputDraft,
     clearInputDraft,
@@ -128,8 +174,22 @@ export default function App() {
       }
     };
 
+    const loadSettingsReadiness = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/settings`);
+        const data = await res.json();
+        if (!cancelled && !didPromptModelSetup.current && defaultProviderNeedsSetup(data)) {
+          didPromptModelSetup.current = true;
+          setShowSettings(true);
+          addTerminalLog('[系统] 默认模型尚未配置 API Key，请先在设置中填写。');
+        }
+      } catch (err) {
+        console.error('[App] Failed to check model settings:', err);
+      }
+    };
+
     const doLoad = async () => {
-      await Promise.all([loadModels(), loadRolesData()]);
+      await Promise.all([loadModels(), loadRolesData(), loadSettingsReadiness()]);
       if (!cancelled) setIsLoadingModels(false);
     };
 
@@ -285,7 +345,7 @@ export default function App() {
         return newGroups;
       });
 
-      setRightTab('editor');
+      layout.setRightTab('editor');
     } catch (err) {
       console.error('[App] Read file error:', err);
     }
@@ -361,11 +421,11 @@ export default function App() {
       prev.map((g) =>
         g.id === groupId
           ? {
-              ...g,
-              openFiles: g.openFiles.map((f) =>
-                f.id === fileId ? { ...f, content, isModified: true } : f
-              ),
-            }
+            ...g,
+            openFiles: g.openFiles.map((f) =>
+              f.id === fileId ? { ...f, content, isModified: true } : f
+            ),
+          }
           : g
       )
     );
@@ -395,20 +455,23 @@ export default function App() {
         prev.map((g) =>
           g.id === groupId
             ? {
-                ...g,
-                openFiles: g.openFiles.map((f) =>
-                  f.id === fileId ? { ...f, isModified: false } : f
-                ),
-              }
+              ...g,
+              openFiles: g.openFiles.map((f) =>
+                f.id === fileId ? { ...f, content, isModified: false, hasConflict: false } : f
+              ),
+            }
             : g
         )
       );
       addTerminalLog(`[系统] 文件已保存: ${file.name}`);
+      if (data.file_edit) {
+        recordFileEdit(data.file_edit as FileEdit, false);
+      }
     } catch (err) {
       console.error('[App] Save file error:', err);
       addTerminalLog(`[错误] 保存文件出错: ${err}`);
     }
-  }, [editorGroups, currentProject, addTerminalLog]);
+  }, [editorGroups, currentProject, addTerminalLog, recordFileEdit]);
 
   const loadSessions = useCallback(() => {
     fetch(`${API_BASE}/api/sessions`)
@@ -424,19 +487,7 @@ export default function App() {
 
       if (tc.name === 'file_write') {
         const path: string = tc.args?.path || '';
-        
-        // 检测是否修改了已打开的文件，标记为 isModified
-        setEditorGroups((prev) =>
-          prev.map((g) => ({
-            ...g,
-            openFiles: g.openFiles.map((f) =>
-              f.path === path || f.path.endsWith('/' + path) || path.endsWith('/' + f.path)
-                ? { ...f, isModified: true }
-                : f
-            ),
-          }))
-        );
-        
+
         if (!path.startsWith('preview/')) return;
 
         const filename = path.replace('preview/', '');
@@ -480,7 +531,7 @@ export default function App() {
         };
 
         setArtifacts((prev) => [...prev, item]);
-        setRightTab('artifacts');
+        layout.setRightTab('artifacts');
       }
 
       if (tc.name === 'shell_execute') {
@@ -511,12 +562,53 @@ export default function App() {
           };
           setArtifacts((prev) => [...prev, item]);
         }
-        setRightTab('artifacts');
+        layout.setRightTab('artifacts');
       }
 
       // browser_screenshot 的截图通过独立的 image 事件传递，此处不处理
     };
   }, [onToolCallRef, artifacts]);
+
+  useEffect(() => {
+    onFileEditRef.current = (edit: FileEdit) => {
+      const editPath = normalizePath(edit.path);
+      const projectRoot = currentProject ? normalizePath(currentProject.path) : '';
+      const relativePath = projectRoot && editPath.startsWith(projectRoot + '/')
+        ? edit.path.replace(/\\/g, '/').slice(currentProject!.path.replace(/\\/g, '/').length + 1)
+        : edit.path.replace(/\\/g, '/');
+
+      setEditorGroups((prev) =>
+        prev.map((g) => ({
+          ...g,
+          openFiles: g.openFiles.map((f) => {
+            const filePath = normalizePath(f.path);
+            const matches = filePath === normalizePath(relativePath) || editPath.endsWith('/' + filePath);
+            if (!matches) return f;
+
+            const hasLocalConflict = !!f.isModified && edit.old_text != null && f.content !== edit.old_text;
+            if (hasLocalConflict) {
+              return { ...f, hasConflict: true, isModified: true };
+            }
+            return {
+              ...f,
+              content: edit.new_text ?? f.content,
+              isModified: false,
+              hasConflict: false,
+            };
+          }),
+        }))
+      );
+
+      layout.setRightTab('changes');
+      layout.setRightPanelVisible(true);
+      if (edit.truncated) {
+        addTerminalLog(`[Edit] ${edit.path} changed; full text was too large for inline diff`);
+      }
+    };
+    return () => {
+      onFileEditRef.current = null;
+    };
+  }, [onFileEditRef, currentProject, layout, addTerminalLog]);
 
   // Electron 菜单事件
   useEffect(() => {
@@ -605,7 +697,17 @@ export default function App() {
 
   useHotkeys('ctrl+b, cmd+b', (e) => {
     e.preventDefault();
-    setSidebarCollapsed((v) => !v);
+    layout.setSidebarCollapsed((v) => !v);
+  });
+
+  useHotkeys('ctrl+backslash, cmd+backslash', (e) => {
+    e.preventDefault();
+    layout.setRightPanelVisible((v) => !v);
+  });
+
+  useHotkeys('ctrl+j, cmd+j', (e) => {
+    e.preventDefault();
+    layout.setShowTerminal((v) => !v);
   });
 
   useHotkeys('esc', () => {
@@ -623,61 +725,30 @@ export default function App() {
     }
   }, [isConnected, addTerminalLog]);
 
-  // 拖拽调整右侧面板宽度
-  const startResizeRight = useCallback((e: React.MouseEvent) => {
-    isResizingRight.current = true;
-    const startX = e.clientX;
-    const startWidth = rightWidth;
-    const handleMove = (moveEvent: MouseEvent) => {
-      if (!isResizingRight.current) return;
-      const delta = startX - moveEvent.clientX;
-      setRightWidth(Math.max(200, Math.min(1400, startWidth + delta)));
-    };
-    const handleUp = () => {
-      isResizingRight.current = false;
-      document.removeEventListener('mousemove', handleMove);
-      document.removeEventListener('mouseup', handleUp);
-    };
-    document.addEventListener('mousemove', handleMove);
-    document.addEventListener('mouseup', handleUp);
-  }, [rightWidth]);
-
-  // 拖拽调整底部终端高度
-  const startResizeBottom = useCallback((e: React.MouseEvent) => {
-    isResizingBottom.current = true;
-    const startY = e.clientY;
-    const startHeight = terminalHeight;
-    const handleMove = (moveEvent: MouseEvent) => {
-      if (!isResizingBottom.current) return;
-      const delta = moveEvent.clientY - startY;
-      setTerminalHeight(Math.max(80, Math.min(600, startHeight + delta)));
-    };
-    const handleUp = () => {
-      isResizingBottom.current = false;
-      document.removeEventListener('mousemove', handleMove);
-      document.removeEventListener('mouseup', handleUp);
-    };
-    document.addEventListener('mousemove', handleMove);
-    document.addEventListener('mouseup', handleUp);
-  }, [terminalHeight]);
-
   return (
-    <div className="h-screen flex flex-col bg-gray-900 text-gray-100 overflow-hidden">
+    <div className="h-screen flex flex-col bg-app text-fg overflow-hidden">
       {/* 顶部标题栏 */}
-      <div className="h-10 bg-gray-800 border-b border-gray-700 flex items-center px-4 justify-between select-none app-drag">
+      <div className="h-10 bg-surface border-b border-border flex items-center px-4 justify-between select-none app-drag">
         <div className="flex items-center gap-2">
           <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
           <span className="text-sm font-medium">Desktop Agent</span>
-          <span className="text-xs text-gray-500 ml-2">{isRunning ? '● 运行中' : '○ 就绪'}</span>
+          <span className="text-xs text-fg-muted ml-2">{isRunning ? '● Running' : '○ Ready'}</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-400 bg-gray-700/50 px-2 py-1 rounded border border-gray-600">
+          <WindowControls
+            showTerminal={layout.showTerminal}
+            rightPanelVisible={layout.rightPanelVisible}
+            onToggleTerminal={layout.toggleTerminal}
+            onToggleRightPanel={layout.toggleRightPanel}
+            onResetLayout={layout.resetLayout}
+          />
+          <span className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border">
             {models.find(m => m.id === currentModel)?.name || currentModel}
           </span>
           <button
             type="button"
             onClick={() => setShowSettings(true)}
-            className="text-gray-400 hover:text-white p-1 rounded hover:bg-gray-700 transition-colors"
+            className="text-fg-secondary hover:text-fg p-1 rounded hover:bg-surface-hover transition-colors"
             title="设置"
           >
             <Settings className="w-4 h-4" />
@@ -687,17 +758,26 @@ export default function App() {
 
       {/* 主内容区 */}
       <div className="flex-1 flex overflow-hidden">
+        {/* Activity Bar — always visible */}
+        <ActivityBar
+          activeSection={layout.activeSection}
+          sidebarCollapsed={layout.sidebarCollapsed}
+          onSectionChange={layout.setActiveSection}
+          onToggleSidebar={layout.toggleSidebar}
+        />
+
         {/* 左侧边栏 */}
-        {!sidebarCollapsed && (
+        {!layout.sidebarCollapsed && (
           <>
             <Sidebar
+              activeSection={layout.activeSection}
+              onSectionChange={layout.setActiveSection}
               roles={roles}
               currentRole={currentRole}
               onRoleChange={handleRoleChange}
               onOpenRoleEditor={() => setShowRoleEditor(true)}
               onOpenSettings={() => setShowSettings(true)}
               onClear={clearSession}
-              onToggleTerminal={() => setShowTerminal((v) => !v)}
               onExecuteTool={executeToolDirect}
               isConnected={isConnected}
               sessions={sessions}
@@ -755,131 +835,232 @@ export default function App() {
           onRolesChanged={handleRolesChanged}
         />
 
-        {/* 中间 + 底部面板 */}
-        <div className="flex-1 flex flex-col min-w-0">
-          <div className="flex-1 min-h-0">
-            <ChatPanel
-              messages={messages}
-              onSend={sendMessage}
-              onStop={stopRunning}
-              onRetry={retryLast}
-              isRunning={isRunning}
-              onDraftSave={saveInputDraft}
-              onDraftLoad={loadInputDraft}
-              onDraftClear={clearInputDraft}
-            />
-          </div>
+        {/* 中间 + 右侧面板 — horizontal Group */}
+        <Group orientation="horizontal" className="flex-1 min-w-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
+          {/* 中间 + 底部面板 */}
+          <Panel>
+            <div className="flex flex-col h-full">
+              <Group orientation="vertical" className="flex-1 min-h-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
+                <Panel>
+                  <ChatPanel
+                    messages={messages}
+                    toolCalls={toolCalls}
+                    onSend={sendMessage}
+                    onStop={stopRunning}
+                    onRetry={retryLast}
+                    isRunning={isRunning}
+                    onDraftSave={saveInputDraft}
+                    onDraftLoad={loadInputDraft}
+                    onDraftClear={clearInputDraft}
+                  />
+                </Panel>
 
-          {/* 底部终端拖拽条 */}
-          {showTerminal && (
-            <div
-              className="h-1 bg-gray-700 cursor-row-resize hover:bg-agent-500/30 shrink-0"
-              onMouseDown={startResizeBottom}
-              title="拖拽调整终端高度"
-            />
-          )}
+                <Separator className="h-4 bg-border hover:bg-accent/30 active:bg-accent/40 transition-colors cursor-row-resize flex items-center justify-center">
+                  <div className="w-8 h-0.5 rounded-full bg-fg-muted/30" />
+                </Separator>
 
-          {showTerminal && (
-            <div style={{ height: terminalHeight, minHeight: 80, maxHeight: 600 }}>
-              <TerminalPanel logs={terminalLogs} />
+                <Panel
+                  id="terminal"
+                  panelRef={terminalPanelRef}
+                  collapsible
+                  collapsedSize={0}
+                  defaultSize={100}
+                  minSize={0}
+                  maxSize={800}
+                  onResize={(size) => {
+                    if (size.asPercentage <= 1) {
+                      layout.setShowTerminal(false);
+                    } else if (!layout.showTerminal) {
+                      layout.setShowTerminal(true);
+                    }
+                  }}
+                >
+                  <div className="relative h-full">
+                    {layout.showTerminal && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => terminalPanelRef.current?.collapse()}
+                          className="absolute -top-4 left-1/2 -translate-x-1/2 w-8 h-4 bg-surface border border-border border-b-0 rounded-t-md flex items-start justify-center hover:bg-surface-hover transition-colors z-10"
+                          title="Collapse terminal (Ctrl+J)"
+                        >
+                          <ChevronDown className="w-3 h-3 text-fg-muted mt-0.5" />
+                        </button>
+                        <TerminalPanel logs={terminalLogs} />
+                      </>
+                    )}
+                  </div>
+                </Panel>
+              </Group>
+
+              {!layout.showTerminal && (
+                <button
+                  type="button"
+                  onClick={() => terminalPanelRef.current?.expand()}
+                  className="h-5 bg-surface border-t border-border flex items-center justify-center hover:bg-surface-hover transition-colors shrink-0 group"
+                  title="Expand terminal (Ctrl+J)"
+                >
+                  <ChevronUp className="w-3 h-3 text-fg-muted group-hover:text-fg-secondary" />
+                </button>
+              )}
             </div>
-          )}
-        </div>
+          </Panel>
 
-        {/* 右侧 Tab 面板（工具调用 / 预览） */}
-        <div
-          className="border-l border-gray-700 bg-gray-800/50 flex flex-col relative"
-          style={{ width: rightWidth, minWidth: 200, maxWidth: 1400 }}
-        >
-          {/* 拖拽分隔条 */}
-          <div
-            className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-agent-500/30 z-10"
-            onMouseDown={startResizeRight}
-          />
-          <div className="flex border-b border-gray-700">
-            <button
-              onClick={() => setRightTab('tools')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'tools' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              工具调用
-            </button>
-            <button
-              onClick={() => setRightTab('artifacts')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'artifacts' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              成果
-            </button>
-            <button
-              onClick={() => setRightTab('editor')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'editor' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              编辑器
-            </button>
-            <button
-              onClick={() => setRightTab('knowledge')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'knowledge' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              知识库
-            </button>
-            <button
-              onClick={() => setRightTab('workflow')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'workflow' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              工作流
-            </button>
-            <button
-              onClick={() => setRightTab('mcp')}
-              className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${
-                rightTab === 'mcp' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              MCP
-            </button>
-          </div>
-          <div className="flex-1 min-h-0 overflow-hidden">
-            {rightTab === 'tools' && (
-              <div className="h-full overflow-y-auto p-2">
-                {toolCalls.length === 0 && (
-                  <div className="text-xs text-gray-500 text-center mt-4">暂无工具调用</div>
-                )}
-                {toolCalls.map((tc, i) => (
-                  <ToolCallView key={tc.timestamp + i} toolCall={tc} />
-                ))}
+          {/* Right panel — always in Group, uses collapsible */}
+          <Separator className="w-4 bg-border hover:bg-accent/30 active:bg-accent/40 transition-colors cursor-col-resize flex items-center justify-center">
+            <div className="h-8 w-0.5 rounded-full bg-fg-muted/30" />
+          </Separator>
+          <Panel
+            panelRef={rightPanelRef}
+            defaultSize={800} minSize={0} maxSize={1600}
+            collapsible collapsedSize={0}
+            onResize={(size) => {
+              if (size.asPercentage <= 1) {
+                layout.setRightPanelVisible(false);
+              } else if (!layout.rightPanelVisible) {
+                layout.setRightPanelVisible(true);
+              }
+            }}
+          >
+            <div className="bg-surface/50 flex flex-col h-full min-w-0">
+              <div className="flex border-b border-border overflow-x-auto max-w-full min-w-0">
+                <button
+                  onClick={() => layout.setRightTab('tools')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'tools' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Tool Calls
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('changes')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'changes' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Changes
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('artifacts')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'artifacts' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Artifacts
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('editor')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'editor' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Editor
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('knowledge')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'knowledge' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Knowledge
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('workflow')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'workflow' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Workflows
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('mcp')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'mcp' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  MCP
+                </button>
               </div>
-            )}
-            {rightTab === 'artifacts' && (
-              <ArtifactPanel artifacts={artifacts} isRunning={isRunning} latestToolCall={latestToolCall} />
-            )}
-            {rightTab === 'editor' && (
-              <EditorPanel
-                groups={editorGroups}
-                activeGroupId={activeEditorGroup}
-                projectName={currentProject?.name || '未打开项目'}
-                onSelectFile={handleSelectFileInEditor}
-                onCloseFile={handleCloseFileInEditor}
-                onMoveToGroup={handleMoveToGroup}
-                onSplitEditor={handleSplitEditor}
-                onCloseSplit={handleCloseSplit}
-                onSetActiveGroup={setActiveEditorGroup}
-                onFileContentChange={handleFileContentChange}
-                onSaveFile={handleSaveFile}
-              />
-            )}
-            {rightTab === 'knowledge' && <KnowledgePanel />}
-            {rightTab === 'workflow' && <WorkflowPanel />}
-            {rightTab === 'mcp' && <McpPanel />}
+              <div className="flex-1 min-h-0 overflow-hidden">
+                {layout.rightTab === 'tools' && (
+                  <div className="h-full overflow-y-auto p-2">
+                    {toolCalls.length === 0 && (
+                      <div className="text-xs text-fg-muted text-center mt-4">No tool calls yet</div>
+                    )}
+                    {toolCalls.map((tc, i) => (
+                      <ToolCallView
+                        key={tc.timestamp + i}
+                        name={tc.name}
+                        args={tc.args}
+                        result={tc.result}
+                        status={tc.result.startsWith('[ERROR]') ? 'error' : 'success'}
+                        durationMs={tc.durationMs}
+                        workerEvents={tc.workerEvents}
+                      />
+                    ))}
+                  </div>
+                )}
+                {layout.rightTab === 'artifacts' && (
+                  <ArtifactPanel artifacts={artifacts} isRunning={isRunning} latestToolCall={latestToolCall} />
+                )}
+                {layout.rightTab === 'editor' && (
+                  <EditorPanel
+                    groups={editorGroups}
+                    activeGroupId={activeEditorGroup}
+                    projectName={currentProject?.name || '未打开项目'}
+                    onSelectFile={handleSelectFileInEditor}
+                    onCloseFile={handleCloseFileInEditor}
+                    onMoveToGroup={handleMoveToGroup}
+                    onSplitEditor={handleSplitEditor}
+                    onCloseSplit={handleCloseSplit}
+                    onSetActiveGroup={setActiveEditorGroup}
+                    onFileContentChange={handleFileContentChange}
+                    onSaveFile={handleSaveFile}
+                  />
+                )}
+                {layout.rightTab === 'changes' && (
+                  <ChangesPanel edits={fileEdits} onOpenFile={(path) => {
+                    if (!currentProject) return;
+                    const projectRoot = currentProject.path.replace(/\\/g, '/');
+                    const normalized = path.replace(/\\/g, '/');
+                    const relative = normalizePath(normalized).startsWith(normalizePath(projectRoot) + '/')
+                      ? normalized.slice(projectRoot.length + 1)
+                      : normalized;
+                    handleSelectFile(relative, 'file');
+                  }} />
+                )}
+                {layout.rightTab === 'knowledge' && <KnowledgePanel />}
+                {layout.rightTab === 'workflow' && <WorkflowPanel />}
+                {layout.rightTab === 'mcp' && <McpPanel />}
+              </div>
+            </div>
+          </Panel>
+        </Group>
+
+        {/* Right panel expand strip — shown when panel is collapsed */}
+        {!layout.rightPanelVisible && (
+          <div className="w-9 flex-shrink-0 border-l border-border bg-surface flex flex-col items-center py-2 gap-3">
+            <button
+              type="button"
+              onClick={() => layout.setRightPanelVisible(true)}
+              className="w-6 h-6 rounded flex items-center justify-center text-fg-muted hover:text-fg hover:bg-surface-hover transition-colors"
+              title="Expand panel (Ctrl+\)"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => { layout.setRightTab('tools'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'tools' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="Tool Calls"
+            >T</button>
+            <button
+              type="button"
+              onClick={() => { layout.setRightTab('editor'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'editor' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="Editor"
+            >E</button>
+            <button
+              type="button"
+              onClick={() => { layout.setRightTab('knowledge'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'knowledge' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="Knowledge"
+            >K</button>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

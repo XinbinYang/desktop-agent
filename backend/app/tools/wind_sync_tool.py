@@ -6,12 +6,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from app.runtime_paths import runtime_dir
 from app.tools.base import BaseTool, ToolResult
 
 # 项目根目录与数据库路径 (wind_sync_tool.py 位于 backend/app/tools/，项目根目录需再向上两级)
-_PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-_QUANT_DB_PATH = _PROJECT_ROOT / "data" / "quant_db.sqlite"
-_MARKET_DB_PATH = _PROJECT_ROOT / "data" / "market_data.db"
+_DATA_DIR = runtime_dir("data")
+_QUANT_DB_PATH = _DATA_DIR / "quant_db.sqlite"
+_MARKET_DB_PATH = _DATA_DIR / "market_data.db"
 
 # WIND 字段映射
 DAILY_PRICE_FIELDS = "open,high,low,close,volume,amt,vwap,pct_chg"
@@ -166,7 +167,7 @@ def _run_wsd_sync(
         local_latest = latest_date_fn(code, table_name)
         if local_latest:
             next_day = (datetime.strptime(local_latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            actual_start = max(start_date, next_day) if start_date else next_day
+            actual_start: Optional[str] = max(start_date, next_day) if start_date else next_day
         else:
             actual_start = start_date
 
@@ -359,7 +360,7 @@ class WindSyncTool(BaseTool):
         "required": ["sync_type", "codes"],
     }
 
-    async def execute(
+    async def execute(  # type: ignore[override]
         self,
         sync_type: str,
         codes: str,

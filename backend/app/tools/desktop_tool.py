@@ -46,7 +46,7 @@ class ScreenshotTool(BaseTool):
             # 压缩以节省 token
             img = img.convert("RGB")
             max_size = (1280, 720)
-            img.thumbnail(max_size, Image.LANCZOS)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
             
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")

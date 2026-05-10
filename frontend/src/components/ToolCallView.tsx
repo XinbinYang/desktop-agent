@@ -1,56 +1,79 @@
 import React, { useState } from 'react';
-import { ChevronDown, ChevronRight, Wrench, Bot, CheckCircle2, XCircle, AlertCircle } from 'lucide-react';
-import { ToolCall, WorkerEvent } from '../types';
-import { JsonTree } from './JsonTree';
+import { ChevronDown, ChevronRight, CheckCircle2, XCircle, Wrench, Loader2, Bot } from 'lucide-react';
+import { WorkerEvent } from '../types';
 
 interface ToolCallViewProps {
-  toolCall: ToolCall;
+  name: string;
+  args: Record<string, any>;
+  result?: string;
+  status: 'running' | 'success' | 'error';
+  durationMs?: number;
+  workerEvents?: WorkerEvent[];
 }
 
-const WorkerCard: React.FC<{ events: WorkerEvent[] }> = ({ events }) => {
-  const [expanded, setExpanded] = useState(true);
+function groupWorkerEvents(events: WorkerEvent[] = []): Record<string, WorkerEvent[]> {
+  return events.reduce<Record<string, WorkerEvent[]>>((acc, event) => {
+    const id = event.workerId || 'worker';
+    acc[id] = [...(acc[id] || []), event];
+    return acc;
+  }, {});
+}
 
-  const doneEvent = events.find(e => e.type === 'worker_done');
-  const status = doneEvent?.status || 'running';
-  const statusIcon = status === 'completed' ? <CheckCircle2 className="w-3 h-3 text-green-400" />
-    : status === 'failed' || status === 'cancelled' ? <XCircle className="w-3 h-3 text-red-400" />
-    : status === 'max_iterations_reached' ? <AlertCircle className="w-3 h-3 text-yellow-400" />
-    : <Bot className="w-3 h-3 text-blue-400 animate-pulse" />;
-
-  const toolEvents = events.filter(e => e.type === 'worker_tool_call');
+const WorkerCard: React.FC<{ workerId: string; events: WorkerEvent[] }> = ({ workerId, events }) => {
+  const [expanded, setExpanded] = useState(false);
+  const start = events.find((event) => event.type === 'worker_start');
+  const done = events.find((event) => event.type === 'worker_done');
+  const toolEvents = events.filter((event) => event.type === 'worker_tool_call');
+  const contentEvents = events.filter((event) => event.type === 'worker_content');
+  const status = done?.status || start?.status || 'running';
 
   return (
-    <div className="border border-gray-700 rounded mt-2 bg-gray-900/50">
+    <div className="rounded-md border border-border-subtle bg-surface/60 overflow-hidden">
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-2 py-1.5 text-xs hover:bg-gray-800/50 rounded-t"
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs hover:bg-surface-hover transition-colors"
       >
-        {statusIcon}
-        <span className="text-gray-300">Worker: {doneEvent?.workerId || events[0]?.workerId}</span>
-        {doneEvent?.durationMs != null && (
-          <span className="text-gray-500 text-[10px]">{doneEvent.durationMs}ms</span>
+        {status === 'running' ? (
+          <Loader2 className="w-3 h-3 text-blue-400 animate-spin shrink-0" />
+        ) : status === 'failed' || status === 'cancelled' ? (
+          <XCircle className="w-3 h-3 text-red-400 shrink-0" />
+        ) : (
+          <CheckCircle2 className="w-3 h-3 text-green-400 shrink-0" />
         )}
-        <span className="text-gray-500 text-[10px] ml-auto">
-          {status === 'completed' ? 'Done' : status}
+        <Bot className="w-3 h-3 text-fg-muted shrink-0" />
+        <span className="text-fg-secondary truncate flex-1 text-left">
+          Agent: {start?.task || workerId}
         </span>
-        {expanded ? <ChevronDown className="w-3 h-3 text-gray-600" /> : <ChevronRight className="w-3 h-3 text-gray-600" />}
+        {done?.durationMs != null && <span className="text-fg-muted tabular-nums">{done.durationMs}ms</span>}
+        {expanded ? <ChevronDown className="w-3 h-3 text-fg-muted shrink-0" /> : <ChevronRight className="w-3 h-3 text-fg-muted shrink-0" />}
       </button>
       {expanded && (
-        <div className="px-2 pb-2 space-y-1">
-          {toolEvents.map((te, i) => (
-            <div key={i} className="text-[10px] text-gray-400 pl-4 border-l border-gray-700/50">
-              <span className="text-blue-400">{te.toolName}</span>
-              {te.toolDurationMs != null && (
-                <span className="text-gray-600 ml-1">{te.toolDurationMs}ms</span>
-              )}
-              <span className="text-gray-500 ml-1 truncate block">
-                {te.toolResult?.slice(0, 120)}
-              </span>
+        <div className="px-[var(--chat-bubble-px)] pb-[var(--chat-space-md)] space-y-[var(--chat-space-md)] chat-text-xs border-t border-border-subtle pt-[var(--chat-space-md)]">
+          <div className="text-fg-muted">
+            {workerId}
+            {start?.profile ? ` · ${start.profile}` : ''}
+            {done?.iterations != null ? ` · ${done.iterations} iterations` : ''}
+          </div>
+          {toolEvents.length > 0 && (
+            <div className="space-y-[var(--chat-space-xs)]">
+              {toolEvents.map((event, index) => (
+                <div key={`${event.toolName}-${index}`} className="rounded bg-surface-alt px-[var(--chat-space-md)] py-[var(--chat-space-xs)] font-mono text-fg-secondary">
+                  <span className="text-blue-300">{event.toolName}</span>
+                  {event.toolDurationMs != null && <span className="text-fg-muted"> {event.toolDurationMs}ms</span>}
+                  {event.toolResult && <div className="mt-[var(--chat-space-xs)] whitespace-pre-wrap">{event.toolResult}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+          {contentEvents.map((event, index) => (
+            <div key={`content-${index}`} className="rounded bg-surface-alt px-[var(--chat-space-md)] py-[var(--chat-space-xs)] text-fg-secondary whitespace-pre-wrap">
+              {event.text}
             </div>
           ))}
-          {doneEvent?.result && (
-            <div className="text-[10px] text-gray-300 mt-1 pl-2 border-l-2 border-green-700/50">
-              {doneEvent.result.slice(0, 300)}
+          {done?.result && (
+            <div className="rounded bg-surface-alt px-[var(--chat-space-md)] py-[var(--chat-space-xs)] text-fg-secondary whitespace-pre-wrap">
+              {done.result}
             </div>
           )}
         </div>
@@ -59,76 +82,65 @@ const WorkerCard: React.FC<{ events: WorkerEvent[] }> = ({ events }) => {
   );
 };
 
-export const ToolCallView: React.FC<ToolCallViewProps> = ({ toolCall }) => {
+export const ToolCallView: React.FC<ToolCallViewProps> = ({
+  name,
+  args,
+  result,
+  status,
+  durationMs,
+  workerEvents,
+}) => {
   const [expanded, setExpanded] = useState(false);
-
-  const isError = toolCall.result.startsWith('[ERROR]');
-  const isDispatch = toolCall.name === 'dispatch_worker' || toolCall.name === 'dispatch_parallel';
-  const hasWorkerEvents = toolCall.workerEvents && toolCall.workerEvents.length > 0;
-
-  // Group worker events by workerId
-  const workerGroups: Record<string, WorkerEvent[]> = {};
-  if (hasWorkerEvents) {
-    for (const we of toolCall.workerEvents!) {
-      if (!workerGroups[we.workerId]) workerGroups[we.workerId] = [];
-      workerGroups[we.workerId].push(we);
-    }
-  }
+  const workerGroups = groupWorkerEvents(workerEvents);
+  const workerCount = Object.keys(workerGroups).length;
 
   return (
-    <div className="tool-call-box">
+    <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/40 overflow-hidden">
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="tool-call-header w-full text-left"
-        aria-label={expanded ? '折叠工具调用详情' : '展开工具调用详情'}
+        type="button"
+        onClick={() => (status !== 'running' || workerCount > 0) && setExpanded(!expanded)}
+        className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm hover:bg-surface-hover transition-colors"
       >
-        <Wrench className="w-3 h-3" />
-        <span className="flex-1">{toolCall.name}</span>
-        {typeof toolCall.durationMs === 'number' && (
-          <span className="text-gray-500 text-[10px]">{toolCall.durationMs}ms</span>
-        )}
-        {isError ? (
-          <span className="text-red-400 text-[10px]">失败</span>
-        ) : isDispatch && hasWorkerEvents ? (
-          <span className="text-blue-400 text-[10px]">
-            {Object.keys(workerGroups).length} worker(s)
-          </span>
+        {status === 'running' ? (
+          <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />
+        ) : status === 'error' ? (
+          <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
         ) : (
-          <span className="text-green-400 text-[10px]">成功</span>
+          <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
         )}
-        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
+        {typeof durationMs === 'number' && (
+          <span className="text-fg-muted tabular-nums">{durationMs}ms</span>
+        )}
+        {workerCount > 0 && (
+          <span className="chat-text-xs text-blue-300/90 shrink-0">{workerCount} agent{workerCount > 1 ? 's' : ''}</span>
+        )}
+        {status === 'running' ? (
+          <span className="chat-text-xs text-blue-400/80 shrink-0 font-medium">Running</span>
+        ) : expanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        )}
       </button>
-
-      {expanded && (
-        <div className="px-3 py-2 space-y-2 text-xs">
-          {(toolCall.runId || toolCall.toolCallId) && (
-            <div className="text-[10px] text-gray-500 space-y-0.5">
-              {toolCall.runId && <div>Run: {toolCall.runId}</div>}
-              {toolCall.toolCallId && <div>Call: {toolCall.toolCallId}</div>}
+      {expanded && (status !== 'running' || workerCount > 0) && (
+        <div className="px-[var(--chat-bubble-px)] pb-[var(--chat-space-lg)] space-y-[var(--chat-space-md)] chat-text-sm font-mono border-t border-border-subtle pt-[var(--chat-space-md)]">
+          <div className="text-fg-muted bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] overflow-x-auto">
+            {JSON.stringify(args, null, 2)}
+          </div>
+          {result != null && (
+            <div className={`bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] whitespace-pre-wrap max-h-80 overflow-auto ${status === 'error' ? 'text-danger' : 'text-fg-secondary'}`} style={{lineHeight:'var(--chat-line-height)'}}>
+              {result}
             </div>
           )}
-          <div>
-            <div className="text-gray-500 mb-0.5">参数:</div>
-            <div className="bg-gray-950 rounded p-1.5 font-mono overflow-x-auto">
-              <JsonTree data={toolCall.args} />
-            </div>
-          </div>
-
-          {isDispatch && hasWorkerEvents && (
-            <div>
-              <div className="text-gray-500 mb-0.5">Worker 执行:</div>
-              {Object.entries(workerGroups).map(([workerId, evts]) => (
-                <WorkerCard key={workerId} events={evts} />
+          {workerCount > 0 && (
+            <div className="space-y-[var(--chat-space-md)]">
+              {Object.entries(workerGroups).map(([workerId, events]) => (
+                <WorkerCard key={workerId} workerId={workerId} events={events} />
               ))}
             </div>
           )}
-
-          <div>
-            <div className="text-gray-500 mb-0.5">结果:</div>
-            <div className={`bg-gray-950 rounded p-1.5 font-mono whitespace-pre-wrap ${isError ? 'text-red-400' : 'text-gray-300'}`}>
-              {toolCall.result}
-            </div>
-          </div>
         </div>
       )}
     </div>

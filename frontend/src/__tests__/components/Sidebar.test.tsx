@@ -1,49 +1,65 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { Sidebar } from '../../components/Sidebar'
-import type { ModelInfo } from '../../types'
+import type { RoleInfo } from '../../types'
 
 describe('Sidebar', () => {
-  const mockModels: ModelInfo[] = [
-    { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
-    { id: 'claude-3', name: 'Claude 3', provider: 'anthropic', vision: true, context: 200000 },
+  const mockRoles: RoleInfo[] = [
+    { id: 'desktop-agent', name: '桌面助手', description: '全能助手', isBuiltin: true },
+    { id: 'code-expert', name: '代码专家', description: '专注代码', isBuiltin: true },
   ]
 
   const defaultProps = {
-    models: mockModels,
-    currentModel: 'gpt-4o',
-    onModelChange: vi.fn(),
+    activeSection: 'tools' as const,
+    onSectionChange: vi.fn(),
+    roles: mockRoles,
+    currentRole: 'desktop-agent',
+    onRoleChange: vi.fn(),
+    onOpenRoleEditor: vi.fn(),
+    onOpenSettings: vi.fn(),
     onClear: vi.fn(),
-    onToggleTerminal: vi.fn(),
     onExecuteTool: vi.fn(),
     isConnected: true,
   }
 
   it('renders quick tools list', () => {
     render(<Sidebar {...defaultProps} />)
-    expect(screen.getByText('截图')).toBeInTheDocument()
-    expect(screen.getByText('打开浏览器')).toBeInTheDocument()
+    expect(screen.getByText('Screenshot')).toBeInTheDocument()
+    expect(screen.getByText('Open Browser')).toBeInTheDocument()
   })
 
-  it('calls onModelChange when selecting different model', () => {
-    const onModelChange = vi.fn()
-    render(<Sidebar {...defaultProps} onModelChange={onModelChange} />)
+  it('shows settings content when activeSection is settings', () => {
+    render(<Sidebar {...defaultProps} activeSection="settings" />)
+    expect(screen.getByText('Open Full Settings')).toBeInTheDocument()
+  })
 
-    // Switch to settings tab first
-    const settingsTab = screen.getByText('设置')
-    fireEvent.click(settingsTab)
+  it('calls onOpenSettings when clicking open settings button', () => {
+    const onOpenSettings = vi.fn()
+    render(<Sidebar {...defaultProps} activeSection="settings" onOpenSettings={onOpenSettings} />)
 
-    const select = screen.getByDisplayValue('GPT-4o')
-    fireEvent.change(select, { target: { value: 'claude-3' } })
+    const openBtn = screen.getByText('Open Full Settings')
+    fireEvent.click(openBtn)
 
-    expect(onModelChange).toHaveBeenCalledWith('claude-3')
+    expect(onOpenSettings).toHaveBeenCalled()
+  })
+
+  it('shows role selector in settings section', () => {
+    render(<Sidebar {...defaultProps} activeSection="settings" />)
+
+    expect(screen.getByDisplayValue('桌面助手')).toBeInTheDocument()
+  })
+
+  it('shows knowledge content when activeSection is knowledge', () => {
+    render(<Sidebar {...defaultProps} activeSection="knowledge" />)
+    expect(screen.getByText('Knowledge Base')).toBeInTheDocument()
+    expect(screen.getByText('View All Documents')).toBeInTheDocument()
   })
 
   it('calls onClear when clicking clear button', () => {
     const onClear = vi.fn()
     render(<Sidebar {...defaultProps} onClear={onClear} />)
 
-    const clearButton = screen.getByText('清空会话')
+    const clearButton = screen.getByText('Clear Session')
     fireEvent.click(clearButton)
 
     expect(onClear).toHaveBeenCalled()
@@ -53,7 +69,7 @@ describe('Sidebar', () => {
     const onExecuteTool = vi.fn()
     render(<Sidebar {...defaultProps} onExecuteTool={onExecuteTool} />)
 
-    const screenshotBtn = screen.getByText('截图')
+    const screenshotBtn = screen.getByText('Screenshot')
     fireEvent.click(screenshotBtn)
 
     expect(onExecuteTool).toHaveBeenCalledWith('screenshot', {})
@@ -61,11 +77,16 @@ describe('Sidebar', () => {
 
   it('shows connected status', () => {
     render(<Sidebar {...defaultProps} isConnected={true} />)
-    expect(screen.getByText('已连接')).toBeInTheDocument()
+    expect(screen.getByText('Connected')).toBeInTheDocument()
   })
 
   it('shows disconnected status', () => {
     render(<Sidebar {...defaultProps} isConnected={false} />)
-    expect(screen.getByText('未连接')).toBeInTheDocument()
+    expect(screen.getByText('Disconnected')).toBeInTheDocument()
+  })
+
+  it('does not render tab buttons (moved to ActivityBar)', () => {
+    render(<Sidebar {...defaultProps} />)
+    expect(screen.queryByRole('button', { name: 'Tools' })).not.toBeInTheDocument()
   })
 })

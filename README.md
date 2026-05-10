@@ -65,22 +65,22 @@ playwright install chromium
 
 ### 2. 配置模型
 
-编辑 `desktop-agent/config/models.yaml`，填入你的 API Key：
+首次启动后，打开左侧“设置”面板，添加或编辑 Provider：
 
-```yaml
-providers:
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: sk-your-key-here          # 直接写key或用 ${OPENAI_API_KEY}
-  anthropic:
-    base_url: https://api.anthropic.com/v1
-    api_key: sk-ant-your-key-here
-  local:
-    base_url: http://localhost:11434/v1
-    api_key: ollama
+- OpenAI: `https://api.openai.com/v1`，填入自己的 `OPENAI_API_KEY` 或直接粘贴 API Key。
+- Anthropic: `https://api.anthropic.com/v1`，填入自己的 `ANTHROPIC_API_KEY` 或直接粘贴 API Key。
+- Kimi: `https://api.kimi.com/coding/v1`，填入自己的 `KIMI_API_KEY` 或直接粘贴 API Key。
+- Ollama: `http://localhost:11434/v1`，API Key 可填 `ollama`。
+
+设置页保存后会写入本机用户数据目录下的用户配置文件，不会修改仓库内的 `config/models.yaml` 模板。编辑 Provider 时 API Key 输入框留空表示保留原 key；保存后界面只显示脱敏值。
+
+高级用户仍可使用环境变量，例如 PowerShell：
+
+```powershell
+$env:OPENAI_API_KEY="<your-api-key>"
 ```
 
-> 也可使用环境变量：`set OPENAI_API_KEY=sk-xxx`（Windows CMD）
+> 发布说明：历史版本中若曾暴露真实 API Key，请立即在对应平台轮换旧 key。当前仓库模板只保留 `${ENV_VAR}` 占位。
 
 ### 3. 前端环境
 

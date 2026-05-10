@@ -2,10 +2,17 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
 class ToolResult:
-    def __init__(self, output: str = "", error: str = "", base64_image: Optional[str] = None):
+    def __init__(
+        self,
+        output: str = "",
+        error: str = "",
+        base64_image: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.output = output
         self.error = error
         self.base64_image = base64_image
+        self.metadata = metadata or {}
     
     def to_text(self) -> str:
         if self.error:

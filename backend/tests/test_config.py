@@ -1,12 +1,70 @@
-import os
-from pathlib import Path
-
-import pytest
-
-from app.config import load_config, get_provider_for_model, list_all_models, CONFIG_PATH
+from app.config import load_config, get_provider_for_model, list_all_models, default_config_path
 
 
 class TestLoadConfig:
+    def test_default_config_path_uses_pyinstaller_meipass(self, monkeypatch, tmp_path):
+        """Packaged PyInstaller builds should load bundled config from sys._MEIPASS."""
+        from app import runtime_paths
+
+        monkeypatch.setattr(runtime_paths.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(runtime_paths.sys, "_MEIPASS", str(tmp_path), raising=False)
+
+        assert default_config_path() == tmp_path / "config" / "models.yaml"
+
+    def test_user_config_copies_from_bundled_template(self, monkeypatch, tmp_path):
+        """Customer runs seed a writable user config from the bundled template."""
+        from app import runtime_paths
+
+        bundle_root = tmp_path / "bundle"
+        template = bundle_root / "config" / "models.yaml"
+        template.parent.mkdir(parents=True)
+        template.write_text(
+            """
+providers:
+  p:
+    base_url: http://x
+    api_key: ${TEST_KEY}
+    models:
+      - id: m
+        name: M
+        context: 1
+settings:
+  default_model: m
+  default_provider: p
+""",
+            encoding="utf-8",
+        )
+        user_data = tmp_path / "user-data"
+
+        monkeypatch.setenv(runtime_paths.USER_DATA_ENV, str(user_data))
+        monkeypatch.setattr(runtime_paths.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(runtime_paths.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+        path = runtime_paths.default_config_path()
+        assert path == user_data / "backend" / "config" / "models.yaml"
+        assert path.read_text(encoding="utf-8") == template.read_text(encoding="utf-8")
+
+    def test_existing_user_config_takes_priority(self, monkeypatch, tmp_path):
+        """Existing customer config is not overwritten by the bundled template."""
+        from app import runtime_paths
+
+        bundle_root = tmp_path / "bundle"
+        template = bundle_root / "config" / "models.yaml"
+        template.parent.mkdir(parents=True)
+        template.write_text("settings:\n  default_model: bundled\n", encoding="utf-8")
+
+        user_data = tmp_path / "user-data"
+        existing = user_data / "backend" / "config" / "models.yaml"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("settings:\n  default_model: customer\n", encoding="utf-8")
+
+        monkeypatch.setenv(runtime_paths.USER_DATA_ENV, str(user_data))
+        monkeypatch.setattr(runtime_paths.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(runtime_paths.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+        assert runtime_paths.default_config_path() == existing
+        assert existing.read_text(encoding="utf-8") == "settings:\n  default_model: customer\n"
+
     def test_load_config_reads_yaml(self, monkeypatch, tmp_path):
         """Config loads from YAML and parses providers correctly"""
         config_yaml = tmp_path / "models.yaml"
@@ -54,13 +112,13 @@ settings:
   default_model: gpt-4
   default_provider: openai
 """)
-        monkeypatch.setenv("TEST_API_KEY", "sk-secret-123")
+        monkeypatch.setenv("TEST_API_KEY", "fake-secret-123")
         monkeypatch.setattr("app.config.CONFIG_PATH", config_yaml)
         from app import config
         config._config = None
 
         cfg = load_config()
-        assert cfg.providers["openai"].api_key == "sk-secret-123"
+        assert cfg.providers["openai"].api_key == "fake-secret-123"
 
     def test_config_caching(self, monkeypatch, tmp_path):
         """Config is cached after first load"""

@@ -1,17 +1,63 @@
 import base64
 import json
+import logging
 from typing import AsyncGenerator, List, Optional, Dict, Any
 import httpx
 from litellm import acompletion
 from app.config import get_provider_for_model
 
+logger = logging.getLogger(__name__)
+
+
+def _safe_content_shape(content: Any) -> Any:
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if isinstance(block, dict):
+                summary = {"type": block.get("type")}
+                if block.get("type") == "tool_use":
+                    summary["name"] = block.get("name")
+                    summary["input_keys"] = sorted((block.get("input") or {}).keys())
+                elif block.get("type") == "tool_result":
+                    summary["tool_use_id_present"] = bool(block.get("tool_use_id"))
+                    summary["content_length"] = len(str(block.get("content", "")))
+                elif block.get("type") == "text":
+                    summary["text_length"] = len(str(block.get("text", "")))
+                elif block.get("type") == "image":
+                    source = block.get("source") or {}
+                    summary["media_type"] = source.get("media_type")
+                    summary["data_length"] = len(str(source.get("data", "")))
+                blocks.append(summary)
+            else:
+                blocks.append({"type": type(block).__name__, "length": len(str(block))})
+        return blocks
+    return {"type": type(content).__name__, "length": len(str(content))}
+
+
+def _safe_message_summary(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "role": message.get("role"),
+            "content": _safe_content_shape(message.get("content", "")),
+        }
+        for message in messages
+    ]
+
 class ModelRouter:
     def __init__(self, model_id: str):
         self.model_id = model_id
-        info = get_provider_for_model(model_id)
-        if info is None:
+        # Verify the model exists in config, but don't cache the provider —
+        # api_key may be updated via Settings at runtime.  _get_provider()
+        # re-reads load_config() so key changes take effect without a session
+        # restart.
+        if get_provider_for_model(model_id) is None:
             raise ValueError(f"Unknown model: {model_id}")
-        self.provider_name, self.provider = info
+
+    def _get_provider(self):
+        info = get_provider_for_model(self.model_id)
+        if info is None:
+            raise ValueError(f"Unknown model (config changed?): {self.model_id}")
+        return info
 
     async def _call_kimi_anthropic(
         self,
@@ -20,18 +66,21 @@ class ModelRouter:
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Kimi Code API 专用：使用 Anthropic 兼容端点获取 thinking 内容。"""
-        api_base = self.provider.base_url.replace("/coding/v1", "/coding")
+        _name, provider = self._get_provider()
+        api_base = provider.base_url.replace("/coding/v1", "/coding")
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": self.provider.api_key,
+            "x-api-key": provider.api_key,
             "anthropic-version": "2023-06-01",
             "User-Agent": "Kilo-Code/1.0",
         }
 
         # 分离 system message，并转换 OpenAI 格式消息为 Anthropic 格式
         system_text = ""
-        anthropic_messages = []
-        for m in messages:
+        anthropic_messages: list[dict] = []
+        i = 0
+        while i < len(messages):
+            m = messages[i]
             role = m.get("role")
             if role == "system":
                 system_text = m.get("content", "")
@@ -49,30 +98,78 @@ class ModelRouter:
                     })
                 anthropic_messages.append({"role": "assistant", "content": content_blocks})
             elif role == "tool":
-                # tool 结果在 Anthropic 中作为 user 消息的 tool_result block
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": [{
+                # 合并连续的 tool 消息为一个 user 消息（Anthropic API 要求）
+                tool_result_blocks = []
+                max_tool_result_len = 8000
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    content = messages[i].get("content") or ""
+                    if len(content) > max_tool_result_len:
+                        content = content[:max_tool_result_len] + f"\n\n[输出过长，已截断。原长度 {len(content)} 字符]"
+                    tool_result_blocks.append({
                         "type": "tool_result",
-                        "tool_use_id": m.get("tool_call_id", ""),
-                        "content": m.get("content", ""),
-                    }]
-                })
+                        "tool_use_id": messages[i].get("tool_call_id", ""),
+                        "content": content,
+                    })
+                    i += 1
+                anthropic_messages.append({"role": "user", "content": tool_result_blocks})
+                continue  # i 已在内层循环中递增
             else:
-                # user 消息直接传递
-                anthropic_messages.append({
-                    "role": role,
-                    "content": m.get("content", ""),
-                })
+                # user 消息：处理 OpenAI vision 格式转换为 Anthropic 格式
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    anthropic_content = []
+                    for block in content:
+                        btype = block.get("type")
+                        if btype == "text":
+                            anthropic_content.append({"type": "text", "text": block.get("text", "")})
+                        elif btype == "image_url":
+                            url = block.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image/png;base64,"):
+                                b64 = url.split(",")[1]
+                                anthropic_content.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": b64,
+                                    }
+                                })
+                            else:
+                                anthropic_content.append({"type": "text", "text": f"[Image: {url}]"})
+                    # 合并连续的 user 消息，避免 Anthropic API 400
+                    if anthropic_messages and anthropic_messages[-1].get("role") == "user":
+                        existing = anthropic_messages[-1]["content"]
+                        if isinstance(existing, list):
+                            existing.extend(anthropic_content)
+                        else:
+                            anthropic_messages[-1]["content"] = [{"type": "text", "text": str(existing)}] + anthropic_content
+                    else:
+                        anthropic_messages.append({"role": "user", "content": anthropic_content})
+                else:
+                    # 合并连续的 user 消息
+                    if anthropic_messages and anthropic_messages[-1].get("role") == "user":
+                        existing = anthropic_messages[-1]["content"]
+                        if isinstance(existing, list):
+                            existing.append({"type": "text", "text": str(content)})
+                        else:
+                            anthropic_messages[-1]["content"] = str(existing) + "\n" + str(content)
+                    else:
+                        anthropic_messages.append({"role": "user", "content": content})
+            i += 1
 
+        # 防御性校验：Anthropic API 要求 messages 必须以 user 开始且角色交替
+        if anthropic_messages and anthropic_messages[0].get("role") != "user":
+            anthropic_messages.insert(0, {"role": "user", "content": "(history truncated)"})
         payload: Dict[str, Any] = {
             "model": self.model_id,
             "max_tokens": max_tokens or 4096,
             "messages": anthropic_messages,
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
         }
         if system_text:
             payload["system"] = system_text
+        # Always enable extended thinking so the frontend can show a collapsible Thinking block
+        payload["thinking"] = {"type": "enabled", "budget_tokens": 2048}
+
         if tools:
             anthropic_tools = []
             for t in tools:
@@ -86,7 +183,34 @@ class ModelRouter:
 
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
-            resp.raise_for_status()
+            # If the API rejects thinking+tools, retry without thinking
+            if resp.status_code == 400 and tools:
+                resp_text = ""
+                try:
+                    resp_text = (resp.text or "")[:2000]
+                except Exception:
+                    pass
+                if "thinking" in resp_text.lower():
+                    logger.info("Kimi API rejected thinking+tools, retrying without thinking")
+                    payload.pop("thinking", None)
+                    resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError:
+                resp_text2 = ""
+                try:
+                    resp_text2 = (resp.text or "")[:2000]
+                except Exception:
+                    pass
+                logger.warning(
+                    "Kimi API request failed: status=%s response_text=%s message_count=%s tool_count=%s message_summary=%s",
+                    resp.status_code,
+                    resp_text2,
+                    len(anthropic_messages),
+                    len(payload.get("tools", [])),
+                    _safe_message_summary(anthropic_messages),
+                )
+                raise
             data = resp.json()
 
         # 解析 Anthropic 响应，转换为 OpenAI 格式
@@ -137,12 +261,13 @@ class ModelRouter:
         stream: bool = False
     ):
         """内部辅助方法：统一调用 LiteLLM。"""
-        if self.provider_name == "local":
+        provider_name, provider = self._get_provider()
+        if provider_name == "local":
             litellm_provider = "openai"
-            api_base = self.provider.base_url
+            api_base = provider.base_url
         else:
-            litellm_provider = self.provider_name
-            api_base = self.provider.base_url
+            litellm_provider = provider_name
+            api_base = provider.base_url
 
         return await acompletion(
             model=f"{litellm_provider}/{self.model_id}",
@@ -151,7 +276,7 @@ class ModelRouter:
             temperature=temperature,
             max_tokens=max_tokens,
             api_base=api_base if api_base else None,
-            api_key=self.provider.api_key if self.provider.api_key else None,
+            api_key=provider.api_key if provider.api_key else None,
             stream=stream
         )
 
@@ -164,7 +289,7 @@ class ModelRouter:
         stream: bool = False
     ) -> AsyncGenerator[str, None]:
         """统一的聊天完成接口。返回 JSON 字符串的流。"""
-        if self.provider_name == "kimi":
+        if self._get_provider()[0] == "kimi":
             response = await self._call_kimi_anthropic(
                 messages=messages, tools=tools, max_tokens=max_tokens
             )
@@ -188,7 +313,7 @@ class ModelRouter:
         max_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
         """非流式调用，返回完整响应字典。"""
-        if self.provider_name == "kimi":
+        if self._get_provider()[0] == "kimi":
             return await self._call_kimi_anthropic(
                 messages=messages, tools=tools, max_tokens=max_tokens
             )

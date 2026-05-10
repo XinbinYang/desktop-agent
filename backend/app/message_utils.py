@@ -105,6 +105,7 @@ class ToolCallResult:
     duration_ms: int = 0
     error: Optional[str] = None
     base64_image: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def parse_tool_args(raw_args: Any) -> Tuple[dict, Optional[str]]:
@@ -127,7 +128,11 @@ async def execute_tool(
     tool_args: dict,
     allowed_tools: List[str],
     session_id: str = "",
-    get_tool_fn: Callable = None,
+    run_id: str = "",
+    tool_call_id: str = "",
+    worker_id: str = "",
+    parent_tool_call_id: str = "",
+    get_tool_fn: Optional[Callable[..., Any]] = None,
 ) -> ToolCallResult:
     """Execute a single tool call with validation and timing.
 
@@ -163,8 +168,17 @@ async def execute_tool(
             error=f"Unknown tool: {tool_name}",
         )
 
-    if "session_id" in inspect.signature(tool.execute).parameters and "session_id" not in tool_args:
-        tool_args["session_id"] = session_id
+    tool_params = inspect.signature(tool.execute).parameters
+    context_args = {
+        "session_id": session_id,
+        "run_id": run_id,
+        "tool_call_id": tool_call_id,
+        "worker_id": worker_id,
+        "parent_tool_call_id": parent_tool_call_id,
+    }
+    for key, value in context_args.items():
+        if key in tool_params and key not in tool_args and value:
+            tool_args[key] = value
 
     try:
         started_at = time.time()
@@ -176,6 +190,7 @@ async def execute_tool(
             result_text=result.to_text(),
             duration_ms=duration_ms,
             base64_image=result.base64_image,
+            metadata=result.metadata,
         )
     except Exception as e:
         return ToolCallResult(

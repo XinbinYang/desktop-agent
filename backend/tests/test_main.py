@@ -2,6 +2,7 @@ import json
 import subprocess
 
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
 
 class TestAPIRoutes:
@@ -72,6 +73,55 @@ class TestAPIRoutes:
         assert data["filename"] == "test.txt"
 
 
+class TestLocalAuth:
+    def test_api_requires_token_when_enabled(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        response = client.get("/api/models")
+
+        assert response.status_code == 401
+
+    def test_api_accepts_valid_token_header(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        response = client.get(
+            "/api/models",
+            headers={"X-Desktop-Agent-Token": "test-token"},
+        )
+
+        assert response.status_code == 200
+
+    def test_cors_preflight_is_not_blocked_by_auth(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        response = client.options(
+            "/api/models",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "X-Desktop-Agent-Token",
+            },
+        )
+
+        assert response.status_code in {200, 204}
+
+    def test_websocket_requires_token_when_enabled(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/auth_missing"):
+                pass
+
+    def test_websocket_accepts_valid_query_token(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        with client.websocket_connect("/ws/auth_ok?token=test-token") as ws:
+            ws.send_json({"type": "clear"})
+            msg = ws.receive_json()
+
+        assert msg["type"] == "cleared"
+
+
 class TestWebSocket:
     @pytest.mark.asyncio
     async def test_websocket_connect_and_chat(self, async_client, mock_litellm):
@@ -132,13 +182,37 @@ class TestWebSocket:
         with client.websocket_connect("/ws/test_tool_error") as ws:
             ws.send_json({
                 "type": "tool_direct",
-                "tool_name": "file_read",
+                "tool_name": "browser_navigate",
                 "args": {}
             })
             msg = ws.receive_json()
             assert msg["type"] == "tool_result"
-            assert msg["data"]["name"] == "file_read"
+            assert msg["data"]["name"] == "browser_navigate"
             assert "Tool execution failed" in msg["data"]["error"]
+
+    def test_websocket_tool_direct_blocks_disallowed_tool(self, client):
+        """tool_direct rejects tools not in SAFE_DIRECT_TOOLS, even if they exist."""
+        with client.websocket_connect("/ws/test_tool_blocked") as ws:
+            ws.send_json({
+                "type": "tool_direct",
+                "tool_name": "shell_execute",
+                "args": {"cmd": "echo hi"}
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert "not allowed" in msg["data"]["message"].lower()
+
+    def test_websocket_tool_direct_blocks_file_write(self, client):
+        """file_write must not be reachable through tool_direct."""
+        with client.websocket_connect("/ws/test_tool_block_write") as ws:
+            ws.send_json({
+                "type": "tool_direct",
+                "tool_name": "file_write",
+                "args": {"path": "/tmp/x", "content": "x"}
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert "not allowed" in msg["data"]["message"].lower()
 
 
 class TestProjectAPI:

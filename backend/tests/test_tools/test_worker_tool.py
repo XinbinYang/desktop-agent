@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from app.tools.worker_tool import DispatchWorkerTool, DispatchParallelTool
+from app.tools.worker_tool import DispatchWorkerTool, DispatchParallelTool, reset_worker_event_callback, set_worker_event_callback
 from app.worker import WorkerSession
 
 
@@ -18,12 +18,21 @@ class TestDispatchWorkerTool:
             }]
         }
         tool = DispatchWorkerTool()
-        result = await tool.execute(
-            task="Write hello.py", profile="code", model_id="gpt-4o",
-        )
+        events = []
+        token = set_worker_event_callback(events.append)
+        try:
+            result = await tool.execute(
+                task="Write hello.py", profile="code", model_id="gpt-4o",
+                run_id="run1", tool_call_id="parent1",
+            )
+        finally:
+            reset_worker_event_callback(token)
         assert "Worker worker_" in result.output
         assert "completed" in result.output
         assert "Done: file created" in result.output
+        assert events[0]["type"] == "worker_start"
+        assert events[0]["data"]["parent_tool_call_id"] == "parent1"
+        assert events[0]["data"]["run_id"] == "run1"
 
     @pytest.mark.asyncio
     async def test_dispatch_worker_with_tool_calls(self, mock_litellm_with_tool_call):

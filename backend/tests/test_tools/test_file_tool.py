@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from app.tools.file_tool import FileReadTool, FileWriteTool, FileListTool, FileSearchTool, FileDeleteTool
 
@@ -17,14 +19,14 @@ class TestFileReadTool:
         assert "hello world" in result.output
 
     @pytest.mark.asyncio
-    async def test_read_nonexistent_file(self, tool):
-        result = await tool.execute(path="/nonexistent/path/file.txt")
-        assert "不存在" in result.error
+    async def test_read_nonexistent_file(self, tool, temp_dir):
+        result = await tool.execute(path=str(temp_dir / "nonexistent.txt"))
+        assert "not found" in result.error
 
     @pytest.mark.asyncio
     async def test_read_directory_not_file(self, tool, temp_dir):
         result = await tool.execute(path=str(temp_dir))
-        assert "不是文件" in result.error
+        assert "not a file" in result.error
 
     @pytest.mark.asyncio
     async def test_read_with_offset_and_limit(self, tool, temp_dir):
@@ -42,7 +44,7 @@ class TestFileReadTool:
         test_file.write_bytes(b"x" * (11 * 1024 * 1024))  # 11MB
 
         result = await tool.execute(path=str(test_file))
-        assert "过大" in result.error
+        assert "too large" in result.error.lower()
 
 
 class TestFileWriteTool:
@@ -56,6 +58,10 @@ class TestFileWriteTool:
         result = await tool.execute(path=str(target), content="new content")
         assert result.error == ""
         assert target.read_text(encoding="utf-8") == "new content"
+        edit = result.metadata["file_edit"]
+        assert edit["operation"] == "create"
+        assert edit["new_text"] == "new content"
+        assert edit["stats"]["added"] >= 1
 
     @pytest.mark.asyncio
     async def test_write_creates_directories(self, tool, temp_dir):
@@ -70,6 +76,21 @@ class TestFileWriteTool:
         target.write_text("old", encoding="utf-8")
         result = await tool.execute(path=str(target), content="new")
         assert target.read_text(encoding="utf-8") == "new"
+        edit = result.metadata["file_edit"]
+        assert edit["operation"] == "modify"
+        assert edit["old_text"] == "old"
+        assert edit["new_text"] == "new"
+        assert "--- a/existing.txt" in edit["unified_diff"]
+
+    @pytest.mark.asyncio
+    async def test_write_large_file_truncates_inline_diff(self, tool, temp_dir):
+        target = temp_dir / "large.txt"
+        result = await tool.execute(path=str(target), content="x" * 1_000_001)
+        assert result.error == ""
+        edit = result.metadata["file_edit"]
+        assert edit["truncated"] is True
+        assert "old_text" not in edit
+        assert "new_text" not in edit
 
 
 class TestFileListTool:
@@ -99,9 +120,9 @@ class TestFileListTool:
         assert "nested.txt" in result.output
 
     @pytest.mark.asyncio
-    async def test_list_nonexistent_directory(self, tool):
-        result = await tool.execute(path="/nonexistent/dir")
-        assert "不存在" in result.error
+    async def test_list_nonexistent_directory(self, tool, temp_dir):
+        result = await tool.execute(path=str(temp_dir / "nonexistent_dir"))
+        assert "not found" in result.error
 
 
 class TestFileSearchTool:
@@ -121,7 +142,7 @@ class TestFileSearchTool:
     @pytest.mark.asyncio
     async def test_search_not_found(self, tool, temp_dir):
         result = await tool.execute(path=str(temp_dir), keyword="nothing")
-        assert "未找到" in result.output
+        assert "No matching" in result.output
 
 
 class TestFileDeleteTool:
@@ -139,11 +160,54 @@ class TestFileDeleteTool:
         assert not target.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_nonexistent_file(self, tool):
-        result = await tool.execute(path="/nonexistent/file.txt")
-        assert "不是文件或不存在" in result.error
+    async def test_delete_nonexistent_file(self, tool, temp_dir):
+        result = await tool.execute(path=str(temp_dir / "nonexistent.txt"))
+        assert "Not a file" in result.error
 
     @pytest.mark.asyncio
     async def test_delete_directory_is_rejected(self, tool, temp_dir):
         result = await tool.execute(path=str(temp_dir))
-        assert "不是文件或不存在" in result.error
+        assert "Not a file" in result.error
+
+
+class TestFileSandbox:
+    """路径沙箱安全测试"""
+
+    @pytest.fixture
+    def read_tool(self):
+        return FileReadTool()
+
+    @pytest.fixture
+    def write_tool(self):
+        return FileWriteTool()
+
+    @pytest.mark.asyncio
+    async def test_read_outside_project_is_blocked(self, read_tool):
+        result = await read_tool.execute(path="C:/Windows/System32/notepad.exe")
+        assert "out of bounds" in result.error
+
+    @pytest.mark.asyncio
+    async def test_prefix_similar_sibling_path_is_blocked(self, read_tool):
+        # A file in a sibling directory OUTSIDE the project root should be blocked
+        backend_root = Path(__file__).parents[2]  # backend/
+        outside_dir = backend_root.parent.parent / f"{backend_root.parent.name}_evil"
+        outside_dir.mkdir(exist_ok=True)
+        target = outside_dir / "sensitive.txt"
+        target.write_text("outside", encoding="utf-8")
+        try:
+            result = await read_tool.execute(path=str(target))
+            assert "out of bounds" in result.error
+        finally:
+            target.unlink(missing_ok=True)
+            outside_dir.rmdir()
+
+    @pytest.mark.asyncio
+    async def test_write_outside_project_is_blocked(self, write_tool):
+        result = await write_tool.execute(path="C:/tmp/hack.txt", content="bad")
+        assert "out of bounds" in result.error
+
+    @pytest.mark.asyncio
+    async def test_traverse_parent_directory_is_blocked(self, read_tool):
+        # 尝试用 ../ 跳出项目目录
+        result = await read_tool.execute(path="../../outside.txt")
+        assert "out of bounds" in result.error

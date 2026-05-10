@@ -45,16 +45,27 @@ class WorkerSession:
     MAX_HISTORY_MESSAGES = 20
     STALE_THRESHOLD = 3
 
-    def __init__(self, worker_id: str, task: str, profile_name: str, model_id: str,
-                 context_files: Optional[List[str]] = None):
+    def __init__(
+        self,
+        worker_id: str,
+        task: str,
+        profile_name: str,
+        model_id: str,
+        context_files: Optional[List[str]] = None,
+        run_id: str = "",
+        parent_tool_call_id: str = "",
+    ):
         self.worker_id = worker_id
         self.task = task
         self.profile = WORKER_PROFILES.get(profile_name, WORKER_PROFILES["general"])
         self.model_id = model_id
+        self.run_id = run_id
+        self.parent_tool_call_id = parent_tool_call_id
         self.router = ModelRouter(model_id)
         self.messages: List[Dict[str, Any]] = []
         self.iteration = 0
         self._cancelled = False
+        self._cancel_event_emitted = False
         self._context_files = context_files or []
         self._stale_count = 0
         self._started_at = time.time()
@@ -98,16 +109,40 @@ class WorkerSession:
     def cancel(self):
         self._cancelled = True
 
+    def _worker_event(self, event_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        event_data = {
+            **data,
+            "worker_id": self.worker_id,
+            "run_id": self.run_id,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "timestamp": time.time(),
+        }
+        return {"type": event_type, "data": event_data}
+
+    def cancel_event(self) -> Optional[Dict[str, Any]]:
+        if self._cancel_event_emitted:
+            return None
+        self._cancel_event_emitted = True
+        return self._worker_event("worker_done", {
+            "status": "cancelled",
+            "result": "[Worker cancelled]",
+            "iterations": self.iteration,
+            "duration_ms": round((time.time() - self._started_at) * 1000),
+        })
+
     async def run(self) -> AsyncGenerator[Dict[str, Any], None]:
+        yield self._worker_event("worker_start", {
+            "task": self.task,
+            "profile": self.profile.name,
+            "model_id": self.model_id,
+            "status": "running",
+        })
+
         while self.iteration < self.profile.max_iterations:
             if self._cancelled:
-                yield {"type": "worker_done", "data": {
-                    "worker_id": self.worker_id,
-                    "status": "cancelled",
-                    "result": "[Worker cancelled]",
-                    "iterations": self.iteration,
-                    "duration_ms": round((time.time() - self._started_at) * 1000),
-                }}
+                event = self.cancel_event()
+                if event:
+                    yield event
                 return
 
             self.iteration += 1
@@ -120,13 +155,12 @@ class WorkerSession:
                     max_tokens=4096,
                 )
             except Exception as e:
-                yield {"type": "worker_done", "data": {
-                    "worker_id": self.worker_id,
+                yield self._worker_event("worker_done", {
                     "status": "failed",
                     "result": f"[Worker model error: {e}]",
                     "iterations": self.iteration,
                     "duration_ms": round((time.time() - self._started_at) * 1000),
-                }}
+                })
                 return
 
             choice = response.get("choices", [{}])[0]
@@ -146,32 +180,29 @@ class WorkerSession:
             if not content and not tool_calls:
                 self._stale_count += 1
                 if self._stale_count >= self.STALE_THRESHOLD:
-                    yield {"type": "worker_done", "data": {
-                        "worker_id": self.worker_id,
+                    yield self._worker_event("worker_done", {
                         "status": "failed",
                         "result": "[Worker stalled: no output for 3 iterations]",
                         "iterations": self.iteration,
                         "duration_ms": round((time.time() - self._started_at) * 1000),
-                    }}
+                    })
                     return
             else:
                 self._stale_count = 0
 
             if content:
-                yield {"type": "worker_content", "data": {
-                    "worker_id": self.worker_id,
+                yield self._worker_event("worker_content", {
                     "text": content,
-                }}
+                })
 
             if not tool_calls:
                 self._trim_messages()
-                yield {"type": "worker_done", "data": {
-                    "worker_id": self.worker_id,
+                yield self._worker_event("worker_done", {
                     "status": "completed",
                     "result": content,
                     "iterations": self.iteration,
                     "duration_ms": round((time.time() - self._started_at) * 1000),
-                }}
+                })
                 return
 
             tool_results = []
@@ -184,13 +215,13 @@ class WorkerSession:
 
                 tool_args, parse_error = parse_tool_args(raw_args)
                 if parse_error:
-                    yield {"type": "worker_tool_call", "data": {
-                        "worker_id": self.worker_id,
+                    yield self._worker_event("worker_tool_call", {
                         "name": tool_name,
                         "args": {},
                         "result": parse_error,
                         "duration_ms": 0,
-                    }}
+                        "tool_call_id": tool_id,
+                    })
                     tool_results.append({
                         "tool_call_id": tool_id,
                         "role": "tool",
@@ -201,16 +232,23 @@ class WorkerSession:
 
                 tc_result = await execute_tool(
                     tool_name, tool_args, self.profile.tools, self.worker_id,
+                    run_id=self.run_id,
+                    tool_call_id=tool_id,
+                    worker_id=self.worker_id,
+                    parent_tool_call_id=self.parent_tool_call_id,
                     get_tool_fn=get_static_tool,
                 )
 
-                yield {"type": "worker_tool_call", "data": {
-                    "worker_id": self.worker_id,
+                if tc_result.metadata.get("file_edit"):
+                    yield self._worker_event("file_edit", tc_result.metadata["file_edit"])
+
+                yield self._worker_event("worker_tool_call", {
                     "name": tool_name,
                     "args": tool_args,
                     "result": tc_result.result_text,
                     "duration_ms": tc_result.duration_ms,
-                }}
+                    "tool_call_id": tool_id,
+                })
 
                 tool_results.append({
                     "tool_call_id": tool_id,
@@ -222,13 +260,12 @@ class WorkerSession:
             self.messages.extend(tool_results)
             self._trim_messages()
 
-        yield {"type": "worker_done", "data": {
-            "worker_id": self.worker_id,
+        yield self._worker_event("worker_done", {
             "status": "max_iterations_reached",
             "result": f"[Worker stopped: max {self.profile.max_iterations} iterations]",
             "iterations": self.iteration,
             "duration_ms": round((time.time() - self._started_at) * 1000),
-        }}
+        })
 
     def _trim_messages(self):
         self.messages = trim_messages(self.messages, self.MAX_HISTORY_MESSAGES)

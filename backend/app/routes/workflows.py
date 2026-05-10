@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -28,7 +28,7 @@ def get_workflow_api(workflow_id: str):
     from app.workflow.engine import get_workflow
     wf = get_workflow(workflow_id)
     if not wf:
-        return {"error": "Workflow not found"}
+        raise HTTPException(status_code=404, detail="Workflow not found")
     return wf.model_dump()
 
 
@@ -62,7 +62,7 @@ async def run_workflow_api(workflow_id: str, req: WorkflowRunRequest):
     from app.workflow.engine import get_workflow, WorkflowExecutor
     wf = get_workflow(workflow_id)
     if not wf:
-        return {"error": "Workflow not found"}
+        raise HTTPException(status_code=404, detail="Workflow not found")
     executor = WorkflowExecutor(wf)
     events = []
     async for event in executor.run(variables=req.variables):

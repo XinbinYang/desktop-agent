@@ -48,6 +48,7 @@ class TestWorkerSession:
         events = []
         async for event in worker.run():
             events.append(event)
+        assert events[0]["type"] == "worker_start"
         assert events[-1]["type"] == "worker_done"
         assert events[-1]["data"]["status"] == "completed"
         assert "completed" in events[-1]["data"]["result"]
@@ -59,8 +60,9 @@ class TestWorkerSession:
         events = []
         async for event in worker.run():
             events.append(event)
-        assert events[0]["type"] == "worker_done"
-        assert events[0]["data"]["status"] == "cancelled"
+        assert events[0]["type"] == "worker_start"
+        assert events[1]["type"] == "worker_done"
+        assert events[1]["data"]["status"] == "cancelled"
 
     @pytest.mark.asyncio
     async def test_worker_rejects_restricted_tool(self, mock_litellm_with_tool_call):

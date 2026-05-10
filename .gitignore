@@ -1,10 +1,15 @@
 # Dependencies
+node_modules/
 frontend/node_modules/
 backend/venv/
 
 # Build outputs
 frontend/dist/
 frontend/build/
+frontend/release/
+frontend/release-packaged/
+backend/build/
+backend/desktop-agent-backend.exe
 backend/__pycache__/
 **/__pycache__/
 **/*.pyc
@@ -25,9 +30,24 @@ Thumbs.db
 npm-debug.log*
 
 # Session data
-backend/sessions/*.json
+backend/sessions/
+backend/projects/
 backend/preview/
+backend/data/
+backend/models/
+backend/workflows/
+data/
+workflows/
+frontend/release-packaged/acceptance/
 
 # Environment
 .env
 .env.local
+
+# Claude Code personal settings (do not share)
+.claude/settings.local.json
+
+# Test coverage artifacts
+.coverage
+backend/.coverage
+htmlcov/

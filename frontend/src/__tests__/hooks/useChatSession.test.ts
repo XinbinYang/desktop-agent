@@ -90,20 +90,24 @@ describe('useChatSession', () => {
 
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
-    // First content event creates assistant message
+    // First content event creates assistant message with a text block
     act(() => {
       messageHandler?.({ type: 'content', data: { text: 'Hello' } })
     })
 
     expect(result.current.messages).toHaveLength(1)
-    expect(result.current.messages[0].content).toBe('Hello')
+    expect(result.current.messages[0].blocks).toBeDefined()
+    expect(result.current.messages[0].blocks![0].type).toBe('text')
+    expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello')
 
-    // Second content event appends
+    // Second content event merges into the same text block
     act(() => {
       messageHandler?.({ type: 'content', data: { text: ' world' } })
     })
 
-    expect(result.current.messages[0].content).toBe('Hello world')
+    // Re-read blocks from the updated state (not stale reference)
+    expect(result.current.messages[0].blocks![0].type).toBe('text')
+    expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello world')
   })
 
   it('handles tool_call event', async () => {
@@ -138,7 +142,10 @@ describe('useChatSession', () => {
     expect(result.current.toolCalls[0].runId).toBe('run-1')
     expect(result.current.toolCalls[0].toolCallId).toBe('call-1')
     expect(result.current.toolCalls[0].durationMs).toBe(12)
-    expect(result.current.messages).toHaveLength(0)
+    // tool_call also adds an inline block to messages
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].blocks).toBeDefined()
+    expect(result.current.messages[0].blocks![0].type).toBe('tool_call')
   })
 
   it('handles tool_result event', async () => {
@@ -198,8 +205,13 @@ describe('useChatSession', () => {
     })
 
     expect(result.current.toolCalls).toHaveLength(1)
+    // tool_result + image = 2 blocks on same assistant message
     expect(result.current.messages).toHaveLength(1)
-    expect(result.current.messages[0].imageBase64).toBe('abc123')
+    const blocks = result.current.messages[0].blocks
+    expect(blocks).toBeDefined()
+    const imageBlock = blocks!.find((b) => b.type === 'image')
+    expect(imageBlock).toBeDefined()
+    expect((imageBlock as { type: 'image'; base64: string }).base64).toBe('abc123')
   })
 
   it('handles error event and stops running', async () => {
@@ -288,6 +300,78 @@ describe('useChatSession', () => {
 
     expect(result.current.toolCalls[0].workerEvents).toHaveLength(2)
     expect(result.current.toolCalls[0].workerEvents![1].status).toBe('completed')
+  })
+
+  it('keeps worker events that arrive before dispatch tool completion', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('test', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'status',
+        data: { status: 'executing', tool: 'dispatch_worker', tool_call_id: 'parent_1' },
+      })
+      messageHandler?.({
+        type: 'worker_start',
+        data: {
+          worker_id: 'w1',
+          parent_tool_call_id: 'parent_1',
+          task: 'Inspect',
+          status: 'running',
+        },
+      })
+      messageHandler?.({
+        type: 'tool_call',
+        data: {
+          name: 'dispatch_worker',
+          args: { task: 'Inspect' },
+          result: 'done',
+          tool_call_id: 'parent_1',
+        },
+      })
+    })
+
+    expect(result.current.toolCalls[0].workerEvents).toHaveLength(1)
+    expect(result.current.toolCalls[0].workerEvents![0].task).toBe('Inspect')
+  })
+
+  it('records file_edit events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('test', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'file_edit',
+        data: {
+          path: 'src/a.ts',
+          operation: 'modify',
+          unified_diff: 'diff',
+          stats: { added: 1, removed: 1 },
+          truncated: false,
+        },
+      })
+    })
+
+    expect(result.current.fileEdits).toHaveLength(1)
+    expect(result.current.messages[0].blocks?.[0].type).toBe('file_edit')
   })
 
   it('resets session state', () => {

@@ -45,3 +45,16 @@ async def search_knowledge(req: KnowledgeSearchRequest):
     from app.rag.engine import get_rag_engine
     results = get_rag_engine().search(req.query, top_k=req.top_k, source_filter=req.source_filter)
     return {"results": [r.model_dump() for r in results]}
+
+
+@router.delete("/api/knowledge")
+def clear_knowledge():
+    from app.rag.engine import get_rag_engine
+    result = get_rag_engine().clear_all()
+    return result
+
+
+@router.get("/api/knowledge/stats")
+def knowledge_stats():
+    from app.rag.engine import get_rag_engine
+    return get_rag_engine().get_stats()

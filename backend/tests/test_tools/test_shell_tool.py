@@ -21,7 +21,44 @@ class TestShellExecuteTool:
     @pytest.mark.asyncio
     async def test_dangerous_command_blocked(self, tool):
         result = await tool.execute(command="rm -rf /")
-        assert "危险" in result.error or "拒绝" in result.error
+        assert "不可逆操作" in result.error
+        assert "用户确认" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_push_force_blocked(self, tool):
+        result = await tool.execute(command="git push --force origin main")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_push_f_blocked(self, tool):
+        result = await tool.execute(command="git push -f origin main")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_reset_hard_blocked(self, tool):
+        result = await tool.execute(command="git reset --hard HEAD~1")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_clean_fd_blocked(self, tool):
+        result = await tool.execute(command="git clean -fd")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_branch_D_blocked(self, tool):
+        result = await tool.execute(command="git branch -D feature-x")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_git_checkout_dot_blocked(self, tool):
+        result = await tool.execute(command="git checkout .")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_normal_git_push_allowed(self, tool):
+        """Normal git push (without --force) should not be blocked."""
+        result = await tool.execute(command="git push origin main")
+        assert "不可逆操作" not in result.error
 
     @pytest.mark.asyncio
     async def test_timeout(self, tool):

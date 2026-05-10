@@ -1,0 +1,129 @@
+{
+  "app": {
+    "title": "Desktop Agent",
+    "running": "● Running",
+    "ready": "○ Ready",
+    "settings": "Settings"
+  },
+  "activityBar": {
+    "tools": "Tools",
+    "project": "Project",
+    "sessions": "Sessions",
+    "knowledge": "Knowledge",
+    "settings": "Settings",
+    "collapseSidebar": "Collapse Sidebar",
+    "expandSidebar": "Expand Sidebar"
+  },
+  "windowControls": {
+    "toggleTerminal": "Toggle Terminal",
+    "toggleRightPanel": "Toggle Right Panel",
+    "resetLayout": "Reset Layout"
+  },
+  "sidebar": {
+    "agentControl": "Agent Control",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "toggleTerminal": "Toggle Terminal",
+    "clearSession": "Clear Session",
+    "status": "Status",
+    "desktopControl": "Desktop Control",
+    "screenshot": "Screenshot",
+    "screenSize": "Screen Size",
+    "openBrowser": "Open Browser",
+    "webScreenshot": "Web Screenshot",
+    "listWindows": "List Windows",
+    "newSession": "New Session",
+    "history": "History",
+    "noSessions": "No sessions yet",
+    "role": "Role",
+    "customRoles": "Custom roles",
+    "theme": "Theme",
+    "dark": "Dark",
+    "light": "Light",
+    "system": "System",
+    "viewKnowledge": "View Knowledge Base",
+    "openSettings": "Open Full Settings",
+    "knowledgeDesc": "Browse and search your indexed knowledge base documents.",
+    "viewAllDocs": "View All Documents"
+  },
+  "chat": {
+    "searchPlaceholder": "Search messages...",
+    "closeSearch": "Close search",
+    "agentWorking": "Agent is working...",
+    "typeMessage": "Type a message... (Shift+Enter for new line)",
+    "voiceInput": "Voice input",
+    "recording": "Recording... Click mic to stop",
+    "transcribing": "Transcribing audio...",
+    "sandboxMode": "Sandbox mode — click for Unrestricted",
+    "unrestrictedMode": "Unrestricted mode — click for Sandbox",
+    "send": "Send",
+    "stop": "Stop",
+    "regenerate": "Regenerate",
+    "scrollToBottom": "Scroll to bottom"
+  },
+  "terminal": {
+    "title": "Execution Log",
+    "copyAll": "Copy All",
+    "waiting": "Waiting for execution..."
+  },
+  "rightPanel": {
+    "toolCalls": "Tool Calls",
+    "artifacts": "Artifacts",
+    "editor": "Editor",
+    "knowledge": "Knowledge",
+    "workflows": "Workflows",
+    "mcp": "MCP",
+    "noToolCalls": "No tool calls yet",
+    "expandPanel": "Expand panel",
+    "collapsePanel": "Collapse panel"
+  },
+  "project": {
+    "noProject": "No project opened",
+    "openFolder": "Open Folder",
+    "newClone": "New / Clone Project",
+    "closeProject": "Close Project",
+    "open": "Open",
+    "new": "New",
+    "refresh": "Refresh",
+    "files": "Files",
+    "clickToOpen": "Click files in the tree to open",
+    "modified": "File has been modified",
+    "close": "Close",
+    "create": "Create Project",
+    "creating": "Creating...",
+    "cloneRepo": "Clone Repository",
+    "cloning": "Cloning...",
+    "repoUrl": "Repository URL",
+    "targetDir": "Target Directory",
+    "token": "Token (for private repos)",
+    "selectFolder": "Select or enter target directory",
+    "createNew": "New / Clone Project"
+  },
+  "editor": {
+    "noProject": "No project opened",
+    "clickToOpen": "Click files in the tree to open"
+  },
+  "settings": {
+    "failedToLoad": "Failed to load settings",
+    "roleId": "Role ID (English identifier)",
+    "name": "Name",
+    "description": "Description",
+    "promptTemplate": "Prompt Template",
+    "save": "Save",
+    "cancel": "Cancel",
+    "newRole": "New Custom Role",
+    "noRoles": "No custom roles yet"
+  },
+  "errors": {
+    "title": "Something went wrong",
+    "unknown": "Unknown error",
+    "retry": "Retry",
+    "connectionFailed": "Connection failed"
+  },
+  "common": {
+    "ok": "OK",
+    "cancel": "Cancel",
+    "close": "Close",
+    "delete": "Delete"
+  }
+}

@@ -3,53 +3,57 @@ providers:
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
     models:
-      - id: gpt-4o
-        name: GPT-4o
-        context: 128000
-        vision: true
-      - id: gpt-4o-mini
-        name: GPT-4o Mini
-        context: 128000
-        vision: true
-
+    - id: gpt-4o
+      name: GPT-4o
+      context: 128000
+      vision: true
+    - id: gpt-4o-mini
+      name: GPT-4o Mini
+      context: 128000
+      vision: true
   anthropic:
     base_url: https://api.anthropic.com/v1
     api_key: ${ANTHROPIC_API_KEY}
     models:
-      - id: claude-3-7-sonnet-20250219
-        name: Claude 3.7 Sonnet
-        context: 200000
-        vision: true
-
+    - id: claude-3-7-sonnet-20250219
+      name: Claude 3.7 Sonnet
+      context: 200000
+      vision: true
   kimi:
     base_url: https://api.kimi.com/coding/v1
-    api_key: sk-kimi-M2fg26F8IQpjm2iRnTyRcKG7G4f3LoeMVlsO4vYm9lSgJp8CUVM5a3d8xLiRBwOW
+    api_key: sk-kimi-HbnjniHLPKZ3hR56j0dkrp2BVDCo8HDluVT9PhxFhpDafdVGkiGJF9E7HGoEPnGI
     models:
-      - id: kimi-for-coding
-        name: Kimi K2.6 (Coding)
-        context: 256000
-        vision: true
-
+    - id: kimi-for-coding
+      name: Kimi K2.6 (Coding)
+      context: 256000
+      vision: true
   local:
     base_url: http://localhost:11434/v1
     api_key: ollama
     models:
-      - id: gemma3:4b
-        name: Gemma 3 (4B)
-        context: 32000
-        vision: false
-      - id: qwen2.5-coder
-        name: Qwen 2.5 Coder
-        context: 32000
-        vision: false
-      - id: llama3.2-vision
-        name: Llama 3.2 Vision
-        context: 128000
-        vision: true
+    - id: gemma3:4b
+      name: Gemma 3 (4B)
+      context: 32000
+      vision: false
+    - id: qwen2.5-coder
+      name: Qwen 2.5 Coder
+      context: 32000
+      vision: false
+    - id: llama3.2-vision
+      name: Llama 3.2 Vision
+      context: 128000
+      vision: true
+rag:
+  embedding_model: all-MiniLM-L6-v2
+  chunk_size: 500
+  chunk_overlap: 50
+  min_score: 0.3
+  top_k: 5
 
 settings:
   default_model: kimi-for-coding
   default_provider: kimi
-  max_iterations: 50
+  max_iterations: 200
   auto_approve: false
   screenshot_on_step: true
+  sandbox_mode: unrestricted

@@ -1,0 +1,73 @@
+/* Design tokens — dark and light themes */
+
+:root[data-theme='dark'] {
+  /* Surface */
+  --bg-app: #0d1117;
+  --bg-surface: #161b22;
+  --bg-surface-hover: #1c2128;
+  --bg-surface-alt: #1c2128;
+  --bg-elevated: #21262d;
+  --bg-input: #0d1117;
+
+  /* Border */
+  --border-subtle: #21262d;
+  --border-default: #30363d;
+  --border-strong: #484f58;
+
+  /* Text */
+  --text-primary: #f0f6fc;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --text-link: #58a6ff;
+
+  /* Accent */
+  --accent-rgb: 88 166 255;
+  --accent-emphasis-rgb: 31 111 235;
+
+  /* Semantic */
+  --success-rgb: 63 185 80;
+  --warning-rgb: 210 153 34;
+  --danger-rgb: 248 81 73;
+  --info-rgb: 88 166 255;
+
+  /* Scrollbar */
+  --scrollbar-track: #161b22;
+  --scrollbar-thumb: #484f58;
+  --scrollbar-thumb-hover: #656d76;
+}
+
+:root[data-theme='light'] {
+  /* Surface */
+  --bg-app: #ffffff;
+  --bg-surface: #f6f8fa;
+  --bg-surface-hover: #f0f3f6;
+  --bg-surface-alt: #eaeef2;
+  --bg-elevated: #ffffff;
+  --bg-input: #f6f8fa;
+
+  /* Border */
+  --border-subtle: #eaeef2;
+  --border-default: #d0d7de;
+  --border-strong: #afb8c1;
+
+  /* Text */
+  --text-primary: #1f2328;
+  --text-secondary: #656d76;
+  --text-muted: #888c94;
+  --text-link: #0969da;
+
+  /* Accent */
+  --accent-rgb: 9 105 218;
+  --accent-emphasis-rgb: 5 80 174;
+
+  /* Semantic */
+  --success-rgb: 26 127 55;
+  --warning-rgb: 154 103 0;
+  --danger-rgb: 207 34 46;
+  --info-rgb: 9 105 218;
+
+  /* Scrollbar */
+  --scrollbar-track: #f6f8fa;
+  --scrollbar-thumb: #afb8c1;
+  --scrollbar-thumb-hover: #888c94;
+}

@@ -1,0 +1,129 @@
+{
+  "app": {
+    "title": "Desktop Agent",
+    "running": "● 运行中",
+    "ready": "○ 就绪",
+    "settings": "设置"
+  },
+  "activityBar": {
+    "tools": "工具",
+    "project": "项目",
+    "sessions": "会话",
+    "knowledge": "知识库",
+    "settings": "设置",
+    "collapseSidebar": "折叠侧栏",
+    "expandSidebar": "展开侧栏"
+  },
+  "windowControls": {
+    "toggleTerminal": "切换终端",
+    "toggleRightPanel": "切换右侧面板",
+    "resetLayout": "重置布局"
+  },
+  "sidebar": {
+    "agentControl": "Agent 控制",
+    "connected": "已连接",
+    "disconnected": "已断开",
+    "toggleTerminal": "切换终端",
+    "clearSession": "清除会话",
+    "status": "状态",
+    "desktopControl": "桌面控制",
+    "screenshot": "截图",
+    "screenSize": "屏幕尺寸",
+    "openBrowser": "打开浏览器",
+    "webScreenshot": "网页截图",
+    "listWindows": "列出窗口",
+    "newSession": "新建会话",
+    "history": "历史",
+    "noSessions": "暂无会话",
+    "role": "角色",
+    "customRoles": "自定义角色",
+    "theme": "主题",
+    "dark": "暗色",
+    "light": "亮色",
+    "system": "跟随系统",
+    "viewKnowledge": "查看知识库",
+    "openSettings": "打开完整设置",
+    "knowledgeDesc": "浏览和搜索已索引的知识库文档。",
+    "viewAllDocs": "查看全部文档"
+  },
+  "chat": {
+    "searchPlaceholder": "搜索消息...",
+    "closeSearch": "关闭搜索",
+    "agentWorking": "Agent 正在处理...",
+    "typeMessage": "输入消息... (Shift+Enter 换行)",
+    "voiceInput": "语音输入",
+    "recording": "录音中... 点击麦克风停止",
+    "transcribing": "转写音频中...",
+    "sandboxMode": "沙盒模式 — 点击切换为无限制",
+    "unrestrictedMode": "无限制模式 — 点击切换为沙盒",
+    "send": "发送",
+    "stop": "停止",
+    "regenerate": "重新生成",
+    "scrollToBottom": "滚动到底部"
+  },
+  "terminal": {
+    "title": "执行日志",
+    "copyAll": "复制全部",
+    "waiting": "等待执行..."
+  },
+  "rightPanel": {
+    "toolCalls": "工具调用",
+    "artifacts": "成果",
+    "editor": "编辑器",
+    "knowledge": "知识库",
+    "workflows": "工作流",
+    "mcp": "MCP",
+    "noToolCalls": "暂无工具调用",
+    "expandPanel": "展开面板",
+    "collapsePanel": "折叠面板"
+  },
+  "project": {
+    "noProject": "没有打开的项目",
+    "openFolder": "打开文件夹",
+    "newClone": "新建 / Clone 项目",
+    "closeProject": "关闭项目",
+    "open": "打开",
+    "new": "新建",
+    "refresh": "刷新",
+    "files": "文件",
+    "clickToOpen": "点击文件树中的文件以打开",
+    "modified": "文件已被修改",
+    "close": "关闭",
+    "create": "创建项目",
+    "creating": "创建中...",
+    "cloneRepo": "Clone 仓库",
+    "cloning": "克隆中...",
+    "repoUrl": "仓库 URL",
+    "targetDir": "目标目录",
+    "token": "Token（私有仓库可选）",
+    "selectFolder": "选择或输入目标目录",
+    "createNew": "新建 / Clone 项目"
+  },
+  "editor": {
+    "noProject": "未打开项目",
+    "clickToOpen": "点击文件树中的文件以打开"
+  },
+  "settings": {
+    "failedToLoad": "加载设置失败",
+    "roleId": "角色 ID（英文标识）",
+    "name": "名称",
+    "description": "描述",
+    "promptTemplate": "Prompt 模板",
+    "save": "保存",
+    "cancel": "取消",
+    "newRole": "新建自定义角色",
+    "noRoles": "暂无自定义角色"
+  },
+  "errors": {
+    "title": "出错了",
+    "unknown": "未知错误",
+    "retry": "重试",
+    "connectionFailed": "连接失败"
+  },
+  "common": {
+    "ok": "确定",
+    "cancel": "取消",
+    "close": "关闭",
+    "delete": "删除"
+  }
+}

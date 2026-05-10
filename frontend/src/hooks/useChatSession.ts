@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { ChatMessage, ToolCall, WS_EVENT } from '../types';
+import { ChatMessage, ToolCall, AssistantBlock, WS_EVENT, WorkerEvent, FileEdit } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { saveSession, loadSession, saveDraft, loadDraft, deleteDraft } from '../lib/db';
 
@@ -7,14 +7,124 @@ function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+function appendBlock(
+  messages: ChatMessage[],
+  block: AssistantBlock,
+  mergeable: boolean,
+): ChatMessage[] {
+  const updated = [...messages];
+  const last = updated[updated.length - 1];
+
+  if (last && last.role === 'assistant' && !last.turnComplete) {
+    const blocks = [...(last.blocks || [])];
+    if (mergeable && blocks.length > 0) {
+      const lastBlock = blocks[blocks.length - 1];
+      if (lastBlock.type === block.type && (lastBlock.type === 'thinking' || lastBlock.type === 'text')) {
+        blocks[blocks.length - 1] = {
+          ...lastBlock,
+          text: (lastBlock as { text: string }).text + (block as { text: string }).text,
+        } as AssistantBlock;
+        updated[updated.length - 1] = { ...last, blocks };
+        return updated;
+      }
+    }
+    updated[updated.length - 1] = { ...last, blocks: [...blocks, block] };
+  } else {
+    updated.push({
+      id: generateId(),
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [block],
+      turnComplete: false,
+    });
+  }
+  return updated;
+}
+
+function markTurnComplete(messages: ChatMessage[]): ChatMessage[] {
+  const updated = [...messages];
+  const last = updated[updated.length - 1];
+  if (last && last.role === 'assistant') {
+    updated[updated.length - 1] = { ...last, turnComplete: true };
+  }
+  return updated;
+}
+
+function mergeBlock(
+  messages: ChatMessage[],
+  predicate: (b: AssistantBlock) => boolean,
+  merge: (b: AssistantBlock) => AssistantBlock,
+): ChatMessage[] | null {
+  const updated = [...messages];
+  for (let mi = updated.length - 1; mi >= 0; mi--) {
+    const msg = updated[mi];
+    if (msg.role !== 'assistant' || !msg.blocks) continue;
+    const blocks = msg.blocks;
+    for (let bi = blocks.length - 1; bi >= 0; bi--) {
+      if (predicate(blocks[bi])) {
+        const newBlocks = [...blocks];
+        newBlocks[bi] = merge(newBlocks[bi]);
+        updated[mi] = { ...msg, blocks: newBlocks };
+        return updated;
+      }
+    }
+  }
+  return null;
+}
+
+function isDispatchTool(name?: string): boolean {
+  return name === 'dispatch_worker' || name === 'dispatch_parallel';
+}
+
+function toWorkerEvent(event: WS_EVENT): WorkerEvent {
+  return {
+    workerId: event.data.worker_id,
+    type: event.type as WorkerEvent['type'],
+    task: event.data.task,
+    profile: event.data.profile,
+    modelId: event.data.model_id,
+    runId: event.data.run_id,
+    parentToolCallId: event.data.parent_tool_call_id,
+    text: event.data.text,
+    toolName: event.data.name,
+    toolArgs: event.data.args,
+    toolResult: event.data.result,
+    toolDurationMs: event.data.duration_ms,
+    status: event.data.status,
+    result: event.data.result,
+    iterations: event.data.iterations,
+    durationMs: event.data.duration_ms,
+  };
+}
+
+function mergeWorkerEvents(existing: WorkerEvent[] = [], incoming: WorkerEvent[] = []): WorkerEvent[] {
+  const merged = [...existing];
+  for (const event of incoming) {
+    const duplicate = merged.some((item) =>
+      item.workerId === event.workerId &&
+      item.type === event.type &&
+      item.parentToolCallId === event.parentToolCallId &&
+      item.task === event.task &&
+      item.text === event.text &&
+      item.toolName === event.toolName &&
+      item.result === event.result
+    );
+    if (!duplicate) merged.push(event);
+  }
+  return merged;
+}
+
 export function useChatSession(sessionId: string, currentModel: string, roleId: string = 'desktop-agent') {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
 
-  // 用于外部监听 tool_call 事件做预览检测
   const onToolCallRef = useRef<((tc: ToolCall) => void) | null>(null);
+  const onFileEditRef = useRef<((edit: FileEdit) => void) | null>(null);
+  const pendingWorkerEventsRef = useRef<Record<string, WorkerEvent[]>>({});
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const addTerminalLog = useCallback((log: string) => {
@@ -24,153 +134,119 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     ]);
   }, []);
 
+  const takePendingWorkerEvents = useCallback((toolCallId?: string): WorkerEvent[] => {
+    const pending = pendingWorkerEventsRef.current;
+    const events = [
+      ...(toolCallId ? pending[toolCallId] || [] : []),
+      ...(pending.__latest__ || []),
+    ];
+    if (toolCallId) delete pending[toolCallId];
+    delete pending.__latest__;
+    return events;
+  }, []);
+
+  const attachWorkerEvent = useCallback((workerEvent: WorkerEvent) => {
+    const parentId = workerEvent.parentToolCallId;
+    let attachedToTool = false;
+
+    setToolCalls((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        const matchesParent = parentId && updated[i].toolCallId === parentId;
+        const matchesFallback = !parentId && isDispatchTool(updated[i].name);
+        if (matchesParent || matchesFallback) {
+          const existing = updated[i].workerEvents || [];
+          updated[i] = { ...updated[i], workerEvents: [...existing, workerEvent] };
+          attachedToTool = true;
+          return updated;
+        }
+      }
+      return prev;
+    });
+
+    setMessages((prev) => {
+      const withUpdate = mergeBlock(
+        prev,
+        (b) =>
+          b.type === 'tool_call' &&
+          (parentId ? b.toolCallId === parentId : isDispatchTool(b.name)),
+        (b) => ({
+          ...b,
+          workerEvents: [...((b as any).workerEvents || []), workerEvent],
+        } as AssistantBlock),
+      );
+      return withUpdate || prev;
+    });
+
+    if (!attachedToTool) {
+      const key = parentId || '__latest__';
+      const pending = pendingWorkerEventsRef.current[key] || [];
+      pendingWorkerEventsRef.current[key] = [...pending, workerEvent];
+    }
+  }, []);
+
+  const recordFileEdit = useCallback((edit: FileEdit, appendToChat = false) => {
+    const normalized = {
+      ...edit,
+      timestamp: edit.timestamp || Date.now(),
+    };
+    setFileEdits((prev) => [...prev, normalized]);
+    if (appendToChat) {
+      setMessages((prev) =>
+        appendBlock(
+          prev,
+          { type: 'file_edit', edit: normalized, timestamp: Date.now() },
+          false,
+        ),
+      );
+    }
+    addTerminalLog(`[Edit] ${normalized.path} (+${normalized.stats?.added || 0}/-${normalized.stats?.removed || 0})`);
+    onFileEditRef.current?.(normalized);
+  }, [addTerminalLog]);
+
   const handleMessage = useCallback(
     (event: WS_EVENT) => {
       switch (event.type) {
         case 'content':
           setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (last && last.role === 'assistant' && !last.isTool) {
-              const updated = [...prev];
-              updated[updated.length - 1] = {
-                ...last,
-                content: last.content + event.data.text,
-                skill: event.data.skill || last.skill,
-              };
-              return updated;
-            }
-            return [
-              ...prev,
-              {
-                id: generateId(),
-                role: 'assistant',
-                content: event.data.text,
-                isTool: false,
-                skill: event.data.skill,
-              },
-            ];
+            const updated = appendBlock(
+              prev,
+              { type: 'text', text: event.data.text, timestamp: Date.now() },
+              true,
+            );
+            return updated;
           });
           break;
 
         case 'reasoning':
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (last && last.role === 'assistant' && !last.isTool) {
-              const updated = [...prev];
-              updated[updated.length - 1] = {
-                ...last,
-                reasoning: (last.reasoning || '') + event.data.text,
-                skill: event.data.skill || last.skill,
-              };
-              return updated;
-            }
-            return [
-              ...prev,
-              {
-                id: generateId(),
-                role: 'assistant',
-                content: '',
-                isTool: false,
-                reasoning: event.data.text,
-                skill: event.data.skill,
-              },
-            ];
-          });
+          setMessages((prev) =>
+            appendBlock(
+              prev,
+              { type: 'thinking', text: event.data.text, timestamp: Date.now() },
+              true,
+            ),
+          );
           break;
 
         case 'worker_start':
-          setToolCalls((prev) => {
-            const updated = [...prev];
-            for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].name === 'dispatch_worker' || updated[i].name === 'dispatch_parallel') {
-                const existing = updated[i].workerEvents || [];
-                updated[i] = {
-                  ...updated[i],
-                  workerEvents: [...existing, {
-                    workerId: event.data.worker_id,
-                    type: 'worker_start' as const,
-                    status: 'running' as const,
-                  }],
-                };
-                break;
-              }
-            }
-            return updated;
-          });
-          break;
-
         case 'worker_content':
-          setToolCalls((prev) => {
-            const updated = [...prev];
-            for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].name === 'dispatch_worker' || updated[i].name === 'dispatch_parallel') {
-                const existing = updated[i].workerEvents || [];
-                updated[i] = {
-                  ...updated[i],
-                  workerEvents: [...existing, {
-                    workerId: event.data.worker_id,
-                    type: 'worker_content' as const,
-                    text: event.data.text,
-                  }],
-                };
-                break;
-              }
-            }
-            return updated;
-          });
-          break;
-
         case 'worker_tool_call':
-          setToolCalls((prev) => {
-            const updated = [...prev];
-            for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].name === 'dispatch_worker' || updated[i].name === 'dispatch_parallel') {
-                const existing = updated[i].workerEvents || [];
-                updated[i] = {
-                  ...updated[i],
-                  workerEvents: [...existing, {
-                    workerId: event.data.worker_id,
-                    type: 'worker_tool_call' as const,
-                    toolName: event.data.name,
-                    toolArgs: event.data.args,
-                    toolResult: event.data.result,
-                    toolDurationMs: event.data.duration_ms,
-                  }],
-                };
-                break;
-              }
-            }
-            return updated;
-          });
-          addTerminalLog(`[Worker:${event.data.worker_id}] ${event.data.name}: ${event.data.result}`);
+        case 'worker_done': {
+          const workerEvent = toWorkerEvent(event);
+          attachWorkerEvent(workerEvent);
+          if (event.type === 'worker_tool_call') {
+            addTerminalLog(`[Worker:${event.data.worker_id}] ${event.data.name}: ${event.data.result}`);
+          } else if (event.type === 'worker_done') {
+            addTerminalLog(`[Worker:${event.data.worker_id}] Done (${event.data.status}, ${event.data.iterations} iterations)`);
+          }
           break;
-
-        case 'worker_done':
-          setToolCalls((prev) => {
-            const updated = [...prev];
-            for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].name === 'dispatch_worker' || updated[i].name === 'dispatch_parallel') {
-                const existing = updated[i].workerEvents || [];
-                updated[i] = {
-                  ...updated[i],
-                  workerEvents: [...existing, {
-                    workerId: event.data.worker_id,
-                    type: 'worker_done' as const,
-                    status: event.data.status,
-                    result: event.data.result,
-                    iterations: event.data.iterations,
-                    durationMs: event.data.duration_ms,
-                  }],
-                };
-                break;
-              }
-            }
-            return updated;
-          });
-          addTerminalLog(`[Worker:${event.data.worker_id}] Done (${event.data.status}, ${event.data.iterations} iterations)`);
-          break;
+        }
 
         case 'tool_call': {
+          const isError = (event.data.result || '').startsWith('[ERROR]');
+          const workerEvents = isDispatchTool(event.data.name)
+            ? takePendingWorkerEvents(event.data.tool_call_id)
+            : undefined;
           const tc: ToolCall = {
             name: event.data.name,
             args: event.data.args,
@@ -179,16 +255,56 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
             runId: event.data.run_id,
             toolCallId: event.data.tool_call_id,
             durationMs: event.data.duration_ms,
+            workerEvents,
           };
           setToolCalls((prev) => [...prev, tc]);
-          // 工具调用不再显示在聊天面板，仅在右侧面板和终端显示
           addTerminalLog(`[工具] ${event.data.name}: ${event.data.result}`);
           onToolCallRef.current?.(tc);
+
+          setMessages((prev) => {
+            // Try to find and update a running placeholder created by status:executing
+            const withUpdate = mergeBlock(
+              prev,
+              (b) =>
+                b.type === 'tool_call' &&
+                b.status === 'running' &&
+                b.toolCallId === event.data.tool_call_id,
+              (b) => ({
+                ...b,
+                name: event.data.name,
+                args: event.data.args,
+                result: event.data.result,
+                status: isError ? 'error' as const : 'success' as const,
+                durationMs: event.data.duration_ms,
+                workerEvents: mergeWorkerEvents(
+                  ((b as any).workerEvents as WorkerEvent[] | undefined) || [],
+                  workerEvents || [],
+                ),
+              }),
+            );
+            if (withUpdate) return withUpdate;
+            return appendBlock(
+              prev,
+              {
+                type: 'tool_call',
+                name: event.data.name,
+                args: event.data.args,
+                result: event.data.result,
+                status: isError ? 'error' : 'success',
+                toolCallId: event.data.tool_call_id,
+                durationMs: event.data.duration_ms,
+                workerEvents,
+                timestamp: Date.now(),
+              },
+              false,
+            );
+          });
           break;
         }
 
         case 'tool_result': {
-          const resultText = event.data.error
+          const isError = !!event.data.error;
+          const resultText = isError
             ? `[ERROR] ${event.data.error}`
             : event.data.output || '';
           const tc: ToolCall = {
@@ -201,79 +317,120 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
             durationMs: event.data.duration_ms,
           };
           setToolCalls((prev) => [...prev, tc]);
-          addTerminalLog(`[å·¥å…·] ${event.data.name}: ${resultText}`);
+          addTerminalLog(`[工具] ${event.data.name}: ${resultText}`);
           onToolCallRef.current?.(tc);
-          if (event.data.image) {
-            setMessages((prev) => [
-              ...prev,
+
+          setMessages((prev) =>
+            appendBlock(
+              prev,
               {
-                id: generateId(),
-                role: 'assistant',
-                content: '',
-                imageBase64: event.data.image,
-                isTool: false,
+                type: 'tool_call',
+                name: event.data.name,
+                args: event.data.args || {},
+                result: resultText,
+                status: isError ? 'error' : 'success',
+                toolCallId: event.data.tool_call_id,
+                durationMs: event.data.duration_ms,
+                timestamp: Date.now(),
               },
-            ]);
+              false,
+            ),
+          );
+
+          if (event.data.image) {
+            setMessages((prev) =>
+              appendBlock(
+                prev,
+                { type: 'image', base64: event.data.image, timestamp: Date.now() },
+                false,
+              ),
+            );
           }
           break;
         }
 
         case 'image':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateId(),
-              role: 'assistant',
-              content: '',
-              imageBase64: event.data.base64,
-              isTool: false,
-            },
-          ]);
+          setMessages((prev) =>
+            appendBlock(
+              prev,
+              { type: 'image', base64: event.data.base64, timestamp: Date.now() },
+              false,
+            ),
+          );
           break;
 
-        case 'status':
-          if (
-            event.data.status === 'completed' ||
-            event.data.status === 'max_iterations_reached'
-          ) {
+        case 'file_edit': {
+          recordFileEdit(event.data as FileEdit, true);
+          break;
+        }
+
+        case 'status': {
+          const status = event.data.status;
+          if (status === 'executing') {
+            // Push a running placeholder — the matching tool_call event will fill in details
+            setMessages((prev) =>
+              appendBlock(
+                prev,
+                {
+                  type: 'tool_call',
+                  name: event.data.tool || '',
+                  args: {},
+                  status: 'running',
+                  toolCallId: event.data.tool_call_id,
+                  timestamp: Date.now(),
+                },
+                false,
+              ),
+            );
+          } else if (status === 'completed' || status === 'max_iterations_reached') {
             setIsRunning(false);
+            setMessages((prev) => markTurnComplete(prev));
+          } else if (status === 'thinking') {
+            // Start of new iteration — no new block needed; reasoning follows as its own block
           }
           addTerminalLog(
             `[状态] ${event.data.status} (迭代: ${event.data.iteration})`
           );
           break;
+        }
 
         case 'error':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateId(),
-              role: 'system',
-              content: `错误: ${event.data.message}`,
-              isTool: false,
-            },
-          ]);
+          setMessages((prev) => {
+            const complete = markTurnComplete(prev);
+            return [
+              ...complete,
+              {
+                id: generateId(),
+                role: 'system',
+                content: `错误: ${event.data.message}`,
+                isTool: false,
+              },
+            ];
+          });
           setIsRunning(false);
           addTerminalLog(`[错误] ${event.data.message}`);
           break;
 
         case 'done':
           setIsRunning(false);
+          setMessages((prev) => markTurnComplete(prev));
           break;
 
         case 'cleared':
           setMessages([]);
           setToolCalls([]);
+          setFileEdits([]);
           addTerminalLog('[系统] 会话已清空');
           break;
 
         case 'interrupted':
           setIsRunning(false);
+          setMessages((prev) => markTurnComplete(prev));
           addTerminalLog('[系统] 用户中断');
           break;
       }
     },
-    [addTerminalLog]
+    [addTerminalLog, attachWorkerEvent, recordFileEdit, takePendingWorkerEvents]
   );
 
   const { isConnected, send, disconnect } = useWebSocket(sessionId, handleMessage);
@@ -285,6 +442,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
       if (!mounted || !data) return;
       setMessages(data.messages || []);
       setToolCalls(data.toolCalls || []);
+      setFileEdits(data.fileEdits || []);
     });
     return () => { mounted = false; };
   }, [sessionId]);
@@ -293,12 +451,12 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
   useEffect(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveSession(sessionId, messages, toolCalls).catch(console.error);
+      saveSession(sessionId, messages, toolCalls, fileEdits).catch(console.error);
     }, 1000);
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [sessionId, messages, toolCalls]);
+  }, [sessionId, messages, toolCalls, fileEdits]);
 
   const sendMessage = useCallback(
     (text: string, imageBase64?: string) => {
@@ -327,7 +485,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
       });
       if (sent === false) {
         setIsRunning(false);
-        addTerminalLog('[é”™è¯¯] WebSocket æœªè¿žæŽ¥ï¼Œæ¶ˆæ¯æœªå‘é€');
+        addTerminalLog('[错误] WebSocket 未连接，消息未发送');
       }
     },
     [send, currentModel, roleId, addTerminalLog]
@@ -357,6 +515,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     disconnect();
     setMessages([]);
     setToolCalls([]);
+    setFileEdits([]);
     setTerminalLogs([]);
     setIsRunning(false);
   }, [disconnect]);
@@ -376,6 +535,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
   return {
     messages,
     toolCalls,
+    fileEdits,
     terminalLogs,
     isRunning,
     isConnected,
@@ -387,6 +547,8 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     resetSession,
     addTerminalLog,
     onToolCallRef,
+    onFileEditRef,
+    recordFileEdit,
     saveInputDraft,
     loadInputDraft,
     clearInputDraft,

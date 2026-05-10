@@ -1,4 +1,5 @@
 import pytest
+import pytest_asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +20,7 @@ def client():
     return TestClient(app)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def async_client():
     """Async HTTP client for ASGI app"""
     from app.main import app
@@ -68,12 +69,37 @@ def mock_litellm_with_tool_call():
 
 
 @pytest.fixture(autouse=True)
-def reset_config_cache():
-    """Reset config cache before each test"""
+def reset_config_cache(monkeypatch, tmp_path):
+    """Reset config cache and isolate writes to a temp file."""
     from app import config
+
     config._config = None
+    # Use a subdirectory so the temp models.yaml doesn't pollute tmp_path
+    # for other tests (e.g. RAGEngine tests that index files from tmp_path).
+    config_dir = tmp_path / ".config-isolation"
+    config_dir.mkdir()
+    temp_config = config_dir / "models.yaml"
+    if config.CONFIG_PATH.exists():
+        import shutil
+        shutil.copy2(config.CONFIG_PATH, temp_config)
+    else:
+        temp_config.write_text(
+            "providers: {}\nsettings: {default_model: '', default_provider: '', max_iterations: 50}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(config, "CONFIG_PATH", temp_config)
+    config._config = None
+
     yield
+
     config._config = None
+
+
+@pytest.fixture(autouse=True)
+def reset_local_auth(monkeypatch):
+    """Local API auth is opt-in per test."""
+    monkeypatch.delenv("DESKTOP_AGENT_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DESKTOP_AGENT_USER_DATA_DIR", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +128,8 @@ def isolate_projects(tmp_path, monkeypatch):
     monkeypatch.setattr(project_manager, "RECENT_FILE", projects_dir / "recent.json")
     monkeypatch.setattr(credential_manager, "PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(credential_manager, "CREDENTIALS_FILE", projects_dir / "credentials.json")
+    monkeypatch.setattr(credential_manager, "CREDENTIALS_FILE_V2", projects_dir / "credentials.dpapi")
+    monkeypatch.setattr(credential_manager, "CREDENTIALS_BACKUP_FILE", projects_dir / "credentials.json.bak")
 
     ProjectManager._current_project = None
     CredentialManager._credentials_cache = None
