@@ -21,7 +21,7 @@ providers:
       vision: true
   kimi:
     base_url: https://api.kimi.com/coding/v1
-    api_key: sk-kimi-HbnjniHLPKZ3hR56j0dkrp2BVDCo8HDluVT9PhxFhpDafdVGkiGJF9E7HGoEPnGI
+    api_key: ${KIMI_API_KEY}
     models:
     - id: kimi-for-coding
       name: Kimi K2.6 (Coding)
@@ -53,7 +53,16 @@ rag:
 settings:
   default_model: kimi-for-coding
   default_provider: kimi
-  max_iterations: 200
+  max_iterations: 10000
   auto_approve: false
   screenshot_on_step: true
-  sandbox_mode: unrestricted
+  sandbox_mode: sandbox
+
+coding_agent:
+  enabled: true
+  default_execution_mode: worktree
+  max_fix_rounds: 2
+  max_parallel_workers: 3
+  require_verification: true
+  require_review: true
+  auto_generate_repo_map: true

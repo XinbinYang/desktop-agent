@@ -35,12 +35,21 @@ from app.tools.workflow_tool import (
     WorkflowRecordTool, WorkflowStopTool, WorkflowListTool, WorkflowRunTool
 )
 from app.tools.worker_tool import DispatchWorkerTool, DispatchParallelTool
+from app.tools.coding_tool import (
+    RepoMapTool, CodeSearchTool, FileOutlineTool, FilePatchTool,
+    VerifyProjectTool, RunReviewTool, WorktreeStatusTool,
+)
+from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool
+from app.tools.test_tool import RunTestsTool
+from app.tools.diagnostics_tool import ListDiagnosticsTool
+from app.tools.ocr_tool import OCRClickTool, OCRFindTool, OCRReadTool
 
 # 全局工具注册表
 ALL_TOOLS: list[BaseTool] = [
     # 文件工具
     FileReadTool(),
     FileWriteTool(),
+    FilePatchTool(),
     FileListTool(),
     FileSearchTool(),
     FileDeleteTool(),
@@ -99,9 +108,23 @@ ALL_TOOLS: list[BaseTool] = [
     WorkflowStopTool(),
     WorkflowListTool(),
     WorkflowRunTool(),
+    RepoMapTool(),
+    CodeSearchTool(),
+    FileOutlineTool(),
+    VerifyProjectTool(),
+    RunReviewTool(),
+    WorktreeStatusTool(),
     # Worker 派发工具
     DispatchWorkerTool(),
     DispatchParallelTool(),
+    # Plan mode 工具
+    PlanAskQuestionsTool(),
+    PlanWriteDraftTool(),
+    RunTestsTool(),
+    ListDiagnosticsTool(),
+    OCRClickTool(),
+    OCRFindTool(),
+    OCRReadTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
@@ -122,7 +145,7 @@ SAFE_DIRECT_TOOLS: set[str] = {
 
 # Tool categories for grouped presentation in the system prompt.
 TOOL_CATEGORIES: dict[str, list[str]] = {
-    "文件工具": ["file_read", "file_write", "file_list", "file_search", "file_delete"],
+    "文件工具": ["file_read", "file_write", "file_patch", "file_list", "file_search", "file_delete"],
     "终端工具": ["shell_execute", "shell_start"],
     "浏览器工具": [
         "browser_navigate", "browser_click", "browser_type",
@@ -141,7 +164,12 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     "WIND 金融数据": ["wind_wsd", "wind_wss", "wind_wset", "wind_edb", "wind_tdays", "wind_sync"],
     "策略回测": ["strategy_list", "backtest_run", "backtest_report"],
     "工作流": ["workflow_record", "workflow_stop", "workflow_list", "workflow_run"],
+    "Coding Agent": [
+        "repo_map", "code_search", "file_outline",
+        "verify_project", "run_review", "worktree_status",
+    ],
     "Worker 派发": ["dispatch_worker", "dispatch_parallel"],
+    "Plan Mode": ["plan_ask_questions", "plan_write_draft"],
 }
 
 

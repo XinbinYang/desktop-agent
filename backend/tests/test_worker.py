@@ -10,7 +10,9 @@ class TestWorkerSession:
         assert profile.name == "code"
         assert "file_read" in profile.tools
         assert "dispatch_worker" not in profile.tools
-        assert profile.max_iterations == 15
+        assert profile.max_iterations == 1000
+        assert len(profile.system_prompt_extra) > 0
+        assert "Read files before editing" in profile.system_prompt_extra
 
     def test_worker_init_builds_system_and_task_messages(self):
         worker = WorkerSession(
@@ -136,3 +138,73 @@ class TestWorkerSession:
         done = events[-1]
         assert done["type"] == "worker_done"
         assert done["data"]["status"] == "max_iterations_reached"
+
+    def test_code_expert_profile_registered(self):
+        profile = WORKER_PROFILES["code-expert"]
+        assert profile.name == "code-expert"
+        assert profile.max_iterations == 1000
+        assert "file_read" in profile.tools
+        assert "git_branch" in profile.tools
+        assert "git_clone" in profile.tools
+        assert "knowledge_search" in profile.tools
+        assert "knowledge_index" in profile.tools
+        assert "knowledge_list" in profile.tools
+        assert "ANALYZE" in profile.system_prompt_extra
+        assert "Read files before editing" in profile.system_prompt_extra
+        assert "VERIFY" in profile.system_prompt_extra
+
+    def test_tdd_worker_profile_registered(self):
+        profile = WORKER_PROFILES["tdd-worker"]
+        assert profile.name == "tdd-worker"
+        assert profile.max_iterations == 1000
+        assert "file_read" in profile.tools
+        assert "file_write" in profile.tools
+        assert "shell_execute" in profile.tools
+        assert "git_status" in profile.tools
+        assert "git_diff" in profile.tools
+        assert "git_commit" in profile.tools
+        assert "browser_navigate" not in profile.tools
+        assert "dispatch_worker" not in profile.tools
+        assert "RED" in profile.system_prompt_extra
+        assert "GREEN" in profile.system_prompt_extra
+        assert "REFACTOR" in profile.system_prompt_extra
+
+    def test_debugger_profile_registered(self):
+        profile = WORKER_PROFILES["debugger"]
+        assert profile.name == "debugger"
+        assert profile.max_iterations == 1000
+        assert "file_read" in profile.tools
+        assert "file_search" in profile.tools
+        assert "shell_execute" in profile.tools
+        assert "git_status" in profile.tools
+        assert "git_diff" in profile.tools
+        assert "file_write" not in profile.tools
+        assert "file_delete" not in profile.tools
+        assert "Phase 1" in profile.system_prompt_extra
+        assert "Root Cause" in profile.system_prompt_extra
+        assert "NO FIXES WITHOUT ROOT CAUSE" in profile.system_prompt_extra
+
+    def test_code_reviewer_profile_registered(self):
+        profile = WORKER_PROFILES["code-reviewer"]
+        assert profile.name == "code-reviewer"
+        assert profile.max_iterations == 500
+        assert "file_read" in profile.tools
+        assert "file_search" in profile.tools
+        assert "git_diff" in profile.tools
+        assert "file_write" not in profile.tools
+        assert "file_delete" not in profile.tools
+        assert "shell_execute" not in profile.tools
+        assert "git_commit" not in profile.tools
+        assert "Stage 1" in profile.system_prompt_extra
+        assert "Critical" in profile.system_prompt_extra
+
+    def test_code_expert_worker_uses_correct_profile(self):
+        worker = WorkerSession(
+            worker_id="w1",
+            task="Build a login system",
+            profile_name="code-expert",
+            model_id="gpt-4o",
+        )
+        assert worker.profile.name == "code-expert"
+        assert worker.profile.max_iterations == 1000
+        assert "ANALYZE" in worker.profile.system_prompt_extra

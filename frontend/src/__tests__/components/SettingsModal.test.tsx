@@ -15,6 +15,7 @@ const mockSettingsResponse: SettingsResponse = {
       name: 'openai',
       base_url: 'https://api.openai.com/v1',
       api_key_masked: 'sk-...BwOW',
+      litellm_provider: 'openai',
       models: [
         { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
         { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', vision: true, context: 128000 },
@@ -24,6 +25,7 @@ const mockSettingsResponse: SettingsResponse = {
       name: 'anthropic',
       base_url: 'https://api.anthropic.com/v1',
       api_key_masked: 'ant...KEY',
+      litellm_provider: 'anthropic',
       models: [
         { id: 'claude-sonnet', name: 'Claude Sonnet', provider: 'anthropic', vision: true, context: 200000 },
       ],
@@ -40,10 +42,12 @@ const mockSettingsResponse: SettingsResponse = {
 };
 
 function mockFetchResponse(data: any) {
+  const body = JSON.stringify(data);
   return Promise.resolve({
     ok: true,
     status: 200,
     json: () => Promise.resolve(data),
+    text: () => Promise.resolve(body),
   });
 }
 
@@ -265,7 +269,7 @@ describe('SettingsModal', () => {
       />
     );
 
-    expect(await screen.findByText('Failed to load settings')).toBeInTheDocument();
+    expect(await screen.findByText(/无法连接后端/)).toBeInTheDocument();
   });
 
   it('cancels from footer calls onClose', async () => {

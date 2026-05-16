@@ -1,13 +1,17 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { DiffEditor } from '@monaco-editor/react';
+import { Check, X, CheckCheck, XCircle } from 'lucide-react';
 import { FileEdit } from '../types';
 import { getLangFromFilename } from '../lib/language';
 import { FileEditView } from './FileEditView';
+import { API_BASE } from '../config';
 
 interface ChangesPanelProps {
   edits: FileEdit[];
   onOpenFile?: (path: string) => void;
 }
+
+type EditStatus = 'pending' | 'accepted' | 'rejected';
 
 function shortPath(path: string): string {
   const normalized = path.replace(/\\/g, '/');
@@ -17,6 +21,8 @@ function shortPath(path: string): string {
 
 export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile }) => {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [statuses, setStatuses] = useState<Record<number, EditStatus>>({});
+  const [reverting, setReverting] = useState(false);
 
   useEffect(() => {
     if (edits.length > 0) {
@@ -25,6 +31,43 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
   }, [edits.length]);
 
   const active = edits[activeIndex];
+  const activeStatus = statuses[activeIndex] || 'pending';
+
+  const rejectEdit = useCallback(async (index: number) => {
+    const edit = edits[index];
+    if (!edit || !edit.old_text) return;
+    setReverting(true);
+    try {
+      await fetch(`${API_BASE}/api/file/revert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: edit.path, old_content: edit.old_text }),
+      });
+      setStatuses((prev) => ({ ...prev, [index]: 'rejected' }));
+    } catch (err) {
+      console.error('Revert failed:', err);
+    } finally {
+      setReverting(false);
+    }
+  }, [edits]);
+
+  const acceptEdit = useCallback((index: number) => {
+    setStatuses((prev) => ({ ...prev, [index]: 'accepted' }));
+  }, []);
+
+  const acceptAll = useCallback(() => {
+    const newStatuses: Record<number, EditStatus> = {};
+    edits.forEach((_, i) => { newStatuses[i] = 'accepted'; });
+    setStatuses(newStatuses);
+  }, [edits]);
+
+  const rejectAll = useCallback(async () => {
+    for (let i = 0; i < edits.length; i++) {
+      if ((statuses[i] || 'pending') !== 'rejected') {
+        await rejectEdit(i);
+      }
+    }
+  }, [edits, rejectEdit, statuses]);
 
   if (edits.length === 0) {
     return (
@@ -34,63 +77,139 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
     );
   }
 
+  const pendingCount = edits.filter((_, i) => (statuses[i] || 'pending') === 'pending').length;
+
   return (
-    <div className="h-full flex bg-gray-900">
-      <div className="w-52 border-r border-gray-700 overflow-y-auto shrink-0">
-        {edits.map((edit, index) => (
+    <div className="h-full flex flex-col bg-app">
+      {/* Toolbar */}
+      {pendingCount > 0 && (
+        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border bg-surface/50">
+          <span className="text-[10px] text-fg-muted mr-auto">
+            {pendingCount} pending
+          </span>
           <button
-            key={`${edit.path}-${edit.timestamp || index}`}
             type="button"
-            onClick={() => setActiveIndex(index)}
-            className={`w-full px-3 py-2 text-left border-b border-gray-800 hover:bg-gray-800 transition-colors ${
-              activeIndex === index ? 'bg-gray-800 text-gray-100' : 'text-gray-400'
-            }`}
+            onClick={acceptAll}
+            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-colors"
           >
-            <div className="text-xs truncate">{shortPath(edit.path)}</div>
-            <div className="mt-1 flex items-center gap-2 text-[11px]">
-              <span className="text-green-400">+{edit.stats?.added || 0}</span>
-              <span className="text-red-400">-{edit.stats?.removed || 0}</span>
-              {edit.truncated && <span className="text-yellow-400">large</span>}
-            </div>
+            <CheckCheck className="w-3 h-3" />
+            Accept All
           </button>
-        ))}
-      </div>
-      <div className="flex-1 min-w-0 flex flex-col">
-        <div className="h-8 border-b border-gray-700 bg-gray-800 flex items-center justify-between px-3">
-          <div className="text-xs text-gray-300 truncate">{active?.path}</div>
-          {active && onOpenFile && (
-            <button
-              type="button"
-              onClick={() => onOpenFile(active.path)}
-              className="text-[11px] text-blue-300 hover:text-blue-200 px-2 py-0.5 rounded hover:bg-gray-700"
-            >
-              Open
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={rejectAll}
+            disabled={reverting}
+            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+          >
+            <XCircle className="w-3 h-3" />
+            Reject All
+          </button>
         </div>
-        <div className="flex-1 min-h-0">
-          {active?.old_text != null && active?.new_text != null && !active.truncated ? (
-            <DiffEditor
-              height="100%"
-              language={getLangFromFilename(active.path, 'monaco')}
-              original={active.old_text}
-              modified={active.new_text}
-              theme="vs-dark"
-              options={{
-                readOnly: true,
-                renderSideBySide: true,
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                automaticLayout: true,
-                fontSize: 12,
-                wordWrap: 'on',
-              }}
-            />
-          ) : active ? (
-            <div className="h-full overflow-auto p-3">
-              <FileEditView edit={active} />
+      )}
+
+      <div className="flex-1 flex min-h-0">
+        {/* Sidebar list */}
+        <div className="w-52 border-r border-border overflow-y-auto shrink-0">
+          {edits.map((edit, index) => {
+            const status = statuses[index] || 'pending';
+            const isActive = activeIndex === index;
+            return (
+              <button
+                key={`${edit.path}-${edit.timestamp || index}`}
+                type="button"
+                onClick={() => setActiveIndex(index)}
+                className={`w-full px-3 py-2 text-left border-b border-border hover:bg-surface transition-colors ${
+                  isActive ? 'bg-surface' : ''
+                } ${status === 'rejected' ? 'opacity-40' : ''}`}
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    status === 'accepted' ? 'bg-green-400'
+                    : status === 'rejected' ? 'bg-red-400'
+                    : 'bg-yellow-400'
+                  }`} />
+                  <span className="text-xs truncate text-fg-secondary">{shortPath(edit.path)}</span>
+                </div>
+                <div className="mt-1 flex items-center gap-2 text-[11px]">
+                  <span className="text-green-400">+{edit.stats?.added || 0}</span>
+                  <span className="text-red-400">-{edit.stats?.removed || 0}</span>
+                  {edit.truncated && <span className="text-yellow-400">large</span>}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Diff view */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div className="h-8 border-b border-border bg-surface flex items-center justify-between px-3">
+            <div className="flex items-center gap-2">
+              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                activeStatus === 'accepted' ? 'bg-green-500/10 text-green-400'
+                : activeStatus === 'rejected' ? 'bg-red-500/10 text-red-400'
+                : 'bg-yellow-500/10 text-yellow-400'
+              }`}>
+                {activeStatus}
+              </span>
+              <span className="text-xs text-fg-secondary truncate">{active?.path}</span>
             </div>
-          ) : null}
+            <div className="flex items-center gap-1">
+              {active && activeStatus === 'pending' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => acceptEdit(activeIndex)}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-colors"
+                  >
+                    <Check className="w-3 h-3" />
+                    Accept
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => rejectEdit(activeIndex)}
+                    disabled={reverting || !active.old_text}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                  >
+                    <X className="w-3 h-3" />
+                    Reject
+                  </button>
+                </>
+              )}
+              {active && onOpenFile && (
+                <button
+                  type="button"
+                  onClick={() => onOpenFile(active.path)}
+                  className="text-[10px] text-blue-300 hover:text-blue-200 px-2 py-0.5 rounded hover:bg-surface-hover ml-2"
+                >
+                  Open
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex-1 min-h-0">
+            {active?.old_text != null && active?.new_text != null && !active.truncated ? (
+              <DiffEditor
+                height="100%"
+                language={getLangFromFilename(active.path, 'monaco')}
+                original={active.old_text}
+                modified={active.new_text}
+                theme="vs-dark"
+                options={{
+                  readOnly: true,
+                  renderSideBySide: true,
+                  minimap: { enabled: false },
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                  fontSize: 12,
+                  wordWrap: 'on',
+                }}
+              />
+            ) : active ? (
+              <div className="h-full overflow-auto p-3">
+                <FileEditView edit={active} />
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>

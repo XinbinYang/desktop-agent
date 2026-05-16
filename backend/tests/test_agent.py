@@ -17,6 +17,22 @@ class TestAgentSession:
         assert len(session.messages) == 1  # system prompt
         assert session.messages[0]["role"] == "system"
 
+    def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        saved = AgentSession(model_id="gpt-4o", session_id="history_session")
+        saved.messages.append({"role": "user", "content": "historical question"})
+        saved.messages.append({"role": "assistant", "content": "historical answer"})
+        saved._save()
+
+        loaded = get_or_create_session("history_session", "new-default-model")
+
+        assert loaded.model_id == "gpt-4o"
+        assert any(m.get("content") == "historical question" for m in loaded.messages)
+
     @pytest.mark.asyncio
     async def test_run_without_tool_calls(self, session):
         mock_response = {
@@ -220,7 +236,7 @@ class TestAgentSession:
         assert any(
             e["type"] == "tool_call"
             and e["data"]["tool_call_id"] == "call_missing_arg"
-            and "Tool execution failed" in e["data"]["result"]
+            and ("Tool execution failed" in e["data"]["result"] or "[ERROR]" in e["data"]["result"])
             for e in events
         )
 
@@ -267,6 +283,136 @@ class TestAgentSession:
         assert session.iteration == 0
         assert len(session.messages) == 1
         assert session.messages[0]["role"] == "system"
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_llm_calls_plan_ask_questions(self, session):
+        """LLM decides to ask clarifying questions in plan mode."""
+        mock_response = {
+            "choices": [{
+                "message": {
+                    "content": "I need more context.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "plan_ask_questions",
+                            "arguments": json.dumps({
+                                "questions": [{
+                                    "id": "scope",
+                                    "prompt": "What scope do you need?",
+                                    "allow_multiple": False,
+                                    "options": [
+                                        {"id": "minimal", "label": "Minimal"},
+                                        {"id": "full", "label": "Full"}
+                                    ]
+                                }]
+                            })
+                        }
+                    }]
+                }
+            }]
+        }
+
+        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+            events = []
+            async for ev in session.run("hi", None, chat_mode="plan"):
+                events.append(ev)
+
+        types = [e["type"] for e in events]
+        assert "plan_questions" in types
+        assert session.plan_state.pending_clarification is True
+        assert session.plan_state.phase == "awaiting_decision"
+        assert len(session.plan_state.questions) == 1
+        assert session.plan_state.questions[0].id == "scope"
+
+    def test_plan_tool_schema_filter_includes_plan_tools(self, session):
+        from app.tools import get_tool_schemas
+
+        session.chat_mode = "plan"
+        session.plan_state.approved = False
+        all_schemas = get_tool_schemas(session.dynamic_registry)
+        filtered = session._filter_tool_schemas_for_plan(all_schemas)
+        names = {s["function"]["name"] for s in filtered}
+        assert "file_write" not in names
+        assert "shell_execute" not in names
+        assert "file_read" in names
+        assert "plan_ask_questions" in names
+        assert "plan_write_draft" in names
+
+    def test_plan_approve_requires_explicit_build(self, session):
+        session.chat_mode = "plan"
+        session.plan_state.phase = "awaiting_approval"
+        session.approve_plan()
+        assert session.plan_state.phase == "approved_waiting_build"
+        assert session.plan_state.approved is True
+        assert session.build_plan() is True
+        assert session.plan_state.phase == "executing"
+        # Build auto-switches to agent mode
+        assert session.chat_mode == "agent"
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_llm_calls_plan_write_draft(self, session):
+        """LLM can skip questions and draft directly for specific requests."""
+        mock_response = {
+            "choices": [{
+                "message": {
+                    "content": "I'll draft a plan now.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "plan_write_draft",
+                            "arguments": json.dumps({
+                                "goal": "Add CSV export to DataTable",
+                                "assumptions": ["Existing CSV library available"],
+                                "research_notes": "Read DataTable.tsx — existing export pattern.",
+                                "steps": [{
+                                    "id": "s1",
+                                    "title": "Add export button",
+                                    "details": "In DataTable.tsx:120 add a button",
+                                    "depends_on": [],
+                                }],
+                                "todos": [{
+                                    "id": "t1",
+                                    "title": "Add CSV export function",
+                                    "acceptance_criteria": "Clicking export downloads a CSV file",
+                                    "depends_on": [],
+                                }],
+                                "risks": ["Large datasets may timeout"],
+                                "verification": ["Test export with sample data"],
+                                "markdown_body": "# Plan: Add CSV export\n\n## Steps\n1. Add export button\n\n## Todos\n- [ ] Add CSV export function\n\n## Verification\n- Test export",
+                            })
+                        }
+                    }]
+                }
+            }]
+        }
+
+        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+            events = []
+            async for ev in session.run("implement csv export", None, chat_mode="plan"):
+                events.append(ev)
+
+        types = [e["type"] for e in events]
+        assert "plan_draft" in types
+        assert "plan_file_ready" in types
+        assert session.plan_state.phase == "awaiting_approval"
+        assert session.plan_state.approved is False
+        assert len(session.plan_state.todos) == 1
+        assert session.plan_state.todos[0].title == "Add CSV export function"
+        assert session.plan_state.plan_file_path is not None
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_reject_resets_to_clarifying(self, session):
+        """Rejecting a plan returns to clarifying phase."""
+        session.chat_mode = "plan"
+        session.plan_state.mode = "plan"
+        session.plan_state.goal = "test"
+        session.plan_state.phase = "awaiting_approval"
+        session.plan_state.approved = False
+        session.reject_plan()
+        assert session.plan_state.phase == "clarifying"
+        assert session.plan_state.approved is False
 
 
 class TestSessionManagement:

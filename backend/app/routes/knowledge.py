@@ -58,3 +58,50 @@ def clear_knowledge():
 def knowledge_stats():
     from app.rag.engine import get_rag_engine
     return get_rag_engine().get_stats()
+
+
+# ── Memory endpoints (cross-session project memory) ──────────────────────
+
+from pydantic import BaseModel
+
+
+class MemorySaveRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    type: str = "project_knowledge"  # user_preference, project_knowledge, decision_log, reference
+    content: str
+    tags: list[str] = []
+
+
+@router.get("/api/memory")
+def list_memories():
+    from app.memory import load_memories
+    from app.project_manager import ProjectManager
+    project = ProjectManager.get_current()
+    if not project:
+        return {"error": {"category": "validation", "message": "没有打开的项目"}}
+    entries = load_memories(project["path"])
+    return {"memories": [e.to_dict() for e in entries]}
+
+
+@router.post("/api/memory")
+def save_memory_endpoint(req: MemorySaveRequest):
+    from app.memory import save_memory
+    from app.project_manager import ProjectManager
+    project = ProjectManager.get_current()
+    if not project:
+        return {"error": {"category": "validation", "message": "没有打开的项目"}}
+    entry = save_memory(project["path"], req.type, req.content, req.tags)
+    if entry:
+        return {"status": "ok", "memory": entry.to_dict()}
+    return {"error": {"category": "internal", "message": "保存记忆失败"}}
+
+
+@router.delete("/api/memory/{memory_id}")
+def delete_memory_endpoint(memory_id: str):
+    from app.memory import delete_memory
+    from app.project_manager import ProjectManager
+    project = ProjectManager.get_current()
+    if not project:
+        return {"error": {"category": "validation", "message": "没有打开的项目"}}
+    ok = delete_memory(project["path"], memory_id)
+    return {"status": "ok" if ok else "not_found"}

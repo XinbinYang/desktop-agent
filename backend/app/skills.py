@@ -79,6 +79,31 @@ MATCH_RULES = [
         "roles": ["code-expert"],
         "skills": ["executing-plans", "subagent-driven-development"],
     },
+    # 项目熟悉 / 代码探索
+    {
+        "patterns": ["熟悉", "了解", "familiarize", "understand the project",
+                     "explore the codebase", "项目概览", "overview",
+                     "介绍一下项目", "这个项目", "代码结构", "explore the project",
+                     "understand the codebase", "familiarize yourself"],
+        "roles": ["code-expert", "desktop-agent"],
+        "skills": ["project-familiarization", "dispatching-parallel-agents"],
+    },
+]
+
+SKILL_PRIORITY = [
+    "using-superpowers",
+    "output-formatting",
+    "writing-plans",
+    "executing-plans",
+    "systematic-debugging",
+    "test-driven-development",
+    "verification-before-completion",
+    "subagent-driven-development",
+    "dispatching-parallel-agents",
+    "requesting-code-review",
+    "receiving-code-review",
+    "finishing-a-development-branch",
+    "using-git-worktrees",
 ]
 
 
@@ -193,7 +218,8 @@ class SkillManager:
         if "output-formatting" in cls.load_skills():
             matched.add("output-formatting")
 
-        return sorted(matched)
+        priority_index = {name: i for i, name in enumerate(SKILL_PRIORITY)}
+        return sorted(matched, key=lambda name: (priority_index.get(name, 999), name))
 
     @classmethod
     def build_skill_prompt(cls, skill_names: List[str]) -> str:

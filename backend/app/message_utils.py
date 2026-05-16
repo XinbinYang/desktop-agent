@@ -1,8 +1,10 @@
 """Shared message utilities for AgentSession and WorkerSession."""
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
@@ -180,22 +182,211 @@ async def execute_tool(
         if key in tool_params and key not in tool_args and value:
             tool_args[key] = value
 
+    guardrail_decisions: List[Dict[str, Any]] = []
+    record_event_fn: Optional[Callable[[str, str, Dict[str, Any]], Any]] = None
+    evaluate_pre_tool_fn: Optional[Callable[..., Dict[str, Any]]] = None
+    evaluate_post_tool_fn: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
+    try:
+        from app.coding_runs import record_event as _record_event
+        from app.guardrails import evaluate_post_tool, evaluate_pre_tool
+
+        record_event_fn = _record_event
+        evaluate_pre_tool_fn = evaluate_pre_tool
+        evaluate_post_tool_fn = evaluate_post_tool
+    except Exception:
+        pass
+
+    if run_id and record_event_fn:
+        try:
+            record_event_fn(run_id, "tool_start", {
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "tool_call_id": tool_call_id,
+                "worker_id": worker_id,
+                "parent_tool_call_id": parent_tool_call_id,
+                "session_id": session_id,
+            })
+        except Exception:
+            pass
+
+    if evaluate_pre_tool_fn:
+        try:
+            decision = evaluate_pre_tool_fn(
+                tool_name,
+                tool_args,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+            )
+            guardrail_decisions.append(decision)
+            if run_id and record_event_fn:
+                record_event_fn(run_id, "guardrail_decision", decision)
+            if decision.get("decision") == "blocked":
+                result_text = f"[GUARDRAIL_BLOCKED] {decision.get('reason', 'Tool use blocked')}"
+                metadata = {"guardrail_decisions": guardrail_decisions}
+                if run_id and record_event_fn:
+                    record_event_fn(run_id, "tool_done", {
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "duration_ms": 0,
+                        "error": decision.get("reason", "Tool use blocked"),
+                        "metadata": metadata,
+                    })
+                return ToolCallResult(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    tool_call_id=tool_call_id,
+                    result_text=result_text,
+                    duration_ms=0,
+                    error=decision.get("reason", "Tool use blocked"),
+                    metadata=metadata,
+                )
+        except Exception:
+            pass
+
     try:
         started_at = time.time()
         result = await tool.execute(**tool_args)
         duration_ms = round((time.time() - started_at) * 1000)
+        metadata = dict(result.metadata or {})
+        if evaluate_post_tool_fn:
+            try:
+                decision = evaluate_post_tool_fn(
+                    tool_name,
+                    result.to_text(),
+                    metadata,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                )
+                if decision:
+                    guardrail_decisions.append(decision)
+                    if run_id and record_event_fn:
+                        record_event_fn(run_id, "guardrail_decision", decision)
+            except Exception:
+                pass
+        if guardrail_decisions:
+            metadata["guardrail_decisions"] = guardrail_decisions
+        if run_id and record_event_fn:
+            try:
+                record_event_fn(run_id, "tool_done", {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "worker_id": worker_id,
+                    "parent_tool_call_id": parent_tool_call_id,
+                    "duration_ms": duration_ms,
+                    "error": result.error,
+                    "metadata": metadata,
+                })
+            except Exception:
+                pass
         return ToolCallResult(
             tool_name=tool_name,
             tool_args=tool_args,
+            tool_call_id=tool_call_id,
             result_text=result.to_text(),
             duration_ms=duration_ms,
             base64_image=result.base64_image,
-            metadata=result.metadata,
+            metadata=metadata,
         )
     except Exception as e:
+        if run_id and record_event_fn:
+            try:
+                record_event_fn(run_id, "tool_done", {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "worker_id": worker_id,
+                    "parent_tool_call_id": parent_tool_call_id,
+                    "duration_ms": 0,
+                    "error": str(e),
+                    "metadata": {"guardrail_decisions": guardrail_decisions},
+                })
+            except Exception:
+                pass
         return ToolCallResult(
             tool_name=tool_name,
             tool_args=tool_args,
+            tool_call_id=tool_call_id,
             result_text=f"[ERROR] Tool execution failed: {e}",
             error=str(e),
+            metadata={"guardrail_decisions": guardrail_decisions} if guardrail_decisions else {},
         )
+
+
+# ── @Mention resolver ───────────────────────────────────────────────────────
+
+_MENTION_PATTERN = re.compile(r"@(file|folder|git|knowledge):([^\s]+)")
+
+def resolve_mentions(user_text: str, project_path: str = "") -> str:
+    """Resolve @mentions in user input and prepend context.
+
+    Supports:
+      @file:relative/path  — reads file content and prepends it
+      @folder:relative/path — lists directory contents
+      @git                 — prepends git status info
+      @knowledge:query     — searches RAG knowledge base
+    """
+    mentions = _MENTION_PATTERN.findall(user_text)
+    if not mentions:
+        return user_text
+
+    context_parts: list[str] = []
+    for mtype, mvalue in mentions:
+        if mtype == "file" and project_path:
+            try:
+                fp = (Path(project_path) / mvalue).resolve()
+                if fp.is_relative_to(Path(project_path).resolve()) and fp.is_file():
+                    content = fp.read_text(encoding="utf-8", errors="replace")
+                    if len(content) > 4000:
+                        content = content[:4000] + "\n... (truncated)"
+                    context_parts.append(f"## @file:{mvalue}\n```\n{content}\n```")
+            except Exception:
+                context_parts.append(f"[Could not read @file:{mvalue}]")
+
+        elif mtype == "folder" and project_path:
+            try:
+                dp = (Path(project_path) / mvalue).resolve()
+                if dp.is_relative_to(Path(project_path).resolve()) and dp.is_dir():
+                    items = sorted(dp.iterdir())[:50]
+                    listing = "\n".join(
+                        f"- {p.name}{'/' if p.is_dir() else ''}" for p in items
+                    )
+                    context_parts.append(f"## @folder:{mvalue}\n{listing}")
+            except Exception:
+                context_parts.append(f"[Could not list @folder:{mvalue}]")
+
+        elif mtype == "git" and project_path:
+            import subprocess
+            try:
+                r = subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=project_path,
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    context_parts.append(f"## @git status\n```\n{r.stdout.strip()[:2000]}\n```")
+            except Exception:
+                context_parts.append("[git status unavailable]")
+
+        elif mtype == "knowledge":
+            try:
+                from app.rag.engine import get_rag_engine
+                rag = get_rag_engine()
+                results = rag.search(mvalue, top_k=3)
+                relevant = [r for r in results if r.score >= 0.3]
+                if relevant:
+                    kctx = "\n".join(
+                        f"### {r.source_path} (score: {r.score:.2f})\n{r.content[:600]}"
+                        for r in relevant
+                    )
+                    context_parts.append(f"## @knowledge:{mvalue}\n{kctx}")
+                else:
+                    context_parts.append(f"[No knowledge results for: {mvalue}]")
+            except Exception:
+                context_parts.append(f"[Knowledge search failed for: {mvalue}]")
+
+    if not context_parts:
+        return user_text
+
+    # Remove @mention syntax from the user-visible text
+    clean_text = _MENTION_PATTERN.sub("", user_text).strip()
+    context_block = "\n\n".join(context_parts)
+    return f"{context_block}\n\n---\n\n{clean_text}"

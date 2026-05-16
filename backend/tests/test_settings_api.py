@@ -238,3 +238,23 @@ settings:
         assert response.status_code == 200
         assert data["ok"] is False
         assert data["model_found"] is False
+
+    def test_roles_reload(self, client):
+        """POST /api/roles/reload should clear cache and return ok."""
+        response = client.post("/api/roles/reload")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        # Verify roles still work after reload
+        roles_resp = client.get("/api/roles")
+        assert roles_resp.status_code == 200
+        assert len(roles_resp.json()["roles"]) >= 4
+
+    def test_skills_reload(self, client):
+        """POST /api/skills/reload should clear cache and return ok."""
+        response = client.post("/api/skills/reload")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        # Verify skills still work after reload
+        skills_resp = client.get("/api/skills")
+        assert skills_resp.status_code == 200
+        assert len(skills_resp.json()["skills"]) > 0

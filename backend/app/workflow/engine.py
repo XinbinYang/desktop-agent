@@ -7,7 +7,6 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from app.workflow.models import Workflow, WorkflowStep, WorkflowVariable
 from app.workflow.storage import save_workflow, load_workflow, list_workflows, delete_workflow
-from app.tools.base import ToolResult
 
 _VARIABLE_PATTERN = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
@@ -45,7 +44,7 @@ class WorkflowRecorder:
             id=f"wf-{uuid.uuid4().hex[:12]}",
             name=self.name,
             description=self.description,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(timezone.utc),
             steps=copy.deepcopy(self.steps),
         )
         save_workflow(workflow)

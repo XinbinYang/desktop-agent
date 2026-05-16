@@ -10,9 +10,13 @@ import { TerminalPanel } from './components/TerminalPanel';
 import { ToolCallView } from './components/ToolCallView';
 import { ArtifactPanel } from './components/ArtifactPanel/ArtifactPanel';
 import { ChangesPanel } from './components/ChangesPanel';
+import { RunSummaryPanel } from './components/RunSummaryPanel';
 import { KnowledgePanel } from './components/KnowledgePanel';
 import { WorkflowPanel } from './components/WorkflowPanel';
 import { McpPanel } from './components/McpPanel';
+import { TestsPanel } from './components/TestsPanel';
+import { ProblemsPanel } from './components/ProblemsPanel';
+import { EvalPanel } from './components/EvalPanel';
 import { ModelInfo, RoleInfo, ToolCall, ArtifactItem, ProjectInfo, FileNode, OpenFile, EditorGroup, SettingsResponse, FileEdit } from './types';
 import { API_BASE } from './config';
 import { useChatSession } from './hooks/useChatSession';
@@ -26,6 +30,16 @@ import { EditorPanel } from './components/EditorPanel/EditorPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
+
+interface SessionListItem {
+  id: string;
+  title?: string;
+  project_path?: string;
+  model_id: string;
+  role_id?: string;
+  message_count: number;
+  updated_at?: number;
+}
 
 function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
   if (!settings?.settings || !settings.providers) return false;
@@ -50,7 +64,7 @@ export default function App() {
   const [currentRole, setCurrentRole] = useState<string>(() => localStorage.getItem('agent_default_role') || 'desktop-agent');
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [sessionId, setSessionId] = useState(() => `session_${Date.now()}`);
-  const [sessions, setSessions] = useState<{ id: string; model_id: string; message_count: number }[]>([]);
+  const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [showRoleEditor, setShowRoleEditor] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -103,6 +117,7 @@ export default function App() {
     messages,
     toolCalls,
     fileEdits,
+    runEvents,
     terminalLogs,
     isRunning,
     isConnected,
@@ -116,10 +131,48 @@ export default function App() {
     onToolCallRef,
     onFileEditRef,
     recordFileEdit,
+    sendRaw,
     saveInputDraft,
     loadInputDraft,
     clearInputDraft,
+    chatMode,
+    setChatMode,
+    thinkingIntensity,
+    setThinkingIntensity,
+    planState,
+    approvePlan,
+    buildPlan,
+    rejectPlan,
+    updatePlanDecision,
   } = useChatSession(sessionId, currentModel, currentRole);
+
+  // Slash command handler
+  const handleSlashCommand = useCallback((command: string, args: string) => {
+    switch (command) {
+      case 'clear':
+        clearSession();
+        addTerminalLog('[命令] 已清除会话');
+        break;
+      case 'help':
+        addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
+        addTerminalLog('[帮助] 在输入框中输入 / 可查看命令菜单');
+        break;
+      case 'compact':
+        // Send compact message over WebSocket
+        sendMessage('__compact__', undefined, { chatMode: 'agent' });
+        addTerminalLog('[命令] 正在压缩对话上下文...');
+        break;
+      case 'config':
+        setShowSettings(true);
+        break;
+      case 'screenshot':
+        executeToolDirect('screenshot', {});
+        addTerminalLog('[命令] 正在截图...');
+        break;
+      default:
+        addTerminalLog(`[命令] 未知命令: /${command}`);
+    }
+  }, [clearSession, addTerminalLog, executeToolDirect]);
 
   // 加载模型列表、角色列表和会话列表
   useEffect(() => {
@@ -254,6 +307,7 @@ export default function App() {
         setEditorGroups([{ id: 'main', activeFileId: null, openFiles: [] }]);
         setActiveEditorGroup('main');
         loadProjectTree();
+        loadSessions(project.path);  // 自动加载该项目的历史会话
         addTerminalLog(`[系统] 已打开项目: ${project.name}`);
       } catch (err) {
         console.error('[App] Open project error:', err);
@@ -269,6 +323,7 @@ export default function App() {
         setExpandedPaths(new Set());
         setEditorGroups([{ id: 'main', activeFileId: null, openFiles: [] }]);
         setActiveEditorGroup('main');
+        loadSessions();  // 恢复显示全部会话
         addTerminalLog('[系统] 已关闭项目');
       })
       .catch(console.error);
@@ -473,8 +528,59 @@ export default function App() {
     }
   }, [editorGroups, currentProject, addTerminalLog, recordFileEdit]);
 
-  const loadSessions = useCallback(() => {
-    fetch(`${API_BASE}/api/sessions`)
+  const runAction = useCallback(async (runId: string, action: 'apply' | 'merge' | 'discard') => {
+    try {
+      const res = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: action === 'merge' ? JSON.stringify({}) : undefined,
+      });
+      const data = await res.json();
+      if (data.error) {
+        addTerminalLog(`[Run] ${action} failed: ${data.error}`);
+        return;
+      }
+      addTerminalLog(`[Run] ${action} ${data.status || 'ok'}: ${runId}`);
+      if (action === 'apply') {
+        loadProjectTree();
+      }
+    } catch (err) {
+      addTerminalLog(`[Run] ${action} error: ${err}`);
+    }
+  }, [addTerminalLog, loadProjectTree]);
+
+  const openRunWorktree = useCallback(async (runId: string) => {
+    try {
+      const statusRes = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/worktree`);
+      const status = await statusRes.json();
+      const worktreePath = status.worktree_path;
+      if (!worktreePath) {
+        addTerminalLog(`[Run] no worktree to open for ${runId}`);
+        return;
+      }
+      const res = await fetch(`${API_BASE}/api/projects/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: worktreePath }),
+      });
+      const project = await res.json();
+      if (project.error) {
+        addTerminalLog(`[Run] open worktree failed: ${project.error}`);
+        return;
+      }
+      setCurrentProject(project);
+      loadProjectTree();
+      addTerminalLog(`[Run] opened worktree: ${worktreePath}`);
+    } catch (err) {
+      addTerminalLog(`[Run] open worktree error: ${err}`);
+    }
+  }, [addTerminalLog, loadProjectTree]);
+
+  const loadSessions = useCallback((projectPath?: string | null) => {
+    const url = projectPath
+      ? `${API_BASE}/api/sessions?project_path=${encodeURIComponent(projectPath)}`
+      : `${API_BASE}/api/sessions`;
+    fetch(url)
       .then((r) => r.json())
       .then((data) => setSessions(data.sessions || []))
       .catch(console.error);
@@ -599,8 +705,6 @@ export default function App() {
         }))
       );
 
-      layout.setRightTab('changes');
-      layout.setRightPanelVisible(true);
       if (edit.truncated) {
         addTerminalLog(`[Edit] ${edit.path} changed; full text was too large for inline diff`);
       }
@@ -623,10 +727,18 @@ export default function App() {
 
   const switchSession = useCallback(
     (newSessionId: string) => {
+      const target = sessions.find((s) => s.id === newSessionId);
+      if (target?.model_id) {
+        setCurrentModel(target.model_id);
+      }
+      if (target?.role_id) {
+        setCurrentRole(target.role_id);
+        localStorage.setItem('agent_default_role', target.role_id);
+      }
       resetSession();
       setSessionId(newSessionId);
     },
-    [resetSession]
+    [resetSession, sessions]
   );
 
   const newSession = useCallback(() => {
@@ -716,6 +828,11 @@ export default function App() {
     }
   });
 
+  useHotkeys('shift+tab', (e) => {
+    e.preventDefault();
+    setChatMode(chatMode === 'plan' ? 'agent' : 'plan');
+  }, { enableOnFormTags: true });
+
   // 连接状态变化时记录日志
   useEffect(() => {
     if (isConnected) {
@@ -742,9 +859,21 @@ export default function App() {
             onToggleRightPanel={layout.toggleRightPanel}
             onResetLayout={layout.resetLayout}
           />
-          <span className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border">
-            {models.find(m => m.id === currentModel)?.name || currentModel}
-          </span>
+          <select
+            value={currentModel}
+            title="切换模型"
+            aria-label="切换模型"
+            onChange={(e) => {
+              const newModel = e.target.value;
+              setCurrentModel(newModel);
+              sendRaw({ type: 'switch_model', model_id: newModel });
+            }}
+            className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border outline-none cursor-pointer hover:bg-surface-hover transition-colors"
+          >
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>{m.name}</option>
+            ))}
+          </select>
           <button
             type="button"
             onClick={() => setShowSettings(true)}
@@ -785,6 +914,7 @@ export default function App() {
               onNewSession={newSession}
               onSwitchSession={switchSession}
               onDeleteSession={deleteSession}
+              currentProjectPath={currentProject?.path ?? null}
               currentProject={currentProject}
               fileTree={fileTree}
               expandedPaths={expandedPaths}
@@ -852,12 +982,22 @@ export default function App() {
                     onDraftSave={saveInputDraft}
                     onDraftLoad={loadInputDraft}
                     onDraftClear={clearInputDraft}
+                    chatMode={chatMode}
+                    onChatModeChange={setChatMode}
+                    thinkingIntensity={thinkingIntensity}
+                    onThinkingIntensityChange={setThinkingIntensity}
+                    planState={planState}
+                    onApprovePlan={approvePlan}
+                    onBuildPlan={buildPlan}
+                    onRejectPlan={rejectPlan}
+                    onUpdatePlanDecision={updatePlanDecision}
+                    onCommand={handleSlashCommand}
+                    projectOpen={!!currentProject}
+                    fileTree={fileTree}
                   />
                 </Panel>
 
-                <Separator className="h-4 bg-border hover:bg-accent/30 active:bg-accent/40 transition-colors cursor-row-resize flex items-center justify-center">
-                  <div className="w-8 h-0.5 rounded-full bg-fg-muted/30" />
-                </Separator>
+                <Separator className="h-px bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-row-resize" />
 
                 <Panel
                   id="terminal"
@@ -907,9 +1047,7 @@ export default function App() {
           </Panel>
 
           {/* Right panel — always in Group, uses collapsible */}
-          <Separator className="w-4 bg-border hover:bg-accent/30 active:bg-accent/40 transition-colors cursor-col-resize flex items-center justify-center">
-            <div className="h-8 w-0.5 rounded-full bg-fg-muted/30" />
-          </Separator>
+          <Separator className="w-px bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-col-resize" />
           <Panel
             panelRef={rightPanelRef}
             defaultSize={800} minSize={0} maxSize={1600}
@@ -922,7 +1060,7 @@ export default function App() {
               }
             }}
           >
-            <div className="bg-surface/50 flex flex-col h-full min-w-0">
+            <div className="bg-surface flex flex-col h-full min-w-0">
               <div className="flex border-b border-border overflow-x-auto max-w-full min-w-0">
                 <button
                   onClick={() => layout.setRightTab('tools')}
@@ -937,6 +1075,34 @@ export default function App() {
                     }`}
                 >
                   Changes
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('runs')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'runs' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Runs
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('tests')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'tests' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Tests
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('problems')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'problems' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Problems
+                </button>
+                <button
+                  onClick={() => layout.setRightTab('eval')}
+                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'eval' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                    }`}
+                >
+                  Eval
                 </button>
                 <button
                   onClick={() => layout.setRightTab('artifacts')}
@@ -1022,6 +1188,41 @@ export default function App() {
                     handleSelectFile(relative, 'file');
                   }} />
                 )}
+                {layout.rightTab === 'runs' && (
+                  <RunSummaryPanel
+                    events={runEvents}
+                    onOpenWorktree={openRunWorktree}
+                    onApplyRun={(runId) => runAction(runId, 'apply')}
+                    onMergeRun={(runId) => runAction(runId, 'merge')}
+                    onDiscardRun={(runId) => runAction(runId, 'discard')}
+                  />
+                )}
+                {layout.rightTab === 'tests' && (
+                  <TestsPanel onOpenFile={(path) => {
+                    const normalized = path.replace(/\\/g, '/');
+                    const projectPrefix = currentProject?.path.replace(/\\/g, '/') || '';
+                    const relative = normalized.startsWith(projectPrefix)
+                      ? normalized.slice(projectPrefix.length + 1)
+                      : normalized;
+                    handleSelectFile(relative, 'file');
+                  }} />
+                )}
+                {layout.rightTab === 'problems' && (
+                  <ProblemsPanel onOpenFile={(path, line) => {
+                    const normalized = path.replace(/\\/g, '/');
+                    const projectPrefix = currentProject?.path.replace(/\\/g, '/') || '';
+                    const relative = normalized.startsWith(projectPrefix)
+                      ? normalized.slice(projectPrefix.length + 1)
+                      : normalized;
+                    handleSelectFile(relative, 'file');
+                    if (line) {
+                      setTimeout(() => {
+                        // Jump to line — editor will auto-scroll on open
+                      }, 300);
+                    }
+                  }} />
+                )}
+                {layout.rightTab === 'eval' && <EvalPanel />}
                 {layout.rightTab === 'knowledge' && <KnowledgePanel />}
                 {layout.rightTab === 'workflow' && <WorkflowPanel />}
                 {layout.rightTab === 'mcp' && <McpPanel />}
@@ -1053,6 +1254,12 @@ export default function App() {
               className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'editor' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
               title="Editor"
             >E</button>
+            <button
+              type="button"
+              onClick={() => { layout.setRightTab('runs'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'runs' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="Runs"
+            >R</button>
             <button
               type="button"
               onClick={() => { layout.setRightTab('knowledge'); layout.setRightPanelVisible(true); }}

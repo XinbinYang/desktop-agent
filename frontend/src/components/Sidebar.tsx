@@ -20,11 +20,12 @@ interface SidebarProps {
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
-  sessions?: {id: string; model_id: string; message_count: number}[];
+  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; message_count: number; updated_at?: number}[];
   currentSession?: string;
   onNewSession?: () => void;
   onSwitchSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
+  currentProjectPath?: string | null;
   // 项目相关
   currentProject?: ProjectInfo | null;
   fileTree?: FileNode[];
@@ -35,6 +36,20 @@ interface SidebarProps {
   onOpenProjectModal?: () => void;
   onCloseProject?: () => void;
   onRefreshTree?: () => void;
+}
+
+type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; message_count: number; updated_at?: number};
+
+function formatSessionLabel(s: SessionItem): string {
+  if (s.title) return s.title.length > 40 ? s.title.slice(0, 40) + '…' : s.title;
+  // Fallback: parse timestamp from session ID
+  const ts = parseInt(s.id.replace('session_', ''), 10);
+  if (ts > 0) {
+    return new Date(ts).toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  }
+  return s.id.replace('session_', '');
 }
 
 const QUICK_TOOLS = [
@@ -61,6 +76,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onNewSession,
   onSwitchSession,
   onDeleteSession,
+  currentProjectPath,
   // 项目
   currentProject,
   fileTree = [],
@@ -137,7 +153,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <Plus className="w-3.5 h-3.5" />
               New Session
             </button>
-            <div className="text-xs text-fg-muted uppercase tracking-wider mt-2">History</div>
+            <div className="flex items-center justify-between mt-2">
+              <span className="text-xs text-fg-muted uppercase tracking-wider">History</span>
+              {currentProjectPath && (
+                <span className="text-[10px] text-accent/80 bg-accent/8 px-1.5 py-0.5 rounded" title={`Filtered: ${currentProjectPath}`}>
+                  Project
+                </span>
+              )}
+            </div>
             {sessions.length === 0 && (
               <div className="text-xs text-fg-muted text-center py-4">No sessions yet</div>
             )}
@@ -150,7 +173,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               >
                 <div className="flex items-center gap-2 flex-1 min-w-0" onClick={() => onSwitchSession?.(s.id)}>
                   <MessageSquare className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{s.id.replace('session_', '')}</span>
+                  <span className="truncate">{formatSessionLabel(s)}</span>
                 </div>
                 <button
                   type="button"

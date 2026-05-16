@@ -41,6 +41,8 @@ def mock_litellm():
                 }
             }]
         }
+        # Prevent MagicMock auto-creation of reasoning_content via getattr
+        mock.return_value.choices[0].message.reasoning_content = None
         yield mock
 
 
@@ -65,6 +67,7 @@ def mock_litellm_with_tool_call():
                 }
             }]
         }
+        mock.return_value.choices[0].message.reasoning_content = None
         yield mock
 
 

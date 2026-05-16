@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { SidebarSection } from '../types';
 
-type RightTab = 'tools' | 'artifacts' | 'editor' | 'changes' | 'knowledge' | 'workflow' | 'mcp';
+type RightTab = 'tools' | 'artifacts' | 'editor' | 'changes' | 'runs' | 'tests' | 'problems' | 'eval' | 'knowledge' | 'workflow' | 'mcp';
 
 interface LayoutState {
   activeSection: SidebarSection;

@@ -10,7 +10,7 @@ WORKFLOWS_DIR = runtime_dir("workflows")
 def save_workflow(workflow: Workflow) -> None:
     path = WORKFLOWS_DIR / f"{workflow.id}.json"
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(workflow.model_dump(), f, ensure_ascii=False, indent=2)
+        json.dump(workflow.model_dump(mode="json"), f, ensure_ascii=False, indent=2)
 
 
 def load_workflow(workflow_id: str) -> Optional[Workflow]:

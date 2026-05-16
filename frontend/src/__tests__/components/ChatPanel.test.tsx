@@ -1,7 +1,20 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { ChatPanel } from '../../components/ChatPanel'
-import type { ChatMessage } from '../../types'
+import type { ChatMessage, PlanState } from '../../types'
+
+const idlePlanState: PlanState = {
+  mode: 'agent',
+  phase: 'idle',
+  goal: '',
+  draft: '',
+  structured_plan: null,
+  questions: [],
+  todos: [],
+  decisions: {},
+  approved: false,
+  pending_clarification: false,
+}
 
 describe('ChatPanel', () => {
   const defaultProps = {
@@ -9,6 +22,15 @@ describe('ChatPanel', () => {
     toolCalls: [],
     onSend: vi.fn(),
     isRunning: false,
+    chatMode: 'agent' as const,
+    onChatModeChange: vi.fn(),
+    thinkingIntensity: 'medium' as const,
+    onThinkingIntensityChange: vi.fn(),
+    planState: idlePlanState,
+    onApprovePlan: vi.fn(),
+    onBuildPlan: vi.fn(),
+    onRejectPlan: vi.fn(),
+    onUpdatePlanDecision: vi.fn(),
   }
 
   it('renders empty state when no messages', () => {
@@ -52,7 +74,10 @@ describe('ChatPanel', () => {
     const sendButton = screen.getByLabelText('Send')
     fireEvent.click(sendButton)
 
-    expect(onSend).toHaveBeenCalledWith('test message', undefined)
+    expect(onSend).toHaveBeenCalledWith('test message', undefined, {
+      chatMode: 'agent',
+      thinkingIntensity: 'medium',
+    })
   })
 
   it('calls onSend when pressing Enter', () => {
@@ -63,7 +88,10 @@ describe('ChatPanel', () => {
     fireEvent.change(input, { target: { value: 'test message' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
-    expect(onSend).toHaveBeenCalledWith('test message', undefined)
+    expect(onSend).toHaveBeenCalledWith('test message', undefined, {
+      chatMode: 'agent',
+      thinkingIntensity: 'medium',
+    })
   })
 
   it('does not call onSend when pressing Shift+Enter', () => {
@@ -80,6 +108,22 @@ describe('ChatPanel', () => {
   it('shows running indicator', () => {
     render(<ChatPanel {...defaultProps} isRunning={true} />)
     expect(screen.getByText('Agent is working...')).toBeInTheDocument()
+  })
+
+  it('Plan mode control marks aria-pressed when plan is selected', () => {
+    render(<ChatPanel {...defaultProps} chatMode="plan" />)
+    expect(screen.getByLabelText('Plan mode')).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('disables chat input while plan awaiting_decision', () => {
+    const awaiting: PlanState = {
+      ...idlePlanState,
+      mode: 'plan',
+      phase: 'awaiting_decision',
+    }
+    render(<ChatPanel {...defaultProps} chatMode="plan" planState={awaiting} />)
+    expect(screen.getByPlaceholderText(/Complete the plan questions/)).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent(/Please complete the questions/)
   })
 
   it('filters messages by search query', () => {

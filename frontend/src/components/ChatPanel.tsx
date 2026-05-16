@@ -1,6 +1,15 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff } from 'lucide-react';
-import { ChatMessage, ToolCall, AssistantBlock } from '../types';
+import {
+  ChatMessage,
+  ToolCall,
+  AssistantBlock,
+  ToolSummary,
+  ClientChatMode,
+  ThinkingIntensity,
+  PlanQuestion,
+  PlanState,
+} from '../types';
 import { API_BASE } from '../config';
 import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
@@ -9,17 +18,95 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneLight, vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { ToolCallView } from './ToolCallView';
 import { FileEditView } from './FileEditView';
+import { SlashCommandMenu } from './SlashCommandMenu';
+import { AtMentionMenu } from './AtMentionMenu';
 
 interface ChatPanelProps {
   messages: ChatMessage[];
   toolCalls: ToolCall[];
-  onSend: (text: string, imageBase64?: string) => void;
+  onSend: (
+    text: string,
+    imageBase64?: string,
+    overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }
+  ) => void;
   onStop?: () => void;
   onRetry?: () => void;
   isRunning: boolean;
   onDraftSave?: (text: string) => void;
   onDraftLoad?: () => Promise<string | undefined>;
   onDraftClear?: () => void;
+  chatMode: ClientChatMode;
+  onChatModeChange: (mode: ClientChatMode) => void;
+  thinkingIntensity: ThinkingIntensity;
+  onThinkingIntensityChange: (intensity: ThinkingIntensity) => void;
+  planState: PlanState;
+  onApprovePlan: () => void;
+  onBuildPlan: () => void;
+  onRejectPlan: () => void;
+  onUpdatePlanDecision: (questionId: string, selected: string[]) => void;
+  onCommand?: (command: string, args: string) => void;
+  projectOpen?: boolean;
+  fileTree?: any[];
+}
+
+type OutputMode = 'concise' | 'balanced' | 'verbose';
+
+function getInitialOutputMode(): OutputMode {
+  try {
+    const v = localStorage.getItem('desktop-agent-output-mode');
+    if (v === 'concise' || v === 'balanced' || v === 'verbose') return v;
+  } catch { /* ignore */ }
+  return 'concise';
+}
+
+function getInitialNoiseFilter(): boolean {
+  try {
+    const raw = localStorage.getItem('desktop-agent-hide-tool-noise');
+    if (raw === '0') return false;
+  } catch { /* ignore */ }
+  return true;
+}
+
+function isNoisyToolBlock(block: Extract<AssistantBlock, { type: 'tool_call' }>): boolean {
+  if (block.status !== 'success') return false;
+  const n = (block.name || '').toLowerCase();
+  return n === 'file_read' || n === 'file_search' || n === 'file_list';
+}
+
+function planPhaseLabel(phase: PlanState['phase']): string {
+  const labels: Record<PlanState['phase'], string> = {
+    idle: 'Idle',
+    clarifying: 'Clarifying',
+    planning: 'Planning',
+    awaiting_decision: 'Awaiting decision',
+    awaiting_approval: 'Awaiting approval',
+    approved_waiting_build: 'Approved, waiting Build',
+    executing: 'Executing',
+    completed: 'Completed',
+  };
+  return labels[phase] || phase;
+}
+
+/** Cursor-style list icon: three lines with dots (top/bottom left, middle right). */
+function PlanModeIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden
+    >
+      <circle cx="3" cy="4" r="1.25" fill="currentColor" />
+      <line x1="5.2" y1="4" x2="13" y2="4" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+      <line x1="3" y1="8" x2="10.8" y2="8" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+      <circle cx="13" cy="8" r="1.25" fill="currentColor" />
+      <circle cx="3" cy="12" r="1.25" fill="currentColor" />
+      <line x1="5.2" y1="12" x2="13" y2="12" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 /** Collapsible thinking/reasoning block */
@@ -40,12 +127,73 @@ const ReasoningBlock: React.FC<{ text: string }> = ({ text }) => {
       </button>
       {expanded && (
         <div
-          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] chat-text-sm font-mono text-fg-secondary whitespace-pre-wrap overflow-auto border-t border-border-subtle"
+          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary whitespace-pre-wrap overflow-auto border-t border-border-subtle"
           style={{ maxHeight: '300px', lineHeight: 'var(--chat-line-height)' }}
         >
           {text}
         </div>
       )}
+    </div>
+  );
+};
+
+const ToolSummaryRow: React.FC<{
+  summary: ToolSummary;
+  expanded: boolean;
+  onToggle: () => void;
+}> = ({ summary, expanded, onToggle }) => {
+  const bucketText = summary.toolBuckets.map((b) => `${b.label} ×${b.count}`).join(' · ');
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="w-full text-left rounded-md border border-border-subtle bg-surface/60 hover:bg-surface-hover transition-colors px-[var(--chat-bubble-px)] py-[var(--chat-space-sm)]"
+    >
+      <div className="flex items-center gap-2 chat-text-xs text-fg-secondary">
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        <span className="font-medium text-fg">Execution summary</span>
+        <span className="text-fg-muted">
+          {summary.total} calls · {summary.success} success
+          {summary.error > 0 ? ` · ${summary.error} error` : ''}
+          {summary.running > 0 ? ` · ${summary.running} running` : ''}
+        </span>
+      </div>
+      {bucketText && <div className="mt-[var(--chat-space-xs)] chat-text-xs text-fg-muted truncate">{bucketText}</div>}
+    </button>
+  );
+};
+
+const PlanQuestionCard: React.FC<{
+  question: PlanQuestion;
+  onChange: (selected: string[]) => void;
+}> = ({ question, onChange }) => {
+  const selected = question.selected || [];
+  const allowMultiple = question.allow_multiple === true;
+  return (
+    <div className="rounded-md border border-border-subtle bg-surface px-3 py-2">
+      <div className="chat-text-sm text-fg mb-1">{question.prompt}</div>
+      <div className="space-y-1">
+        {question.options.map((opt) => {
+          const checked = selected.includes(opt.id);
+          return (
+            <label key={opt.id} className="flex items-center gap-2 chat-text-xs text-fg-secondary cursor-pointer">
+              <input
+                type={allowMultiple ? 'checkbox' : 'radio'}
+                name={question.id}
+                checked={checked}
+                onChange={() => {
+                  if (allowMultiple) {
+                    onChange(checked ? selected.filter((s) => s !== opt.id) : [...selected, opt.id]);
+                    return;
+                  }
+                  onChange([opt.id]);
+                }}
+              />
+              <span>{opt.label}</span>
+            </label>
+          );
+        })}
+      </div>
     </div>
   );
 };
@@ -105,7 +253,21 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onDraftSave,
   onDraftLoad,
   onDraftClear,
+  chatMode,
+  onChatModeChange,
+  thinkingIntensity,
+  onThinkingIntensityChange,
+  planState,
+  onApprovePlan,
+  onBuildPlan,
+  onRejectPlan,
+  onUpdatePlanDecision,
+  onCommand,
+  projectOpen = false,
+  fileTree = [],
 }) => {
+  const planBlocksChatSend = chatMode === 'plan' && planState.phase === 'awaiting_decision';
+  const isPlanModeActive = chatMode === 'plan';
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
   const [attachedImage, setAttachedImage] = useState<string | null>(null);
@@ -116,6 +278,28 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const [showSearch, setShowSearch] = useState(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [sandboxMode, setSandboxMode] = useState<'sandbox' | 'unrestricted'>('sandbox');
+  const [expandedToolDetails, setExpandedToolDetails] = useState<Record<string, boolean>>({});
+  const [showAllToolDetails, setShowAllToolDetails] = useState<Record<string, boolean>>({});
+  const [outputMode, setOutputMode] = useState<OutputMode>(getInitialOutputMode);
+  const [hideToolNoise, setHideToolNoise] = useState<boolean>(getInitialNoiseFilter);
+  const [slashQuery, setSlashQuery] = useState('');
+  const showSlashMenu = slashQuery !== '';
+  const [atQuery, setAtQuery] = useState('');
+  const showAtMenu = atQuery !== '';
+
+  const density = outputMode === 'concise' ? 'compact' : outputMode === 'verbose' ? 'comfortable' : 'balanced';
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('desktop-agent-output-mode', outputMode);
+    } catch { /* ignore */ }
+  }, [outputMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('desktop-agent-hide-tool-noise', hideToolNoise ? '1' : '0');
+    } catch { /* ignore */ }
+  }, [hideToolNoise]);
 
   // 加载当前权限模式
   useEffect(() => {
@@ -212,8 +396,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   const handleSend = () => {
+    if (planBlocksChatSend) return;
     if (!input.trim() && !attachedImage) return;
-    onSend(input.trim(), attachedImage || undefined);
+    onSend(input.trim(), attachedImage || undefined, { chatMode, thinkingIntensity });
     setInput('');
     setAttachedImage(null);
     onDraftClear?.();
@@ -222,8 +407,50 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     }
   };
 
+  const handleAtMention = useCallback((item: { id: string; label: string; category: string }) => {
+    setAtQuery('');
+    // Replace the last @query with the structured mention
+    const atIdx = input.lastIndexOf('@');
+    const before = atIdx >= 0 ? input.slice(0, atIdx) : input;
+    const mention = item.id; // e.g. "file:src/app/main.py" or "git" or "knowledge"
+    const newInput = before + `@${mention} `;
+    setInput(newInput);
+    setTimeout(() => {
+      textareaRef.current?.focus();
+      adjustTextareaHeight();
+    }, 0);
+  }, [input]);
+
+  const handleCommand = useCallback((cmd: { name: string; args: string }) => {
+    setSlashQuery('');
+    if (cmd.name === 'clear') {
+      onCommand?.('clear', '');
+      setInput('');
+    } else if (cmd.name === 'help') {
+      onCommand?.('help', '');
+      setInput('');
+    } else if (cmd.name === 'compact') {
+      onCommand?.('compact', '');
+      setInput('');
+    } else if (cmd.name === 'config') {
+      onCommand?.('config', '');
+      setInput('');
+    } else if (cmd.name === 'screenshot') {
+      onCommand?.('screenshot', '');
+      setInput('');
+    } else {
+      // For commands with args, fill the command prefix and let user type args
+      setInput(`/${cmd.name} `);
+      if (cmd.args) {
+        // Focus back on textarea for arg input
+        setTimeout(() => textareaRef.current?.focus(), 0);
+      }
+    }
+  }, [onCommand]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
+      if (planBlocksChatSend) return;
       e.preventDefault();
       handleSend();
     }
@@ -266,6 +493,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   const startRecording = async () => {
+    if (planBlocksChatSend) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
@@ -339,14 +567,19 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     : messages;
 
   // Markdown 自定义渲染
+  // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
   const markdownComponents = {
-    code({ node, inline, className, children, ...props }: any) {
-      const match = /language-(\w+)/.exec(className || '');
-      const language = match ? match[1] : '';
-      const value = String(children).replace(/\n$/, '');
-      if (!inline && value) {
-        return <CodeBlock language={language} value={value} theme={resolved} />;
+    pre({ node, children, ...props }: any) {
+      const codeNode = node?.children?.[0];
+      if (codeNode?.tagName === 'code') {
+        const className = codeNode.properties?.className?.[0] || '';
+        const match = /language-(\w+)/.exec(className);
+        const value = codeNode.children?.map((c: any) => c.value).join('') || '';
+        return <CodeBlock language={match ? match[1] : ''} value={value} theme={resolved} />;
       }
+      return <pre {...props}>{children}</pre>;
+    },
+    code({ node, className, children, ...props }: any) {
       return (
         <code className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary" {...props}>
           {children}
@@ -356,7 +589,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   return (
-    <div className="h-full flex flex-col bg-app" data-density="compact">
+    <div className="h-full flex flex-col bg-app" data-density={density}>
       {/* 搜索栏 */}
       {showSearch && (
         <div className="px-4 pt-3 pb-1 border-b border-border flex items-center gap-2">
@@ -380,21 +613,60 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         </div>
       )}
 
+      {/* 输出风格控制 */}
+      <div className="px-[var(--chat-space-lg)] pt-[var(--chat-space-md)] pb-[var(--chat-space-sm)] border-b border-border-subtle flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5">
+          {(['concise', 'balanced', 'verbose'] as OutputMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setOutputMode(mode)}
+              className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
+                outputMode === mode
+                  ? 'bg-surface-alt border-border text-fg'
+                  : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
+              }`}
+            >
+              {mode === 'concise' ? 'Concise' : mode === 'balanced' ? 'Balanced' : 'Verbose'}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={() => setHideToolNoise((v) => !v)}
+          className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
+            hideToolNoise
+              ? 'bg-info/12 border-info/30 text-info'
+              : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
+          }`}
+        >
+          {hideToolNoise ? 'Noise filter: ON' : 'Noise filter: OFF'}
+        </button>
+      </div>
+
       {/* 消息列表 */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-[var(--chat-space-lg)] space-y-[var(--chat-message-gap)] relative">
+        {chatMode === 'plan' && (planState.goal || planState.draft) && (
+          <div className="sticky top-0 z-20 mb-2 rounded-md border border-accent/30 bg-surface/95 backdrop-blur px-3 py-2">
+            <div className="chat-text-xs text-fg-secondary">
+              <span className="text-fg font-medium">Task requirement:</span>{' '}
+              {planState.goal || planState.draft.split('\n')[0]?.replace(/^Goal:\s*/, '') || ''}
+            </div>
+          </div>
+        )}
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-fg-muted">
             <div className="text-4xl mb-4">🖥️</div>
-            <div className="text-lg font-medium mb-2">Desktop Agent Ready</div>
-            <div className="text-sm text-center max-w-md">
+            <div className="text-lg font-medium mb-2 text-fg">Desktop Agent Ready</div>
+            <div className="text-sm text-center max-w-md text-fg-secondary">
               I can help you control your computer: manage files, run commands,<br />
               control the browser, operate desktop keyboard &amp; mouse, and interact with other applications.
             </div>
             <div className="mt-6 grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary">Read / Write Files</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary">Browser Automation</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary">Keyboard &amp; Mouse</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary">Window Management</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Read / Write Files</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Browser Automation</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Keyboard &amp; Mouse</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Window Management</div>
             </div>
           </div>
         )}
@@ -460,7 +732,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       ? 'bg-accent/15 text-fg rounded-lg px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] ml-auto max-w-[85%] border border-accent/20 chat-text-sm'
                       : msg.role === 'system'
                       ? 'bg-danger/10 text-danger rounded px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs border border-danger/20'
-                      : 'text-fg-secondary py-[var(--chat-space-xs)]'
+                      : 'text-fg py-[var(--chat-space-xs)]'
                   }`}>
                     {/* Retry button */}
                     {msg.role === 'assistant' && !msg.isTool && onRetry && !isRunning && msg.id === messages[messages.length - 1]?.id && (
@@ -494,7 +766,50 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                     {/* New: render blocks inline (primary path for assistant messages) */}
                     {msg.role === 'assistant' && msg.blocks && msg.blocks.length > 0 ? (
                       <div className="space-y-[var(--chat-block-gap)]">
-                        {msg.blocks.map((block, bi) => renderBlock(block, bi))}
+                        {(() => {
+                          const toolBlocks = msg.blocks.filter(
+                            (block): block is Extract<AssistantBlock, { type: 'tool_call' }> => block.type === 'tool_call'
+                          );
+                          const nonToolBlocks = msg.blocks.filter((block) => block.type !== 'tool_call');
+                          const isExpanded = expandedToolDetails[msg.id] === true;
+                          const showAll = showAllToolDetails[msg.id] === true;
+                          const filteredToolBlocks =
+                            hideToolNoise && !showAll
+                              ? toolBlocks.filter((block) => !isNoisyToolBlock(block))
+                              : toolBlocks;
+                          const hiddenCount = Math.max(toolBlocks.length - filteredToolBlocks.length, 0);
+
+                          return (
+                            <>
+                              {nonToolBlocks.map((block, bi) => renderBlock(block, bi))}
+                              {msg.toolSummary && toolBlocks.length > 0 && (
+                                <ToolSummaryRow
+                                  summary={msg.toolSummary}
+                                  expanded={isExpanded}
+                                  onToggle={() =>
+                                    setExpandedToolDetails((prev) => ({ ...prev, [msg.id]: !isExpanded }))
+                                  }
+                                />
+                              )}
+                              {toolBlocks.length > 0 && (isExpanded || !msg.toolSummary) && (
+                                <div className="space-y-[var(--chat-block-gap)]">
+                                  {filteredToolBlocks.map((block, bi) => renderBlock(block, bi))}
+                                  {hiddenCount > 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setShowAllToolDetails((prev) => ({ ...prev, [msg.id]: true }))
+                                      }
+                                      className="chat-text-xs text-fg-muted hover:text-fg-secondary border border-border-subtle rounded px-2 py-1 bg-surface"
+                                    >
+                                      Show {hiddenCount} hidden read/search/list calls
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                     ) : msg.role === 'assistant' && msg.reasoning ? (
                       /* Fallback: old sessions without blocks */
@@ -518,6 +833,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                         <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
                           {msg.content}
                         </ReactMarkdown>
+                      </div>
+                    ) : msg.role === 'user' && msg.content ? (
+                      <div className="prose prose-sm chat-prose chat-prose-plain max-w-none">
+                        <p className="whitespace-pre-wrap">{msg.content}</p>
                       </div>
                     ) : msg.content ? (
                       <span>{msg.content}</span>
@@ -555,6 +874,142 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
       {/* Input area */}
       <div className="border-t border-border p-[var(--chat-space-lg)] bg-surface">
+        {chatMode === 'plan' && (
+          <div
+            className="mb-2 rounded-lg border px-3 py-1.5 chat-text-xs text-fg border-[color-mix(in_srgb,var(--plan-pill-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--plan-pill-bg)_18%,var(--bg-surface))]"
+            role="status"
+          >
+            <span className="font-medium">Plan mode</span>
+            {' — '}
+            Your next message follows the Plan flow (clarify → draft → approve → build).
+          </div>
+        )}
+        {planBlocksChatSend && (
+          <div
+            className="mb-2 rounded-lg border border-warning/35 bg-warning/10 px-3 py-1.5 chat-text-xs text-warning"
+            role="alert"
+          >
+            Please complete the questions above before sending a new chat message.
+          </div>
+        )}
+        {chatMode === 'plan' && (
+          <div className="mb-2 rounded-md border border-info/25 bg-info/8 px-3 py-2 space-y-2">
+            {/* ── Phase: clarifying / planning ── */}
+            {(planState.phase === 'clarifying' || planState.phase === 'planning') && (
+              <div className="flex items-center gap-2 chat-text-xs text-fg-muted">
+                <span className="inline-block w-2 h-2 rounded-full bg-accent animate-pulse" />
+                Researching & planning{planState.goal ? `: ${planState.goal.slice(0, 100)}` : '…'}
+              </div>
+            )}
+
+            {/* ── Phase: awaiting_decision (structured questions) ── */}
+            {planState.phase === 'awaiting_decision' && (
+              <>
+                {planState.pending_clarification && (
+                  <div className="chat-text-xs text-warning/90 border border-warning/25 rounded px-2 py-1 bg-warning/8">
+                    Please answer the questions below to continue.
+                  </div>
+                )}
+                {planState.questions.length > 0 && (
+                  <div className="space-y-2">
+                    {planState.questions.map((q) => (
+                      <PlanQuestionCard
+                        key={q.id}
+                        question={q}
+                        onChange={(selected) => onUpdatePlanDecision(q.id, selected)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* ── Phase: awaiting_approval — plan draft + Build button ── */}
+            {planState.phase === 'awaiting_approval' && (
+              <>
+                {planState.plan_file_path && (
+                  <div className="flex items-center justify-between chat-text-xs text-fg-muted bg-surface rounded px-2 py-1">
+                    <span className="truncate" title={planState.plan_file_path}>
+                      Plan: {planState.plan_file_path}
+                    </span>
+                    <button
+                      type="button"
+                      className="ml-2 px-2 py-0.5 rounded border border-border text-fg-secondary hover:text-fg hover:border-fg-muted shrink-0"
+                      onClick={() => {
+                        if (typeof window !== 'undefined' && (window as any).electronAPI?.openPath) {
+                          (window as any).electronAPI.openPath(planState.plan_file_path);
+                        }
+                      }}
+                      title="Open plan file in editor"
+                    >
+                      Open
+                    </button>
+                  </div>
+                )}
+                {planState.draft && (
+                  <div className="chat-text-xs text-fg-secondary max-h-64 overflow-y-auto">
+                    <div className="prose prose-sm max-w-none dark:prose-invert">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {planState.draft.slice(0, 4000) + (planState.draft.length > 4000 ? '\n\n*[truncated]*' : '')}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                )}
+                {planState.todos.length > 0 && (
+                  <details className="chat-text-xs text-fg-muted">
+                    <summary className="cursor-pointer text-fg-secondary">To-Do ({planState.todos.length})</summary>
+                    <div className="mt-1 space-y-1">
+                      {planState.todos.map((t) => (
+                        <div key={t.id} className="text-fg-muted">
+                          [{t.status}] {t.title}
+                          {t.depends_on && t.depends_on.length > 0 && (
+                            <span className="block text-[10px] text-fg-muted mt-0.5">
+                              Depends on: {t.depends_on.join(', ')}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+                <button
+                  type="button"
+                  onClick={onBuildPlan}
+                  className="chat-text-xs w-full px-3 py-2 rounded font-medium bg-accent text-fg-on-accent hover:brightness-110 transition"
+                  title="Approve plan and start execution"
+                >
+                  Start Build
+                </button>
+                <div className="chat-text-xs text-fg-muted text-center">
+                  Not what you expected? Describe changes in chat and I&apos;ll revise the plan.
+                </div>
+              </>
+            )}
+
+            {/* ── Phase: approved_waiting_build / executing ── */}
+            {(planState.phase === 'approved_waiting_build' || planState.phase === 'executing') && (
+              <>
+                <div className="flex items-center gap-2 chat-text-xs text-accent font-medium">
+                  <span className="inline-block w-2 h-2 rounded-full bg-accent animate-pulse" />
+                  Executing plan{planState.goal ? `: ${planState.goal.slice(0, 80)}` : '…'}
+                </div>
+                {planState.todos.length > 0 && (
+                  <div className="rounded border border-border-subtle bg-surface px-2 py-1">
+                    <div className="chat-text-xs text-fg-secondary mb-1">To-Do</div>
+                    <div className="space-y-1">
+                      {planState.todos.map((t) => (
+                        <div key={t.id} className="chat-text-xs text-fg-muted">
+                          <span className="text-fg-secondary">[{t.status}]</span> {t.title}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         {attachedImage && (
           <div className="mb-2 flex items-center gap-2">
             <div className="relative inline-block">
@@ -565,7 +1020,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               />
               <button
                 onClick={() => setAttachedImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-red-500 rounded-full text-white text-xs flex items-center justify-center"
+                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-white text-xs flex items-center justify-center"
                 aria-label="Remove image"
               >
                 ×
@@ -598,7 +1053,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           {isRecording ? (
             <button
               onClick={stopRecording}
-              className="p-2 rounded-lg transition-colors bg-red-600 hover:bg-red-500 text-white animate-pulse"
+              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-white animate-pulse"
               title="Click to stop recording"
               aria-label="Stop recording"
             >
@@ -610,9 +1065,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           ) : (
             <button
               onClick={startRecording}
-              disabled={isTranscribing || isRunning}
+              disabled={isTranscribing || isRunning || planBlocksChatSend}
               className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors disabled:opacity-50"
-              title="Voice input"
+              title={planBlocksChatSend ? 'Voice input disabled while answering plan questions' : 'Voice input'}
               aria-label="Voice input"
             >
               {isTranscribing ? (
@@ -627,24 +1082,62 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             <textarea
               ref={textareaRef}
               value={input}
-              disabled={isRecording || isTranscribing}
+              disabled={isRecording || isTranscribing || planBlocksChatSend}
               onChange={(e) => {
-                setInput(e.target.value);
+                const val = e.target.value;
+                setInput(val);
                 adjustTextareaHeight();
+                // Slash command detection: / at start of input
+                if (val.startsWith('/') && !val.includes(' ')) {
+                  setSlashQuery(val);
+                } else {
+                  setSlashQuery('');
+                }
+                // @Mention detection: @ anywhere in input (look for last @)
+                const atIdx = val.lastIndexOf('@');
+                if (atIdx >= 0) {
+                  const afterAt = val.slice(atIdx);
+                  if (!afterAt.includes(' ') && afterAt.length <= 30) {
+                    setAtQuery(afterAt);
+                  } else {
+                    setAtQuery('');
+                  }
+                } else {
+                  setAtQuery('');
+                }
               }}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               placeholder={
-                isRecording
+                planBlocksChatSend
+                  ? 'Complete the plan questions above to continue…'
+                  : isRecording
                   ? 'Recording... Click mic to stop'
                   : isTranscribing
                   ? 'Transcribing audio...'
                   : 'Type a message... (Shift+Enter for new line)'
               }
               rows={1}
-              className="w-full bg-surface-input border border-border rounded-lg px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] pr-10 chat-text-sm text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-32 disabled:opacity-60"
-              style={{ minHeight: '40px' }}
+              className="w-full min-h-[40px] bg-surface-input border border-border rounded-lg px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] pr-10 chat-text-sm text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-32 disabled:opacity-60"
             />
+            {showSlashMenu && (
+              <SlashCommandMenu
+                query={slashQuery}
+                onSelect={(cmd) => handleCommand(cmd)}
+                onClose={() => setSlashQuery('')}
+                inputRef={textareaRef}
+              />
+            )}
+            {showAtMenu && (
+              <AtMentionMenu
+                query={atQuery}
+                onSelect={(item) => handleAtMention(item)}
+                onClose={() => setAtQuery('')}
+                inputRef={textareaRef}
+                projectOpen={projectOpen}
+                fileTree={fileTree}
+              />
+            )}
           </div>
 
           {/* Sandbox mode toggle */}
@@ -654,8 +1147,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             title={sandboxMode === 'sandbox' ? 'Sandbox mode — click for Unrestricted' : 'Unrestricted mode — click for Sandbox'}
             className={`p-2 rounded-lg transition-colors disabled:opacity-50 ${
               sandboxMode === 'sandbox'
-                ? 'text-green-500 hover:bg-surface-hover hover:text-green-400'
-                : 'text-orange-500 hover:bg-surface-hover hover:text-orange-400'
+                ? 'text-success hover:bg-surface-hover hover:text-success/85'
+                : 'text-warning hover:bg-surface-hover hover:text-warning/85'
             }`}
           >
             {sandboxMode === 'sandbox' ? <Shield className="w-5 h-5" /> : <ShieldOff className="w-5 h-5" />}
@@ -663,16 +1156,73 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
           <button
             onClick={isRunning ? onStop : handleSend}
-            disabled={!isRunning && !input.trim() && !attachedImage}
+            disabled={!isRunning && (planBlocksChatSend || (!input.trim() && !attachedImage))}
             aria-label={isRunning ? 'Stop' : 'Send'}
+            title={planBlocksChatSend ? 'Send disabled until plan questions are answered' : undefined}
             className={`p-2 rounded-lg transition-colors ${
               isRunning
-                ? 'bg-red-600 hover:bg-red-500 text-white'
+                ? 'bg-danger hover:bg-danger/85 text-white'
                 : 'bg-accent/85 hover:bg-accent text-white disabled:bg-surface-alt disabled:text-fg-muted'
             }`}
           >
             {isRunning ? <Square className="w-5 h-5" /> : <Send className="w-5 h-5" />}
           </button>
+        </div>
+
+        <div
+          className="mt-2 pt-2 border-t border-border-subtle flex items-center justify-between gap-3 flex-wrap"
+          aria-label="Chat mode and thinking intensity"
+        >
+          <div className="flex items-center gap-2">
+            <span className="chat-text-xs text-fg-muted">Mode</span>
+            <button
+              type="button"
+              onClick={() => onChatModeChange('agent')}
+              className={`chat-text-xs px-2.5 py-1 rounded-md border transition-colors ${
+                chatMode === 'agent'
+                  ? 'bg-surface-alt border-border text-fg'
+                  : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
+              }`}
+            >
+              Agent
+            </button>
+            <button
+              type="button"
+              onClick={() => onChatModeChange('plan')}
+              aria-pressed={isPlanModeActive}
+              aria-label="Plan mode"
+              className={`chat-text-xs inline-flex items-center gap-1 pl-2 pr-1.5 py-1 rounded-full border transition-colors ${
+                isPlanModeActive
+                  ? 'shadow-sm border-[color:var(--plan-pill-border)] bg-[color:var(--plan-pill-bg)] text-[color:var(--plan-pill-fg)]'
+                  : 'border-border-subtle text-fg-muted hover:text-fg-secondary bg-surface'
+              }`}
+            >
+              <PlanModeIcon className="shrink-0 opacity-90" />
+              <span className="font-medium pr-0.5">Plan</span>
+              <ChevronDown className="w-3 h-3 shrink-0 opacity-60" aria-hidden />
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="chat-text-xs text-fg-muted">Thinking</span>
+            {(['low', 'medium', 'high'] as ThinkingIntensity[]).map((level) => (
+              <button
+                key={level}
+                type="button"
+                onClick={() => onThinkingIntensityChange(level)}
+                className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
+                  thinkingIntensity === level
+                    ? 'bg-info/12 border-info/30 text-info'
+                    : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
+                }`}
+              >
+                {level}
+              </button>
+            ))}
+            <span className="chat-text-xs text-fg-muted ml-1" title="Server plan phase">
+              Status: {planPhaseLabel(planState.phase)}
+            </span>
+          </div>
         </div>
       </div>
     </div>

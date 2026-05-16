@@ -46,6 +46,19 @@ class TestFileReadTool:
         result = await tool.execute(path=str(test_file))
         assert "too large" in result.error.lower()
 
+    @pytest.mark.asyncio
+    async def test_read_accepts_file_path_alias(self, tool, temp_dir, monkeypatch):
+        from app.project_manager import ProjectManager
+
+        monkeypatch.setattr(ProjectManager, "_current_project", {"path": str(temp_dir), "name": "tmp"})
+        test_file = temp_dir / "alias.txt"
+        test_file.write_text("alias-ok", encoding="utf-8")
+
+        result = await tool.execute(file_path="alias.txt", project_relative=True)
+
+        assert result.error == ""
+        assert "alias-ok" in result.output
+
 
 class TestFileWriteTool:
     @pytest.fixture
@@ -172,6 +185,20 @@ class TestFileDeleteTool:
 
 class TestFileSandbox:
     """路径沙箱安全测试"""
+
+    @pytest.fixture(autouse=True)
+    def _force_sandbox_mode(self, monkeypatch):
+        """Tests must not depend on local models.yaml sandbox_mode (e.g. unrestricted)."""
+        import app.config as config_mod
+
+        orig = config_mod.load_config
+
+        def wrapped():
+            c = orig()
+            c.settings.sandbox_mode = "sandbox"
+            return c
+
+        monkeypatch.setattr(config_mod, "load_config", wrapped)
 
     @pytest.fixture
     def read_tool(self):

@@ -31,6 +31,12 @@ describe('useChatSession', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.setItem('desktop-agent-chat-mode', 'agent')
+    mockSend.mockReset()
+    mockSend.mockReturnValue(true)
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({ json: () => Promise.resolve({ error: 'not found' }) })
+    ))
     mockedUseWebSocket.mockReturnValue({
       isConnected: true,
       send: mockSend,
@@ -62,11 +68,15 @@ describe('useChatSession', () => {
       model_id: 'gpt-4o',
       role_id: 'desktop-agent',
       image_base64: undefined,
+      chat_mode: 'agent',
+      thinking_intensity: 'medium',
     })
   })
 
   it('stops running when websocket send fails', () => {
-    mockSend.mockReturnValueOnce(false)
+    mockSend.mockImplementation((payload: { type?: string }) =>
+      payload?.type === 'chat' ? false : true,
+    )
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
     act(() => {
@@ -108,6 +118,52 @@ describe('useChatSession', () => {
     // Re-read blocks from the updated state (not stale reference)
     expect(result.current.messages[0].blocks![0].type).toBe('text')
     expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello world')
+  })
+
+  it('hydrates a full backend history snapshot', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [
+            { role: 'system', content: 'system' },
+            { role: 'user', content: 'hello history' },
+            {
+              role: 'assistant',
+              content: 'I will read it',
+              tool_calls: [{
+                id: 'call-1',
+                type: 'function',
+                function: { name: 'file_read', arguments: '{"path":"a.txt"}' },
+              }],
+            },
+            { role: 'tool', tool_call_id: 'call-1', name: 'file_read', content: 'file body' },
+          ],
+        },
+      })
+    })
+
+    expect(result.current.messages).toHaveLength(2)
+    expect(result.current.messages[0].role).toBe('user')
+    expect(result.current.messages[0].content).toBe('hello history')
+    expect(result.current.messages[1].blocks?.some((b) => b.type === 'tool_call')).toBe(true)
+    expect(result.current.toolCalls[0].result).toBe('file body')
   })
 
   it('handles tool_call event', async () => {
@@ -388,5 +444,86 @@ describe('useChatSession', () => {
     expect(result.current.messages).toEqual([])
     expect(result.current.toolCalls).toEqual([])
     expect(result.current.isRunning).toBe(false)
+  })
+
+  it('setChatMode sends set_chat_mode to the server', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('plan')
+    })
+
+    expect(result.current.chatMode).toBe('plan')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
+  })
+
+  it('applies chat_mode events from the server', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'plan' } })
+    })
+    expect(result.current.chatMode).toBe('plan')
+
+    act(() => {
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'agent' } })
+    })
+    expect(result.current.chatMode).toBe('agent')
+  })
+
+  it('history_snapshot does not downgrade plan to agent when plan phase is idle', () => {
+    localStorage.setItem('desktop-agent-chat-mode', 'plan')
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-merge', 'gpt-4o'))
+
+    expect(result.current.chatMode).toBe('plan')
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-merge',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          plan_state: {
+            mode: 'agent',
+            phase: 'idle',
+            goal: '',
+            draft: '',
+            structured_plan: null,
+            questions: [],
+            todos: [],
+            decisions: {},
+            approved: false,
+            pending_clarification: false,
+          },
+          messages: [],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('plan')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
+    localStorage.setItem('desktop-agent-chat-mode', 'agent')
   })
 })

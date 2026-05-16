@@ -1,6 +1,6 @@
 import os
 import yaml
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, PrivateAttr
 
 from app.runtime_paths import default_config_path
@@ -17,6 +17,7 @@ class ModelInfo(BaseModel):
 class ProviderConfig(BaseModel):
     base_url: str
     api_key: str
+    litellm_provider: str = ""
     models: List[ModelInfo]
 
     # The api_key field stores the resolved value (env vars expanded). The raw
@@ -31,18 +32,41 @@ class RagConfig(BaseModel):
     min_score: float = 0.3
     top_k: int = 5
 
+class CodingAgentConfig(BaseModel):
+    enabled: bool = True
+    default_execution_mode: str = "worktree"
+    max_fix_rounds: int = 2
+    max_parallel_workers: int = 3
+    require_verification: bool = True
+    require_review: bool = True
+    auto_generate_repo_map: bool = True
+
+class AutoApproveRule(BaseModel):
+    """A permission rule for auto-approval of tool calls."""
+    tool: str = ""             # Tool name pattern (supports * wildcard)
+    path: str = ""             # File path pattern (supports * wildcard)
+    action: str = "allow"      # "allow" or "deny"
+    risk: str = ""             # Optional: only match specific risk level ("low", "medium", "high")
+
 class Settings(BaseModel):
     default_model: str
     default_provider: str
-    max_iterations: int = 50
+    max_iterations: int = 10000
     auto_approve: bool = False
     screenshot_on_step: bool = True
     sandbox_mode: str = "sandbox"
+    thinking_intensity_default: str = "medium"
+    thinking_policy_by_provider: Dict[str, Dict[str, Any]] = {}
+    collaboration_mode: str = "serial"
+    max_parallel_agents: int = 3
+    review_gate_enabled: bool = True
+    auto_approve_rules: List[AutoApproveRule] = []
 
 class AppConfig(BaseModel):
     providers: Dict[str, ProviderConfig]
     settings: Settings
     rag: RagConfig = RagConfig()
+    coding_agent: CodingAgentConfig = CodingAgentConfig()
 
 _config: Optional[AppConfig] = None
 
@@ -91,12 +115,15 @@ def save_config(cfg: AppConfig) -> None:
         providers_data[name] = {
             "base_url": provider.base_url,
             "api_key": raw_key,
+            "litellm_provider": provider.litellm_provider,
             "models": [m.model_dump() for m in provider.models],
         }
 
     data: Dict[str, object] = {
         "providers": providers_data,
         "settings": cfg.settings.model_dump(),
+        "rag": cfg.rag.model_dump(),
+        "coding_agent": cfg.coding_agent.model_dump(),
     }
 
     # 原子写入：先写临时文件，再 os.replace

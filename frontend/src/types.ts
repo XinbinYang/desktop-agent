@@ -1,3 +1,10 @@
+export interface SuggestedModel {
+  id: string;
+  suggested_name: string;
+  suggested_context: number;
+  vision: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
@@ -18,6 +25,7 @@ export interface ProviderSettings {
   base_url: string;
   api_key_masked: string;
   api_key_configured?: boolean;
+  litellm_provider: string;
   models: ModelInfo[];
 }
 
@@ -28,11 +36,26 @@ export interface AppSettings {
   auto_approve: boolean;
   screenshot_on_step: boolean;
   sandbox_mode: string;
+  thinking_intensity_default?: ThinkingIntensity;
+  collaboration_mode?: "serial" | "parallel" | "hybrid";
+  max_parallel_agents?: number;
+  review_gate_enabled?: boolean;
+}
+
+export interface CodingAgentSettings {
+  enabled: boolean;
+  default_execution_mode: "worktree" | "current_dir" | string;
+  max_fix_rounds: number;
+  max_parallel_workers: number;
+  require_verification: boolean;
+  require_review: boolean;
+  auto_generate_repo_map: boolean;
 }
 
 export interface SettingsResponse {
   providers: Record<string, ProviderSettings>;
   settings: AppSettings;
+  coding_agent?: CodingAgentSettings;
 }
 
 export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video';
@@ -96,6 +119,93 @@ export interface ToolCall {
   workerEvents?: WorkerEvent[];
 }
 
+export interface ToolSummary {
+  total: number;
+  success: number;
+  error: number;
+  running: number;
+  toolBuckets: Array<{ label: string; count: number }>;
+}
+
+export interface RunEvent {
+  id: string;
+  type:
+    | 'run_created'
+    | 'context_pack'
+    | 'guardrail_decision'
+    | 'approval_required'
+    | 'verification_start'
+    | 'verification_result'
+    | 'review_finding'
+    | 'run_completed';
+  runId?: string;
+  timestamp: number;
+  data: Record<string, any>;
+}
+
+export type ClientChatMode = "agent" | "plan";
+export type ThinkingIntensity = "low" | "medium" | "high";
+
+export interface PlanQuestionOption {
+  id: string;
+  label: string;
+}
+
+export interface PlanQuestion {
+  id: string;
+  prompt: string;
+  allow_multiple?: boolean;
+  options: PlanQuestionOption[];
+  selected?: string[];
+}
+
+export type PlanTodoStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
+
+export interface PlanTodo {
+  id: string;
+  title: string;
+  status: PlanTodoStatus;
+  depends_on?: string[];
+  owner?: string;
+  parallel_group?: string;
+  acceptance_criteria?: string;
+}
+
+export interface StructuredPlanStep {
+  id: string;
+  title: string;
+  details?: string;
+  depends_on?: string[];
+  parallel_group?: string;
+}
+
+export interface StructuredPlanDraft {
+  goal: string;
+  assumptions: string[];
+  steps: StructuredPlanStep[];
+  todos: PlanTodo[];
+  risks: string[];
+  acceptance_criteria: string[];
+}
+
+export interface PlanState {
+  mode: ClientChatMode;
+  phase: "idle" | "clarifying" | "planning" | "awaiting_decision" | "awaiting_approval" | "approved_waiting_build" | "executing" | "completed";
+  goal: string;
+  draft: string;
+  structured_plan?: StructuredPlanDraft | null;
+  questions: PlanQuestion[];
+  todos: PlanTodo[];
+  decisions: Record<string, string[]>;
+  approved: boolean;
+  /** Server: full todos withheld until user answers clarification questions */
+  pending_clarification?: boolean;
+  /** Path to the rendered plan markdown file on disk */
+  plan_file_path?: string | null;
+  /** Markdown research notes from the exploration phase */
+  research_notes?: string;
+}
+
 export type AssistantBlock =
   | { type: 'thinking'; text: string; timestamp: number }
   | { type: 'text'; text: string; timestamp: number }
@@ -122,6 +232,7 @@ export interface ChatMessage {
   reasoning?: string;
   skill?: string;
   blocks?: AssistantBlock[];
+  toolSummary?: ToolSummary;
   turnComplete?: boolean;
 }
 
@@ -187,9 +298,33 @@ export interface WorkflowData {
   steps: { step_id: string; tool_name: string; args: Record<string, any>; param_args?: Record<string, any> }[];
 }
 
+export interface ErrorData {
+  category: string;       // ErrorCategory: auth, network, rate_limit, provider, timeout, context_length, sandbox, tool_failure, tool_not_found, validation, not_found, internal, unknown
+  message: string;
+  retryable: boolean;
+  details?: Record<string, any>;
+}
+
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done';
+  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'compacted' | 'model_switched';
   data: any;
+}
+
+/** Extract a display message from either a structured error or legacy flat error. */
+export function errorMessage(data: any): string {
+  if (typeof data === 'string') return data;
+  if (data?.message) return data.message;
+  return JSON.stringify(data);
+}
+
+/** Check whether an error event is retryable. */
+export function isRetryableError(data: any): boolean {
+  return !!(data?.retryable);
+}
+
+/** Get the error category, falling back to 'unknown'. */
+export function errorCategory(data: any): string {
+  return data?.category || 'unknown';
 }
 
 declare global {

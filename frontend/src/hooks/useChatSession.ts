@@ -1,10 +1,36 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { ChatMessage, ToolCall, AssistantBlock, WS_EVENT, WorkerEvent, FileEdit } from '../types';
+import { useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
+import {
+  ChatMessage,
+  ToolCall,
+  AssistantBlock,
+  WS_EVENT,
+  WorkerEvent,
+  FileEdit,
+  ToolSummary,
+  ClientChatMode,
+  errorMessage,
+  isRetryableError,
+  ThinkingIntensity,
+  PlanQuestion,
+  PlanState,
+  PlanTodo,
+  RunEvent,
+} from '../types';
 import { useWebSocket } from './useWebSocket';
+import { API_BASE } from '../config';
 import { saveSession, loadSession, saveDraft, loadDraft, deleteDraft } from '../lib/db';
 
 function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function initialChatModeFromStorage(): ClientChatMode {
+  try {
+    const v = localStorage.getItem('desktop-agent-chat-mode');
+    return v === 'plan' ? 'plan' : 'agent';
+  } catch {
+    return 'agent';
+  }
 }
 
 function appendBlock(
@@ -40,6 +66,55 @@ function appendBlock(
     });
   }
   return updated;
+}
+
+function toolBucketLabel(name: string): string {
+  const n = (name || '').toLowerCase();
+  if (n.includes('file_read')) return 'Read';
+  if (n.includes('file_search')) return 'Search';
+  if (n.includes('file_list')) return 'List';
+  if (n.includes('file_write') || n.includes('file_patch') || n.includes('file_edit')) return 'Edit';
+  if (n.includes('code_search') || n.includes('repo_map') || n.includes('file_outline')) return 'Code';
+  if (n.includes('verify_project') || n.includes('run_review')) return 'Verify';
+  if (n.includes('shell')) return 'Shell';
+  if (n.includes('browser')) return 'Browser';
+  if (n.includes('dispatch') || n.includes('worker')) return 'Agent';
+  return n ? n.replace(/_/g, ' ') : 'Tool';
+}
+
+function buildToolSummary(blocks?: AssistantBlock[]): ToolSummary | undefined {
+  if (!blocks || blocks.length === 0) return undefined;
+  const toolBlocks = blocks.filter((b): b is Extract<AssistantBlock, { type: 'tool_call' }> => b.type === 'tool_call');
+  if (toolBlocks.length === 0) return undefined;
+
+  const total = toolBlocks.length;
+  const success = toolBlocks.filter((b) => b.status === 'success').length;
+  const error = toolBlocks.filter((b) => b.status === 'error').length;
+  const running = toolBlocks.filter((b) => b.status === 'running').length;
+
+  const buckets = new Map<string, number>();
+  for (const block of toolBlocks) {
+    const label = toolBucketLabel(block.name);
+    buckets.set(label, (buckets.get(label) || 0) + 1);
+  }
+  const toolBuckets = [...buckets.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([label, count]) => ({ label, count }));
+
+  return { total, success, error, running, toolBuckets };
+}
+
+function refreshLatestAssistantSummary(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const updated = [...messages];
+  for (let i = updated.length - 1; i >= 0; i--) {
+    if (updated[i].role !== 'assistant') continue;
+    const summary = buildToolSummary(updated[i].blocks);
+    updated[i] = { ...updated[i], toolSummary: summary };
+    return updated;
+  }
+  return messages;
 }
 
 function markTurnComplete(messages: ChatMessage[]): ChatMessage[] {
@@ -115,17 +190,195 @@ function mergeWorkerEvents(existing: WorkerEvent[] = [], incoming: WorkerEvent[]
   return merged;
 }
 
+function contentToText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part?.type === 'text') return part.text || '';
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return content == null ? '' : String(content);
+}
+
+function parseToolArgs(raw: any): Record<string, any> {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function sessionSnapshotToState(snapshot: any): {
+  messages: ChatMessage[];
+  toolCalls: ToolCall[];
+  chatMode?: ClientChatMode;
+  thinkingIntensity?: ThinkingIntensity;
+  planState?: PlanState;
+} {
+  const restoredMessages: ChatMessage[] = [];
+  const restoredToolCalls: ToolCall[] = [];
+  const pendingTools = new Map<string, { messageIndex: number; blockIndex: number; name: string; args: Record<string, any> }>();
+
+  for (const msg of snapshot?.messages || []) {
+    const role = msg?.role;
+    if (role === 'system') continue;
+
+    if (role === 'user') {
+      const text = contentToText(msg.content);
+      restoredMessages.push({
+        id: generateId(),
+        role: 'user',
+        content: text,
+        isTool: false,
+        turnComplete: true,
+      });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      const blocks: AssistantBlock[] = [];
+      const timestamp = Date.now();
+      if (msg.reasoning_content) {
+        blocks.push({ type: 'thinking', text: msg.reasoning_content, timestamp });
+      }
+      const text = contentToText(msg.content);
+      if (text) {
+        blocks.push({ type: 'text', text, timestamp });
+      }
+      for (const tc of msg.tool_calls || []) {
+        const func = tc.function || {};
+        const args = parseToolArgs(func.arguments);
+        const block: AssistantBlock = {
+          type: 'tool_call',
+          name: func.name || '',
+          args,
+          result: '[executed]',
+          status: 'success',
+          toolCallId: tc.id,
+          timestamp,
+        };
+        pendingTools.set(tc.id || `${func.name}_${blocks.length}`, {
+          messageIndex: restoredMessages.length,
+          blockIndex: blocks.length,
+          name: func.name || '',
+          args,
+        });
+        blocks.push(block);
+      }
+      if (blocks.length > 0) {
+        restoredMessages.push({
+          id: generateId(),
+          role: 'assistant',
+          content: text,
+          isTool: false,
+          blocks,
+          toolSummary: buildToolSummary(blocks),
+          turnComplete: true,
+        });
+      }
+      continue;
+    }
+
+    if (role === 'tool') {
+      const toolCallId = msg.tool_call_id || '';
+      const pending = pendingTools.get(toolCallId);
+      const result = contentToText(msg.content);
+      if (pending) {
+        const target = restoredMessages[pending.messageIndex];
+        const blocks = [...(target.blocks || [])];
+        const block = blocks[pending.blockIndex];
+        if (block?.type === 'tool_call') {
+          blocks[pending.blockIndex] = {
+            ...block,
+            result,
+            status: result.startsWith('[ERROR]') ? 'error' : 'success',
+          };
+          restoredMessages[pending.messageIndex] = {
+            ...target,
+            blocks,
+            toolSummary: buildToolSummary(blocks),
+          };
+        }
+        restoredToolCalls.push({
+          name: pending.name || msg.name || '',
+          args: pending.args,
+          result,
+          timestamp: Date.now(),
+          toolCallId,
+        });
+      } else {
+        restoredToolCalls.push({
+          name: msg.name || '',
+          args: {},
+          result,
+          timestamp: Date.now(),
+          toolCallId,
+        });
+      }
+    }
+  }
+
+  const chatMode = snapshot?.chat_mode === 'plan' ? 'plan' : snapshot?.chat_mode === 'agent' ? 'agent' : undefined;
+  const thinkingIntensity =
+    snapshot?.thinking_intensity === 'low' || snapshot?.thinking_intensity === 'medium' || snapshot?.thinking_intensity === 'high'
+      ? snapshot.thinking_intensity
+      : undefined;
+
+  return {
+    messages: restoredMessages,
+    toolCalls: restoredToolCalls,
+    chatMode,
+    thinkingIntensity,
+    planState: snapshot?.plan_state,
+  };
+}
+
 export function useChatSession(sessionId: string, currentModel: string, roleId: string = 'desktop-agent') {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
+  const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [chatMode, setChatModeState] = useState<ClientChatMode>(() => initialChatModeFromStorage());
+  const sendRef = useRef<(obj: object) => boolean>(() => false);
+  const chatModeRef = useRef<ClientChatMode>(initialChatModeFromStorage());
+  const [thinkingIntensity, setThinkingIntensity] = useState<ThinkingIntensity>(() => {
+    try {
+      const v = localStorage.getItem('desktop-agent-thinking-intensity');
+      if (v === 'low' || v === 'medium' || v === 'high') return v;
+    } catch { /* ignore */ }
+    return 'medium';
+  });
+  const [planState, setPlanState] = useState<PlanState>({
+    mode: 'agent',
+    phase: 'idle',
+    goal: '',
+    draft: '',
+    structured_plan: null,
+    questions: [],
+    todos: [],
+    decisions: {},
+    approved: false,
+    pending_clarification: false,
+    plan_file_path: null,
+    research_notes: '',
+  });
 
   const onToolCallRef = useRef<((tc: ToolCall) => void) | null>(null);
   const onFileEditRef = useRef<((edit: FileEdit) => void) | null>(null);
   const pendingWorkerEventsRef = useRef<Record<string, WorkerEvent[]>>({});
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userTouchedRef = useRef(false);
+  const [hydratedSessionId, setHydratedSessionId] = useState('');
 
   const addTerminalLog = useCallback((log: string) => {
     setTerminalLogs((prev) => [
@@ -133,6 +386,33 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
       `[${new Date().toLocaleTimeString()}] ${log}`,
     ]);
   }, []);
+
+  const recordRunEvent = useCallback((event: WS_EVENT) => {
+    const runEvent: RunEvent = {
+      id: `${event.type}_${event.data?.run_id || 'run'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: event.type as RunEvent['type'],
+      runId: event.data?.run_id,
+      timestamp: event.data?.timestamp ? event.data.timestamp * 1000 : Date.now(),
+      data: event.data || {},
+    };
+    setRunEvents((prev) => [...prev.slice(-300), runEvent]);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('desktop-agent-chat-mode', chatMode);
+    } catch { /* ignore */ }
+  }, [chatMode]);
+
+  useEffect(() => {
+    chatModeRef.current = chatMode;
+  }, [chatMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('desktop-agent-thinking-intensity', thinkingIntensity);
+    } catch { /* ignore */ }
+  }, [thinkingIntensity]);
 
   const takePendingWorkerEvents = useCallback((toolCallId?: string): WorkerEvent[] => {
     const pending = pendingWorkerEventsRef.current;
@@ -207,7 +487,44 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
   const handleMessage = useCallback(
     (event: WS_EVENT) => {
       switch (event.type) {
+        case 'history_snapshot': {
+          const restored = sessionSnapshotToState(event.data);
+          setMessages(restored.messages);
+          setToolCalls(restored.toolCalls);
+          setFileEdits([]);
+          const fromServer = restored.chatMode;
+          const serverPlanPhase = (event.data as { plan_state?: { phase?: string } })?.plan_state?.phase;
+          const prev = chatModeRef.current;
+          let merged: ClientChatMode = prev;
+          if (!fromServer) {
+            merged = prev;
+          } else if (fromServer === 'plan') {
+            merged = 'plan';
+          } else if (prev === 'plan' && fromServer === 'agent') {
+            merged = serverPlanPhase && serverPlanPhase !== 'idle' ? 'plan' : prev;
+          } else {
+            merged = fromServer;
+          }
+          setChatModeState(merged);
+          if (merged === 'plan' && fromServer === 'agent') {
+            sendRef.current({ type: 'set_chat_mode', chat_mode: 'plan' });
+          }
+          if (restored.thinkingIntensity) setThinkingIntensity(restored.thinkingIntensity);
+          if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
+          setHydratedSessionId(sessionId);
+          break;
+        }
+
+        case 'chat_mode': {
+          const m = event.data?.chat_mode;
+          if (m === 'plan' || m === 'agent') {
+            setChatModeState(m);
+          }
+          break;
+        }
+
         case 'content':
+          userTouchedRef.current = true;
           setMessages((prev) => {
             const updated = appendBlock(
               prev,
@@ -282,8 +599,8 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
                 ),
               }),
             );
-            if (withUpdate) return withUpdate;
-            return appendBlock(
+            if (withUpdate) return refreshLatestAssistantSummary(withUpdate);
+            return refreshLatestAssistantSummary(appendBlock(
               prev,
               {
                 type: 'tool_call',
@@ -297,7 +614,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
                 timestamp: Date.now(),
               },
               false,
-            );
+            ));
           });
           break;
         }
@@ -321,7 +638,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           onToolCallRef.current?.(tc);
 
           setMessages((prev) =>
-            appendBlock(
+            refreshLatestAssistantSummary(appendBlock(
               prev,
               {
                 type: 'tool_call',
@@ -334,7 +651,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
                 timestamp: Date.now(),
               },
               false,
-            ),
+            )),
           );
 
           if (event.data.image) {
@@ -364,12 +681,48 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           break;
         }
 
+        case 'run_created':
+          recordRunEvent(event);
+          addTerminalLog(`[Run] ${event.data.run_id || ''} ${event.data.mode || ''} ${event.data.worktree_path || event.data.project_path || ''}`.trim());
+          break;
+
+        case 'context_pack':
+          recordRunEvent(event);
+          addTerminalLog(`[Run] Context pack ready (${(event.data.files || []).length} files shown)`);
+          break;
+
+        case 'guardrail_decision':
+        case 'approval_required':
+          recordRunEvent(event);
+          addTerminalLog(`[Guardrail] ${event.data.decision || 'decision'}: ${event.data.reason || ''}`);
+          break;
+
+        case 'verification_start':
+          recordRunEvent(event);
+          addTerminalLog(`[Verify] ${event.data.command || ''}`);
+          break;
+
+        case 'verification_result':
+          recordRunEvent(event);
+          addTerminalLog(`[Verify] ${event.data.passed ? 'passed' : 'failed'}: ${event.data.command || ''}`);
+          break;
+
+        case 'review_finding':
+          recordRunEvent(event);
+          addTerminalLog(`[Review] ${event.data.severity || 'info'}: ${event.data.message || ''}`);
+          break;
+
+        case 'run_completed':
+          recordRunEvent(event);
+          addTerminalLog(`[Run] ${event.data.status || 'completed'}: ${event.data.summary || ''}`);
+          break;
+
         case 'status': {
           const status = event.data.status;
           if (status === 'executing') {
             // Push a running placeholder — the matching tool_call event will fill in details
             setMessages((prev) =>
-              appendBlock(
+              refreshLatestAssistantSummary(appendBlock(
                 prev,
                 {
                   type: 'tool_call',
@@ -380,7 +733,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
                   timestamp: Date.now(),
                 },
                 false,
-              ),
+              )),
             );
           } else if (status === 'completed' || status === 'max_iterations_reached') {
             setIsRunning(false);
@@ -394,7 +747,101 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           break;
         }
 
-        case 'error':
+        case 'plan_status':
+          setPlanState((prev) => ({
+            ...prev,
+            mode: (event.data.mode || prev.mode) as ClientChatMode,
+            phase: event.data.phase || prev.phase,
+            approved: typeof event.data.approved === 'boolean' ? event.data.approved : prev.approved,
+            goal: event.data.goal || prev.goal,
+            structured_plan: event.data.structured_plan ?? prev.structured_plan,
+            pending_clarification:
+              typeof event.data.pending_clarification === 'boolean'
+                ? event.data.pending_clarification
+                : prev.pending_clarification,
+            plan_file_path:
+              event.data.plan_file_path !== undefined ? event.data.plan_file_path : prev.plan_file_path,
+            research_notes:
+              typeof event.data.research_notes === 'string' ? event.data.research_notes : prev.research_notes,
+          }));
+          break;
+
+        case 'plan_draft':
+          setPlanState((prev) => ({
+            ...prev,
+            mode: 'plan',
+            draft: event.data.draft || '',
+            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+            phase: event.data.phase || prev.phase,
+            goal: event.data.goal || prev.goal,
+            structured_plan: event.data.structured_plan ?? prev.structured_plan,
+            pending_clarification:
+              typeof event.data.pending_clarification === 'boolean'
+                ? event.data.pending_clarification
+                : prev.pending_clarification,
+          }));
+          break;
+
+        case 'plan_questions':
+          setPlanState((prev) => ({
+            ...prev,
+            mode: 'plan',
+            questions: Array.isArray(event.data.questions) ? event.data.questions as PlanQuestion[] : [],
+            phase: event.data.phase || 'awaiting_decision',
+            pending_clarification:
+              typeof event.data.pending_clarification === 'boolean'
+                ? event.data.pending_clarification
+                : prev.pending_clarification,
+          }));
+          break;
+
+        case 'plan_approved_waiting_build':
+          setPlanState((prev) => ({
+            ...prev,
+            approved: true,
+            phase: 'approved_waiting_build',
+          }));
+          addTerminalLog('[计划] 已批准，等待 Build 启动');
+          setIsRunning(false);
+          break;
+
+        case 'build_started':
+          setPlanState((prev) => ({
+            ...prev,
+            phase: 'executing',
+          }));
+          addTerminalLog('[计划] Build 已启动，进入执行阶段');
+          break;
+
+        case 'plan_rejected':
+          setPlanState((prev) => ({
+            ...prev,
+            approved: false,
+            phase: 'clarifying',
+            pending_clarification: false,
+          }));
+          addTerminalLog('[计划] 已拒绝，等待修订');
+          break;
+
+        case 'todo_update':
+          setPlanState((prev) => ({
+            ...prev,
+            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+          }));
+          break;
+
+        case 'plan_file_ready':
+          setPlanState((prev) => ({
+            ...prev,
+            plan_file_path: typeof event.data.plan_file_path === 'string' ? event.data.plan_file_path : prev.plan_file_path,
+            draft: typeof event.data.markdown === 'string' ? event.data.markdown : prev.draft,
+          }));
+          addTerminalLog(`[计划] 文件已保存: ${event.data.plan_file_path}`);
+          break;
+
+        case 'error': {
+          const msg = errorMessage(event.data);
+          const retryable = isRetryableError(event.data);
           setMessages((prev) => {
             const complete = markTurnComplete(prev);
             return [
@@ -402,13 +849,24 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
               {
                 id: generateId(),
                 role: 'system',
-                content: `错误: ${event.data.message}`,
+                content: retryable ? `⚠️ ${msg} (可重试)` : `错误: ${msg}`,
                 isTool: false,
               },
             ];
           });
-          setIsRunning(false);
-          addTerminalLog(`[错误] ${event.data.message}`);
+          if (!retryable) {
+            setIsRunning(false);
+          }
+          addTerminalLog(`[错误${retryable ? '·可重试' : ''}] ${msg}`);
+          break;
+        }
+
+        case 'compacted':
+          addTerminalLog(`[压缩] 对话已压缩，从 ${event.data.message_count || '?'} 条消息中提取摘要`);
+          break;
+
+        case 'model_switched':
+          addTerminalLog(`[模型] 已切换至 ${event.data.model_id}`);
           break;
 
         case 'done':
@@ -420,6 +878,20 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           setMessages([]);
           setToolCalls([]);
           setFileEdits([]);
+          setRunEvents([]);
+          setChatModeState('agent');
+          setPlanState({
+            mode: 'agent',
+            phase: 'idle',
+            goal: '',
+            draft: '',
+            structured_plan: null,
+            questions: [],
+            todos: [],
+            decisions: {},
+            approved: false,
+            pending_clarification: false,
+          });
           addTerminalLog('[系统] 会话已清空');
           break;
 
@@ -430,41 +902,139 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           break;
       }
     },
-    [addTerminalLog, attachWorkerEvent, recordFileEdit, takePendingWorkerEvents]
+    [addTerminalLog, attachWorkerEvent, recordFileEdit, recordRunEvent, sessionId, takePendingWorkerEvents]
   );
 
   const { isConnected, send, disconnect } = useWebSocket(sessionId, handleMessage);
 
-  // 加载持久化数据
+  useLayoutEffect(() => {
+    sendRef.current = send;
+  }, [send]);
+
+  const setChatMode = useCallback((mode: ClientChatMode) => {
+    setChatModeState(mode);
+    sendRef.current({ type: 'set_chat_mode', chat_mode: mode });
+  }, []);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    send({ type: 'set_chat_mode', chat_mode: chatModeRef.current });
+  }, [isConnected, sessionId, send]);
+
+  // 加载持久化数据（不强制 WS：连接后的 effect 会同步 chat_mode）
   useEffect(() => {
     let mounted = true;
-    loadSession(sessionId).then((data) => {
-      if (!mounted || !data) return;
-      setMessages(data.messages || []);
-      setToolCalls(data.toolCalls || []);
-      setFileEdits(data.fileEdits || []);
-    });
+    userTouchedRef.current = false;
+    setHydratedSessionId('');
+
+    const hydrate = async () => {
+      const data = await loadSession(sessionId);
+      if (!mounted || userTouchedRef.current) return;
+      if (data && ((data.messages || []).length > 0 || (data.toolCalls || []).length > 0)) {
+        setMessages(data.messages || []);
+        setToolCalls(data.toolCalls || []);
+        setFileEdits(data.fileEdits || []);
+        if (data.chatMode === 'plan' || data.chatMode === 'agent') {
+          setChatModeState(data.chatMode);
+        }
+        if (data.thinkingIntensity === 'low' || data.thinkingIntensity === 'medium' || data.thinkingIntensity === 'high') {
+          setThinkingIntensity(data.thinkingIntensity);
+        }
+        if (data.planState) {
+          setPlanState((prev) => ({ ...prev, ...data.planState }));
+        }
+        setHydratedSessionId(sessionId);
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}`);
+        const snapshot = await res.json();
+        if (!mounted || userTouchedRef.current || snapshot?.error) return;
+        const restored = sessionSnapshotToState(snapshot);
+        setMessages(restored.messages);
+        setToolCalls(restored.toolCalls);
+        setFileEdits([]);
+        if (restored.chatMode) setChatModeState(restored.chatMode);
+        if (restored.thinkingIntensity) setThinkingIntensity(restored.thinkingIntensity);
+        if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
+      } catch {
+        // The WebSocket history snapshot can still hydrate the session.
+      } finally {
+        if (mounted) setHydratedSessionId(sessionId);
+      }
+    };
+
+    hydrate();
     return () => { mounted = false; };
   }, [sessionId]);
 
   // 自动保存到 IndexedDB（debounce 1s）
   useEffect(() => {
+    let cancelled = false;
+    const loadRunJournal = async () => {
+      try {
+        const listRes = await fetch(`${API_BASE}/api/runs?limit=20`);
+        const listData = await listRes.json();
+        const runIds = (listData.runs || [])
+          .filter((run: any) => !run.session_id || run.session_id === sessionId)
+          .slice(0, 6)
+          .map((run: any) => run.run_id)
+          .filter(Boolean);
+        const details = await Promise.all(
+          runIds.map(async (runId: string) => {
+            const res = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}`);
+            return res.json();
+          }),
+        );
+        if (cancelled) return;
+        const restored: RunEvent[] = [];
+        for (const detail of details) {
+          const runId = detail?.run?.run_id;
+          for (const event of detail?.events || []) {
+            const data = event.data || {};
+            restored.push({
+              id: `${event.type}_${runId || data.run_id || 'run'}_${event.timestamp}`,
+              type: event.type as RunEvent['type'],
+              runId: data.run_id || runId,
+              timestamp: event.timestamp ? event.timestamp * 1000 : Date.now(),
+              data,
+            });
+          }
+        }
+        setRunEvents((prev) => (prev.length > 0 ? prev : restored));
+      } catch {
+        // History restore is best-effort; live WebSocket events remain authoritative for the current turn.
+      }
+    };
+    loadRunJournal();
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (hydratedSessionId !== sessionId) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveSession(sessionId, messages, toolCalls, fileEdits).catch(console.error);
+      saveSession(sessionId, messages, toolCalls, fileEdits, {
+        chatMode,
+        thinkingIntensity,
+        planState,
+      }).catch(console.error);
     }, 1000);
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [sessionId, messages, toolCalls, fileEdits]);
+  }, [sessionId, hydratedSessionId, messages, toolCalls, fileEdits, chatMode, thinkingIntensity, planState]);
 
   const sendMessage = useCallback(
-    (text: string, imageBase64?: string) => {
+    (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => {
       if (!text.trim() && !imageBase64) return;
       if (!currentModel) {
         addTerminalLog('[错误] 模型未加载，请等待页面加载完成');
         return;
       }
+      userTouchedRef.current = true;
+      setHydratedSessionId(sessionId);
       setIsRunning(true);
       setMessages((prev) => [
         ...prev,
@@ -482,13 +1052,15 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
         model_id: currentModel,
         role_id: roleId,
         image_base64: imageBase64,
+        chat_mode: overrides?.chatMode || chatMode,
+        thinking_intensity: overrides?.thinkingIntensity || thinkingIntensity,
       });
       if (sent === false) {
         setIsRunning(false);
         addTerminalLog('[错误] WebSocket 未连接，消息未发送');
       }
     },
-    [send, currentModel, roleId, addTerminalLog]
+    [send, sessionId, currentModel, roleId, addTerminalLog, chatMode, thinkingIntensity]
   );
 
   const clearSession = useCallback(() => {
@@ -500,9 +1072,38 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
   }, [send]);
 
   const retryLast = useCallback(() => {
-    send({ type: 'retry', model_id: currentModel, role_id: roleId });
+    send({
+      type: 'retry',
+      model_id: currentModel,
+      role_id: roleId,
+      chat_mode: chatMode,
+      thinking_intensity: thinkingIntensity,
+    });
     setIsRunning(true);
-  }, [send, currentModel, roleId]);
+  }, [send, currentModel, roleId, chatMode, thinkingIntensity]);
+
+  const approvePlan = useCallback(() => {
+    setIsRunning(false);
+    send({ type: 'approve_plan' });
+  }, [send]);
+
+  const buildPlan = useCallback(() => {
+    setIsRunning(true);
+    send({ type: 'build_plan' });
+  }, [send]);
+
+  const rejectPlan = useCallback(() => {
+    send({ type: 'reject_plan' });
+  }, [send]);
+
+  const updatePlanDecision = useCallback((questionId: string, selected: string[]) => {
+    send({ type: 'update_plan_decision', question_id: questionId, selected });
+    setPlanState((prev) => ({
+      ...prev,
+      decisions: { ...prev.decisions, [questionId]: selected },
+      questions: prev.questions.map((q) => (q.id === questionId ? { ...q, selected } : q)),
+    }));
+  }, [send]);
 
   const executeToolDirect = useCallback(
     (toolName: string, args: any) => {
@@ -513,11 +1114,27 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
 
   const resetSession = useCallback(() => {
     disconnect();
+    userTouchedRef.current = false;
+    setHydratedSessionId('');
     setMessages([]);
     setToolCalls([]);
     setFileEdits([]);
+    setRunEvents([]);
     setTerminalLogs([]);
     setIsRunning(false);
+    setChatModeState(initialChatModeFromStorage());
+    setPlanState({
+      mode: 'agent',
+      phase: 'idle',
+      goal: '',
+      draft: '',
+      structured_plan: null,
+      questions: [],
+      todos: [],
+      decisions: {},
+      approved: false,
+      pending_clarification: false,
+    });
   }, [disconnect]);
 
   const saveInputDraft = useCallback(async (text: string) => {
@@ -536,6 +1153,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     messages,
     toolCalls,
     fileEdits,
+    runEvents,
     terminalLogs,
     isRunning,
     isConnected,
@@ -549,8 +1167,18 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     onToolCallRef,
     onFileEditRef,
     recordFileEdit,
+    sendRaw: send,
     saveInputDraft,
     loadInputDraft,
     clearInputDraft,
+    chatMode,
+    setChatMode,
+    thinkingIntensity,
+    setThinkingIntensity,
+    planState,
+    approvePlan,
+    buildPlan,
+    rejectPlan,
+    updatePlanDecision,
   };
 }

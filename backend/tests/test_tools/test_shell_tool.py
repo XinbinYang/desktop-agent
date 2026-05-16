@@ -89,3 +89,42 @@ class TestShellStartTool:
             result = await tool.execute(command="echo hi")
         assert "PID" in result.output
         assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_start_dangerous_command_blocked(self, tool):
+        result = await tool.execute(command="rm -rf /")
+        assert "不可逆操作" in result.error
+        assert "用户确认" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_git_push_force_blocked(self, tool):
+        result = await tool.execute(command="git push --force origin main")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_git_push_f_blocked(self, tool):
+        result = await tool.execute(command="git push -f origin main")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_git_reset_hard_blocked(self, tool):
+        result = await tool.execute(command="git reset --hard HEAD~1")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_git_clean_fd_blocked(self, tool):
+        result = await tool.execute(command="git clean -fd")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_git_branch_D_blocked(self, tool):
+        result = await tool.execute(command="git branch -D feature-x")
+        assert "不可逆操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_start_safe_command_allowed(self, tool):
+        if sys.platform == "win32":
+            result = await tool.execute(command="cmd /c echo safe_test")
+        else:
+            result = await tool.execute(command="echo safe_test")
+        assert result.error == ""

@@ -21,7 +21,11 @@ except Exception:
 
 class ScreenshotTool(BaseTool):
     name = "screenshot"
-    description = "截取整个屏幕或指定区域的截图，返回 base64 编码的 PNG 图片。用于让 AI '看见' 当前屏幕状态。"
+    description = (
+        "截取整个屏幕或指定区域的截图，返回 base64 编码的 PNG 图片。"
+        "用于让 AI '看见' 当前屏幕状态。"
+        "设置 annotate=true 可在截图上标注 OCR 识别到的文字元素（调试用）。"
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -29,25 +33,60 @@ class ScreenshotTool(BaseTool):
                 "type": "array",
                 "description": "截取区域 [left, top, width, height]，不传则全屏",
                 "items": {"type": "integer"}
-            }
+            },
+            "annotate": {
+                "type": "boolean",
+                "description": "是否在截图上标注 OCR 识别到的 UI 元素（默认 false）",
+            },
         },
         "required": []
     }
     
-    async def execute(self, region: Optional[list] = None) -> ToolResult:
+    async def execute(
+        self,
+        region: Optional[list] = None,
+        annotate: bool = False,
+        x: int = 0,
+        y: int = 0,
+        width: int = 0,
+        height: int = 0,
+    ) -> ToolResult:
         if not HAS_PYAUTOGUI:
             return ToolResult(error="pyautogui 未安装，无法截图")
         try:
-            if region and len(region) == 4:
+            if x and width and height:
+                img = pyautogui.screenshot(region=(x, y, width, height))
+            elif region and len(region) == 4:
                 img = pyautogui.screenshot(region=tuple(region))
             else:
                 img = pyautogui.screenshot()
-            
+
             # 压缩以节省 token
             img = img.convert("RGB")
             max_size = (1280, 720)
             img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
+
+            # Annotate with OCR results if requested
+            if annotate:
+                try:
+                    from app.ocr import get_ocr_engine
+                    import io as _io
+                    buf = _io.BytesIO()
+                    img.save(buf, format="PNG")
+                    engine = get_ocr_engine()
+                    results = engine.recognize(buf.getvalue())
+                    if results:
+                        from PIL import ImageDraw, ImageFont
+                        draw = ImageDraw.Draw(img)
+                        for r in results[:30]:
+                            draw.rectangle(
+                                [r.x, r.y, r.x + r.width, r.y + r.height],
+                                outline="red", width=1,
+                            )
+                        img = img.copy()  # ensure draw is committed
+                except Exception:
+                    pass  # Annotation is best-effort, don't fail the screenshot
+
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
             b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -57,22 +96,31 @@ class ScreenshotTool(BaseTool):
 
 class MouseClickTool(BaseTool):
     name = "mouse_click"
-    description = "在屏幕指定坐标点击鼠标。坐标系原点在屏幕左上角。"
+    description = (
+        "在屏幕指定坐标点击鼠标。坐标系原点在屏幕左上角。"
+        "设置 relative=true 可将坐标视为相对于当前鼠标位置的偏移量。"
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "x": {"type": "integer", "description": "横坐标"},
-            "y": {"type": "integer", "description": "纵坐标"},
+            "x": {"type": "integer", "description": "横坐标（或相对偏移量）"},
+            "y": {"type": "integer", "description": "纵坐标（或相对偏移量）"},
             "button": {"type": "string", "description": "鼠标按键: left/right/middle", "default": "left"},
-            "clicks": {"type": "integer", "description": "点击次数", "default": 1}
+            "clicks": {"type": "integer", "description": "点击次数", "default": 1},
+            "relative": {"type": "boolean", "description": "是否将 x,y 视为相对于当前鼠标位置的偏移", "default": False},
         },
         "required": ["x", "y"]
     }
     
-    async def execute(self, x: int, y: int, button: str = "left", clicks: int = 1) -> ToolResult:
+    async def execute(
+        self, x: int, y: int, button: str = "left", clicks: int = 1, relative: bool = False,
+    ) -> ToolResult:
         if not HAS_PYAUTOGUI:
             return ToolResult(error="pyautogui 未安装")
         try:
+            if relative:
+                cur = pyautogui.position()
+                x, y = cur[0] + x, cur[1] + y
             pyautogui.click(x, y, clicks=clicks, button=button)
             return ToolResult(output=f"已在 ({x}, {y}) 点击 {button} 键 {clicks} 次")
         except OSError as e:

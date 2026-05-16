@@ -172,7 +172,7 @@ export const AIMouseCursor: React.FC<AIMouseCursorProps> = ({
 
         {/* 输入气泡 */}
         {inputText && (
-          <div className="absolute left-5 top-4 bg-gray-800 text-gray-200 text-[10px] px-2 py-1 rounded shadow-lg whitespace-nowrap border border-gray-600">
+          <div className="absolute left-5 top-4 bg-surface text-fg text-[10px] px-2 py-1 rounded shadow-lg whitespace-nowrap border border-border-subtle">
             {inputText}...
           </div>
         )}

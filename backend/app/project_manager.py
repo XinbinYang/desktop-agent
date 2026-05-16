@@ -1,11 +1,13 @@
 import json
+import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.runtime_paths import runtime_dir
-from app.security import is_relative_to
+from app.security import is_relative_to, redact_sensitive_text
 
 # 项目数据存储目录
 PROJECTS_DIR = runtime_dir("projects")
@@ -39,6 +41,7 @@ class ProjectManager:
     """管理当前打开的项目和最近项目列表"""
 
     _current_project: Optional[Dict[str, Any]] = None
+    _lock = threading.Lock()
 
     @classmethod
     def _load_recent(cls) -> List[Dict[str, Any]]:
@@ -53,8 +56,9 @@ class ProjectManager:
     @classmethod
     def _save_recent(cls, projects: List[Dict[str, Any]]) -> None:
         try:
-            with open(RECENT_FILE, "w", encoding="utf-8") as f:
-                json.dump(projects, f, ensure_ascii=False, indent=2)
+            tmp = RECENT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, RECENT_FILE)
         except OSError as e:
             print(f"[ProjectManager] Failed to save recent projects: {e}")
 
@@ -89,7 +93,7 @@ class ProjectManager:
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
-                info["remote_url"] = result.stdout.strip() or None
+                info["remote_url"] = redact_sensitive_text(result.stdout.strip()) or None
 
             # Ahead/behind
             if info["branch"]:
@@ -150,7 +154,11 @@ class ProjectManager:
             "last_opened": datetime.now(timezone.utc).isoformat(),
         }
 
-        cls._current_project = project
+        cls._lock.acquire()
+        try:
+            cls._current_project = project
+        finally:
+            cls._lock.release()
 
         # 更新最近列表
         recent = cls._load_recent()
@@ -165,12 +173,14 @@ class ProjectManager:
     @classmethod
     def close_project(cls) -> None:
         """关闭当前项目"""
-        cls._current_project = None
+        with cls._lock:
+            cls._current_project = None
 
     @classmethod
     def get_current(cls) -> Optional[Dict[str, Any]]:
         """返回当前项目信息"""
-        return cls._current_project
+        with cls._lock:
+            return dict(cls._current_project) if cls._current_project else None
 
     @classmethod
     def list_recent(cls) -> List[Dict[str, Any]]:

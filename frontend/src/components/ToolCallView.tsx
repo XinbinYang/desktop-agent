@@ -35,11 +35,11 @@ const WorkerCard: React.FC<{ workerId: string; events: WorkerEvent[] }> = ({ wor
         className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs hover:bg-surface-hover transition-colors"
       >
         {status === 'running' ? (
-          <Loader2 className="w-3 h-3 text-blue-400 animate-spin shrink-0" />
+          <Loader2 className="w-3 h-3 text-info animate-spin shrink-0" />
         ) : status === 'failed' || status === 'cancelled' ? (
-          <XCircle className="w-3 h-3 text-red-400 shrink-0" />
+          <XCircle className="w-3 h-3 text-danger shrink-0" />
         ) : (
-          <CheckCircle2 className="w-3 h-3 text-green-400 shrink-0" />
+          <CheckCircle2 className="w-3 h-3 text-success shrink-0" />
         )}
         <Bot className="w-3 h-3 text-fg-muted shrink-0" />
         <span className="text-fg-secondary truncate flex-1 text-left">
@@ -59,7 +59,7 @@ const WorkerCard: React.FC<{ workerId: string; events: WorkerEvent[] }> = ({ wor
             <div className="space-y-[var(--chat-space-xs)]">
               {toolEvents.map((event, index) => (
                 <div key={`${event.toolName}-${index}`} className="rounded bg-surface-alt px-[var(--chat-space-md)] py-[var(--chat-space-xs)] font-mono text-fg-secondary">
-                  <span className="text-blue-300">{event.toolName}</span>
+                  <span className="text-info">{event.toolName}</span>
                   {event.toolDurationMs != null && <span className="text-fg-muted"> {event.toolDurationMs}ms</span>}
                   {event.toolResult && <div className="mt-[var(--chat-space-xs)] whitespace-pre-wrap">{event.toolResult}</div>}
                 </div>
@@ -98,15 +98,17 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
     <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/40 overflow-hidden">
       <button
         type="button"
+        aria-expanded={expanded}
+        aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
         onClick={() => (status !== 'running' || workerCount > 0) && setExpanded(!expanded)}
         className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm hover:bg-surface-hover transition-colors"
       >
         {status === 'running' ? (
-          <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />
+          <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
         ) : status === 'error' ? (
-          <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+          <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
         ) : (
-          <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+          <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
         )}
         <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
         <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
@@ -114,10 +116,10 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
           <span className="text-fg-muted tabular-nums">{durationMs}ms</span>
         )}
         {workerCount > 0 && (
-          <span className="chat-text-xs text-blue-300/90 shrink-0">{workerCount} agent{workerCount > 1 ? 's' : ''}</span>
+          <span className="chat-text-xs text-info/90 shrink-0">{workerCount} agent{workerCount > 1 ? 's' : ''}</span>
         )}
         {status === 'running' ? (
-          <span className="chat-text-xs text-blue-400/80 shrink-0 font-medium">Running</span>
+          <span className="chat-text-xs text-info/80 shrink-0 font-medium">Running</span>
         ) : expanded ? (
           <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
         ) : (

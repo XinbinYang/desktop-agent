@@ -147,6 +147,114 @@ class TestWebSocket:
             assert "status" in types
             assert "done" in types
 
+    def test_websocket_plan_chat_emits_plan_draft(self, client):
+        """Plan mode: LLM calls plan_write_draft → frontend receives plan_draft."""
+        from unittest.mock import patch, AsyncMock
+        from app.agent import PLAN_CONTINUE_MARKER
+
+        mock_llm = AsyncMock(return_value={
+            "choices": [{
+                "message": {
+                    "content": "Here is the plan.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "plan_write_draft",
+                            "arguments": json.dumps({
+                                "goal": "Test plan",
+                                "assumptions": [],
+                                "research_notes": "none",
+                                "steps": [{"id": "s1", "title": "Step 1", "details": "", "depends_on": []}],
+                                "todos": [{"id": "t1", "title": "Todo 1", "acceptance_criteria": "works", "depends_on": []}],
+                                "risks": [],
+                                "verification": [],
+                                "markdown_body": "# Test Plan\n\nTest content.",
+                            })
+                        }
+                    }]
+                }
+            }]
+        })
+
+        with patch("app.agent.ModelRouter.chat_completion_non_stream", mock_llm):
+            with client.websocket_connect("/ws/test_plan_ws") as ws:
+                ws.send_json({
+                    "type": "chat",
+                    "text": "plan this",
+                    "model_id": "gpt-4o",
+                    "chat_mode": "plan",
+                    "thinking_intensity": "medium",
+                })
+                types = []
+                for _ in range(20):
+                    msg = ws.receive_json()
+                    types.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "plan_draft" in types
+                assert "plan_status" in types
+                assert "done" in types
+
+    def test_websocket_plan_approve_then_build(self, client):
+        from unittest.mock import patch, AsyncMock
+        from app.agent import PLAN_CONTINUE_MARKER
+
+        mock_llm = AsyncMock(return_value={
+            "choices": [{
+                "message": {
+                    "content": "Here is the plan.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "plan_write_draft",
+                            "arguments": json.dumps({
+                                "goal": "Test plan",
+                                "assumptions": [],
+                                "research_notes": "none",
+                                "steps": [{"id": "s1", "title": "Step 1", "details": "", "depends_on": []}],
+                                "todos": [{"id": "t1", "title": "Todo 1", "acceptance_criteria": "works", "depends_on": []}],
+                                "risks": [],
+                                "verification": [],
+                                "markdown_body": "# Test Plan\n\nTest content.",
+                            })
+                        }
+                    }]
+                }
+            }]
+        })
+
+        with patch("app.agent.ModelRouter.chat_completion_non_stream", mock_llm):
+            with client.websocket_connect("/ws/test_plan_build_ws") as ws:
+                ws.send_json({
+                    "type": "chat",
+                    "text": "plan this work",
+                    "model_id": "gpt-4o",
+                    "chat_mode": "plan",
+                })
+                for _ in range(25):
+                    msg = ws.receive_json()
+                    if msg.get("type") == "done":
+                        break
+
+                ws.send_json({"type": "approve_plan"})
+                approve_types = []
+                for _ in range(10):
+                    msg = ws.receive_json()
+                    approve_types.append(msg["type"])
+                assert "plan_approved_waiting_build" in approve_types
+
+                ws.send_json({"type": "build_plan"})
+                build_types = []
+                for _ in range(20):
+                    msg = ws.receive_json()
+                    build_types.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "build_started" in build_types
+                assert "done" in build_types
+
     def test_websocket_clear(self, client):
         """WebSocket clear message type"""
         with client.websocket_connect("/ws/test_clear") as ws:
@@ -213,6 +321,25 @@ class TestWebSocket:
             msg = ws.receive_json()
             assert msg["type"] == "error"
             assert "not allowed" in msg["data"]["message"].lower()
+
+    def test_websocket_set_chat_mode_persists(self, client):
+        """set_chat_mode updates session, echoes chat_mode, and persists to snapshot."""
+        sid = "test_ws_set_chat_mode_persist"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "set_chat_mode", "chat_mode": "plan"})
+            msg = ws.receive_json()
+            assert msg["type"] == "chat_mode"
+            assert msg["data"]["chat_mode"] == "plan"
+        snap = client.get(f"/api/sessions/{sid}").json()
+        assert snap.get("chat_mode") == "plan"
+
+    def test_websocket_set_chat_mode_invalid(self, client):
+        sid = "test_ws_set_chat_mode_invalid"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "set_chat_mode", "chat_mode": "bogus"})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert "invalid" in msg["data"]["message"].lower()
 
 
 class TestProjectAPI:

@@ -1,11 +1,20 @@
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 
 from app.project_manager import ProjectManager
 from app.credential_manager import CredentialManager
+from app.coding_context import build_repo_map
+from app.project_rules import (
+    PROJECT_RULES_FILE,
+    USER_RULES_DIR,
+    USER_RULES_FILE,
+    get_project_rules,
+    get_user_rules,
+)
 
 router = APIRouter()
 
@@ -42,6 +51,14 @@ def list_projects():
 def get_current_project():
     """获取当前打开的项目"""
     return ProjectManager.get_current()
+
+
+@router.get("/api/projects/repomap")
+def get_project_repomap(max_files: int = 220):
+    project = ProjectManager.get_current()
+    if not project:
+        return {"error": "No current project"}
+    return build_repo_map(project["path"], max_files=max(20, min(max_files, 1000)))
 
 
 @router.post("/api/projects/open")
@@ -102,3 +119,80 @@ def create_project(req: CreateProjectRequest):
 def get_project_tree(path: str = ""):
     """获取项目文件树"""
     return {"nodes": ProjectManager.get_tree(path)}
+
+
+# ── Agent rules (.desktop-agent.md / AGENTS.md) ──────────────────────────
+
+class RulesWriteRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    content: str
+
+
+@router.get("/api/projects/rules")
+def get_project_rules_endpoint():
+    """读取当前项目的 .desktop-agent.md 规则文件。"""
+    project = ProjectManager.get_current()
+    if not project:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"category": "validation", "message": "没有打开的项目"}},
+        )
+    rules_path = Path(project["path"]) / PROJECT_RULES_FILE
+    exists = rules_path.exists()
+    content = ""
+    if exists:
+        try:
+            content = rules_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return {"error": {"category": "internal", "message": f"读取规则文件失败: {e}"}}
+    return {"path": str(rules_path), "exists": exists, "content": content}
+
+
+@router.put("/api/projects/rules")
+def save_project_rules_endpoint(req: RulesWriteRequest):
+    """保存当前项目的 .desktop-agent.md 规则文件。"""
+    project = ProjectManager.get_current()
+    if not project:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"category": "validation", "message": "没有打开的项目"}},
+        )
+    rules_path = Path(project["path"]) / PROJECT_RULES_FILE
+    try:
+        rules_path.write_text(req.content, encoding="utf-8")
+    except OSError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"category": "internal", "message": f"保存规则文件失败: {e}"}},
+        )
+    return {"status": "ok", "path": str(rules_path)}
+
+
+@router.get("/api/projects/rules/user")
+def get_user_rules_endpoint():
+    """读取全局用户规则 ~/.desktop-agent/AGENTS.md。"""
+    rules_path = Path.home() / USER_RULES_DIR / USER_RULES_FILE
+    exists = rules_path.exists()
+    content = ""
+    if exists:
+        try:
+            content = rules_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return {"error": {"category": "internal", "message": f"读取用户规则失败: {e}"}}
+    return {"path": str(rules_path), "exists": exists, "content": content}
+
+
+@router.put("/api/projects/rules/user")
+def save_user_rules_endpoint(req: RulesWriteRequest):
+    """保存全局用户规则 ~/.desktop-agent/AGENTS.md。"""
+    rules_dir = Path.home() / USER_RULES_DIR
+    rules_path = rules_dir / USER_RULES_FILE
+    try:
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text(req.content, encoding="utf-8")
+    except OSError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"category": "internal", "message": f"保存用户规则失败: {e}"}},
+        )
+    return {"status": "ok", "path": str(rules_path)}

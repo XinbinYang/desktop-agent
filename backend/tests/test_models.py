@@ -106,3 +106,10 @@ settings:
         assert "secret answer" not in rendered
         assert "secret result" not in rendered
         assert "length" in rendered
+
+    def test_thinking_intensity_maps_budget_and_temperature(self, router):
+        assert router._map_thinking_budget("low") == 2048
+        assert router._map_thinking_budget("medium") == 4096
+        assert router._map_thinking_budget("high") == 8192
+        assert router._map_generic_temperature("low", 0.5) <= 0.5
+        assert router._map_generic_temperature("high", 0.5) >= 0.5

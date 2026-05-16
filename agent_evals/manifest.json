@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "description": "Local smoke evals for Desktop Agent coding-agent engineering changes.",
+  "metrics": [
+    "success_rate",
+    "verification_pass_rate",
+    "average_iterations",
+    "tool_calls",
+    "duration_ms",
+    "changed_files",
+    "guardrail_blocks"
+  ],
+  "tasks": [
+    {
+      "id": "backend-tool-schema-smoke",
+      "category": "tooling",
+      "prompt": "Add or adjust one backend tool schema field and verify the schema appears in /api/tools.",
+      "verification": "pytest backend/tests/test_main.py -k tools"
+    },
+    {
+      "id": "file-tool-diff-regression",
+      "category": "bugfix",
+      "prompt": "Fix a file_write/file_patch diff metadata regression and add a focused backend test.",
+      "verification": "pytest backend/tests/test_tools -k file"
+    },
+    {
+      "id": "frontend-tool-view-state",
+      "category": "ui",
+      "prompt": "Adjust ToolCallView rendering for a new tool state and add a component test.",
+      "verification": "cd frontend && npx vitest run src/__tests__/components"
+    },
+    {
+      "id": "project-route-small-change",
+      "category": "api",
+      "prompt": "Add a small read-only project route and cover it with a TestClient test.",
+      "verification": "pytest backend/tests/test_main.py backend/tests/test_routes.py"
+    },
+    {
+      "id": "config-roundtrip",
+      "category": "config",
+      "prompt": "Add one optional config field and ensure save/load round-trips without leaking API keys.",
+      "verification": "pytest backend/tests/test_config.py"
+    },
+    {
+      "id": "worker-profile-readonly",
+      "category": "multi-agent",
+      "prompt": "Add a read-only worker profile and test that it excludes write tools.",
+      "verification": "pytest backend/tests -k worker"
+    },
+    {
+      "id": "frontend-settings-field",
+      "category": "ui",
+      "prompt": "Expose one backend settings field in SettingsModal and add a frontend test.",
+      "verification": "cd frontend && npx vitest run src/__tests__"
+    },
+    {
+      "id": "rag-search-edge",
+      "category": "bugfix",
+      "prompt": "Improve a knowledge search edge case and add a targeted test.",
+      "verification": "pytest backend/tests/test_tools/test_knowledge_tool.py"
+    },
+    {
+      "id": "mcp-status-display",
+      "category": "integration",
+      "prompt": "Adjust MCP status display for disconnected servers and verify rendering.",
+      "verification": "cd frontend && npx vitest run src/__tests__"
+    },
+    {
+      "id": "review-fix-loop",
+      "category": "workflow",
+      "prompt": "Make a small implementation, run verification, then address one reviewer finding.",
+      "verification": "python -m compileall backend/app && cd frontend && npx tsc --noEmit"
+    }
+  ]
+}

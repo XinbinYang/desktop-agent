@@ -89,7 +89,7 @@ def is_auth_enabled() -> bool:
 def is_valid_auth_token(token: Optional[str]) -> bool:
     expected = get_auth_token()
     if not expected:
-        return True
+        return False
     if not token:
         return False
     return secrets.compare_digest(token, expected)

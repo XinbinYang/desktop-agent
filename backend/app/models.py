@@ -4,6 +4,7 @@ import logging
 from typing import AsyncGenerator, List, Optional, Dict, Any
 import httpx
 from litellm import acompletion
+from litellm.exceptions import BadRequestError
 from app.config import get_provider_for_model
 
 logger = logging.getLogger(__name__)
@@ -59,11 +60,33 @@ class ModelRouter:
             raise ValueError(f"Unknown model (config changed?): {self.model_id}")
         return info
 
+    def _normalize_thinking_intensity(self, thinking_intensity: Optional[str]) -> str:
+        if thinking_intensity in {"low", "medium", "high"}:
+            return thinking_intensity
+        return "medium"
+
+    def _map_thinking_budget(self, thinking_intensity: Optional[str]) -> int:
+        intensity = self._normalize_thinking_intensity(thinking_intensity)
+        if intensity == "low":
+            return 2048
+        if intensity == "high":
+            return 8192
+        return 4096
+
+    def _map_generic_temperature(self, thinking_intensity: Optional[str], base: float) -> float:
+        intensity = self._normalize_thinking_intensity(thinking_intensity)
+        if intensity == "low":
+            return max(0.1, min(base, 0.3))
+        if intensity == "high":
+            return min(1.0, max(base, 0.7))
+        return base
+
     async def _call_kimi_anthropic(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict]] = None,
         max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Kimi Code API 专用：使用 Anthropic 兼容端点获取 thinking 内容。"""
         _name, provider = self._get_provider()
@@ -168,7 +191,10 @@ class ModelRouter:
         if system_text:
             payload["system"] = system_text
         # Always enable extended thinking so the frontend can show a collapsible Thinking block
-        payload["thinking"] = {"type": "enabled", "budget_tokens": 2048}
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": self._map_thinking_budget(thinking_intensity),
+        }
 
         if tools:
             anthropic_tools = []
@@ -252,33 +278,135 @@ class ModelRouter:
             "usage": data.get("usage", {}),
         }
 
+    def _is_deepseek(self) -> bool:
+        provider_name, provider = self._get_provider()
+        return provider_name == "deepseek" or provider.litellm_provider == "deepseek"
+
+    async def _call_deepseek(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Call DeepSeek API directly, preserving reasoning_content in both directions.
+
+        LiteLLM 1.52.0 does not recognise reasoning_content (a DeepSeek extension
+        to the OpenAI message schema), so it drops the field during response
+        deserialization.  DeepSeek thinking mode *requires* that reasoning_content
+        be passed back in subsequent turns, so we bypass LiteLLM entirely.
+        """
+        _, provider = self._get_provider()
+        api_base = provider.base_url.rstrip("/")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {provider.api_key}",
+        }
+        # Convert OpenAI-format tool definitions for the API
+        api_tools = None
+        if tools:
+            api_tools = []
+            for t in tools:
+                func = t.get("function", {})
+                api_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": func.get("name", ""),
+                        "description": func.get("description", ""),
+                        "parameters": func.get("parameters", {"type": "object", "properties": {}}),
+                    },
+                })
+
+        payload: Dict[str, Any] = {
+            "model": self.model_id,
+            "messages": messages,
+            "temperature": self._map_generic_temperature(thinking_intensity, temperature),
+        }
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        if api_tools:
+            payload["tools"] = api_tools
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload)
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError:
+                resp_text = ""
+                try:
+                    resp_text = (resp.text or "")[:2000]
+                except Exception:
+                    pass
+                logger.warning(
+                    "DeepSeek API request failed: status=%s response_text=%s payload_summary=%s",
+                    resp.status_code,
+                    resp_text,
+                    _safe_message_summary(messages),
+                )
+                raise
+            return resp.json()
+
     async def _call_litellm(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        stream: bool = False
+        stream: bool = False,
+        thinking_intensity: Optional[str] = None,
     ):
         """内部辅助方法：统一调用 LiteLLM。"""
         provider_name, provider = self._get_provider()
-        if provider_name == "local":
-            litellm_provider = "openai"
-            api_base = provider.base_url
-        else:
-            litellm_provider = provider_name
-            api_base = provider.base_url
+        litellm_provider = provider.litellm_provider or ("openai" if provider_name == "local" else provider_name)
+        api_base = provider.base_url
 
-        return await acompletion(
-            model=f"{litellm_provider}/{self.model_id}",
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            api_base=api_base if api_base else None,
-            api_key=provider.api_key if provider.api_key else None,
-            stream=stream
-        )
+        try:
+            return await acompletion(
+                model=f"{litellm_provider}/{self.model_id}",
+                messages=messages,
+                tools=tools,
+                temperature=self._map_generic_temperature(thinking_intensity, temperature),
+                max_tokens=max_tokens,
+                api_base=api_base if api_base else None,
+                api_key=provider.api_key if provider.api_key else None,
+                stream=stream
+            )
+        except BadRequestError as e:
+            error_text = str(e).lower()
+            if "reasoning_content" in error_text and messages:
+                # Distinguish "must be passed back" (DeepSeek thinking mode
+                # requires it) from "not supported" (stale field on a provider
+                # that rejects it).  Only strip for the latter.
+                if "must be passed back" in error_text:
+                    logger.warning(
+                        "reasoning_content required but missing — LiteLLM likely "
+                        "dropped it during message processing; retrying via direct "
+                        "DeepSeek path"
+                    )
+                    return await self._call_deepseek(
+                        messages=messages, tools=tools, temperature=temperature,
+                    max_tokens=max_tokens, thinking_intensity=thinking_intensity,
+                    )
+                logger.warning(
+                    "reasoning_content rejected by upstream, stripping from history and retrying once"
+                )
+                stripped = []
+                for msg in messages:
+                    if msg.get("role") == "assistant" and "reasoning_content" in msg:
+                        msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
+                    stripped.append(msg)
+                return await acompletion(
+                    model=f"{litellm_provider}/{self.model_id}",
+                    messages=stripped,
+                    tools=tools,
+                    temperature=self._map_generic_temperature(thinking_intensity, temperature),
+                    max_tokens=max_tokens,
+                    api_base=api_base if api_base else None,
+                    api_key=provider.api_key if provider.api_key else None,
+                    stream=stream
+                )
+            raise
 
     async def chat_completion(
         self,
@@ -286,18 +414,26 @@ class ModelRouter:
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        stream: bool = False
+        stream: bool = False,
+        thinking_intensity: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """统一的聊天完成接口。返回 JSON 字符串的流。"""
-        if self._get_provider()[0] == "kimi":
+        provider_name = self._get_provider()[0]
+        if provider_name == "kimi":
             response = await self._call_kimi_anthropic(
-                messages=messages, tools=tools, max_tokens=max_tokens
+                messages=messages, tools=tools, max_tokens=max_tokens, thinking_intensity=thinking_intensity
+            )
+            yield json.dumps(response) + "\n"
+        elif self._is_deepseek():
+            response = await self._call_deepseek(
+                messages=messages, tools=tools, temperature=temperature,
+                max_tokens=max_tokens, thinking_intensity=thinking_intensity,
             )
             yield json.dumps(response) + "\n"
         else:
             response = await self._call_litellm(
                 messages=messages, tools=tools, temperature=temperature,
-                max_tokens=max_tokens, stream=stream
+                max_tokens=max_tokens, stream=stream, thinking_intensity=thinking_intensity
             )
             if stream:
                 async for chunk in response:
@@ -310,18 +446,31 @@ class ModelRouter:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
     ) -> Dict[str, Any]:
         """非流式调用，返回完整响应字典。"""
-        if self._get_provider()[0] == "kimi":
+        provider_name = self._get_provider()[0]
+        if provider_name == "kimi":
             return await self._call_kimi_anthropic(
-                messages=messages, tools=tools, max_tokens=max_tokens
+                messages=messages, tools=tools, max_tokens=max_tokens, thinking_intensity=thinking_intensity
+            )
+        if self._is_deepseek():
+            return await self._call_deepseek(
+                messages=messages, tools=tools, temperature=temperature,
+                max_tokens=max_tokens, thinking_intensity=thinking_intensity,
             )
         response = await self._call_litellm(
             messages=messages, tools=tools, temperature=temperature,
-            max_tokens=max_tokens, stream=False
+            max_tokens=max_tokens, stream=False, thinking_intensity=thinking_intensity
         )
-        return response.model_dump()
+        dumped = response.model_dump(exclude_none=False)
+        # litellm's ModelResponse.model_dump() may omit reasoning_content
+        # (a non-standard OpenAI field used by DeepSeek thinking mode).
+        rc = getattr(response.choices[0].message, "reasoning_content", None)
+        if rc is not None:
+            dumped["choices"][0]["message"]["reasoning_content"] = rc
+        return dumped
 
     @staticmethod
     def encode_image_to_base64(image_path: str) -> str:
