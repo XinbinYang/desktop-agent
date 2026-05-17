@@ -9,11 +9,12 @@ interface CaptureRect {
 
 declare global {
   interface Window {
-    electronAPI?: {
+    electronAPI: {
       selectFolder: () => Promise<string | null>;
       selectFile: () => Promise<string | null>;
       getAppVersion: () => Promise<string>;
       getAuthToken: () => Promise<string | null>;
+      setTheme: (theme: 'dark' | 'light') => Promise<'dark' | 'light'>;
       captureRegion: (rect: CaptureRect) => Promise<string | null>;
       onNewSession: (cb: () => void) => () => void;
     };

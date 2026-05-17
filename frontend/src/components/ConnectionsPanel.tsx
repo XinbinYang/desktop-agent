@@ -147,9 +147,9 @@ export function ConnectionsPanel() {
 
   const statusColor = (status: string): string => {
     switch (status) {
-      case 'running': return 'bg-green-400';
-      case 'error': return 'bg-red-400';
-      default: return 'bg-surface-hover';
+      case 'running': return 'bg-success';
+      case 'error': return 'bg-danger';
+      default: return 'bg-border';
     }
   };
 
@@ -170,7 +170,7 @@ export function ConnectionsPanel() {
     <div className="h-full flex flex-col text-sm">
       <div className="px-3 py-2 border-b border-border">
         <div className="flex items-center gap-2">
-          <Plug size={14} className="text-green-400" />
+          <Plug size={14} className="text-accent" />
           <span className="font-semibold text-fg">平台连接</span>
         </div>
         <p className="text-[10px] text-fg-muted mt-0.5">
@@ -179,9 +179,9 @@ export function ConnectionsPanel() {
       </div>
 
       {error && (
-        <div className="px-3 py-1.5 bg-red-900/30 border-b border-red-800 flex items-center justify-between">
-          <span className="text-xs text-red-400">{error}</span>
-          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300 text-xs">&times;</button>
+        <div className="px-3 py-1.5 bg-danger/10 border-b border-danger/35 flex items-center justify-between">
+          <span className="text-xs text-danger">{error}</span>
+          <button onClick={() => setError(null)} className="text-danger hover:text-danger/80 text-xs">&times;</button>
         </div>
       )}
 
@@ -193,12 +193,12 @@ export function ConnectionsPanel() {
             {connectors.map((c) => {
               const uptime = (c as any).uptime_seconds || 0;
               return (
-                <div key={c.name} className="bg-surface rounded p-3">
+                <div key={c.name} className="bg-surface-alt/35 border border-border-subtle rounded p-3 transition-colors hover:border-border">
                   {/* Header */}
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
                       {operatingId === c.name ? (
-                        <Loader2 size={12} className="animate-spin text-yellow-400 shrink-0" />
+                        <Loader2 size={12} className="animate-spin text-warning shrink-0" />
                       ) : (
                         <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor(c.status)} ${
                           c.status === 'running' ? 'animate-pulse' : ''
@@ -225,7 +225,7 @@ export function ConnectionsPanel() {
                           <button
                             onClick={() => handleStop(c.name)}
                             disabled={operatingId === c.name}
-                            className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] bg-yellow-600/20 text-yellow-400 hover:bg-yellow-600/30 disabled:opacity-50"
+                            className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] bg-warning/10 text-warning border border-warning/25 hover:bg-warning/15 disabled:opacity-50"
                           >
                             <Square size={10} />
                             停止
@@ -235,7 +235,7 @@ export function ConnectionsPanel() {
                         <button
                           onClick={() => handleStart(c.name)}
                           disabled={operatingId === c.name}
-                          className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] bg-green-600/20 text-green-400 hover:bg-green-600/30 disabled:opacity-50"
+                          className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] bg-success/10 text-success border border-success/25 hover:bg-success/15 disabled:opacity-50"
                         >
                           <Play size={10} />
                           启动
@@ -244,7 +244,7 @@ export function ConnectionsPanel() {
                       <button
                         onClick={() => handleDelete(c.name)}
                         disabled={operatingId === c.name || c.status === 'running'}
-                        className="p-1 text-fg-muted hover:text-red-400 disabled:opacity-30"
+                        className="p-1 text-fg-muted hover:text-danger disabled:opacity-30"
                         title="删除"
                       >
                         <Trash2 size={10} />
@@ -259,7 +259,7 @@ export function ConnectionsPanel() {
                   {c.status_message && (
                     <p
                       className={`text-[10px] mt-0.5 truncate ${
-                        c.status === 'error' ? 'text-red-400' : 'text-fg-secondary'
+                        c.status === 'error' ? 'text-danger' : 'text-fg-secondary'
                       }`}
                       title={c.status_message}
                     >
@@ -275,7 +275,7 @@ export function ConnectionsPanel() {
                         const show = editing.showValue[key] ?? !isSensitive;
                         return (
                           <div key={key}>
-                            <label className="text-[10px] text-fg-secondary block">
+                            <label className="text-[10px] text-fg-secondary block font-medium">
                               {prop.label || key}
                             </label>
                             <div className="flex gap-1 mt-0.5">
@@ -284,12 +284,12 @@ export function ConnectionsPanel() {
                                 value={editing.fields[key] || ''}
                                 onChange={(e) => updateField(key, e.target.value)}
                                 placeholder={prop.description || `输入 ${prop.label || key}...`}
-                                className="flex-1 text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1 outline-none text-fg"
+                                className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
                               />
                               {isSensitive && (
                                 <button
                                   onClick={() => toggleShow(key)}
-                                  className="px-1.5 text-fg-secondary hover:text-fg bg-surface-alt border border-border-subtle rounded"
+                                  className="px-1.5 text-fg-secondary hover:text-fg bg-surface border border-border rounded hover:bg-surface-hover"
                                   title={show ? '隐藏' : '显示'}
                                 >
                                   {show ? <EyeOff size={12} /> : <Eye size={12} />}
@@ -303,14 +303,14 @@ export function ConnectionsPanel() {
                         <button
                           onClick={handleSave}
                           disabled={operatingId === c.name}
-                          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/15 disabled:opacity-50"
+                          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-accent/10 text-accent border border-accent/25 hover:bg-accent/15 disabled:opacity-50"
                         >
                           <Save size={10} />
                           保存
                         </button>
                         <button
                           onClick={cancelEdit}
-                          className="px-2 py-1 rounded text-[10px] text-fg-secondary hover:bg-surface-hover"
+                          className="px-2 py-1 rounded text-[10px] text-fg-secondary hover:text-fg hover:bg-surface-hover"
                         >
                           取消
                         </button>
@@ -321,7 +321,7 @@ export function ConnectionsPanel() {
                       <div className="mt-2">
                         <button
                           onClick={() => startEdit(c)}
-                          className="text-[10px] text-fg-secondary hover:text-fg"
+                          className="inline-flex items-center px-2 py-1 rounded border border-accent/25 bg-accent/10 text-[10px] font-medium text-accent hover:bg-accent/15 hover:border-accent/40 focus:outline-none focus:ring-2 focus:ring-accent/30"
                         >
                           配置凭据
                         </button>

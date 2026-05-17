@@ -27,7 +27,12 @@ interface ChatMessageItemProps {
     expanded: boolean;
     onToggle: () => void;
   }>;
-  ReasoningBlock: React.FC<{ text: string }>;
+  ReasoningBlock: React.FC<{
+    text: string;
+    complete?: boolean;
+    startedAt?: number;
+    endedAt?: number;
+  }>;
 }
 
 export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
@@ -145,7 +150,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
           </div>
         ) : msg.role === 'assistant' && msg.reasoning ? (
           <>
-            <ReasoningBlock text={msg.reasoning} />
+            <ReasoningBlock text={msg.reasoning} complete />
             {msg.content && (
               <div className="prose prose-sm chat-prose max-w-none">
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>

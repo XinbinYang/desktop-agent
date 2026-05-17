@@ -175,9 +175,9 @@ def _filter_tools_by_agent(agent_type: str | None) -> frozenset[str] | None:
 
 
 # Tools the frontend may invoke via WebSocket `tool_direct`. Restricted to
-# read-only or user-visible actions that match the Sidebar QUICK_TOOLS list,
-# so a compromised renderer (or any process on localhost in dev mode) cannot
-# call shell_execute / file_write / etc. without going through the agent.
+# read-only or user-visible actions so a compromised renderer (or any process
+# on localhost in dev mode) cannot call shell_execute / file_write / etc.
+# without going through the agent.
 SAFE_DIRECT_TOOLS: set[str] = {
     "screenshot",
     "get_screen_size",

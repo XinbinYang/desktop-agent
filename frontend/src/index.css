@@ -15,6 +15,12 @@
   textarea {
     font: inherit;
   }
+  html,
+  body,
+  #root {
+    height: 100%;
+    background: var(--bg-app);
+  }
   code,
   pre,
   kbd,
@@ -50,6 +56,24 @@
   .tool-call-body {
     @apply px-3 py-2 text-sm text-fg-secondary whitespace-pre-wrap;
   }
+}
+
+.app-drag {
+  -webkit-app-region: drag;
+}
+
+.app-drag button,
+.app-drag select,
+.app-drag input,
+.app-drag textarea,
+.app-drag a,
+.app-drag [role='button'],
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.app-titlebar {
+  padding-right: max(1rem, calc(100vw - env(titlebar-area-width, 100vw) + 1rem));
 }
 
 /* Typography plugin overrides */

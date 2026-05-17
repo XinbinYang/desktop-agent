@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -32,6 +32,45 @@ const isDev = process.argv.includes('--dev');
 const isPackaged = app.isPackaged;
 const shouldOpenDevTools = process.env.DESKTOP_AGENT_OPEN_DEVTOOLS === '1';
 let authToken = null;
+
+const WINDOW_THEMES = {
+  dark: {
+    background: '#0d1117',
+    titleBar: '#161b22',
+    symbol: '#e6edf3',
+  },
+  light: {
+    background: '#ffffff',
+    titleBar: '#f3f3f3',
+    symbol: '#1e1e1e',
+  },
+};
+
+function normalizeTheme(theme) {
+  return theme === 'light' ? 'light' : 'dark';
+}
+
+function getTitleBarOverlay(theme) {
+  const colors = WINDOW_THEMES[normalizeTheme(theme)];
+  return {
+    color: colors.titleBar,
+    symbolColor: colors.symbol,
+    height: 40,
+  };
+}
+
+function applyWindowTheme(theme) {
+  const resolvedTheme = normalizeTheme(theme);
+  const colors = WINDOW_THEMES[resolvedTheme];
+
+  nativeTheme.themeSource = resolvedTheme;
+
+  if (!mainWindow) return;
+  mainWindow.setBackgroundColor(colors.background);
+  if (process.platform !== 'darwin' && typeof mainWindow.setTitleBarOverlay === 'function') {
+    mainWindow.setTitleBarOverlay(getTitleBarOverlay(resolvedTheme));
+  }
+}
 
 function getAuthStorePath() {
   return path.join(app.getPath('userData'), 'local-auth.json');
@@ -288,7 +327,9 @@ function createWindow() {
     y: state.y,
     minWidth: 1000,
     minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'darwin' ? {} : { titleBarOverlay: getTitleBarOverlay('dark') }),
+    backgroundColor: WINDOW_THEMES.dark.background,
     autoHideMenuBar: true,
     show: false, // 先隐藏，等加载完成再显示，避免闪烁
     webPreferences: {
@@ -298,6 +339,7 @@ function createWindow() {
       webSecurity: false,
     },
   });
+  applyWindowTheme('dark');
 
   if (state.maximized) {
     mainWindow.maximize();
@@ -455,6 +497,12 @@ ipcMain.handle('select-file', async () => {
 ipcMain.handle('get-app-version', () => app.getVersion());
 
 ipcMain.handle('get-auth-token', () => getAuthToken());
+
+ipcMain.handle('set-theme', (_event, theme) => {
+  const resolvedTheme = normalizeTheme(theme);
+  applyWindowTheme(resolvedTheme);
+  return resolvedTheme;
+});
 
 ipcMain.handle('capture-region', async (_event, rect) => {
   try {

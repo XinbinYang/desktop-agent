@@ -9,6 +9,10 @@ export const DEFAULT_TERMINAL_LAYOUT: PanelLayout = { conversation: 76, terminal
 
 const REQUIRED_MAIN_KEYS = Object.keys(DEFAULT_MAIN_LAYOUT);
 const REQUIRED_TERMINAL_KEYS = Object.keys(DEFAULT_TERMINAL_LAYOUT);
+const DEFAULT_SIDEBAR_SECTION: SidebarSection = 'skills';
+const SIDEBAR_SECTIONS: SidebarSection[] = [
+  'personal', 'coding', 'skills', 'project', 'sessions', 'settings',
+];
 
 // Legacy 11-tab values, kept only to migrate persisted layout state.
 type LegacyRightTab =
@@ -66,13 +70,22 @@ function normalizeLayout(value: unknown, fallback: PanelLayout, requiredKeys: st
   }, {});
 }
 
+function normalizeSidebarSection(value: unknown): SidebarSection {
+  if (value === 'tools') return 'skills';
+  if (value === 'knowledge') return 'settings';
+  if (typeof value === 'string' && SIDEBAR_SECTIONS.includes(value as SidebarSection)) {
+    return value as SidebarSection;
+  }
+  return DEFAULT_SIDEBAR_SECTION;
+}
+
 function loadLayout(): LayoutState {
   try {
     const raw = localStorage.getItem('desktop-agent-layout');
     if (raw) {
       const parsed = JSON.parse(raw);
       return {
-        activeSection: parsed.activeSection || 'tools',
+        activeSection: normalizeSidebarSection(parsed.activeSection),
         activeAgent: (parsed.activeAgent as AgentType) || 'personal',
         showTerminal: parsed.showTerminal ?? true,
         rightZone: parsed.rightZone ?? mapLegacyTab(parsed.rightTab) ?? 'workspace',
@@ -84,7 +97,7 @@ function loadLayout(): LayoutState {
     }
   } catch { /* ignore */ }
   return {
-    activeSection: 'tools',
+    activeSection: DEFAULT_SIDEBAR_SECTION,
     activeAgent: 'personal',
     showTerminal: true,
     rightZone: 'workspace',
@@ -156,7 +169,7 @@ export function useLayoutState() {
 
   const resetLayout = useCallback(() => {
     setState({
-      activeSection: 'tools',
+      activeSection: DEFAULT_SIDEBAR_SECTION,
       activeAgent: 'personal',
       showTerminal: true,
       rightZone: 'workspace',

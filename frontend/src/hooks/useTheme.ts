@@ -1,57 +1,70 @@
 import { useState, useEffect, useCallback } from 'react';
-
-type Theme = 'dark' | 'light' | 'system';
-
-function getSystemTheme(): 'dark' | 'light' {
-  if (typeof window === 'undefined') return 'dark';
-  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-}
-
-function resolveTheme(stored: Theme): 'dark' | 'light' {
-  return stored === 'system' ? getSystemTheme() : stored;
-}
-
-function getStoredTheme(): Theme {
-  try {
-    const stored = localStorage.getItem('desktop-agent-theme');
-    if (stored === 'dark' || stored === 'light' || stored === 'system') return stored;
-  } catch { /* localStorage unavailable */ }
-  return 'dark';
-}
+import {
+  THEME_CHANGE_EVENT,
+  THEME_STORAGE_KEY,
+  applyResolvedTheme,
+  broadcastThemePreference,
+  getStoredTheme,
+  getSystemTheme,
+  isThemePreference,
+  resolveTheme,
+  type ThemePreference,
+} from '../lib/theme';
 
 export function useTheme() {
-  const [stored, setStored] = useState<Theme>(getStoredTheme);
+  const [stored, setStoredState] = useState<ThemePreference>(getStoredTheme);
+  const [systemTheme, setSystemTheme] = useState(getSystemTheme);
 
-  const apply = useCallback((theme: 'dark' | 'light') => {
-    document.documentElement.setAttribute('data-theme', theme);
+  const resolved = resolveTheme(stored, systemTheme);
+
+  const setTheme = useCallback((theme: ThemePreference) => {
+    setStoredState((current) => (current === theme ? current : theme));
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // ignore
+    }
+    broadcastThemePreference(theme);
   }, []);
 
   useEffect(() => {
-    const resolved = resolveTheme(stored);
-    apply(resolved);
-    try {
-      localStorage.setItem('desktop-agent-theme', stored);
-    } catch { /* ignore */ }
-  }, [stored, apply]);
+    applyResolvedTheme(resolved);
+  }, [resolved]);
 
-  // Listen for system theme changes when in "system" mode
   useEffect(() => {
-    if (stored !== 'system') return;
     const mq = window.matchMedia('(prefers-color-scheme: light)');
-    const handler = () => apply(getSystemTheme());
+    const handler = () => setSystemTheme(getSystemTheme());
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
-  }, [stored, apply]);
+  }, []);
 
-  const resolved = resolveTheme(stored);
+  useEffect(() => {
+    const syncPreference = (theme: ThemePreference) => {
+      setStoredState((current) => (current === theme ? current : theme));
+    };
+
+    const onThemeChange = (event: Event) => {
+      const theme = (event as CustomEvent<{ theme?: unknown }>).detail?.theme;
+      if (isThemePreference(theme)) syncPreference(theme);
+    };
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== THEME_STORAGE_KEY) return;
+      if (isThemePreference(event.newValue)) syncPreference(event.newValue);
+    };
+
+    window.addEventListener(THEME_CHANGE_EVENT, onThemeChange);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener(THEME_CHANGE_EVENT, onThemeChange);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
 
   return {
     theme: stored,
     resolved,
-    setTheme: setStored,
-    toggle: () => setStored((prev) => {
-      const current = resolveTheme(prev);
-      return current === 'dark' ? 'light' : 'dark';
-    }),
+    setTheme,
+    toggle: () => setTheme(resolved === 'dark' ? 'light' : 'dark'),
   };
 }

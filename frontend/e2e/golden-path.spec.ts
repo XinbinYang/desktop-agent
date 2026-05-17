@@ -85,7 +85,7 @@ test.describe('Desktop Agent Golden Path', () => {
     const hasSidebar = await sidebar.isVisible({ timeout: 2000 }).catch(() => false);
     if (hasSidebar) {
       // Look for section labels
-      for (const section of ['Sessions', 'Tools', 'Project', 'Knowledge', 'Settings']) {
+      for (const section of ['Sessions', 'Skills', 'Project', 'Knowledge', 'Settings']) {
         const sectionEl = sidebar.locator(`text=${section}`).first();
         const visible = await sectionEl.isVisible({ timeout: 1000 }).catch(() => false);
         console.log(`Sidebar "${section}": ${visible ? 'found' : 'not found'}`);

@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from "react";
 import { DiffEditor } from "@monaco-editor/react";
 import { FileEdit } from "../types";
 import { getLangFromFilename } from "../lib/language";
+import { ensureMonacoThemes, getMonacoThemeName } from "../lib/monacoTheme";
+import { useTheme } from "../hooks/useTheme";
 import { UnifiedDiffFallback } from "./UnifiedDiffFallback";
 
 interface InlineDiffViewerProps {
@@ -23,6 +25,8 @@ export const InlineDiffViewer: React.FC<InlineDiffViewerProps> = ({ edit }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isClipped, setIsClipped] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const { resolved } = useTheme();
+  const monacoTheme = getMonacoThemeName(resolved);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -46,7 +50,7 @@ export const InlineDiffViewer: React.FC<InlineDiffViewerProps> = ({ edit }) => {
         className="overflow-hidden"
         style={{
           maxHeight: expanded ? undefined : "240px",
-          backgroundColor: "#1e1e1e",
+          backgroundColor: "var(--bg-app)",
         }}
       >
         {showMonaco ? (
@@ -54,7 +58,8 @@ export const InlineDiffViewer: React.FC<InlineDiffViewerProps> = ({ edit }) => {
             original={edit.old_text!}
             modified={edit.new_text!}
             language={language}
-            theme="vs-dark"
+            theme={monacoTheme}
+            beforeMount={ensureMonacoThemes}
             options={MONACO_OPTIONS}
             height={expanded ? "auto" : "240px"}
           />
@@ -68,14 +73,13 @@ export const InlineDiffViewer: React.FC<InlineDiffViewerProps> = ({ edit }) => {
           <div
             className="absolute bottom-0 left-0 right-0 h-12 pointer-events-none"
             style={{
-              background: "linear-gradient(to bottom, transparent, #1e1e1e)",
+              background: "linear-gradient(to bottom, transparent, var(--bg-app))",
             }}
           />
           <button
             type="button"
             onClick={() => setExpanded(true)}
-            className="absolute bottom-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded text-xs font-medium"
-            style={{ backgroundColor: "#2d2d2d", color: "#d4d4d4" }}
+            className="absolute bottom-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded text-xs font-medium bg-surface text-fg border border-border hover:bg-surface-hover"
           >
             Click to expand
           </button>
@@ -83,12 +87,11 @@ export const InlineDiffViewer: React.FC<InlineDiffViewerProps> = ({ edit }) => {
       )}
 
       {expanded && isClipped && (
-        <div className="flex justify-center pt-2 pb-1" style={{ backgroundColor: "#1e1e1e" }}>
+        <div className="flex justify-center pt-2 pb-1 bg-app">
           <button
             type="button"
             onClick={() => setExpanded(false)}
-            className="px-3 py-1 rounded text-xs font-medium"
-            style={{ backgroundColor: "#2d2d2d", color: "#d4d4d4" }}
+            className="px-3 py-1 rounded text-xs font-medium bg-surface text-fg border border-border hover:bg-surface-hover"
           >
             Show less
           </button>

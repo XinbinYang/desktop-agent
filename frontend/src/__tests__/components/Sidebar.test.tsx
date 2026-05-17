@@ -1,10 +1,10 @@
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { Sidebar } from '../../components/Sidebar'
 
 describe('Sidebar', () => {
   const defaultProps = {
-    activeSection: 'tools' as const,
+    activeSection: 'skills' as const,
     activeAgent: 'personal' as const,
     onSectionChange: vi.fn(),
     agentModel: 'gpt-4o',
@@ -15,10 +15,90 @@ describe('Sidebar', () => {
     isConnected: true,
   }
 
-  it('renders quick tools list', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        skills: [
+          {
+            id: 'using-superpowers',
+            name: 'using-superpowers',
+            description: 'Load relevant skills only when needed.',
+            source: 'superpowers',
+            enabledByAgent: { personal: true, coding: true },
+            recommendedFor: ['personal', 'coding'],
+            category: 'workflow',
+            trustLevel: 'local',
+          },
+          {
+            id: 'test-driven-development',
+            name: 'test-driven-development',
+            description: 'Write tests before implementation.',
+            source: 'superpowers',
+            enabledByAgent: { personal: false, coding: true },
+            recommendedFor: ['coding'],
+            category: 'workflow',
+            trustLevel: 'local',
+          },
+          {
+            id: 'personal:data_analysis',
+            name: 'Data Analysis',
+            description: 'Personal data analysis preference.',
+            source: 'personal',
+            enabledByAgent: { personal: true, coding: false },
+            recommendedFor: ['personal'],
+            category: 'personal',
+            trustLevel: 'local',
+          },
+        ],
+        preferences: {
+          personal: {
+            'using-superpowers': true,
+            'test-driven-development': false,
+            'personal:data_analysis': true,
+          },
+          coding: {
+            'using-superpowers': true,
+            'test-driven-development': true,
+            'personal:data_analysis': false,
+          },
+        },
+        defaults: { personal: {}, coding: {} },
+        presets: [
+          {
+            id: 'personal-daily',
+            name: 'Personal Daily',
+            description: 'Personal task defaults.',
+            agentTypes: ['personal'],
+            skillIds: ['using-superpowers', 'personal:data_analysis'],
+          },
+          {
+            id: 'debug-fix',
+            name: 'Debug Fix',
+            description: 'Debug and verify.',
+            agentTypes: ['coding'],
+            skillIds: ['test-driven-development'],
+          },
+        ],
+      }),
+    })))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('renders skills catalog instead of quick tools', async () => {
     render(<Sidebar {...defaultProps} />)
-    expect(screen.getByText('Screenshot')).toBeInTheDocument()
-    expect(screen.getByText('Open Browser')).toBeInTheDocument()
+    expect(await screen.findByText('Core')).toBeInTheDocument()
+    expect(screen.queryByText('using-superpowers')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('Expand Core'))
+    expect(screen.getByText('using-superpowers')).toBeInTheDocument()
+    expect(screen.getByText('Quality & Review')).toBeInTheDocument()
+    expect(screen.getByLabelText('Disable all Personal for Personal Agent')).toBeInTheDocument()
+    expect(screen.queryByText('Screenshot')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open Browser')).not.toBeInTheDocument()
   })
 
   it('shows settings content when activeSection is settings', () => {
@@ -42,12 +122,6 @@ describe('Sidebar', () => {
     expect(screen.queryByLabelText('Select role')).not.toBeInTheDocument()
   })
 
-  it('shows knowledge content when activeSection is knowledge', () => {
-    render(<Sidebar {...defaultProps} activeSection="knowledge" />)
-    expect(screen.getByText('Knowledge Base')).toBeInTheDocument()
-    expect(screen.getByText('View All Documents')).toBeInTheDocument()
-  })
-
   it('calls onClear when clicking clear button', () => {
     const onClear = vi.fn()
     render(<Sidebar {...defaultProps} onClear={onClear} />)
@@ -57,13 +131,77 @@ describe('Sidebar', () => {
     expect(onClear).toHaveBeenCalled()
   })
 
-  it('calls onExecuteTool when clicking quick tool', () => {
-    const onExecuteTool = vi.fn()
-    render(<Sidebar {...defaultProps} onExecuteTool={onExecuteTool} />)
+  it('saves skill preference when toggling a skill', async () => {
+    const fetchMock = vi.mocked(fetch)
+    render(<Sidebar {...defaultProps} />)
 
-    fireEvent.click(screen.getByText('Screenshot'))
+    fireEvent.click(await screen.findByLabelText('Expand Core'))
+    const toggle = await screen.findByLabelText('Disable using-superpowers for Personal Agent')
+    fireEvent.click(toggle)
 
-    expect(onExecuteTool).toHaveBeenCalledWith('screenshot', {})
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:8765/api/skills/preferences',
+        expect.objectContaining({ method: 'PUT' })
+      )
+    })
+  })
+
+  it('saves all skills in a category when toggling the category checkbox', async () => {
+    const fetchMock = vi.mocked(fetch)
+    render(<Sidebar {...defaultProps} />)
+
+    const toggle = await screen.findByLabelText('Disable all Core for Personal Agent')
+    fireEvent.click(toggle)
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([url]) => (
+        url === 'http://127.0.0.1:8765/api/skills/preferences'
+      ))
+      expect(saveCall).toBeTruthy()
+      const body = JSON.parse((saveCall?.[1] as RequestInit).body as string)
+      expect(body.personal['using-superpowers']).toBe(false)
+    })
+  })
+
+  it('applies a skill preset for the current agent', async () => {
+    const fetchMock = vi.mocked(fetch)
+    render(<Sidebar {...defaultProps} />)
+
+    fireEvent.click(await screen.findByLabelText('Apply Personal Daily preset'))
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([url]) => (
+        url === 'http://127.0.0.1:8765/api/skills/preferences'
+      ))
+      expect(saveCall).toBeTruthy()
+      const body = JSON.parse((saveCall?.[1] as RequestInit).body as string)
+      expect(body.personal['using-superpowers']).toBe(true)
+      expect(body.personal['personal:data_analysis']).toBe(true)
+    })
+  })
+
+  it('expands and collapses a skill category', async () => {
+    render(<Sidebar {...defaultProps} />)
+
+    expect(await screen.findByLabelText('Expand Core')).toBeInTheDocument()
+    expect(screen.queryByText('using-superpowers')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Expand Core'))
+    expect(screen.getByText('using-superpowers')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Collapse Core'))
+    expect(screen.queryByText('using-superpowers')).not.toBeInTheDocument()
+  })
+
+  it('persists expanded skill categories per agent', async () => {
+    render(<Sidebar {...defaultProps} />)
+
+    fireEvent.click(await screen.findByLabelText('Expand Core'))
+
+    expect(JSON.parse(localStorage.getItem('desktop-agent-skills-expanded:personal') || '{}')).toMatchObject({
+      core: true,
+    })
   })
 
   it('shows connected status', () => {
@@ -78,6 +216,6 @@ describe('Sidebar', () => {
 
   it('does not render tab buttons (moved to ActivityBar)', () => {
     render(<Sidebar {...defaultProps} />)
-    expect(screen.queryByRole('button', { name: 'Tools' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Skills' })).not.toBeInTheDocument()
   })
 })

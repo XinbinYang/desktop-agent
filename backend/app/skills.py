@@ -1,8 +1,129 @@
+import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from app.runtime_paths import agents_dir, runtime_file
 
 SKILL_DIR = Path(__file__).parent.parent / "prompts" / "skills"
+SKILL_PREFS_PATH = runtime_file("data", "skill_preferences.json")
+PERSONAL_SKILL_PREFIX = "personal:"
+AGENT_TYPES: Tuple[str, str] = ("personal", "coding")
+
+DEFAULT_ENABLED_SKILLS: Dict[str, Set[str]] = {
+    "personal": {
+        "using-superpowers",
+        "output-formatting",
+    },
+    "coding": {
+        "using-superpowers",
+        "project-familiarization",
+        "dispatching-parallel-agents",
+        "subagent-driven-development",
+        "systematic-debugging",
+        "test-driven-development",
+        "verification-before-completion",
+        "requesting-code-review",
+    },
+}
+
+SKILL_PRESETS: List[Dict[str, Any]] = [
+    {
+        "id": "quick-code",
+        "name": "Quick Code",
+        "description": "Fast implementation with project context and verification.",
+        "agentTypes": ["coding"],
+        "skillIds": [
+            "using-superpowers",
+            "project-familiarization",
+            "test-driven-development",
+            "verification-before-completion",
+        ],
+    },
+    {
+        "id": "debug-fix",
+        "name": "Debug Fix",
+        "description": "Systematic bug diagnosis, test guidance, and verification.",
+        "agentTypes": ["coding"],
+        "skillIds": [
+            "using-superpowers",
+            "systematic-debugging",
+            "test-driven-development",
+            "verification-before-completion",
+        ],
+    },
+    {
+        "id": "code-review",
+        "name": "Code Review",
+        "description": "Review-oriented workflow with feedback handling and verification.",
+        "agentTypes": ["coding"],
+        "skillIds": [
+            "requesting-code-review",
+            "receiving-code-review",
+            "verification-before-completion",
+        ],
+    },
+    {
+        "id": "multi-agent-build",
+        "name": "Multi-Agent Build",
+        "description": "Project exploration plus parallel worker orchestration.",
+        "agentTypes": ["coding"],
+        "skillIds": [
+            "using-superpowers",
+            "project-familiarization",
+            "dispatching-parallel-agents",
+            "subagent-driven-development",
+            "verification-before-completion",
+        ],
+    },
+    {
+        "id": "personal-daily",
+        "name": "Personal Daily",
+        "description": "Personal task handling with concise output and learned preferences.",
+        "agentTypes": ["personal"],
+        "skillIds": [
+            "using-superpowers",
+            "output-formatting",
+        ],
+    },
+]
+
+SKILL_CATEGORY_BY_ID: Dict[str, str] = {
+    "using-superpowers": "core",
+    "project-familiarization": "explore-plan",
+    "brainstorming": "explore-plan",
+    "writing-plans": "explore-plan",
+    "executing-plans": "explore-plan",
+    "systematic-debugging": "build-debug",
+    "test-driven-development": "quality-review",
+    "verification-before-completion": "quality-review",
+    "requesting-code-review": "quality-review",
+    "receiving-code-review": "quality-review",
+    "dispatching-parallel-agents": "multi-agent",
+    "subagent-driven-development": "multi-agent",
+    "using-git-worktrees": "workspace-release",
+    "finishing-a-development-branch": "workspace-release",
+    "output-formatting": "writing",
+    "writing-skills": "writing",
+}
+
+SKILL_REASON_BY_ID: Dict[str, str] = {
+    "using-superpowers": "Task can benefit from the local skill workflow.",
+    "output-formatting": "Personal Agent keeps responses concise and structured.",
+    "project-familiarization": "Task asks to understand or work inside the current project.",
+    "brainstorming": "Task looks like early design or implementation planning.",
+    "writing-plans": "Task benefits from an explicit implementation plan.",
+    "executing-plans": "Task asks to execute an existing plan.",
+    "systematic-debugging": "Task looks like debugging or bug fixing.",
+    "test-driven-development": "Task mentions tests or code changes that should be test-guided.",
+    "verification-before-completion": "Coding work should finish with verification.",
+    "requesting-code-review": "Task asks for code review or review-style checking.",
+    "receiving-code-review": "Task asks to address review feedback.",
+    "dispatching-parallel-agents": "Task may benefit from parallel exploration or worker dispatch.",
+    "subagent-driven-development": "Task may benefit from specialized worker agents.",
+    "using-git-worktrees": "Task involves branch or git workflow changes.",
+    "finishing-a-development-branch": "Task looks like branch completion or release cleanup.",
+}
 
 # Skill 匹配规则：根据用户消息关键词和角色匹配适用的 skills
 MATCH_RULES = [
@@ -111,6 +232,56 @@ class SkillManager:
     """管理 Superpowers skills 的扫描、匹配和加载"""
 
     _skills_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    _personal_skills_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+    @classmethod
+    def _normalize_agent_type(cls, agent_type: Optional[str] = None, role_id: Optional[str] = None) -> str:
+        if agent_type in AGENT_TYPES:
+            return agent_type
+        if role_id == "code-expert":
+            return "coding"
+        return "personal"
+
+    @classmethod
+    def _personal_skills_dir(cls) -> Path:
+        return agents_dir() / "personal" / "skills"
+
+    @classmethod
+    def _parse_personal_skill_md(cls, path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+        frontmatter: Dict[str, str] = {}
+        body = content
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                fm_text = content[3:end].strip()
+                body = content[end + 3:].strip()
+                for line in fm_text.split("\n"):
+                    if ":" in line:
+                        key, val = line.split(":", 1)
+                        frontmatter[key.strip()] = val.strip()
+
+        title = frontmatter.get("name") or path.stem.replace("_", " ").replace("-", " ").title()
+        description = frontmatter.get("description", "")
+        if not description:
+            for line in body.splitlines():
+                text = line.strip().lstrip("#").strip()
+                if text:
+                    description = text[:140]
+                    break
+
+        return {
+            "id": f"{PERSONAL_SKILL_PREFIX}{path.stem}",
+            "name": title,
+            "description": description or "Personal crystallized skill",
+            "body": body,
+            "path": str(path),
+            "source": "personal",
+        }
 
     @classmethod
     def _parse_skill_md(cls, path: Path) -> Optional[Dict[str, Any]]:
@@ -162,17 +333,283 @@ class SkillManager:
         return skills
 
     @classmethod
+    def load_personal_skills(cls) -> Dict[str, Dict[str, Any]]:
+        """Scan Personal Agent crystallized skills under AGENTS/personal/skills."""
+        if cls._personal_skills_cache is not None:
+            return cls._personal_skills_cache
+
+        skills: Dict[str, Dict[str, Any]] = {}
+        skills_dir = cls._personal_skills_dir()
+        if skills_dir.exists():
+            for skill_md in sorted(skills_dir.glob("*.md")):
+                parsed = cls._parse_personal_skill_md(skill_md)
+                if parsed:
+                    skills[parsed["id"]] = parsed
+
+        cls._personal_skills_cache = skills
+        return skills
+
+    @classmethod
     def reload_skills(cls) -> None:
         """强制重新加载 skills"""
         cls._skills_cache = None
+        cls._personal_skills_cache = None
 
     @classmethod
     def list_skills(cls) -> List[Dict[str, str]]:
         """返回所有可用 skill 的简要信息"""
         return [
-            {"name": s["name"], "description": s["description"]}
+            {"id": s["name"], "name": s["name"], "description": s["description"]}
             for s in cls.load_skills().values()
         ]
+
+    @classmethod
+    def _known_skill_ids(cls) -> Set[str]:
+        return set(cls.load_skills()) | set(cls.load_personal_skills())
+
+    @classmethod
+    def _default_enabled_for(cls, skill_id: str, agent_type: str) -> bool:
+        if skill_id.startswith(PERSONAL_SKILL_PREFIX):
+            return agent_type == "personal"
+        return skill_id in DEFAULT_ENABLED_SKILLS.get(agent_type, set())
+
+    @classmethod
+    def _load_stored_preferences(cls) -> Dict[str, Dict[str, bool]]:
+        if not SKILL_PREFS_PATH.exists():
+            return {agent: {} for agent in AGENT_TYPES}
+        try:
+            raw = json.loads(SKILL_PREFS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {agent: {} for agent in AGENT_TYPES}
+
+        preferences: Dict[str, Dict[str, bool]] = {agent: {} for agent in AGENT_TYPES}
+        known = cls._known_skill_ids()
+        if not isinstance(raw, dict):
+            return preferences
+        for agent in AGENT_TYPES:
+            values = raw.get(agent, {})
+            if not isinstance(values, dict):
+                continue
+            for skill_id, enabled in values.items():
+                if skill_id in known and isinstance(enabled, bool):
+                    preferences[agent][skill_id] = enabled
+        return preferences
+
+    @classmethod
+    def effective_preferences(cls) -> Dict[str, Dict[str, bool]]:
+        """Return per-agent effective enabled state for all known skills."""
+        stored = cls._load_stored_preferences()
+        known = sorted(cls._known_skill_ids())
+        return {
+            agent: {
+                skill_id: stored[agent].get(skill_id, cls._default_enabled_for(skill_id, agent))
+                for skill_id in known
+            }
+            for agent in AGENT_TYPES
+        }
+
+    @classmethod
+    def default_preferences(cls) -> Dict[str, Dict[str, bool]]:
+        known = sorted(cls._known_skill_ids())
+        return {
+            agent: {skill_id: cls._default_enabled_for(skill_id, agent) for skill_id in known}
+            for agent in AGENT_TYPES
+        }
+
+    @classmethod
+    def update_preferences(cls, preferences: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Persist preference overrides. Unknown skill IDs are ignored."""
+        known = cls._known_skill_ids()
+        existing = cls._load_stored_preferences()
+        ignored: List[str] = []
+
+        for agent in AGENT_TYPES:
+            values = preferences.get(agent, {})
+            if not isinstance(values, dict):
+                continue
+            for skill_id, enabled in values.items():
+                if skill_id not in known:
+                    ignored.append(skill_id)
+                    continue
+                if isinstance(enabled, bool):
+                    existing[agent][skill_id] = enabled
+
+        try:
+            SKILL_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SKILL_PREFS_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Failed to save skill preferences: {exc}") from exc
+
+        return {
+            "preferences": cls.effective_preferences(),
+            "ignored": sorted(set(ignored)),
+        }
+
+    @classmethod
+    def is_skill_enabled(cls, skill_id: str, agent_type: Optional[str] = None, role_id: Optional[str] = None) -> bool:
+        agent = cls._normalize_agent_type(agent_type, role_id)
+        return cls.effective_preferences().get(agent, {}).get(
+            skill_id,
+            cls._default_enabled_for(skill_id, agent),
+        )
+
+    @classmethod
+    def list_skill_catalog(cls) -> Dict[str, Any]:
+        """Return local skill catalog, effective preferences, and backend defaults."""
+        preferences = cls.effective_preferences()
+        defaults = cls.default_preferences()
+        catalog: List[Dict[str, Any]] = []
+
+        for skill_id, skill in sorted(cls.load_skills().items()):
+            recommended_for = [
+                agent for agent in AGENT_TYPES
+                if defaults[agent].get(skill_id, False)
+            ]
+            category = SKILL_CATEGORY_BY_ID.get(skill_id, "other")
+            catalog.append({
+                "id": skill_id,
+                "name": skill.get("name", skill_id),
+                "description": skill.get("description", ""),
+                "source": "superpowers",
+                "enabledByAgent": {
+                    "personal": preferences["personal"].get(skill_id, False),
+                    "coding": preferences["coding"].get(skill_id, False),
+                },
+                "recommendedFor": recommended_for,
+                "category": category,
+                "trustLevel": "local",
+            })
+
+        for skill_id, skill in sorted(cls.load_personal_skills().items()):
+            catalog.append({
+                "id": skill_id,
+                "name": skill.get("name", skill_id),
+                "description": skill.get("description", ""),
+                "source": "personal",
+                "enabledByAgent": {
+                    "personal": preferences["personal"].get(skill_id, True),
+                    "coding": preferences["coding"].get(skill_id, False),
+                },
+                "recommendedFor": ["personal"],
+                "category": "personal",
+                "trustLevel": "local",
+            })
+
+        return {
+            "skills": catalog,
+            "preferences": preferences,
+            "defaults": defaults,
+            "presets": cls.list_presets(),
+        }
+
+    @classmethod
+    def list_presets(cls) -> List[Dict[str, Any]]:
+        """Return task presets with only currently available skill IDs."""
+        known = cls._known_skill_ids()
+        presets: List[Dict[str, Any]] = []
+        for preset in SKILL_PRESETS:
+            presets.append({
+                **preset,
+                "skillIds": [
+                    skill_id for skill_id in preset.get("skillIds", [])
+                    if skill_id in known
+                ],
+            })
+        return presets
+
+    @classmethod
+    def _skill_trace_item(cls, skill_id: str, reason: str) -> Optional[Dict[str, Any]]:
+        skill = cls.load_skills().get(skill_id)
+        source = "superpowers"
+        if skill is None:
+            skill = cls.load_personal_skills().get(skill_id)
+            source = "personal"
+        if skill is None:
+            return None
+        return {
+            "id": skill_id,
+            "name": skill.get("name", skill_id),
+            "category": SKILL_CATEGORY_BY_ID.get(skill_id, "personal" if source == "personal" else "other"),
+            "source": source,
+            "reason": reason,
+        }
+
+    @classmethod
+    def _add_candidate(
+        cls,
+        candidates: Dict[str, Set[str]],
+        skill_id: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        candidates.setdefault(skill_id, set()).add(
+            reason or SKILL_REASON_BY_ID.get(skill_id, "Matched the current task.")
+        )
+
+    @classmethod
+    def _collect_match_candidates(
+        cls,
+        user_message: str,
+        role_id: str,
+        has_project: bool,
+    ) -> Dict[str, Set[str]]:
+        candidates: Dict[str, Set[str]] = {}
+        msg_lower = user_message.lower()
+
+        for rule in MATCH_RULES:
+            if rule["roles"] and role_id not in rule["roles"]:
+                continue
+            if any(pattern.lower() in msg_lower for pattern in rule["patterns"]):
+                for skill_id in rule["skills"]:
+                    cls._add_candidate(candidates, skill_id)
+
+        if has_project and role_id in ("code-expert",):
+            cls._add_candidate(candidates, "using-superpowers", "A project is open for Coding Agent work.")
+            cls._add_candidate(candidates, "project-familiarization", "A project is open, so project context can improve execution.")
+        if role_id in ("code-expert",):
+            cls._add_candidate(candidates, "verification-before-completion", "Coding Agent uses verification before completion.")
+        if role_id in ("desktop-agent", "general-assistant", "quant-analyst"):
+            cls._add_candidate(candidates, "using-superpowers", "Personal Agent can route to relevant local skills.")
+
+        if role_id in ("desktop-agent", "general-assistant", "quant-analyst") and "output-formatting" in cls.load_skills():
+            cls._add_candidate(candidates, "output-formatting", "Output formatting is available for concise responses.")
+
+        return candidates
+
+    @classmethod
+    def explain_match_skills(
+        cls,
+        user_message: str,
+        role_id: str,
+        has_project: bool,
+        agent_type: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return enabled matched skills plus disabled would-have-matched skills."""
+        resolved_agent = cls._normalize_agent_type(agent_type, role_id)
+        known = set(cls.load_skills())
+        candidates = {
+            skill_id: reasons
+            for skill_id, reasons in cls._collect_match_candidates(user_message, role_id, has_project).items()
+            if skill_id in known
+        }
+        priority_index = {name: i for i, name in enumerate(SKILL_PRIORITY)}
+        ordered_ids = sorted(candidates, key=lambda name: (priority_index.get(name, 999), name))
+
+        enabled_items: List[Dict[str, Any]] = []
+        disabled_items: List[Dict[str, Any]] = []
+        for skill_id in ordered_ids:
+            reason = "; ".join(sorted(candidates[skill_id])[:2])
+            item = cls._skill_trace_item(skill_id, reason)
+            if item is None:
+                continue
+            if cls.is_skill_enabled(skill_id, resolved_agent, role_id):
+                enabled_items.append(item)
+            else:
+                disabled_items.append(item)
+
+        return {
+            "skills": enabled_items,
+            "disabled_matches": disabled_items,
+        }
 
     @classmethod
     def get_skill(cls, name: str) -> Optional[str]:
@@ -191,38 +628,16 @@ class SkillManager:
         return skill["body"] if skill else None
 
     @classmethod
-    def match_skills(cls, user_message: str, role_id: str, has_project: bool) -> List[str]:
+    def match_skills(
+        cls,
+        user_message: str,
+        role_id: str,
+        has_project: bool,
+        agent_type: Optional[str] = None,
+    ) -> List[str]:
         """根据用户消息、角色、项目状态匹配适用的 skill 名称列表"""
-        matched: set = set()
-        msg_lower = user_message.lower()
-
-        for rule in MATCH_RULES:
-            # 检查角色匹配
-            if rule["roles"] and role_id not in rule["roles"]:
-                continue
-
-            # 检查关键词匹配
-            for pattern in rule["patterns"]:
-                if pattern.lower() in msg_lower:
-                    matched.update(rule["skills"])
-                    break
-
-        # 如果有项目打开，且是编码角色，总是包含 using-superpowers
-        if has_project and role_id in ("code-expert",):
-            matched.add("using-superpowers")
-        # code-expert 角色：永远包含验证技能（任何代码改动都要 verification）
-        if role_id in ("code-expert",):
-            matched.add("verification-before-completion")
-        # Personal agent (desktop-agent): always include using-superpowers for skill discovery
-        if role_id in ("desktop-agent", "general-assistant", "quant-analyst"):
-            matched.add("using-superpowers")
-
-        # 总是包含输出格式规范（如果 skill 存在）
-        if "output-formatting" in cls.load_skills():
-            matched.add("output-formatting")
-
-        priority_index = {name: i for i, name in enumerate(SKILL_PRIORITY)}
-        return sorted(matched, key=lambda name: (priority_index.get(name, 999), name))
+        trace = cls.explain_match_skills(user_message, role_id, has_project, agent_type=agent_type)
+        return [skill["id"] for skill in trace["skills"]]
 
     @classmethod
     def build_skill_prompt(cls, skill_names: List[str]) -> str:

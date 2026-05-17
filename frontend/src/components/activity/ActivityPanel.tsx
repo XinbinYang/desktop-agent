@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import {
   Wrench, FileDiff, Play, TestTube, AlertTriangle, BarChart3,
-  ChevronDown, ChevronRight,
+  ChevronDown, ChevronRight, Sparkles,
 } from 'lucide-react';
-import type { ToolCall, FileEdit, RunEvent } from '../../types';
+import type { ToolCall, FileEdit, RunEvent, MatchedSkillTrace } from '../../types';
 import { ToolCallView } from '../ToolCallView';
 import { ChangesPanel } from '../ChangesPanel';
 import { RunSummaryPanel } from '../RunSummaryPanel';
@@ -28,9 +28,10 @@ interface ActivityPanelProps {
   onDiscardRun: (runId: string) => void;
 }
 
-type ActivitySection = 'tools' | 'changes' | 'runs' | 'tests' | 'problems' | 'eval';
+type ActivitySection = 'skills' | 'tools' | 'changes' | 'runs' | 'tests' | 'problems' | 'eval';
 
 const SECTIONS: { key: ActivitySection; label: string; icon: React.FC<{ className?: string }> }[] = [
+  { key: 'skills', label: 'Skills', icon: Sparkles },
   { key: 'tools', label: '工具', icon: Wrench },
   { key: 'changes', label: '变更', icon: FileDiff },
   { key: 'runs', label: '运行', icon: Play },
@@ -51,7 +52,12 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
   onMergeRun,
   onDiscardRun,
 }) => {
-  const [expanded, setExpanded] = useState<Set<ActivitySection>>(new Set(['tools', 'changes']));
+  const [expanded, setExpanded] = useState<Set<ActivitySection>>(new Set(['skills', 'tools', 'changes']));
+  const latestSkillsEvent = [...runEvents].reverse().find((event) => event.type === 'skills_matched');
+  const matchedSkills = (latestSkillsEvent?.data?.skills || []) as MatchedSkillTrace[];
+  const disabledMatches = (latestSkillsEvent?.data?.disabled_matches || []) as MatchedSkillTrace[];
+  const skillTraceCount = matchedSkills.length + disabledMatches.length;
+  const codingRunEvents = runEvents.filter((event) => event.type !== 'skills_matched');
 
   const toggle = (s: ActivitySection) => {
     setExpanded((prev) => {
@@ -80,20 +86,75 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
                   {toolCalls.length}
                 </span>
               )}
+              {key === 'skills' && skillTraceCount > 0 && (
+                <span className="ml-auto text-[10px] text-fg-muted bg-surface-alt px-1.5 py-0.5 rounded">
+                  {skillTraceCount}
+                </span>
+              )}
               {key === 'changes' && fileEdits.length > 0 && (
                 <span className="ml-auto text-[10px] text-fg-muted bg-surface-alt px-1.5 py-0.5 rounded">
                   {fileEdits.length}
                 </span>
               )}
-              {key === 'runs' && runEvents.length > 0 && (
+              {key === 'runs' && codingRunEvents.length > 0 && (
                 <span className="ml-auto text-[10px] text-fg-muted bg-surface-alt px-1.5 py-0.5 rounded">
-                  {runEvents.length}
+                  {codingRunEvents.length}
                 </span>
               )}
             </button>
 
             {isOpen && (
               <div className="px-1 pb-2">
+                {key === 'skills' && (
+                  <div className="space-y-1.5 px-2 py-1">
+                    {!latestSkillsEvent ? (
+                      <div className="rounded border border-border bg-surface-alt px-2 py-3 text-center text-xs text-fg-muted">
+                        No skill trace yet.
+                      </div>
+                    ) : skillTraceCount === 0 ? (
+                      <div className="rounded border border-border bg-surface-alt px-2 py-3 text-center text-xs text-fg-muted">
+                        No matched skills for this turn.
+                      </div>
+                    ) : (
+                      <>
+                        {matchedSkills.map((skill) => (
+                          <div key={`matched-${skill.id}`} className="rounded border border-success/25 bg-success/5 px-2 py-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg">{skill.name}</span>
+                              <span className="rounded border border-success/30 bg-success/10 px-1.5 py-0.5 text-[9px] leading-none text-success">
+                                Auto
+                              </span>
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              <span className="rounded border border-border bg-surface px-1.5 py-0.5 text-[9px] leading-none text-fg-muted">
+                                {String(skill.category || 'other').replace(/[-_]/g, ' ')}
+                              </span>
+                              <span className="rounded border border-border bg-surface px-1.5 py-0.5 text-[9px] leading-none text-fg-muted">
+                                {skill.source || 'local'}
+                              </span>
+                            </div>
+                            {skill.reason && (
+                              <div className="mt-1 text-[10px] leading-snug text-fg-secondary">{skill.reason}</div>
+                            )}
+                          </div>
+                        ))}
+                        {disabledMatches.map((skill) => (
+                          <div key={`disabled-${skill.id}`} className="rounded border border-border bg-surface-alt px-2 py-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg-secondary">{skill.name}</span>
+                              <span className="rounded border border-danger/30 bg-danger/10 px-1.5 py-0.5 text-[9px] leading-none text-danger">
+                                Disabled
+                              </span>
+                            </div>
+                            {skill.reason && (
+                              <div className="mt-1 text-[10px] leading-snug text-fg-muted">{skill.reason}</div>
+                            )}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
                 {key === 'tools' && (
                   toolCalls.length === 0 ? (
                     <div className="text-xs text-fg-muted text-center py-4">暂无工具调用</div>
@@ -116,7 +177,7 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
                 )}
                 {key === 'runs' && (
                   <RunSummaryPanel
-                    events={runEvents}
+                    events={codingRunEvents}
                     onOpenWorktree={onOpenWorktree}
                     onApplyRun={onApplyRun}
                     onMergeRun={onMergeRun}

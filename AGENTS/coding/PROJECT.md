@@ -1,21 +1,9 @@
 ---
-updated_at: 2026-05-16
+updated_at: 2026-05-17
 ---
 
 # PROJECT.md — 当前项目上下文
 
-> 此文件由 Coding Agent 自动维护，记录当前项目的技术上下文。
-
 ## 项目信息
-
-- **名称**: （自动检测）
-- **路径**: （自动检测）
-- **Git 分支**: （自动检测）
-
-## 技术栈
-
-（自动检测：语言、框架、构建工具）
-
-## 项目结构概要
-
-（自动检测：关键目录和入口文件）
+- **名称**: quant_agent_system
+- **路径**: C:\Users\Harrys\Desktop\quant-agent-system-main\quant_agent_system

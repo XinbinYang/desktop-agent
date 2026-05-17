@@ -160,10 +160,23 @@ def _extract_model_ids(payload: dict[str, Any]) -> list[str]:
 
 
 async def _fetch_provider_models(provider_name: str | None, base_url: str, api_key: str) -> tuple[int, dict[str, Any]]:
-    url = base_url.rstrip("/") + "/models"
     lowered = (provider_name or "").lower() + " " + base_url.lower()
+    if "kimi" in lowered and "/coding" in base_url.lower():
+        base = base_url.rstrip("/")
+        for suffix in ("/chat/completions", "/v1/messages", "/messages", "/models"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)].rstrip("/")
+                break
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        url = f"{base}/models"
+    else:
+        url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {}
-    if "anthropic" in lowered:
+    if "kimi" in lowered and "/coding" in base_url.lower():
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    elif "anthropic" in lowered:
         headers["anthropic-version"] = "2023-06-01"
         if api_key:
             headers["x-api-key"] = api_key

@@ -7,6 +7,8 @@ export interface SessionPane {
   model: string;
   agentType: AgentType;
   role?: string;
+  title?: string;
+  isPrimary?: boolean;
   teamId?: string;
 }
 
@@ -242,6 +244,8 @@ export function normalizePaneTree(node: unknown): PaneNode | null {
         model: typeof pane.model === 'string' ? pane.model : '',
         agentType,
         role: typeof pane.role === 'string' ? pane.role : roleForAgent(agentType),
+        ...(typeof pane.title === 'string' && pane.title ? { title: pane.title } : {}),
+        ...(typeof pane.isPrimary === 'boolean' ? { isPrimary: pane.isPrimary } : {}),
         ...(typeof pane.teamId === 'string' && pane.teamId ? { teamId: pane.teamId } : {}),
       },
     };

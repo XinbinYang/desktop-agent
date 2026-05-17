@@ -9,28 +9,28 @@ export const UnifiedDiffFallback: React.FC<UnifiedDiffFallbackProps> = ({ diff }
 
   const getLineStyle = (line: string): React.CSSProperties => {
     if (line.startsWith("+++") || line.startsWith("---")) {
-      return { color: "#d4d4d4", backgroundColor: "transparent" };
+      return { color: "var(--text-primary)", backgroundColor: "transparent" };
     }
     if (line.startsWith("+")) {
-      return { color: "#7ee787", backgroundColor: "#2d4a3e" };
+      return { color: "rgb(var(--success-rgb))", backgroundColor: "rgb(var(--success-rgb) / 0.12)" };
     }
     if (line.startsWith("-")) {
-      return { color: "#ffa198", backgroundColor: "#4a2d2d" };
+      return { color: "rgb(var(--danger-rgb))", backgroundColor: "rgb(var(--danger-rgb) / 0.12)" };
     }
     if (line.startsWith("@@")) {
-      return { color: "#79c0ff", backgroundColor: "transparent" };
+      return { color: "var(--text-link)", backgroundColor: "transparent" };
     }
-    return { color: "#d4d4d4", backgroundColor: "transparent" };
+    return { color: "var(--text-primary)", backgroundColor: "transparent" };
   };
 
   return (
-    <div className="overflow-auto" style={{ backgroundColor: "#1e1e1e" }}>
+    <div className="overflow-auto bg-app">
       <div className="font-mono text-xs leading-5">
         {lines.map((line, idx) => (
           <div key={idx} className="flex">
             <span
               className="select-none text-right shrink-0 pl-2 pr-3"
-              style={{ color: "#6e7681", minWidth: "2.5rem" }}
+              style={{ color: "var(--text-muted)", minWidth: "2.5rem" }}
             >
               {idx + 1}
             </span>

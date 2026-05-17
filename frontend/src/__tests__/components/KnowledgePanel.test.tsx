@@ -42,7 +42,7 @@ describe('KnowledgePanel', () => {
       return mockFetchResponse({});
     });
     render(<KnowledgePanel />);
-    expect(await screen.findByText('知识库为空，添加文件或文件夹开始索引')).toBeInTheDocument();
+    expect(await screen.findByText('The knowledge base is empty.')).toBeInTheDocument();
   });
 
   it('renders indexed documents', async () => {
@@ -62,7 +62,7 @@ describe('KnowledgePanel', () => {
     });
     render(<KnowledgePanel />);
     expect(await screen.findByText('/docs/readme.md')).toBeInTheDocument();
-    expect(screen.getByText('5 chunks')).toBeInTheDocument();
+    expect(screen.getByText(/5 chunks/)).toBeInTheDocument();
     expect(screen.getByText('/docs/guide.md')).toBeInTheDocument();
   });
 
@@ -84,11 +84,11 @@ describe('KnowledgePanel', () => {
       return mockFetchResponse({});
     });
     render(<KnowledgePanel />);
-    await screen.findByText('知识库为空，添加文件或文件夹开始索引');
+    await screen.findByText('The knowledge base is empty.');
 
-    const input = screen.getByPlaceholderText('输入文件或文件夹路径...');
+    const input = screen.getByPlaceholderText('File or folder path');
     fireEvent.change(input, { target: { value: '/test/file.md' } });
-    fireEvent.click(screen.getAllByRole('button')[1]);
+    fireEvent.click(screen.getByLabelText('Add to knowledge base'));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -119,8 +119,7 @@ describe('KnowledgePanel', () => {
     render(<KnowledgePanel />);
     await screen.findByText('/docs/readme.md');
 
-    const deleteBtn = screen.getAllByRole('button').find((b) => b.querySelector('.lucide-trash2'));
-    fireEvent.click(deleteBtn!);
+    fireEvent.click(screen.getByLabelText('Delete /docs/readme.md'));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -148,11 +147,11 @@ describe('KnowledgePanel', () => {
     });
 
     render(<KnowledgePanel />);
-    await screen.findByText('知识库为空，添加文件或文件夹开始索引');
+    await screen.findByText('The knowledge base is empty.');
 
-    const searchInput = screen.getByPlaceholderText('搜索知识库...');
+    const searchInput = screen.getByPlaceholderText('Search indexed content');
     fireEvent.change(searchInput, { target: { value: 'hello' } });
-    fireEvent.click(screen.getAllByRole('button')[2]);
+    fireEvent.click(screen.getByLabelText('Search knowledge base'));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -174,10 +173,9 @@ describe('KnowledgePanel', () => {
       return mockFetchResponse({});
     });
     render(<KnowledgePanel />);
-    await screen.findByText('知识库为空，添加文件或文件夹开始索引');
+    await screen.findByText('The knowledge base is empty.');
 
-    const folderBtn = screen.getAllByRole('button')[0];
-    fireEvent.click(folderBtn);
+    fireEvent.click(screen.getByLabelText('Choose folder'));
 
     await waitFor(() => {
       expect((window as any).electronAPI.selectFolder).toHaveBeenCalled();

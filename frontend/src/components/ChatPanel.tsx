@@ -132,26 +132,95 @@ function PlanModeIcon({ className }: { className?: string }) {
   );
 }
 
-/** Collapsible thinking/reasoning block */
-const ReasoningBlock: React.FC<{ text: string }> = ({ text }) => {
-  const [expanded, setExpanded] = useState(false);
-  const lineCount = text.split('\n').length;
+/** Friendly elapsed-time label: <60s → "8s", ≥60s → "2m 5s". */
+function formatThinkDuration(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
+}
+
+/**
+ * Live, auto-collapsing thinking/reasoning block (VSCode Claude-Code style).
+ * - In progress: auto-expanded fixed-height window streaming tokens, pinned
+ *   to the bottom, with an animated indicator and a running elapsed timer.
+ * - Complete: auto-collapses to a single "Thought for Ns" line; clicking
+ *   re-expands the full reasoning. A manual toggle overrides the auto state.
+ */
+const ReasoningBlock: React.FC<{
+  text: string;
+  complete?: boolean;
+  startedAt?: number;
+  endedAt?: number;
+}> = ({ text, complete, startedAt, endedAt }) => {
+  // null = follow auto behaviour; true/false = user explicitly toggled.
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const inProgress = !complete;
+  const expanded = userToggled ?? inProgress;
+
+  // Tick once a second while thinking so the timer updates live.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (complete) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [complete]);
+
+  const hasTimer = typeof startedAt === 'number';
+  const elapsedMs = hasTimer
+    ? (complete ? (endedAt ?? now) : now) - (startedAt as number)
+    : 0;
+
+  // Keep the live window pinned to the latest tokens.
+  useEffect(() => {
+    if (!complete && expanded && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [text, complete, expanded]);
+
+  const headerLabel = inProgress
+    ? 'Thinking'
+    : hasTimer
+      ? `Thought for ${formatThinkDuration(elapsedMs)}`
+      : 'Thought';
 
   return (
     <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/60 overflow-hidden border-l-2 border-l-info/70">
       <button
         type="button"
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => setUserToggled((v) => !(v ?? expanded))}
         className="w-full flex items-center gap-1.5 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm text-fg-secondary hover:text-fg hover:bg-surface-hover transition-colors"
       >
-        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        <span className="font-medium">Thinking</span>
-        <span className="text-fg-muted ml-1 chat-text-xs">({lineCount} lines)</span>
+        {inProgress ? (
+          <span className="flex items-center gap-0.5 text-info" aria-hidden>
+            <span className="think-dot w-1 h-1 rounded-full bg-current" />
+            <span className="think-dot w-1 h-1 rounded-full bg-current" />
+            <span className="think-dot w-1 h-1 rounded-full bg-current" />
+          </span>
+        ) : expanded ? (
+          <ChevronDown className="w-3 h-3" />
+        ) : (
+          <ChevronRight className="w-3 h-3" />
+        )}
+        <span className="font-medium">{headerLabel}</span>
+        {inProgress && hasTimer && (
+          <span className="text-fg-muted ml-1 chat-text-xs tabular-nums">
+            {formatThinkDuration(elapsedMs)}
+          </span>
+        )}
       </button>
       {expanded && (
         <div
-          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary whitespace-pre-wrap overflow-auto border-t border-border-subtle"
-          style={{ maxHeight: '300px', lineHeight: 'var(--chat-line-height)' }}
+          ref={scrollRef}
+          aria-live="polite"
+          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary whitespace-pre-wrap overflow-y-auto border-t border-border-subtle"
+          style={{
+            maxHeight: inProgress ? '140px' : '360px',
+            lineHeight: 'var(--chat-line-height)',
+          }}
         >
           {text}
         </div>

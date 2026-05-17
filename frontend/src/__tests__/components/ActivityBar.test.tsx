@@ -4,7 +4,7 @@ import { ActivityBar } from '../../components/ActivityBar'
 
 describe('ActivityBar', () => {
   const defaultProps = {
-    activeSection: 'tools' as const,
+    activeSection: 'skills' as const,
     activeAgent: 'personal' as const,
     sidebarCollapsed: false,
     onSectionChange: vi.fn(),
@@ -20,10 +20,9 @@ describe('ActivityBar', () => {
 
   it('renders all section icons', () => {
     render(<ActivityBar {...defaultProps} />)
-    expect(screen.getByLabelText('Tools')).toBeInTheDocument()
+    expect(screen.getByLabelText('Skills')).toBeInTheDocument()
     expect(screen.getByLabelText('Project')).toBeInTheDocument()
     expect(screen.getByLabelText('Sessions')).toBeInTheDocument()
-    expect(screen.getByLabelText('Knowledge')).toBeInTheDocument()
     expect(screen.getByLabelText('Settings')).toBeInTheDocument()
   })
 
@@ -54,9 +53,9 @@ describe('ActivityBar', () => {
   it('calls onToggleSidebar when clicking the same active section', () => {
     const onToggleSidebar = vi.fn()
     render(
-      <ActivityBar {...defaultProps} activeSection="tools" sidebarCollapsed={false} onToggleSidebar={onToggleSidebar} />
+      <ActivityBar {...defaultProps} activeSection="skills" sidebarCollapsed={false} onToggleSidebar={onToggleSidebar} />
     )
-    fireEvent.click(screen.getByLabelText('Tools'))
+    fireEvent.click(screen.getByLabelText('Skills'))
     expect(onToggleSidebar).toHaveBeenCalled()
   })
 
@@ -64,7 +63,7 @@ describe('ActivityBar', () => {
     const onSectionChange = vi.fn()
     const onToggleSidebar = vi.fn()
     render(
-      <ActivityBar {...defaultProps} activeSection="tools" sidebarCollapsed={false}
+      <ActivityBar {...defaultProps} activeSection="skills" sidebarCollapsed={false}
         onSectionChange={onSectionChange} onToggleSidebar={onToggleSidebar} />
     )
     fireEvent.click(screen.getByLabelText('Sessions'))

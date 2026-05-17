@@ -71,6 +71,17 @@ class AgentManager:
         """Personal Agent: full OpenClaw cognitive system with bootstrap detection."""
         parts: List[str] = []
 
+        parts.append(
+            "## Runtime Context\n"
+            "- The host has already loaded the Personal Agent workspace files into this system prompt. "
+            "Do not call file or shell tools merely to locate or re-read AGENTS/personal/SOUL.md, "
+            "USER.md, MEMORY.md, BOOTSTRAP.md, or related identity files.\n"
+            "- For greetings, identity questions, model questions, and ordinary conversation, answer directly.\n"
+            "- Use tools only when the user's task requires observation, file changes, external lookup, "
+            "or desktop/browser control. This is a Windows desktop app; if shell commands are needed, "
+            "prefer PowerShell-compatible commands."
+        )
+
         # 0. Bootstrap detection — highest priority
         bootstrap_path = cls._personal_dir() / "BOOTSTRAP.md"
         if bootstrap_path.exists():
@@ -512,7 +523,15 @@ class AgentManager:
             return ""
 
         parts: List[str] = []
+        try:
+            from app.skills import SkillManager
+        except Exception:
+            SkillManager = None  # type: ignore[assignment]
+
         for skill_file in sorted(skills_dir.glob("*.md")):
+            skill_id = f"personal:{skill_file.stem}"
+            if SkillManager and not SkillManager.is_skill_enabled(skill_id, agent_type="personal"):
+                continue
             try:
                 content = skill_file.read_text(encoding="utf-8")
                 parts.append(content[:1500])

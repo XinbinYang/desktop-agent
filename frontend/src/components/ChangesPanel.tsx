@@ -3,6 +3,8 @@ import { DiffEditor } from '@monaco-editor/react';
 import { Check, X, CheckCheck, XCircle } from 'lucide-react';
 import { FileEdit } from '../types';
 import { getLangFromFilename } from '../lib/language';
+import { ensureMonacoThemes, getMonacoThemeName } from '../lib/monacoTheme';
+import { useTheme } from '../hooks/useTheme';
 import { FileEditView } from './FileEditView';
 import { API_BASE } from '../config';
 
@@ -23,6 +25,8 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
   const [activeIndex, setActiveIndex] = useState(0);
   const [statuses, setStatuses] = useState<Record<number, EditStatus>>({});
   const [reverting, setReverting] = useState(false);
+  const { resolved } = useTheme();
+  const monacoTheme = getMonacoThemeName(resolved);
 
   useEffect(() => {
     if (edits.length > 0) {
@@ -193,7 +197,8 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
                 language={getLangFromFilename(active.path, 'monaco')}
                 original={active.old_text}
                 modified={active.new_text}
-                theme="vs-dark"
+                theme={monacoTheme}
+                beforeMount={ensureMonacoThemes}
                 options={{
                   readOnly: true,
                   renderSideBySide: true,

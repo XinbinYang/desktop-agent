@@ -45,6 +45,11 @@ function renderPane(node: PaneNode, overrides: Partial<React.ComponentProps<type
     currentModel: 'gpt-test',
     currentAgentType: 'personal',
     currentRole: 'desktop-agent',
+    models: [
+      { id: 'gpt-test', name: 'GPT Test', provider: 'test', vision: false, context: 1 },
+      { id: 'kimi-for-coding', name: 'Kimi Coding', provider: 'kimi', vision: true, context: 256000 },
+    ],
+    onModelChange: vi.fn(),
     onSnapshot: vi.fn(),
     onCommand: vi.fn(),
     runAction: vi.fn(async () => undefined),
@@ -100,5 +105,32 @@ describe('PaneRenderer', () => {
         role: 'desktop-agent',
       }),
     );
+  });
+
+  it('shows agent type, session title, and model in the pane header', () => {
+    renderPane(leaf('a', 'pane-a', 'session-a'), {
+      sessionMetaById: {
+        'session-a': {
+          title: 'Planning work',
+          model_id: 'gpt-test',
+          agent_type: 'personal',
+          is_primary: false,
+        },
+      },
+    });
+
+    expect(screen.getByText('Personal')).toBeInTheDocument();
+    expect(screen.getByText('Planning work')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('GPT Test')).toBeInTheDocument();
+  });
+
+  it('switches the pane model from the title bar selector', () => {
+    const onModelChange = vi.fn();
+
+    renderPane(leaf('a', 'pane-a', 'session-a'), { onModelChange });
+
+    fireEvent.change(screen.getByLabelText('Pane model'), { target: { value: 'kimi-for-coding' } });
+
+    expect(onModelChange).toHaveBeenCalledWith('a', 'kimi-for-coding');
   });
 });

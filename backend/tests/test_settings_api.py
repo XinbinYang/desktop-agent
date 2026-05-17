@@ -239,6 +239,46 @@ settings:
         assert data["ok"] is False
         assert data["model_found"] is False
 
+    @pytest.mark.asyncio
+    async def test_fetch_provider_models_normalizes_kimi_messages_url(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"data": [{"id": "kimi-for-coding"}]}
+
+        class FakeClient:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def get(self, url, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return FakeResponse()
+
+        monkeypatch.setattr("app.routes.settings.httpx.AsyncClient", FakeClient)
+        from app.routes.settings import _fetch_provider_models
+
+        status_code, payload = await _fetch_provider_models(
+            "kimi",
+            "https://api.kimi.com/coding/v1/messages",
+            "fake-key",
+        )
+
+        assert status_code == 200
+        assert payload["data"][0]["id"] == "kimi-for-coding"
+        assert captured["url"] == "https://api.kimi.com/coding/v1/models"
+        assert captured["headers"]["Authorization"] == "Bearer fake-key"
+
     def test_roles_reload(self, client):
         """POST /api/roles/reload should clear cache and return ok."""
         response = client.post("/api/roles/reload")

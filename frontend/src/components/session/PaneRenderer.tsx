@@ -4,7 +4,7 @@ import { X, Plus, GripVertical, Users, UserPlus } from 'lucide-react';
 import { SessionView, type SessionViewHandle } from './SessionView';
 import type { PaneNode, SessionPane, SplitNode } from './PaneTypes';
 import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSessionContext';
-import type { AgentType, ProjectInfo } from '../../types';
+import type { AgentType, ModelInfo, ProjectInfo } from '../../types';
 import type { Team } from '../../lib/teamStore';
 import { getTeamForPane } from '../../lib/teamStore';
 import { agentForRole, roleForAgent } from '../../lib/agentProfiles';
@@ -18,6 +18,14 @@ interface SplitPaneOptions {
   model?: string;
   role?: string;
   agentType?: AgentType;
+}
+
+interface SessionMeta {
+  title?: string;
+  model_id?: string;
+  role_id?: string;
+  agent_type?: AgentType;
+  is_primary?: boolean;
 }
 
 interface DragPayload {
@@ -50,6 +58,9 @@ interface PaneRendererProps {
   currentModel: string;
   currentAgentType: AgentType;
   currentRole: string;
+  models: ModelInfo[];
+  sessionMetaById?: Record<string, SessionMeta>;
+  onModelChange: (leafId: string, modelId: string) => void;
   onSnapshot: (snapshot: SessionSnapshot | null, actions: SessionActions) => void;
   onCommand: (command: string, args: string) => void;
   runAction: (runId: string, action: 'apply' | 'merge' | 'discard') => Promise<void>;
@@ -82,6 +93,9 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   currentModel,
   currentAgentType,
   currentRole,
+  models,
+  sessionMetaById = {},
+  onModelChange,
   onSnapshot,
   onCommand,
   runAction,
@@ -109,6 +123,9 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         currentModel={currentModel}
         currentAgentType={currentAgentType}
         currentRole={currentRole}
+        models={models}
+        sessionMetaById={sessionMetaById}
+        onModelChange={onModelChange}
         onSnapshot={node.id === focusedLeafId ? onSnapshot : () => {}}
         onCommand={onCommand}
         runAction={runAction}
@@ -159,6 +176,9 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               currentModel={currentModel}
               currentAgentType={currentAgentType}
               currentRole={currentRole}
+              models={models}
+              sessionMetaById={sessionMetaById}
+              onModelChange={onModelChange}
               onSnapshot={child.id === focusedLeafId ? onSnapshot : () => {}}
               onCommand={onCommand}
               runAction={runAction}
@@ -191,6 +211,9 @@ interface LeafPaneProps {
   currentModel: string;
   currentAgentType: AgentType;
   currentRole: string;
+  models: ModelInfo[];
+  sessionMetaById: Record<string, SessionMeta>;
+  onModelChange: (leafId: string, modelId: string) => void;
   onSnapshot: (snapshot: SessionSnapshot | null, actions: SessionActions) => void;
   onCommand: (command: string, args: string) => void;
   runAction: (runId: string, action: 'apply' | 'merge' | 'discard') => Promise<void>;
@@ -217,6 +240,9 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   currentModel,
   currentAgentType,
   currentRole,
+  models,
+  sessionMetaById,
+  onModelChange,
   onSnapshot,
   onCommand,
   runAction,
@@ -361,6 +387,16 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   };
 
   const borderColor = team?.color;
+  const meta = sessionMetaById[pane.sessionId];
+  const agentType = pane.agentType || meta?.agent_type || agentForRole(pane.role);
+  const agentLabel = agentType === 'personal' ? 'Personal' : 'Coding';
+  const paneTitle = agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')
+    ? 'Main'
+    : (meta?.title || pane.title || pane.sessionId.replace(/^session_(coding_)?/, '#'));
+  const modelLabel = pane.model || meta?.model_id || currentModel;
+  const modelOptions = modelLabel && !models.some((model) => model.id === modelLabel)
+    ? [{ id: modelLabel, name: modelLabel, provider: '', vision: false, context: 0 }, ...models]
+    : models;
 
   return (
     <div
@@ -407,10 +443,34 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           aria-label="Drag pane"
         >
           <GripVertical className="w-3 h-3 text-fg-muted shrink-0 pointer-events-none" />
-          <span className="text-[10px] font-medium text-fg truncate px-1 select-none pointer-events-none">
-            {pane.sessionId.replace('session_', '#')}
+          <span className="text-[10px] font-semibold text-fg truncate px-1 select-none pointer-events-none">
+            {agentLabel}
+          </span>
+          <span className="text-[10px] text-fg-secondary truncate px-0.5 select-none pointer-events-none">
+            {paneTitle}
           </span>
         </div>
+        <select
+          value={modelLabel}
+          aria-label="Pane model"
+          title={`Model for ${agentLabel} ${paneTitle}`}
+          onPointerDown={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => {
+            event.stopPropagation();
+            onFocus();
+            onModelChange(leafId, event.target.value);
+          }}
+          className="h-5 max-w-[42%] min-w-[88px] shrink text-[9px] text-fg-muted bg-surface border border-transparent hover:border-border focus:border-accent/50 rounded px-1 outline-none cursor-pointer app-no-drag"
+        >
+          {!modelLabel && <option value="">No model</option>}
+          {modelOptions.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.name || model.id}
+            </option>
+          ))}
+        </select>
         <button
           type="button"
           onPointerDown={(event) => event.stopPropagation()}
@@ -499,7 +559,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
             else sessionViewRefs.current.delete(pane.sessionId);
           }}
           sessionId={pane.sessionId}
-          model={pane.model || currentModel}
+          model={modelLabel}
           agentType={pane.agentType || currentAgentType}
           role={pane.role || roleForAgent(pane.agentType || currentAgentType)}
           teamId={pane.teamId}

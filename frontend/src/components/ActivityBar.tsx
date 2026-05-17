@@ -1,9 +1,8 @@
 import React from 'react';
 import {
-  Zap,
+  Sparkles,
   FolderOpen,
   MessageSquare,
-  BookOpen,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
@@ -37,10 +36,9 @@ const AGENT_ITEMS: ActivityItem[] = [
 ];
 
 const SECTION_ITEMS: ActivityItem[] = [
-  { id: 'tools', icon: Zap, label: 'Tools' },
+  { id: 'skills', icon: Sparkles, label: 'Skills' },
   { id: 'project', icon: FolderOpen, label: 'Project' },
   { id: 'sessions', icon: MessageSquare, label: 'Sessions' },
-  { id: 'knowledge', icon: BookOpen, label: 'Knowledge' },
   { id: 'settings', icon: Settings, label: 'Settings' },
 ];
 

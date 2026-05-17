@@ -20,6 +20,21 @@ describe('useLayoutState', () => {
     expect(stored.terminalLayout).toEqual({ conversation: 70, terminal: 30 });
   });
 
+  it('uses skills as the default sidebar section', () => {
+    const { result } = renderHook(() => useLayoutState());
+    expect(result.current.activeSection).toBe('skills');
+  });
+
+  it('migrates legacy tools sidebar section to skills', () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({
+      activeSection: 'tools',
+      activeAgent: 'personal',
+    }));
+
+    const { result } = renderHook(() => useLayoutState());
+    expect(result.current.activeSection).toBe('skills');
+  });
+
   it('normalizes invalid persisted layouts and resets to defaults', () => {
     localStorage.setItem('desktop-agent-layout', JSON.stringify({
       activeSection: 'sessions',
@@ -41,6 +56,7 @@ describe('useLayoutState', () => {
 
     expect(result.current.showTerminal).toBe(true);
     expect(result.current.rightPanelVisible).toBe(true);
+    expect(result.current.activeSection).toBe('skills');
     expect(result.current.mainLayout).toEqual(DEFAULT_MAIN_LAYOUT);
     expect(result.current.terminalLayout).toEqual(DEFAULT_TERMINAL_LAYOUT);
   });

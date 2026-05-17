@@ -1,6 +1,8 @@
 /* Design tokens — dark and light themes */
 
 :root[data-theme='dark'] {
+  color-scheme: dark;
+
   /* Surface */
   --bg-app: #0d1117;
   --bg-surface: #161b22;
@@ -50,6 +52,8 @@
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
+
   /* Surface (VS Code Light baseline) */
   --bg-app: #ffffff;
   --bg-surface: #f3f3f3;
