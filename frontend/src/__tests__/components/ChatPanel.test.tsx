@@ -134,6 +134,25 @@ describe('ChatPanel', () => {
     expect(screen.getByLabelText('Plan mode')).toHaveAttribute('aria-pressed', 'true')
   })
 
+  it('uses a folded Thinking menu and reports selected intensity', () => {
+    const onThinkingIntensityChange = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        thinkingIntensity="medium"
+        onThinkingIntensityChange={onThinkingIntensityChange}
+      />,
+    )
+
+    const trigger = screen.getByRole('button', { name: /Thinking intensity MEDIUM/i })
+    expect(trigger).toHaveTextContent('MEDIUM')
+
+    fireEvent.pointerDown(trigger)
+    fireEvent.click(screen.getByText('HIGH'))
+
+    expect(onThinkingIntensityChange).toHaveBeenCalledWith('high')
+  })
+
   it('disables chat input while plan awaiting_decision', () => {
     const awaiting: PlanState = {
       ...idlePlanState,
@@ -164,5 +183,58 @@ describe('ChatPanel', () => {
     const stopButton = screen.getByLabelText('Stop')
     fireEvent.click(stopButton)
     expect(onStop).toHaveBeenCalled()
+  })
+
+  it('renders context meter and compacts on click', () => {
+    const onCompact = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        contextUsage={{
+          session_id: 's1',
+          model_id: 'gpt-4o',
+          model_context: 1000,
+          estimated_tokens: 720,
+          used_tokens: 720,
+          remaining_tokens: 280,
+          used_percent: 72,
+          exact: false,
+          source: 'estimate',
+          status: 'warning',
+          breakdown: { history: 500, tools: 100, system: 120 },
+        }}
+        onCompact={onCompact}
+      />,
+    )
+
+    fireEvent.click(screen.getByTitle(/Context 72\.0%/))
+    expect(onCompact).toHaveBeenCalledWith(false)
+  })
+
+  it('lists rewind checkpoints and calls rewind action', async () => {
+    const onRewindToCheckpoint = vi.fn()
+    const onLoadCheckpoints = vi.fn(async () => [])
+    const onRewindOpenChange = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        rewindOpen
+        checkpoints={[{
+          id: 'chk_1',
+          index: 1,
+          role: 'user',
+          preview: 'Try this earlier prompt',
+          created_at: 1710000000,
+        }]}
+        onLoadCheckpoints={onLoadCheckpoints}
+        onRewindToCheckpoint={onRewindToCheckpoint}
+        onRewindOpenChange={onRewindOpenChange}
+      />,
+    )
+
+    fireEvent.click(screen.getByText('Try this earlier prompt'))
+    expect(onLoadCheckpoints).toHaveBeenCalled()
+    expect(onRewindToCheckpoint).toHaveBeenCalledWith('chk_1')
+    expect(onRewindOpenChange).toHaveBeenCalledWith(false)
   })
 })

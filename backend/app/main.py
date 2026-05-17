@@ -12,7 +12,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.agent import (
     AgentSession,
@@ -20,7 +20,9 @@ from app.agent import (
     _sessions,
     clear_session,
     get_or_create_session,
+    list_session_records,
     refresh_all_sessions_mcp_tools,
+    resolve_agent_session,
     PLAN_CONTINUE_MARKER,
 )
 from app.config import list_all_models, load_config
@@ -31,6 +33,7 @@ from app.errors import (
     categorize_exception,
     error_response,
     not_found_error,
+    sandbox_error,
     tool_failure_error,
     tool_not_found_error,
     validation_error,
@@ -154,6 +157,22 @@ class ChatRequest(BaseModel):
     image_base64: Optional[str] = None
 
 
+class SessionResolveRequest(BaseModel):
+    agent_type: str
+    policy: str = "last_or_create"
+    project_path: Optional[str] = None
+
+
+class CompactSessionRequest(BaseModel):
+    focus: Optional[str] = ""
+    force: bool = False
+
+
+class RewindSessionRequest(BaseModel):
+    checkpoint_id: str
+    retry: bool = False
+
+
 def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> str:
     if agent_type in ("personal", "coding"):
         return agent_type
@@ -201,7 +220,10 @@ async def chat(req: ChatRequest):
     model_id = req.model_id or load_config().settings.default_model
     agent_type = _resolve_agent_type(req.agent_type, req.role_id)
     role_id = req.role_id or AgentManager.get_default_role(agent_type)
-    session = get_or_create_session(req.session_id, model_id, role_id, agent_type=agent_type)
+    try:
+        session = get_or_create_session(req.session_id, model_id, role_id, agent_type=agent_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     results = []
     async for event in session.run(req.message, req.image_base64):
@@ -210,29 +232,20 @@ async def chat(req: ChatRequest):
     return {"events": results}
 
 @app.get("/api/sessions")
-def list_sessions(project_path: str = ""):
+def list_sessions(project_path: str = "", agent_type: str = ""):
     """获取所有保存的会话列表，可按项目路径过滤"""
-    sessions = []
-    for path in SESSIONS_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            sp = data.get("project_path")
-            if project_path and sp != project_path:
-                continue
-            sessions.append({
-                "id": data.get("session_id", path.stem),
-                "title": data.get("title", ""),
-                "project_path": sp,
-                "model_id": data.get("model_id", ""),
-                "role_id": data.get("role_id", "desktop-agent"),
-                "agent_type": _resolve_agent_type(data.get("agent_type"), data.get("role_id", "desktop-agent")),
-                "message_count": len(data.get("messages", [])),
-                "updated_at": path.stat().st_mtime,
-            })
-        except Exception:
-            pass
-    return {"sessions": sorted(sessions, key=lambda s: s.get("updated_at", 0), reverse=True)}
+    if agent_type and agent_type not in ("personal", "coding"):
+        raise HTTPException(status_code=400, detail=f"Unknown agent_type: {agent_type}")
+    return {"sessions": list_session_records(project_path=project_path, agent_type=agent_type)}
+
+
+@app.post("/api/sessions/resolve")
+def resolve_session(req: SessionResolveRequest):
+    """Resolve the concrete session that should back an agent navigation action."""
+    try:
+        return resolve_agent_session(req.agent_type, req.policy, req.project_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.get("/api/sessions/{session_id}")
 def get_session_snapshot(session_id: str):
@@ -246,6 +259,44 @@ def get_session_snapshot(session_id: str):
 def clear_chat(session_id: str):
     clear_session(session_id)
     return {"status": "ok", "message": f"Session {session_id} cleared"}
+
+
+@app.get("/api/sessions/{session_id}/context")
+def get_session_context(session_id: str):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session.context_usage()
+
+
+@app.get("/api/sessions/{session_id}/checkpoints")
+def get_session_checkpoints(session_id: str):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"checkpoints": session.build_checkpoints()}
+
+
+@app.post("/api/sessions/{session_id}/compact")
+async def compact_session(session_id: str, req: CompactSessionRequest):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = await session.compact_context(req.focus or "", force=req.force)
+    if result is None:
+        raise HTTPException(status_code=500, detail="Context compaction failed")
+    return {**result, "snapshot": session.to_snapshot()}
+
+
+@app.post("/api/sessions/{session_id}/rewind")
+def rewind_session(session_id: str, req: RewindSessionRequest):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = session.rewind_to_checkpoint(req.checkpoint_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    return {**result, "retry": False, "snapshot": session.to_snapshot()}
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
@@ -553,10 +604,31 @@ def detect_test_framework():
 
 # ====== Skills API ======
 
+class SkillPreferencesRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    personal: Dict[str, bool] = Field(default_factory=dict)
+    coding: Dict[str, bool] = Field(default_factory=dict)
+
+
 @app.get("/api/skills")
 def list_skills():
     """获取所有可用的 Superpowers skills"""
-    return {"skills": SkillManager.list_skills()}
+    return SkillManager.list_skill_catalog()
+
+
+@app.put("/api/skills/preferences")
+def update_skill_preferences(req: SkillPreferencesRequest):
+    """Persist per-agent skill enablement preferences."""
+    try:
+        result = SkillManager.update_preferences(req.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    catalog = SkillManager.list_skill_catalog()
+    return {
+        **catalog,
+        "ignored": result["ignored"],
+    }
 
 
 # ====== Commands API ======
@@ -708,6 +780,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
         await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
 
+    await websocket.send_json({"type": "context_usage", "data": session.context_usage()})
+
     try:
         run_task: "asyncio.Task | None" = None
 
@@ -730,7 +804,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 current_role_id = role_id
                 current_agent_type = agent_type
 
-                session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "data": validation_error(str(exc))})
+                    continue
 
                 # Cancel any in-progress run before starting a new one
                 if run_task and not run_task.done():
@@ -759,7 +837,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "clear":
                 clear_session(session_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 await websocket.send_json({"type": "cleared"})
+                await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
+                await websocket.send_json({"type": "context_usage", "data": session.context_usage()})
 
             elif msg_type == "set_chat_mode":
                 mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
@@ -770,6 +851,17 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
                 else:
                     await websocket.send_json({"type": "error", "data": validation_error("Invalid chat_mode")})
+
+            elif msg_type == "set_thinking_intensity":
+                intensity = msg.get("thinking_intensity") or msg.get("thinkingIntensity") or ""
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                if isinstance(intensity, str) and session.set_session_thinking_intensity(intensity):
+                    await websocket.send_json({
+                        "type": "thinking_intensity",
+                        "data": {"thinking_intensity": session.thinking_intensity},
+                    })
+                else:
+                    await websocket.send_json({"type": "error", "data": validation_error("Invalid thinking_intensity")})
 
             elif msg_type == "stop":
                 session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
@@ -787,7 +879,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 current_model = model_id
                 current_role_id = role_id
                 current_agent_type = agent_type
-                session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 if session.retry_last():
                     # Cancel any in-progress run before retrying
                     if run_task and not run_task.done():
@@ -831,6 +927,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     session.model_id = model_id
                     session._agent_models[current_agent_type] = model_id
                     session._refresh_system_prompt()
+                    session._save()
                     await websocket.send_json({
                         "type": "model_switched",
                         "data": {"model_id": model_id, "agent_type": current_agent_type},
@@ -844,17 +941,76 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "compact":
                 session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
-                summary = await session.compact_context()
-                if summary:
+                result = await session.compact_context(
+                    focus=str(msg.get("focus") or ""),
+                    force=bool(msg.get("force", False)),
+                )
+                if result:
                     await websocket.send_json({
                         "type": "compacted",
-                        "data": {"summary": summary, "message_count": len(session.messages)},
+                        "data": {
+                            **result,
+                            "message_count": len(session.messages),
+                            "source": msg.get("source") or "websocket",
+                        },
                     })
+                    await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
+                    await websocket.send_json({"type": "context_usage", "data": session.context_usage()})
                 else:
                     await websocket.send_json({
                         "type": "error",
                         "data": validation_error("对话消息不足，无需压缩（至少需要 15 条消息）"),
                     })
+
+            elif msg_type == "context":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await websocket.send_json({"type": "context_usage", "data": session.context_usage()})
+
+            elif msg_type == "rewind":
+                model_id = msg.get("model_id", current_model)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
+                chat_mode = msg.get("chat_mode")
+                thinking_intensity = msg.get("thinking_intensity")
+                checkpoint_id = str(msg.get("checkpoint_id") or msg.get("checkpointId") or "")
+                current_model = model_id
+                current_role_id = role_id
+                current_agent_type = agent_type
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                if run_task and not run_task.done():
+                    session.cancel()
+                    run_task.cancel()
+                result = session.rewind_to_checkpoint(checkpoint_id)
+                if not result:
+                    await websocket.send_json({"type": "error", "data": validation_error("Checkpoint not found")})
+                    continue
+                await websocket.send_json({"type": "rewound", "data": result})
+                await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
+                await websocket.send_json({"type": "context_usage", "data": session.context_usage()})
+                if bool(msg.get("retry", True)):
+                    async def _rewind_retry_agent():
+                        token = set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
+                        try:
+                            async for event in session.run(
+                                "",
+                                None,
+                                chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
+                                thinking_intensity=thinking_intensity
+                                if thinking_intensity in ("low", "medium", "high")
+                                else None,
+                            ):
+                                await websocket.send_json(event)
+                            await websocket.send_json({"type": "done"})
+                        except asyncio.CancelledError:
+                            pass
+                        finally:
+                            reset_worker_event_callback(token)
+
+                    run_task = asyncio.create_task(_rewind_retry_agent())
 
             elif msg_type == "build_plan":
                 session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
@@ -930,8 +1086,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 if agent_type not in ("personal", "coding"):
                     await websocket.send_json({"type": "error", "data": {"message": f"Unknown agent_type: {agent_type}"}})
                     continue
-                session = get_or_create_session(session_id, current_model, role_id=current_role_id, agent_type=agent_type)
-                session.switch_agent(agent_type)
+                try:
+                    session = get_or_create_session(session_id, current_model, role_id=current_role_id, agent_type=agent_type)
+                    session.switch_agent(agent_type)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 current_role_id = session.role_id
                 current_agent_type = agent_type
                 current_model = session.model_id
@@ -948,10 +1108,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             elif msg_type == "switch_role":
                 role_id = msg.get("role_id", current_role_id)
                 agent_type = AgentManager.get_agent_type_for_role(role_id)
+                try:
+                    session = get_or_create_session(session_id, current_model, role_id=role_id, agent_type=agent_type)
+                    session.switch_role(role_id)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 current_role_id = role_id
                 current_agent_type = agent_type
-                session = get_or_create_session(session_id, current_model, role_id=role_id, agent_type=agent_type)
-                session.switch_role(role_id)
                 await websocket.send_json({
                     "type": "agent_switched",
                     "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
@@ -996,11 +1160,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 try:
                     result = await tool.execute(**tool_args)
                 except Exception as e:
+                    failure = tool_failure_error(f"Tool execution failed: {e}", tool_name)
                     await websocket.send_json({
                         "type": "tool_result",
                         "data": {
                             "name": tool_name, "args": tool_args, "output": "",
-                            "error": tool_failure_error(f"Tool execution failed: {e}", tool_name),
+                            "error": failure.get("message", str(e)),
                             "image": None,
                         }
                     })

@@ -32,6 +32,7 @@ describe('useChatSession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.setItem('desktop-agent-chat-mode', 'agent')
+    localStorage.setItem('desktop-agent-thinking-intensity', 'medium')
     mockSend.mockReset()
     mockSend.mockReturnValue(true)
     vi.stubGlobal('fetch', vi.fn(() =>
@@ -119,6 +120,36 @@ describe('useChatSession', () => {
     // Re-read blocks from the updated state (not stale reference)
     expect(result.current.messages[0].blocks![0].type).toBe('text')
     expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello world')
+  })
+
+  it('records skills_matched events for activity trace', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'skills_matched',
+        data: {
+          run_id: 'run-1',
+          skills: [{ id: 'systematic-debugging', name: 'systematic-debugging' }],
+          disabled_matches: [{ id: 'test-driven-development', name: 'test-driven-development' }],
+        },
+      })
+    })
+
+    expect(result.current.runEvents).toHaveLength(1)
+    expect(result.current.runEvents[0].type).toBe('skills_matched')
+    expect(result.current.runEvents[0].data.skills).toHaveLength(1)
+    expect(result.current.terminalLogs.some((line) => line.includes('[Skills] 1 matched, 1 disabled'))).toBe(true)
   })
 
   it('hydrates a full backend history snapshot', () => {
@@ -458,6 +489,100 @@ describe('useChatSession', () => {
     expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
   })
 
+  it('setThinkingIntensity sends set_thinking_intensity to the server', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.setThinkingIntensity('high')
+    })
+
+    expect(result.current.thinkingIntensity).toBe('high')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_thinking_intensity', thinking_intensity: 'high' })
+  })
+
+  it('sends compact and rewind session control messages', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.compactSession(false)
+      result.current.rewindToCheckpoint('chk_1')
+    })
+
+    expect(mockSend).toHaveBeenCalledWith({ type: 'compact', force: false, focus: '', source: 'ui' })
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'rewind',
+      checkpoint_id: 'chk_1',
+      retry: true,
+      model_id: 'gpt-4o',
+      agent_type: 'personal',
+      role_id: 'desktop-agent',
+      chat_mode: 'agent',
+      thinking_intensity: 'medium',
+    })
+  })
+
+  it('stores context_usage and compacted context payloads', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'context_usage',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          model_context: 1000,
+          estimated_tokens: 500,
+          used_tokens: 500,
+          remaining_tokens: 500,
+          used_percent: 50,
+          exact: false,
+          source: 'estimate',
+          status: 'ok',
+          breakdown: { history: 400, system: 100 },
+        },
+      })
+    })
+
+    expect(result.current.contextUsage?.used_percent).toBe(50)
+
+    act(() => {
+      messageHandler?.({
+        type: 'compacted',
+        data: {
+          skipped: false,
+          before_message_count: 20,
+          after_message_count: 6,
+          context_usage: {
+            session_id: 'session-1',
+            model_id: 'gpt-4o',
+            model_context: 1000,
+            estimated_tokens: 250,
+            used_tokens: 250,
+            remaining_tokens: 750,
+            used_percent: 25,
+            exact: false,
+            source: 'estimate',
+            status: 'ok',
+            breakdown: { history: 150, system: 100 },
+          },
+        },
+      })
+    })
+
+    expect(result.current.contextUsage?.used_percent).toBe(25)
+    expect(result.current.isRunning).toBe(false)
+  })
+
   it('applies chat_mode events from the server', () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -480,6 +605,26 @@ describe('useChatSession', () => {
       messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'agent' } })
     })
     expect(result.current.chatMode).toBe('agent')
+  })
+
+  it('applies thinking_intensity events from the server', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'thinking_intensity', data: { thinking_intensity: 'low' } })
+    })
+
+    expect(result.current.thinkingIntensity).toBe('low')
   })
 
   it('history_snapshot does not downgrade plan to agent when plan phase is idle', () => {

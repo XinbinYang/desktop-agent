@@ -24,6 +24,13 @@ class TestAgentSession:
         assert len(session.messages) == 1  # system prompt
         assert session.messages[0]["role"] == "system"
 
+    def test_set_session_thinking_intensity_updates_active_agent(self, session):
+        assert session.set_session_thinking_intensity("high") is True
+        assert session.thinking_intensity == "high"
+        assert session._agent_thinking[session.agent_type] == "high"
+        assert session.set_session_thinking_intensity("extreme") is False
+        assert session.thinking_intensity == "high"
+
     def test_completion_quality_payload_marks_missing_gates(self):
         missing = _completion_quality_payload(
             files_modified=True,
@@ -59,6 +66,58 @@ class TestAgentSession:
         assert _shell_command_looks_like_verification("python -m pytest tests/test_agent.py")
         assert _shell_command_looks_like_verification("npm run build")
         assert not _shell_command_looks_like_verification("pwd")
+
+    def test_context_usage_and_checkpoints_have_stable_shape(self, session):
+        session.messages.append({"role": "user", "content": "first prompt"})
+        session.messages.append({"role": "assistant", "content": "first answer"})
+
+        usage = session.context_usage()
+        checkpoints = session.build_checkpoints()
+
+        assert usage["model_context"] > 0
+        assert usage["used_tokens"] >= 0
+        assert usage["used_percent"] >= 0
+        assert usage["source"] in {"estimate", "provider"}
+        assert "history" in usage["breakdown"]
+        assert len(checkpoints) == 1
+        assert checkpoints[0]["id"].startswith("chk_")
+        assert checkpoints[0]["preview"] == "first prompt"
+
+    def test_rewind_to_checkpoint_trims_later_conversation(self, session):
+        session.messages.append({"role": "user", "content": "keep me"})
+        session.messages.append({"role": "assistant", "content": "old answer"})
+        session.messages.append({"role": "user", "content": "remove me"})
+        session.messages.append({"role": "assistant", "content": "remove answer"})
+        checkpoint_id = session.build_checkpoints()[0]["id"]
+
+        result = session.rewind_to_checkpoint(checkpoint_id)
+
+        assert result is not None
+        assert result["checkpoint_id"] == checkpoint_id
+        assert [m.get("content") for m in session.messages if m.get("role") != "system"] == ["keep me"]
+        assert session.messages[0]["role"] == "system"
+
+    @pytest.mark.asyncio
+    async def test_compact_context_summarizes_older_messages_and_keeps_recent_turns(self, session):
+        async def fake_summary(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Summary: earlier decisions and tool results."}}]}
+
+        for i in range(6):
+            session.messages.append({"role": "user", "content": f"user turn {i}"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session.router.chat_completion_non_stream = fake_summary
+
+        result = await session.compact_context(force=True)
+
+        assert result is not None
+        assert result["skipped"] is False
+        assert result["before_message_count"] == 12
+        assert result["after_message_count"] == 6
+        assert session.compaction_summary.startswith("Summary:")
+        assert len([m for m in session.messages if m.get("role") == "system"]) == 1
+        remaining_text = "\n".join(str(m.get("content")) for m in session.messages)
+        assert "user turn 0" not in remaining_text
+        assert "user turn 5" in remaining_text
 
     def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
         import app.agent as agent_module
@@ -97,6 +156,26 @@ class TestAgentSession:
             assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
             assert all("run_id" in e["data"] for e in events if "data" in e)
             assert all("timestamp" in e["data"] for e in events if "data" in e)
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_response_uses_non_stream_fallback(self, session):
+        async def empty_stream(*args, **kwargs):
+            yield {"type": "done", "response": {"choices": [{"message": {"content": ""}}]}}
+
+        async def non_stream_fallback(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Recovered fallback"}}]}
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", empty_stream),
+            patch("app.agent.ModelRouter.chat_completion_non_stream", non_stream_fallback),
+        ):
+            events = []
+            async for event in session.run("hi"):
+                events.append(event)
+
+        streamed_text = "".join(e["data"]["text"] for e in events if e["type"] == "content")
+        assert streamed_text == "Recovered fallback"
+        assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
 
     @pytest.mark.asyncio
     async def test_run_with_tool_call(self, session):
@@ -544,12 +623,31 @@ class TestAgentType:
         # The prompts should differ because coding excludes personal files
         assert old_prompt != new_prompt
 
+    def test_switch_agent_rejects_nonempty_identity_change(self):
+        """Non-empty sessions keep a stable agent identity."""
+        session = AgentSession(model_id="gpt-4o", session_id="test_at", agent_type="personal")
+        session.messages.append({"role": "user", "content": "hello"})
+
+        with pytest.raises(ValueError, match="Cannot switch a non-empty session"):
+            session.switch_agent("coding")
+
     def test_switch_role_backward_compat(self):
         """switch_role() still works and maps through agent_type."""
         session = AgentSession(model_id="gpt-4o", session_id="test_at", agent_type="personal")
         session.switch_role("code-expert")
         assert session.agent_type == "coding"
         assert session.role_id == "code-expert"
+
+    def test_get_or_create_rejects_reusing_nonempty_session_as_other_agent(self):
+        import app.agent as agent_module
+
+        agent_module._sessions.clear()
+        session = AgentSession(model_id="gpt-4o", session_id="at_nonempty", agent_type="personal")
+        session.messages.append({"role": "user", "content": "hello"})
+        agent_module._sessions["at_nonempty"] = session
+
+        with pytest.raises(ValueError, match="already belongs to personal"):
+            get_or_create_session("at_nonempty", "gpt-4o", role_id="code-expert", agent_type="coding")
 
     def test_get_or_create_session_with_agent_type(self):
         s = get_or_create_session("at_s1", "gpt-4o", role_id="code-expert", agent_type="coding")

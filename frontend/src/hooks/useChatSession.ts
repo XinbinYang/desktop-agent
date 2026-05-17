@@ -17,6 +17,8 @@ import {
   StructuredPlanDraft,
   RunEvent,
   AgentType,
+  ContextUsage,
+  ConversationCheckpoint,
 } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { API_BASE } from '../config';
@@ -35,6 +37,10 @@ function initialChatModeFromStorage(): ClientChatMode {
   }
 }
 
+function isThinkingIntensity(value: unknown): value is ThinkingIntensity {
+  return value === 'low' || value === 'medium' || value === 'high';
+}
+
 function appendBlock(
   messages: ChatMessage[],
   block: AssistantBlock,
@@ -47,7 +53,15 @@ function appendBlock(
     const blocks = [...(last.blocks || [])];
     if (mergeable && blocks.length > 0) {
       const lastBlock = blocks[blocks.length - 1];
-      if (lastBlock.type === block.type && (lastBlock.type === 'thinking' || lastBlock.type === 'text')) {
+      // Never resurrect a sealed thinking block: a `reasoning` event arriving
+      // after a tool/answer must start a NEW thinking block (its own timer).
+      const sealedThinking =
+        lastBlock.type === 'thinking' && (lastBlock as { complete?: boolean }).complete === true;
+      if (
+        lastBlock.type === block.type &&
+        (lastBlock.type === 'thinking' || lastBlock.type === 'text') &&
+        !sealedThinking
+      ) {
         blocks[blocks.length - 1] = {
           ...lastBlock,
           text: (lastBlock as { text: string }).text + (block as { text: string }).text,
@@ -150,6 +164,37 @@ function mergeBlock(
   return null;
 }
 
+/**
+ * Seal the most recent still-open thinking block (frontend-derived
+ * completion). Called before appending any non-thinking block and on every
+ * turn-ending event, so the live thinking window auto-collapses into a
+ * "Thought for Ns" summary and its timer freezes.
+ */
+function completeOpenThinking(messages: ChatMessage[]): ChatMessage[] {
+  const result = mergeBlock(
+    messages,
+    (b) => b.type === 'thinking' && !(b as { complete?: boolean }).complete,
+    (b) => ({ ...b, complete: true, endedAt: Date.now() } as AssistantBlock),
+  );
+  return result ?? messages;
+}
+
+function ensureThinkingPlaceholder(messages: ChatMessage[]): ChatMessage[] {
+  const last = messages[messages.length - 1];
+  if (
+    last?.role === 'assistant' &&
+    !last.turnComplete &&
+    last.blocks?.some((block) => block.type === 'thinking' || block.type === 'text' || block.type === 'tool_call')
+  ) {
+    return messages;
+  }
+  return appendBlock(
+    messages,
+    { type: 'thinking', text: 'Waiting for model response...', timestamp: Date.now(), startedAt: Date.now() },
+    false,
+  );
+}
+
 function isDispatchTool(name?: string): boolean {
   return name === 'dispatch_worker' || name === 'dispatch_parallel';
 }
@@ -224,6 +269,8 @@ function sessionSnapshotToState(snapshot: any): {
   chatMode?: ClientChatMode;
   thinkingIntensity?: ThinkingIntensity;
   planState?: PlanState;
+  contextUsage?: ContextUsage | null;
+  checkpoints?: ConversationCheckpoint[];
 } {
   const restoredMessages: ChatMessage[] = [];
   const restoredToolCalls: ToolCall[] = [];
@@ -236,9 +283,13 @@ function sessionSnapshotToState(snapshot: any): {
     if (role === 'user') {
       const text = contentToText(msg.content);
       restoredMessages.push({
-        id: generateId(),
+        id: msg.message_id || generateId(),
         role: 'user',
         content: text,
+        messageId: msg.message_id,
+        turnId: msg.turn_id,
+        checkpointId: msg.checkpoint_id,
+        createdAt: typeof msg.created_at === 'number' ? msg.created_at * 1000 : undefined,
         isTool: false,
         turnComplete: true,
       });
@@ -249,7 +300,9 @@ function sessionSnapshotToState(snapshot: any): {
       const blocks: AssistantBlock[] = [];
       const timestamp = Date.now();
       if (msg.reasoning_content) {
-        blocks.push({ type: 'thinking', text: msg.reasoning_content, timestamp });
+        // Restored from history: already finished. No startedAt → the block
+        // renders collapsed with a plain "Thought" label (no live timer).
+        blocks.push({ type: 'thinking', text: msg.reasoning_content, timestamp, complete: true });
       }
       const text = contentToText(msg.content);
       if (text) {
@@ -277,9 +330,13 @@ function sessionSnapshotToState(snapshot: any): {
       }
       if (blocks.length > 0) {
         restoredMessages.push({
-          id: generateId(),
+          id: msg.message_id || generateId(),
           role: 'assistant',
           content: text,
+          messageId: msg.message_id,
+          turnId: msg.turn_id,
+          checkpointId: msg.checkpoint_id,
+          createdAt: typeof msg.created_at === 'number' ? msg.created_at * 1000 : undefined,
           isTool: false,
           blocks,
           toolSummary: buildToolSummary(blocks),
@@ -330,7 +387,7 @@ function sessionSnapshotToState(snapshot: any): {
 
   const chatMode = snapshot?.chat_mode === 'plan' ? 'plan' : snapshot?.chat_mode === 'agent' ? 'agent' : undefined;
   const thinkingIntensity =
-    snapshot?.thinking_intensity === 'low' || snapshot?.thinking_intensity === 'medium' || snapshot?.thinking_intensity === 'high'
+    isThinkingIntensity(snapshot?.thinking_intensity)
       ? snapshot.thinking_intensity
       : undefined;
 
@@ -340,6 +397,8 @@ function sessionSnapshotToState(snapshot: any): {
     chatMode,
     thinkingIntensity,
     planState: snapshot?.plan_state,
+    contextUsage: snapshot?.context_usage || null,
+    checkpoints: Array.isArray(snapshot?.checkpoints) ? snapshot.checkpoints : [],
   };
 }
 
@@ -364,6 +423,8 @@ export function useChatSession(
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [checkpoints, setCheckpoints] = useState<ConversationCheckpoint[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [suggestAgentSwitch, setSuggestAgentSwitch] = useState<{
@@ -372,13 +433,14 @@ export function useChatSession(
   const [chatMode, setChatModeState] = useState<ClientChatMode>(() => initialChatModeFromStorage());
   const sendRef = useRef<(obj: object) => boolean>(() => false);
   const chatModeRef = useRef<ClientChatMode>(initialChatModeFromStorage());
-  const [thinkingIntensity, setThinkingIntensity] = useState<ThinkingIntensity>(() => {
+  const [thinkingIntensity, setThinkingIntensityState] = useState<ThinkingIntensity>(() => {
     try {
       const v = localStorage.getItem('desktop-agent-thinking-intensity');
-      if (v === 'low' || v === 'medium' || v === 'high') return v;
+      if (isThinkingIntensity(v)) return v;
     } catch { /* ignore */ }
     return 'medium';
   });
+  const thinkingIntensityRef = useRef<ThinkingIntensity>(thinkingIntensity);
   const [planState, setPlanState] = useState<PlanState>({
     mode: 'agent',
     phase: 'idle',
@@ -430,6 +492,7 @@ export function useChatSession(
   }, [chatMode]);
 
   useEffect(() => {
+    thinkingIntensityRef.current = thinkingIntensity;
     try {
       localStorage.setItem('desktop-agent-thinking-intensity', thinkingIntensity);
     } catch { /* ignore */ }
@@ -513,6 +576,8 @@ export function useChatSession(
           setMessages(restored.messages);
           setToolCalls(restored.toolCalls);
           setFileEdits([]);
+          setContextUsage(restored.contextUsage || null);
+          setCheckpoints(restored.checkpoints || []);
           const fromServer = restored.chatMode;
           const serverPlanPhase = (event.data as { plan_state?: { phase?: string } })?.plan_state?.phase;
           const prev = chatModeRef.current;
@@ -530,7 +595,7 @@ export function useChatSession(
           if (merged === 'plan' && fromServer === 'agent') {
             sendRef.current({ type: 'set_chat_mode', chat_mode: 'plan' });
           }
-          if (restored.thinkingIntensity) setThinkingIntensity(restored.thinkingIntensity);
+          if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
           if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
           setHydratedSessionId(sessionId);
           break;
@@ -544,11 +609,20 @@ export function useChatSession(
           break;
         }
 
+        case 'thinking_intensity': {
+          const intensity = event.data?.thinking_intensity;
+          if (isThinkingIntensity(intensity)) {
+            setThinkingIntensityState(intensity);
+          }
+          break;
+        }
+
         case 'content':
           userTouchedRef.current = true;
           setMessages((prev) => {
+            // Answer text starting seals any open thinking block.
             const updated = appendBlock(
-              prev,
+              completeOpenThinking(prev),
               { type: 'text', text: event.data.text, timestamp: Date.now() },
               true,
             );
@@ -560,11 +634,31 @@ export function useChatSession(
           setMessages((prev) =>
             appendBlock(
               prev,
-              { type: 'thinking', text: event.data.text, timestamp: Date.now() },
+              {
+                type: 'thinking',
+                text: event.data.text,
+                timestamp: Date.now(),
+                startedAt: Date.now(),
+              },
               true,
             ),
           );
           break;
+
+        case 'knowledge_context': {
+          const sources = Array.isArray(event.data?.sources) ? event.data.sources : [];
+          if (sources.length > 0) {
+            setMessages((prev) =>
+              appendBlock(
+                prev,
+                { type: 'knowledge_context', sources, timestamp: Date.now() },
+                false,
+              ),
+            );
+            addTerminalLog(`[Knowledge] Using ${sources.length} indexed source${sources.length === 1 ? '' : 's'}`);
+          }
+          break;
+        }
 
         case 'worker_start':
         case 'worker_content':
@@ -599,7 +693,10 @@ export function useChatSession(
           addTerminalLog(`[工具] ${event.data.name}: ${event.data.result}`);
           onToolCallRef.current?.(tc);
 
-          setMessages((prev) => {
+          setMessages((prev0) => {
+            // A tool landing seals any open thinking block (covers the case
+            // where no status:executing event preceded this result).
+            const prev = completeOpenThinking(prev0);
             // Try to find and update a running placeholder created by status:executing
             const withUpdate = mergeBlock(
               prev,
@@ -660,7 +757,7 @@ export function useChatSession(
 
           setMessages((prev) =>
             refreshLatestAssistantSummary(appendBlock(
-              prev,
+              completeOpenThinking(prev),
               {
                 type: 'tool_call',
                 name: event.data.name,
@@ -712,6 +809,11 @@ export function useChatSession(
           addTerminalLog(`[Run] Context pack ready (${(event.data.files || []).length} files shown)`);
           break;
 
+        case 'skills_matched':
+          recordRunEvent(event);
+          addTerminalLog(`[Skills] ${(event.data.skills || []).length} matched, ${(event.data.disabled_matches || []).length} disabled`);
+          break;
+
         case 'guardrail_decision':
         case 'approval_required':
           recordRunEvent(event);
@@ -741,10 +843,11 @@ export function useChatSession(
         case 'status': {
           const status = event.data.status;
           if (status === 'executing') {
+            // Tool execution starting seals the preceding thinking block.
             // Push a running placeholder — the matching tool_call event will fill in details
             setMessages((prev) =>
               refreshLatestAssistantSummary(appendBlock(
-                prev,
+                completeOpenThinking(prev),
                 {
                   type: 'tool_call',
                   name: event.data.tool || '',
@@ -758,9 +861,9 @@ export function useChatSession(
             );
           } else if (status === 'completed' || status === 'max_iterations_reached') {
             setIsRunning(false);
-            setMessages((prev) => markTurnComplete(prev));
+            setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
           } else if (status === 'thinking') {
-            // Start of new iteration — no new block needed; reasoning follows as its own block
+            setMessages((prev) => ensureThinkingPlaceholder(prev));
           }
           addTerminalLog(
             `[状态] ${event.data.status} (迭代: ${event.data.iteration})`
@@ -884,7 +987,7 @@ export function useChatSession(
           const msg = errorMessage(event.data);
           const retryable = isRetryableError(event.data);
           setMessages((prev) => {
-            const complete = markTurnComplete(prev);
+            const complete = markTurnComplete(completeOpenThinking(prev));
             return [
               ...complete,
               {
@@ -902,17 +1005,48 @@ export function useChatSession(
           break;
         }
 
+        case 'context_usage':
+          setContextUsage(event.data as ContextUsage);
+          break;
+
         case 'compacted':
+          setIsRunning(false);
+          if (event.data?.skipped) {
+            if (event.data?.context_usage) {
+              setContextUsage(event.data.context_usage as ContextUsage);
+            }
+            addTerminalLog(`[Context] ${event.data.message || 'Current context does not need compaction yet'}`);
+            break;
+          }
+          if (event.data?.context_usage) {
+            setContextUsage(event.data.context_usage as ContextUsage);
+          }
           addTerminalLog(`[压缩] 对话已压缩，从 ${event.data.message_count || '?'} 条消息中提取摘要`);
+          break;
+
+        case 'rewound':
+          if (event.data?.context_usage) {
+            setContextUsage(event.data.context_usage as ContextUsage);
+          }
+          addTerminalLog(`[Rewind] Restored checkpoint ${event.data?.checkpoint_id || ''}`);
           break;
 
         case 'model_switched':
           addTerminalLog(`[模型] 已切换至 ${event.data.model_id}`);
           break;
 
+        case 'agent_switched': {
+          const intensity = event.data?.thinking_intensity;
+          if (isThinkingIntensity(intensity)) {
+            setThinkingIntensityState(intensity);
+          }
+          addTerminalLog(`[Agent] ${event.data?.name || event.data?.agent_type || 'switched'}`);
+          break;
+        }
+
         case 'done':
           setIsRunning(false);
-          setMessages((prev) => markTurnComplete(prev));
+          setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
           break;
 
         case 'cleared':
@@ -920,6 +1054,8 @@ export function useChatSession(
           setToolCalls([]);
           setFileEdits([]);
           setRunEvents([]);
+          setContextUsage(null);
+          setCheckpoints([]);
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -938,7 +1074,7 @@ export function useChatSession(
 
         case 'interrupted':
           setIsRunning(false);
-          setMessages((prev) => markTurnComplete(prev));
+          setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
           addTerminalLog('[系统] 用户中断');
           break;
 
@@ -965,9 +1101,16 @@ export function useChatSession(
     sendRef.current({ type: 'set_chat_mode', chat_mode: mode });
   }, []);
 
+  const setThinkingIntensity = useCallback((intensity: ThinkingIntensity) => {
+    setThinkingIntensityState(intensity);
+    thinkingIntensityRef.current = intensity;
+    sendRef.current({ type: 'set_thinking_intensity', thinking_intensity: intensity });
+  }, []);
+
   useEffect(() => {
     if (!isConnected) return;
     send({ type: 'set_chat_mode', chat_mode: chatModeRef.current });
+    send({ type: 'set_thinking_intensity', thinking_intensity: thinkingIntensityRef.current });
   }, [isConnected, sessionId, send]);
 
   // 加载持久化数据（不强制 WS：连接后的 effect 会同步 chat_mode）
@@ -986,8 +1129,8 @@ export function useChatSession(
         if (data.chatMode === 'plan' || data.chatMode === 'agent') {
           setChatModeState(data.chatMode);
         }
-        if (data.thinkingIntensity === 'low' || data.thinkingIntensity === 'medium' || data.thinkingIntensity === 'high') {
-          setThinkingIntensity(data.thinkingIntensity);
+        if (isThinkingIntensity(data.thinkingIntensity)) {
+          setThinkingIntensityState(data.thinkingIntensity);
         }
         if (data.planState) {
           setPlanState((prev) => ({ ...prev, ...data.planState }));
@@ -1005,8 +1148,10 @@ export function useChatSession(
         setToolCalls(restored.toolCalls);
         setFileEdits([]);
         if (restored.chatMode) setChatModeState(restored.chatMode);
-        if (restored.thinkingIntensity) setThinkingIntensity(restored.thinkingIntensity);
+        if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
         if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
+        setContextUsage(restored.contextUsage || null);
+        setCheckpoints(restored.checkpoints || []);
       } catch {
         // The WebSocket history snapshot can still hydrate the session.
       } finally {
@@ -1115,7 +1260,43 @@ export function useChatSession(
 
   const clearSession = useCallback(() => {
     send({ type: 'clear' });
+    setIsRunning(false);
   }, [send]);
+
+  const compactSession = useCallback((force = false, focus = '') => {
+    setIsRunning(true);
+    const sent = send({ type: 'compact', force, focus, source: 'ui' });
+    if (sent === false) setIsRunning(false);
+  }, [send]);
+
+  const loadCheckpoints = useCallback(async (): Promise<ConversationCheckpoint[]> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/checkpoints`);
+      const data = await res.json();
+      const next = Array.isArray(data.checkpoints) ? data.checkpoints as ConversationCheckpoint[] : [];
+      setCheckpoints(next);
+      return next;
+    } catch (err) {
+      addTerminalLog(`[Rewind] Failed to load checkpoints: ${err}`);
+      return [];
+    }
+  }, [sessionId, addTerminalLog]);
+
+  const rewindToCheckpoint = useCallback((checkpointId: string) => {
+    if (!checkpointId) return;
+    setIsRunning(true);
+    const sent = send({
+      type: 'rewind',
+      checkpoint_id: checkpointId,
+      retry: true,
+      model_id: currentModel,
+      agent_type: agentType,
+      role_id: roleId,
+      chat_mode: chatMode,
+      thinking_intensity: thinkingIntensity,
+    });
+    if (sent === false) setIsRunning(false);
+  }, [send, currentModel, agentType, roleId, chatMode, thinkingIntensity]);
 
   const stopRunning = useCallback(() => {
     send({ type: 'stop' });
@@ -1132,6 +1313,11 @@ export function useChatSession(
     });
     setIsRunning(true);
   }, [send, currentModel, agentType, roleId, chatMode, thinkingIntensity]);
+
+  const switchModel = useCallback((modelId: string) => {
+    if (!modelId) return;
+    send({ type: 'switch_model', model_id: modelId });
+  }, [send]);
 
   const approvePlan = useCallback(() => {
     setIsRunning(false);
@@ -1171,6 +1357,8 @@ export function useChatSession(
     setToolCalls([]);
     setFileEdits([]);
     setRunEvents([]);
+    setContextUsage(null);
+    setCheckpoints([]);
     setTerminalLogs([]);
     setIsRunning(false);
     setChatModeState(initialChatModeFromStorage());
@@ -1207,13 +1395,19 @@ export function useChatSession(
     toolCalls,
     fileEdits,
     runEvents,
+    contextUsage,
+    checkpoints,
     terminalLogs,
     isRunning,
     isConnected,
     sendMessage,
     clearSession,
+    compactSession,
+    loadCheckpoints,
+    rewindToCheckpoint,
     stopRunning,
     retryLast,
+    switchModel,
     executeToolDirect,
     resetSession,
     addTerminalLog,

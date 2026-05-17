@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useCallback, useRef } from 'react';
-import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, ClientChatMode, ThinkingIntensity, AgentType } from '../types';
+import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, ClientChatMode, ThinkingIntensity, AgentType, ContextUsage, ConversationCheckpoint } from '../types';
 
 // ---- Types ----
 
@@ -11,6 +11,8 @@ export interface SessionSnapshot {
   chatMode: ClientChatMode;
   thinkingIntensity: ThinkingIntensity;
   planState: PlanState;
+  contextUsage?: ContextUsage | null;
+  checkpoints?: ConversationCheckpoint[];
   suggestAgentSwitch?: { from: string; to: string; reason: string } | null;
   // Per-session derived (changes relatively slowly)
   artifacts: ArtifactItem[];
@@ -23,8 +25,13 @@ export interface SessionSnapshot {
 }
 export interface SessionActions {
   sendMessage: (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => void;
+  clearSession: () => void;
+  compactSession: (force?: boolean, focus?: string) => void;
+  loadCheckpoints: () => Promise<ConversationCheckpoint[]>;
+  rewindToCheckpoint: (checkpointId: string) => void;
   stopRunning: () => void;
   retryLast: () => void;
+  switchModel: (modelId: string) => void;
   executeToolDirect: (toolName: string, args: any) => void;
   addTerminalLog: (msg: string) => void;
   approvePlan: () => void;
@@ -46,8 +53,13 @@ export interface SessionActions {
 
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
+  clearSession: () => {},
+  compactSession: () => {},
+  loadCheckpoints: async () => [],
+  rewindToCheckpoint: () => {},
   stopRunning: () => {},
   retryLast: () => {},
+  switchModel: () => {},
   executeToolDirect: () => {},
   addTerminalLog: () => {},
   approvePlan: () => {},

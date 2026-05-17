@@ -28,8 +28,23 @@ BUILTIN_COMMANDS: List[CommandInfo] = [
         category="session",
     ),
     CommandInfo(
+        name="new",
+        description="Start a fresh session; Coding creates a new session, Personal clears the current one.",
+        category="session",
+    ),
+    CommandInfo(
         name="compact",
         description="压缩对话上下文，生成摘要并释放 token",
+        category="session",
+    ),
+    CommandInfo(
+        name="rewind",
+        description="Rewind to a previous user-message checkpoint and retry from there.",
+        category="session",
+    ),
+    CommandInfo(
+        name="context",
+        description="Show current context usage and source breakdown.",
         category="session",
     ),
     CommandInfo(

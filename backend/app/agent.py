@@ -4,6 +4,7 @@ import ntpath
 import os
 import time
 import uuid
+import copy
 from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -22,7 +23,7 @@ from app.project_manager import ProjectManager
 from app.project_rules import build_rules_prompt
 from app.roles import RoleManager  # deprecated — kept for backward compat
 from app.agents.manager import AgentManager
-from app.runtime_paths import runtime_dir, backend_root
+from app.runtime_paths import runtime_dir, runtime_file, backend_root
 from app.skills import SkillManager
 from app.tools import build_tools_description, get_tool, get_tool_schemas, list_tool_names, DynamicToolRegistry
 from app.tools.browser_tool import set_browser_session
@@ -36,9 +37,27 @@ from app.workflow.plan_files import write_plan_file, read_plan_file
 logger = logging.getLogger(__name__)
 
 SESSIONS_DIR = runtime_dir("sessions")
+SESSION_REGISTRY_PATH = runtime_file("session_registry.json")
+GLOBAL_PROJECT_KEY = "__global__"
 
 # Internal: resume agent loop after user clicks Build (WebSocket `build_plan`).
 PLAN_CONTINUE_MARKER = "__plan_continue__"
+
+_LOCAL_MESSAGE_META_KEYS: frozenset[str] = frozenset({
+    "message_id",
+    "turn_id",
+    "created_at",
+    "checkpoint_id",
+})
+
+_LLM_MESSAGE_KEYS: frozenset[str] = frozenset({
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    "reasoning_content",
+})
 
 # Plan-mode planning phase: only these tools may be offered / executed until approved.
 READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
@@ -79,6 +98,215 @@ _VERIFICATION_COMMAND_HINTS: tuple[str, ...] = (
     "gradle test",
     "mvn test",
 )
+
+
+def _normalize_project_key(project_path: str | None = None) -> str:
+    if not project_path:
+        try:
+            project = ProjectManager.get_current()
+            if project:
+                project_path = project.get("path")
+        except Exception:
+            project_path = None
+    if not project_path:
+        return GLOBAL_PROJECT_KEY
+    return str(project_path).replace("\\", "/").rstrip("/").lower()
+
+
+def _load_session_registry() -> Dict[str, Any]:
+    if not SESSION_REGISTRY_PATH.exists():
+        return {"personal": {}, "coding": {"last_session_by_project": {}}}
+    try:
+        data = json.loads(SESSION_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    personal = data.setdefault("personal", {})
+    if not isinstance(personal, dict):
+        data["personal"] = {}
+    coding = data.setdefault("coding", {})
+    if not isinstance(coding, dict):
+        coding = {}
+        data["coding"] = coding
+    if not isinstance(coding.get("last_session_by_project"), dict):
+        coding["last_session_by_project"] = {}
+    return data
+
+
+def _save_session_registry(data: Dict[str, Any]) -> None:
+    try:
+        tmp = SESSION_REGISTRY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, SESSION_REGISTRY_PATH)
+    except OSError:
+        pass
+
+
+def _text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif block.get("type") == "image_url":
+                    parts.append("[image]")
+                elif block.get("type") == "tool_result":
+                    parts.append(str(block.get("content") or ""))
+                else:
+                    parts.append(str(block.get("text") or block.get("content") or ""))
+            else:
+                parts.append(str(block))
+        return "\n".join(p for p in parts if p)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _estimate_tokens(text: Any) -> int:
+    """Cheap cross-provider estimate used only for UI context health."""
+    body = _text_from_content(text)
+    if not body:
+        return 0
+    # Mixed Chinese/English/code tends to land around 3-4 chars/token.
+    return max(1, int(len(body) / 3.6))
+
+
+def _usage_input_tokens(usage: Dict[str, Any] | None) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("prompt_tokens", "input_tokens", "total_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    total = 0
+    for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            total += value
+    fresh = usage.get("input_tokens")
+    if isinstance(fresh, int):
+        total += fresh
+    return total
+
+
+def _usage_output_tokens(usage: Dict[str, Any] | None) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("completion_tokens", "output_tokens", "total_output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return 0
+
+
+def _load_session_data(session_id: str) -> Optional[Dict[str, Any]]:
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _session_title_from_data(data: Dict[str, Any]) -> str:
+    title = str(data.get("title") or "").strip()
+    if title:
+        return title[:80]
+    for msg in data.get("messages", []):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
+            return msg["content"].strip()[:80]
+    plan_state = data.get("plan_state")
+    if isinstance(plan_state, dict) and isinstance(plan_state.get("goal"), str):
+        return plan_state["goal"].strip()[:80]
+    return ""
+
+
+def _session_title_from_messages(messages: List[Dict[str, Any]], plan_state: PlanState) -> str:
+    for msg in messages:
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
+            return msg["content"].strip()[:80]
+    if plan_state.goal:
+        return plan_state.goal[:80]
+    return ""
+
+
+def _session_has_history_data(data: Dict[str, Any]) -> bool:
+    return any(msg.get("role") != "system" for msg in data.get("messages", []))
+
+
+def _session_has_history(session: "AgentSession") -> bool:
+    return any(msg.get("role") != "system" for msg in session.messages)
+
+
+def _resolve_stored_agent_type(data: Dict[str, Any]) -> str:
+    raw = data.get("agent_type")
+    if raw in ("personal", "coding"):
+        return raw
+    return AgentManager.get_agent_type_for_role(data.get("role_id", "desktop-agent"))
+
+
+def _session_record_matches(
+    session_id: str,
+    *,
+    agent_type: str,
+    project_path: str | None = None,
+) -> bool:
+    live = _sessions.get(session_id)
+    if live and live.agent_type == agent_type:
+        return True if not project_path else _normalize_project_key(project_path) == _normalize_project_key(None)
+
+    data = _load_session_data(session_id)
+    if not data or _resolve_stored_agent_type(data) != agent_type:
+        return False
+    if project_path:
+        stored = data.get("project_path")
+        if _normalize_project_key(stored) != _normalize_project_key(project_path):
+            return False
+    return True
+
+
+def list_session_records(project_path: str = "", agent_type: str = "") -> List[Dict[str, Any]]:
+    registry = _load_session_registry()
+    primary_id = registry.get("personal", {}).get("primary_session_id")
+    sessions: List[Dict[str, Any]] = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            stored_agent_type = _resolve_stored_agent_type(data)
+            if agent_type and stored_agent_type != agent_type:
+                continue
+            sp = data.get("project_path")
+            if project_path and _normalize_project_key(sp) != _normalize_project_key(project_path):
+                continue
+            session_id = data.get("session_id", path.stem)
+            is_primary = stored_agent_type == "personal" and session_id == primary_id
+            sessions.append({
+                "id": session_id,
+                "title": _session_title_from_data(data),
+                "project_path": sp,
+                "model_id": data.get("model_id", ""),
+                "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
+                "agent_type": stored_agent_type,
+                "message_count": len(data.get("messages", [])),
+                "updated_at": path.stat().st_mtime,
+                "is_primary": is_primary,
+            })
+        except Exception:
+            pass
+    return sorted(
+        sessions,
+        key=lambda s: (0 if s.get("is_primary") else 1, -float(s.get("updated_at", 0))),
+    )
 
 
 def _shell_command_looks_like_verification(command: str) -> bool:
@@ -174,12 +402,17 @@ class AgentSession:
         self._last_user_message = ""
         self._rag_cache_key: str = ""
         self._rag_cache_text: str = ""
+        self._rag_cache_sources: List[Dict[str, Any]] = []
+        self._rag_context_sources: List[Dict[str, Any]] = []
         self.dynamic_registry = DynamicToolRegistry()
         self.chat_mode = "agent"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
+        self.compaction_summary: str = ""
+        self._last_usage: Dict[str, Any] = {}
+        self._last_context_usage: Dict[str, Any] = {}
         self.team_id: str | None = None
         self.team_name: str = ""
         self._setup_system_prompt()
@@ -311,7 +544,7 @@ class AgentSession:
 
         if self._last_user_message:
             matched_skills = SkillManager.match_skills(
-                self._last_user_message, self.role_id, project is not None
+                self._last_user_message, self.role_id, project is not None, agent_type=self._agent_type
             )
             if matched_skills:
                 skill_prompt = SkillManager.build_skill_prompt(matched_skills)
@@ -321,6 +554,7 @@ class AgentSession:
         # Auto-inject RAG context if knowledge base has indexed documents.
         # Cache results per (user_message, doc_count) to avoid redundant embedding
         # searches across _refresh_system_prompt calls (retry, MCP refresh, etc.).
+        self._rag_context_sources = []
         _RAG_SKIP_PATTERNS = [
             r"^(你好|hi|hello|hey)[\s!！。.]*$",
             r"^(截图|screenshot|screen)[\s!！。.]*$",
@@ -343,21 +577,34 @@ class AgentSession:
                 rag = get_rag_engine()
                 docs = rag.list_docs()
                 if docs and self._last_user_message:
-                    # Build a cache key from the user message + doc count hint
-                    doc_key = f"{self._last_user_message}::{len(docs)}"
+                    # Build a cache key from the user message + index signature.
+                    # This keeps repeated prompt refreshes cheap while still
+                    # invalidating when a document is reindexed.
+                    chunk_total = sum(int(d.get("chunk_count") or 0) for d in docs)
+                    last_indexed = max(int(d.get("last_indexed") or 0) for d in docs)
+                    doc_key = f"{self._last_user_message}::{len(docs)}::{chunk_total}::{last_indexed}"
                     if doc_key != self._rag_cache_key:
                         results = rag.search(self._last_user_message, top_k=3)
                         relevant = [r for r in results if r.score >= 0.3]
                         if relevant:
                             rag_ctx = "\n\n## Relevant Knowledge Base Context\n"
+                            sources: List[Dict[str, Any]] = []
                             for r in relevant:
                                 rag_ctx += f"\n### {r.source_path} (score: {r.score:.2f})\n{r.content[:800]}\n"
+                                sources.append({
+                                    "source_path": r.source_path,
+                                    "score": r.score,
+                                    "preview": r.content[:240],
+                                })
                             self._rag_cache_text = rag_ctx
+                            self._rag_cache_sources = sources
                         else:
                             self._rag_cache_text = ""
+                            self._rag_cache_sources = []
                         self._rag_cache_key = doc_key
                     if self._rag_cache_text:
                         system_msg += self._rag_cache_text
+                        self._rag_context_sources = list(self._rag_cache_sources)
         except Exception as e:
             logger.warning("RAG auto-retrieval failed: %s", e)
 
@@ -367,6 +614,14 @@ class AgentSession:
             team_ctx = build_team_context_prompt(self.team_id, self.team_name or "Team")
             if team_ctx:
                 system_msg += team_ctx
+
+        if self.compaction_summary:
+            system_msg += (
+                "\n\n## Conversation Summary\n"
+                "The earlier part of this session was compacted. Preserve these decisions, "
+                "constraints, and open tasks while continuing from the recent messages.\n"
+                f"{self.compaction_summary[:5000]}"
+            )
 
         return system_msg
 
@@ -405,6 +660,182 @@ class AgentSession:
         event_data.setdefault("timestamp", time.time())
         return {"type": event_type, "data": event_data}
 
+    def _stamp_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        turn_id: str | None = None,
+        checkpoint_id: str | None = None,
+        created_at: float | None = None,
+    ) -> Dict[str, Any]:
+        message.setdefault("message_id", f"msg_{uuid.uuid4().hex[:16]}")
+        message.setdefault("created_at", created_at or time.time())
+        if turn_id:
+            message.setdefault("turn_id", turn_id)
+        if checkpoint_id:
+            message.setdefault("checkpoint_id", checkpoint_id)
+        return message
+
+    def _ensure_message_metadata(self) -> None:
+        current_turn = ""
+        current_checkpoint = ""
+        for msg in self.messages:
+            role = msg.get("role")
+            if role == "user":
+                current_turn = msg.get("turn_id") or f"turn_{uuid.uuid4().hex[:12]}"
+                current_checkpoint = msg.get("checkpoint_id") or f"chk_{uuid.uuid4().hex[:12]}"
+                self._stamp_message(msg, turn_id=current_turn, checkpoint_id=current_checkpoint)
+            elif role == "assistant" or role == "tool":
+                self._stamp_message(
+                    msg,
+                    turn_id=msg.get("turn_id") or current_turn or None,
+                    checkpoint_id=msg.get("checkpoint_id") or current_checkpoint or None,
+                )
+            else:
+                self._stamp_message(msg)
+
+    def _messages_for_llm(self, messages: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Strip local session/checkpoint metadata before sending to providers."""
+        safe_messages: list[dict[str, Any]] = []
+        for msg in messages or self.messages:
+            safe = {k: copy.deepcopy(v) for k, v in msg.items() if k in _LLM_MESSAGE_KEYS}
+            safe_messages.append(safe)
+        return safe_messages
+
+    def _active_turn_metadata(self) -> tuple[str, str]:
+        for msg in reversed(self.messages):
+            if msg.get("role") == "user":
+                turn_id = msg.get("turn_id") or f"turn_{uuid.uuid4().hex[:12]}"
+                checkpoint_id = msg.get("checkpoint_id") or f"chk_{uuid.uuid4().hex[:12]}"
+                self._stamp_message(msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
+                return turn_id, checkpoint_id
+        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        return turn_id, f"chk_{uuid.uuid4().hex[:12]}"
+
+    def _model_context_limit(self) -> int:
+        try:
+            provider_info = get_provider_for_model(self.model_id)
+            if provider_info:
+                _provider_name, provider = provider_info
+                for model in provider.models:
+                    if model.id == self.model_id:
+                        return max(1, int(model.context))
+        except Exception:
+            pass
+        return 32000
+
+    def _update_usage_from_response(self, response: Dict[str, Any] | None) -> None:
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if isinstance(usage, dict) and usage:
+            self._last_usage = usage
+
+    def context_usage(self) -> Dict[str, Any]:
+        self._ensure_message_metadata()
+        context_limit = self._model_context_limit()
+        breakdown = {
+            "system": 0,
+            "history": 0,
+            "tools": 0,
+            "rag": 0,
+            "screenshots": 0,
+            "tool_schemas": 0,
+        }
+
+        for msg in self.messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            tokens = _estimate_tokens(content)
+            if role == "system":
+                text = _text_from_content(content)
+                if "Relevant Knowledge Base Context" in text:
+                    breakdown["rag"] += tokens
+                else:
+                    breakdown["system"] += tokens
+            elif role == "tool":
+                breakdown["tools"] += tokens
+            else:
+                breakdown["history"] += tokens
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        breakdown["screenshots"] += 1200
+
+        try:
+            schemas = self._filter_tool_schemas_for_plan(
+                get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type)
+            )
+            breakdown["tool_schemas"] = _estimate_tokens(json.dumps(schemas, ensure_ascii=False))
+        except Exception:
+            breakdown["tool_schemas"] = 0
+
+        estimate = sum(breakdown.values())
+        provider_input = _usage_input_tokens(self._last_usage)
+        provider_output = _usage_output_tokens(self._last_usage)
+        exact = provider_input > 0
+        used_tokens = provider_input + provider_output if exact else estimate
+        used_percent = min(100.0, round((used_tokens / context_limit) * 100, 1))
+        status = "critical" if used_percent >= 85 else "warning" if used_percent >= 70 else "ok"
+        payload = {
+            "session_id": self.session_id,
+            "model_id": self.model_id,
+            "model_context": context_limit,
+            "estimated_tokens": estimate,
+            "used_tokens": used_tokens,
+            "output_tokens": provider_output,
+            "remaining_tokens": max(0, context_limit - used_tokens),
+            "used_percent": used_percent,
+            "exact": exact,
+            "source": "provider" if exact else "estimate",
+            "status": status,
+            "breakdown": breakdown,
+        }
+        self._last_context_usage = payload
+        return payload
+
+    def build_checkpoints(self) -> List[Dict[str, Any]]:
+        self._ensure_message_metadata()
+        checkpoints: list[dict[str, Any]] = []
+        for index, msg in enumerate(self.messages):
+            if msg.get("role") != "user":
+                continue
+            if msg.get("source") == "internal":
+                continue
+            text = _text_from_content(msg.get("content", "")).strip()
+            checkpoints.append({
+                "id": msg.get("checkpoint_id"),
+                "message_id": msg.get("message_id"),
+                "turn_id": msg.get("turn_id"),
+                "index": index,
+                "role": "user",
+                "preview": text[:180] if text else "(image or empty prompt)",
+                "created_at": msg.get("created_at") or time.time(),
+            })
+        return checkpoints
+
+    def rewind_to_checkpoint(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        self._ensure_message_metadata()
+        target_index = -1
+        target: Dict[str, Any] | None = None
+        for index, msg in enumerate(self.messages):
+            if msg.get("role") == "user" and msg.get("checkpoint_id") == checkpoint_id:
+                target_index = index
+                target = msg
+                break
+        if target_index < 0 or target is None:
+            return None
+        self.messages = self.messages[:target_index + 1]
+        self.iteration = 0
+        self._cancelled = False
+        self._last_user_message = _text_from_content(target.get("content", ""))
+        self._refresh_system_prompt()
+        self._save()
+        return {
+            "checkpoint_id": checkpoint_id,
+            "message_id": target.get("message_id"),
+            "preview": _text_from_content(target.get("content", ""))[:180],
+            "context_usage": self.context_usage(),
+        }
+
     def _trim_messages(self):
         """Trim history without splitting assistant tool_calls from their tool results."""
         self.messages = trim_messages(
@@ -439,6 +870,15 @@ class AgentSession:
         if mode not in ("agent", "plan"):
             return False
         self.chat_mode = mode
+        self._save()
+        return True
+
+    def set_session_thinking_intensity(self, intensity: str) -> bool:
+        """Persist UI-selected thinking intensity for the active agent."""
+        if intensity not in ("low", "medium", "high"):
+            return False
+        self.thinking_intensity = intensity
+        self._agent_thinking[self._agent_type] = intensity
         self._save()
         return True
 
@@ -606,7 +1046,10 @@ class AgentSession:
                 lines.append(f"- {q.prompt} => {', '.join(labels)}")
         lines.append("")
         lines.append("Please synthesize these decisions with your research and call plan_write_draft.")
-        self.messages.append({"role": "user", "content": "\n".join(lines)})
+        msg = {"role": "user", "content": "\n".join(lines), "source": "internal"}
+        turn_id, checkpoint_id = self._active_turn_metadata()
+        self._stamp_message(msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
+        self.messages.append(msg)
         self.plan_state.pending_clarification = False
         self.plan_state.questions = []
         self.plan_state.decisions = {}
@@ -704,7 +1147,7 @@ class AgentSession:
         if chat_mode in ("agent", "plan"):
             self.chat_mode = chat_mode
         if thinking_intensity in ("low", "medium", "high"):
-            self.thinking_intensity = thinking_intensity
+            self.set_session_thinking_intensity(thinking_intensity)
 
         self.iteration = 0
         self._cancelled = False
@@ -803,12 +1246,26 @@ class AgentSession:
 
             self._last_user_message = user_input  # Keep original for skill matching
             self._refresh_system_prompt()
+            if self._rag_context_sources:
+                yield self._event(
+                    "knowledge_context",
+                    {
+                        "count": len(self._rag_context_sources),
+                        "sources": self._rag_context_sources,
+                    },
+                    run_id,
+                )
+            active_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+            active_checkpoint_id = f"chk_{uuid.uuid4().hex[:12]}"
             if image_base64:
                 user_msg = self.router.build_vision_message(resolved_input, image_base64)
             else:
                 user_msg = {"role": "user", "content": resolved_input}
+            user_msg["source"] = "user"
+            self._stamp_message(user_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
             self.messages.append(user_msg)
             self._trim_messages()
+            yield self._event("context_usage", self.context_usage(), run_id)
 
             if self.chat_mode == "plan":
                 is_new_plan = self.plan_state.phase in ("idle", "completed")
@@ -845,12 +1302,27 @@ class AgentSession:
             if self.plan_state.todos:
                 yield self._event("todo_update", {"todos": [t.model_dump() for t in self.plan_state.todos]}, run_id)
 
+        active_turn_id, active_checkpoint_id = self._active_turn_metadata()
+
         active_skills: List[str] = []
+        skills_trace = {"skills": [], "disabled_matches": []}
         if self._last_user_message:
             project = ProjectManager.get_current()
-            active_skills = SkillManager.match_skills(
-                self._last_user_message, self.role_id, project is not None
+            skills_trace = SkillManager.explain_match_skills(
+                self._last_user_message,
+                self.role_id,
+                project is not None,
+                agent_type=self._agent_type,
             )
+            active_skills = [skill["id"] for skill in skills_trace["skills"]]
+        skills_payload = {
+            "agent_type": self._agent_type,
+            "skills": skills_trace.get("skills", []),
+            "disabled_matches": skills_trace.get("disabled_matches", []),
+        }
+        if coding_run:
+            record_event(run_id, "skills_matched", skills_payload)
+        yield self._event("skills_matched", skills_payload, run_id)
 
         yield self._event("status", {"status": "thinking"}, run_id)
 
@@ -885,19 +1357,28 @@ class AgentSession:
                         else:
                             self.messages[-1]["content"] = [{"type": "text", "text": str(last_content)}] + ss_content
                     else:
-                        self.messages.append({
+                        screenshot_msg = {
                             "role": "user",
-                            "content": ss_content
-                        })
+                            "content": ss_content,
+                            "source": "internal",
+                        }
+                        self._stamp_message(
+                            screenshot_msg,
+                            turn_id=active_turn_id,
+                            checkpoint_id=active_checkpoint_id,
+                        )
+                        self.messages.append(screenshot_msg)
 
             tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type))
 
             # Stream LLM response token-by-token for real-time frontend display
             response = None
             stream_error = None
+            streamed_reasoning_text = ""
+            streamed_content_text = ""
             try:
                 async for token in self.router.chat_completion_stream(
-                    messages=self.messages,
+                    messages=self._messages_for_llm(),
                     tools=tool_schemas or None,
                     temperature=0.5,
                     max_tokens=8192,
@@ -905,12 +1386,14 @@ class AgentSession:
                 ):
                     ttype = token.get("type", "")
                     if ttype == "thinking_delta":
+                        streamed_reasoning_text += token["text"]
                         yield self._event(
                             "reasoning",
                             {"text": token["text"], "skill": active_skills[0] if active_skills else None},
                             run_id,
                         )
                     elif ttype == "text_delta":
+                        streamed_content_text += token["text"]
                         yield self._event(
                             "content",
                             {"text": token["text"], "skill": active_skills[0] if active_skills else None},
@@ -929,7 +1412,7 @@ class AgentSession:
                 if "does not support tools" in error_msg or "tool" in error_msg.lower() or "tools" in error_msg.lower():
                     try:
                         response = await self.router.chat_completion_non_stream(
-                            messages=self.messages,
+                            messages=self._messages_for_llm(),
                             temperature=0.5,
                             max_tokens=8192,
                             thinking_intensity=ti,
@@ -948,9 +1431,82 @@ class AgentSession:
                 yield self._event("error", {"message": "Model returned no response"}, run_id)
                 finished = True
                 break
+            self._update_usage_from_response(response)
+            yield self._event("context_usage", self.context_usage(), run_id)
 
             choice = response.get("choices", [{}])[0]
             message = choice.get("message", {})
+            is_empty_message = (
+                not str(message.get("content") or "").strip()
+                and not message.get("tool_calls")
+                and not str(message.get("reasoning_content") or "").strip()
+            )
+            if is_empty_message:
+                try:
+                    fallback_response = await self.router.chat_completion_non_stream(
+                        messages=self._messages_for_llm(),
+                        tools=tool_schemas or None,
+                        temperature=0.5,
+                        max_tokens=8192,
+                        thinking_intensity=ti,
+                    )
+                    fallback_message = fallback_response.get("choices", [{}])[0].get("message", {})
+                    fallback_empty = (
+                        not str(fallback_message.get("content") or "").strip()
+                        and not fallback_message.get("tool_calls")
+                        and not str(fallback_message.get("reasoning_content") or "").strip()
+                    )
+                    if fallback_empty:
+                        yield self._event(
+                            "error",
+                            {"message": "Model returned an empty response. Please retry or switch models."},
+                            run_id,
+                        )
+                        finished = True
+                        break
+                    response = fallback_response
+                    choice = response.get("choices", [{}])[0]
+                    message = fallback_message
+                    if message.get("reasoning_content"):
+                        streamed_reasoning_text += message["reasoning_content"]
+                        yield self._event(
+                            "reasoning",
+                            {"text": message["reasoning_content"], "skill": active_skills[0] if active_skills else None},
+                            run_id,
+                        )
+                    if message.get("content"):
+                        streamed_content_text += message["content"]
+                        yield self._event(
+                            "content",
+                            {"text": message["content"], "skill": active_skills[0] if active_skills else None},
+                            run_id,
+                        )
+                except Exception as empty_fallback_error:
+                    yield self._event(
+                        "error",
+                        {"message": f"Model returned an empty response and fallback failed: {empty_fallback_error}"},
+                        run_id,
+                    )
+                    finished = True
+                    break
+
+            # Some providers, including Kimi when stream fallback is used, can
+            # return a full non-streaming response without token deltas. Make
+            # sure the final assistant text is still visible in the UI.
+            if message.get("reasoning_content") and not streamed_reasoning_text:
+                streamed_reasoning_text = message["reasoning_content"]
+                yield self._event(
+                    "reasoning",
+                    {"text": message["reasoning_content"], "skill": active_skills[0] if active_skills else None},
+                    run_id,
+                )
+            if message.get("content") and not streamed_content_text:
+                streamed_content_text = message["content"]
+                yield self._event(
+                    "content",
+                    {"text": message["content"], "skill": active_skills[0] if active_skills else None},
+                    run_id,
+                )
 
             assistant_msg = {
                 "role": "assistant",
@@ -960,7 +1516,13 @@ class AgentSession:
                 assistant_msg["tool_calls"] = message["tool_calls"]
             if message.get("reasoning_content"):
                 assistant_msg["reasoning_content"] = message["reasoning_content"]
+            self._stamp_message(
+                assistant_msg,
+                turn_id=active_turn_id,
+                checkpoint_id=active_checkpoint_id,
+            )
             self.messages.append(assistant_msg)
+            yield self._event("context_usage", self.context_usage(), run_id)
 
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
@@ -974,18 +1536,27 @@ class AgentSession:
                     and self.chat_mode != "plan"
                 ):
                     _verify_gate_fired = True
-                    self.messages.append({
+                    verify_msg = {
                         "role": "user",
+                        "source": "internal",
                         "content": (
                             "[VERIFICATION REQUIRED] You modified files this session but have not run "
                             "verify_project. You MUST run verify_project (or the project test/typecheck "
                             "command) before claiming the task is done. Do not say the task is complete "
                             "without showing verification output."
                         ),
-                    })
+                    }
+                    self._stamp_message(
+                        verify_msg,
+                        turn_id=active_turn_id,
+                        checkpoint_id=active_checkpoint_id,
+                    )
+                    self.messages.append(verify_msg)
+                    yield self._event("context_usage", self.context_usage(), run_id)
                     continue
                 self._trim_messages()
                 self._save()
+                yield self._event("context_usage", self.context_usage(), run_id)
                 yield self._event("status", {"status": "completed"}, run_id)
                 finished = True
                 break
@@ -1174,9 +1745,16 @@ class AgentSession:
                     "content": result_text,
                 })
 
+            for result_msg in tool_results:
+                self._stamp_message(
+                    result_msg,
+                    turn_id=active_turn_id,
+                    checkpoint_id=active_checkpoint_id,
+                )
             self.messages.extend(tool_results)
             self._trim_messages()
             self._save()
+            yield self._event("context_usage", self.context_usage(), run_id)
             yield self._event("status", {"status": "thinking"}, run_id)
 
             if plan_turn_done:
@@ -1293,71 +1871,126 @@ class AgentSession:
                         return True
         return self.iteration % 5 == 0
 
-    async def compact_context(self) -> Optional[str]:
-        """Compress long message history into a structured summary.
+    async def compact_context(self, focus: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
+        """Compress older conversation turns into the session summary.
 
-        Called when message count exceeds COMPACTION_THRESHOLD. Asks the model to
-        produce a concise summary, then replaces old messages with that summary,
-        keeping the system prompt and the last KEEP_RECENT messages intact.
+        The summary is injected into the rebuilt system prompt instead of being
+        stored as a second system message. That keeps provider-specific system
+        handling predictable while preserving recent turns verbatim.
         """
         COMPACTION_THRESHOLD = 15
-        KEEP_RECENT = 3
+        RECENT_USER_TURNS = 3
 
-        user_messages = [m for m in self.messages if m.get("role") != "system"]
-        if len(user_messages) < COMPACTION_THRESHOLD:
-            return None
+        self._ensure_message_metadata()
+        before_count = len([m for m in self.messages if m.get("role") != "system"])
+        current_usage = self.context_usage()
+        if not force and before_count < COMPACTION_THRESHOLD and current_usage["used_percent"] < 70:
+            return {
+                "skipped": True,
+                "reason": "Current context is still healthy; no compaction is needed yet.",
+                "message": "当前无需压缩，Context 仍然充足。",
+                "summary": self.compaction_summary,
+                "before_message_count": before_count,
+                "after_message_count": before_count,
+                "context_usage": current_usage,
+            }
 
-        # Separate recent messages to keep, older ones to summarize
-        recent = user_messages[-KEEP_RECENT:]
-        to_summarize = user_messages[:-KEEP_RECENT]
+        history = [m for m in self.messages if m.get("role") != "system"]
+        real_user_checkpoint_ids: list[str] = []
+        for msg in history:
+            if msg.get("role") == "user" and msg.get("source") != "internal":
+                checkpoint_id = msg.get("checkpoint_id")
+                if checkpoint_id and checkpoint_id not in real_user_checkpoint_ids:
+                    real_user_checkpoint_ids.append(str(checkpoint_id))
+        recent_checkpoint_ids = set(real_user_checkpoint_ids[-RECENT_USER_TURNS:])
+        if not recent_checkpoint_ids and history:
+            recent_checkpoint_ids = {str(history[-1].get("checkpoint_id") or "")}
+
+        recent: list[dict[str, Any]] = []
+        to_summarize: list[dict[str, Any]] = []
+        for msg in history:
+            if msg.get("checkpoint_id") in recent_checkpoint_ids:
+                recent.append(copy.deepcopy(msg))
+            else:
+                to_summarize.append(msg)
 
         if len(to_summarize) < 2:
-            return None
+            return {
+                "skipped": True,
+                "reason": "There are not enough older turns to compact safely.",
+                "message": "可压缩的旧对话不足，已保持当前上下文不变。",
+                "summary": self.compaction_summary,
+                "before_message_count": before_count,
+                "after_message_count": before_count,
+                "context_usage": current_usage,
+            }
 
-        # Build a summarization prompt
-        conv_text = ""
-        for m in to_summarize:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") if isinstance(c, dict) else str(c)
-                    for c in content
-                )
-            conv_text += f"[{role}] {str(content)[:500]}\n"
+        conv_lines: list[str] = []
+        for msg in to_summarize:
+            role = msg.get("role", "?")
+            name = msg.get("name") or ""
+            content = _text_from_content(msg.get("content", "")).strip()
+            if msg.get("tool_calls"):
+                tool_names = [
+                    ((tc.get("function") or {}).get("name") or "tool")
+                    for tc in msg.get("tool_calls", [])
+                    if isinstance(tc, dict)
+                ]
+                content = (content + "\n" if content else "") + f"[tool_calls: {', '.join(tool_names)}]"
+            conv_lines.append(f"[{role}{':' + name if name else ''}] {content[:1200]}")
+        conv_text = "\n\n".join(conv_lines)
+
+        prompt_parts = [
+            "Summarize the older part of this Desktop Agent session for future continuation.",
+            "Preserve durable facts, user preferences, decisions, open tasks, plan/todo state, files touched, tool results, blockers, and warnings.",
+            "Do not include filler or transcript-like detail. Use the same primary language as the conversation.",
+        ]
+        if focus:
+            prompt_parts.append(f"User focus for this compaction: {focus}")
+        if self.compaction_summary:
+            prompt_parts.append(f"Previous compacted summary to merge:\n{self.compaction_summary[:4000]}")
+        if self.plan_state.phase != "idle" or self.plan_state.goal:
+            prompt_parts.append(
+                "Current plan state:\n"
+                + json.dumps(self.plan_state.model_dump(), ensure_ascii=False)[:4000]
+            )
+        prompt_parts.append(f"Conversation to compact:\n{conv_text[:14000]}")
 
         summary_messages = [
-            {"role": "system", "content": (
-                "Summarize the following conversation into a concise paragraph in the SAME "
-                "language as the conversation. Include: key decisions, files changed, tools used, "
-                "and any important context. Keep it under 300 words.\n\n"
-                f"Conversation:\n{conv_text}"
-            )},
-            {"role": "user", "content": "Please summarize the conversation above."},
+            {"role": "system", "content": "\n\n".join(prompt_parts)},
+            {"role": "user", "content": "Create the compacted continuation summary now."},
         ]
 
         try:
             response = await self.router.chat_completion_non_stream(
                 messages=summary_messages,
-                temperature=0.3,
-                max_tokens=1024,
+                temperature=0.2,
+                max_tokens=1600,
             )
-            summary = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            self._update_usage_from_response(response)
+            summary = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not summary or len(summary) < 10:
                 return None
         except Exception as e:
             logger.warning("Context compaction failed: %s", e)
             return None
 
-        # Rebuild messages: system prompt + summary + recent messages
-        system_msgs = [m for m in self.messages if m.get("role") == "system"]
-        self.messages = system_msgs + [
-            {"role": "system", "content": f"## Conversation Summary\n{summary}"},
-        ] + recent
-
-        logger.info("Context compacted: %d -> %d messages", len(user_messages), len(self.messages) - len(system_msgs))
+        self.compaction_summary = summary[:6000]
+        self.messages = recent
+        self._refresh_system_prompt()
+        self._ensure_message_metadata()
+        after_count = len([m for m in self.messages if m.get("role") != "system"])
+        usage = self.context_usage()
+        logger.info("Context compacted: %d -> %d messages", before_count, after_count)
         self._save()
-        return summary
+        return {
+            "skipped": False,
+            "summary": self.compaction_summary,
+            "new_summary": summary,
+            "before_message_count": before_count,
+            "after_message_count": after_count,
+            "context_usage": usage,
+        }
 
     def cancel(self):
         self._cancelled = True
@@ -1375,6 +2008,11 @@ class AgentSession:
                 self.messages = self.messages[:i]
                 self.iteration = 0
                 self._cancelled = False
+                active_user = next((m for m in reversed(self.messages) if m.get("role") == "user"), None)
+                if active_user:
+                    self._last_user_message = _text_from_content(active_user.get("content", ""))
+                self._refresh_system_prompt()
+                self._save()
                 return True
         return False
 
@@ -1382,12 +2020,16 @@ class AgentSession:
         self.messages = []
         self.iteration = 0
         self._cancelled = False
+        self.compaction_summary = ""
+        self._last_usage = {}
+        self._last_context_usage = {}
         self.chat_mode = "agent"
         self.thinking_intensity = getattr(
             load_config().settings, "thinking_intensity_default", "medium"
         ) or "medium"
         if self.thinking_intensity not in ("low", "medium", "high"):
             self.thinking_intensity = "medium"
+        self._agent_thinking[self._agent_type] = self.thinking_intensity
         self.plan_state = PlanState()
         self._plan_exec_hint_sent = False
         self._repo_map_cache = None
@@ -1396,6 +2038,14 @@ class AgentSession:
 
     def switch_agent(self, agent_type: str):
         """Switch the active agent type, model, thinking intensity, and refresh the system prompt."""
+        if agent_type not in ("personal", "coding"):
+            raise ValueError(f"Unknown agent_type: {agent_type}")
+        if agent_type != self._agent_type and _session_has_history(self):
+            raise ValueError(
+                "Cannot switch a non-empty session between agent identities. "
+                "Resolve or create a session for the target agent instead."
+            )
+
         AgentManager.switch_agent(self, agent_type)
 
         # Switch to the agent's configured model
@@ -1407,16 +2057,23 @@ class AgentSession:
             except ValueError:
                 pass  # Keep existing router if new model is unrecognised
 
-        # Update thinking intensity for the new agent
-        ti = get_thinking_intensity_for_agent(agent_type)
+        # Update thinking intensity for the new agent, preferring any UI override
+        # already stored in this session.
+        ti = self._agent_thinking.get(agent_type) or get_thinking_intensity_for_agent(agent_type)
         if ti in ("low", "medium", "high"):
             self.thinking_intensity = ti
+            self._agent_thinking[agent_type] = ti
 
         self._save()
 
     def switch_role(self, role_id: str):
         """Backward-compatible alias for switch_agent."""
         agent_type = AgentManager.get_agent_type_for_role(role_id)
+        if agent_type != self._agent_type and _session_has_history(self):
+            raise ValueError(
+                "Cannot switch a non-empty session between agent identities. "
+                "Resolve or create a session for the target agent instead."
+            )
         self.role_id = role_id
         self._agent_type = agent_type
         self._refresh_system_prompt()
@@ -1443,6 +2100,7 @@ class AgentSession:
 
     def _save(self):
         path = SESSIONS_DIR / f"{self.session_id}.json"
+        self._ensure_message_metadata()
         # Extract title from first user message
         title = ""
         for m in self.messages:
@@ -1472,6 +2130,9 @@ class AgentSession:
             "chat_mode": self.chat_mode,
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
+            "compaction_summary": self.compaction_summary,
+            "last_usage": self._last_usage,
+            "last_context_usage": self._last_context_usage,
             "title": title,
             "project_path": project_path,
         }
@@ -1504,6 +2165,11 @@ class AgentSession:
             )
             session.messages = data.get("messages", [])
             session.iteration = 0
+            session.compaction_summary = str(data.get("compaction_summary") or "")
+            last_usage = data.get("last_usage")
+            session._last_usage = last_usage if isinstance(last_usage, dict) else {}
+            last_context_usage = data.get("last_context_usage")
+            session._last_context_usage = last_context_usage if isinstance(last_context_usage, dict) else {}
 
             # Restore per-agent model and thinking intensity from persisted data
             stored_agent_models = data.get("agent_models")
@@ -1514,19 +2180,21 @@ class AgentSession:
             stored_agent_thinking = data.get("agent_thinking")
             if isinstance(stored_agent_thinking, dict):
                 for at in ("personal", "coding"):
-                    if at in stored_agent_thinking:
+                    if stored_agent_thinking.get(at) in ("low", "medium", "high"):
                         session._agent_thinking[at] = stored_agent_thinking[at]
 
             cm = data.get("chat_mode", "agent")
             session.chat_mode = cm if cm in ("agent", "plan") else "agent"
             ti = data.get("thinking_intensity", "medium")
             session.thinking_intensity = ti if ti in ("low", "medium", "high") else "medium"
+            session._agent_thinking[session._agent_type] = session.thinking_intensity
             ps = data.get("plan_state")
             if isinstance(ps, dict):
                 try:
                     session.plan_state = PlanState.model_validate(ps)
                 except Exception:
                     session.plan_state = PlanState()
+            session._ensure_message_metadata()
             session._trim_messages()
             session._refresh_system_prompt()
             session.refresh_mcp_tools()
@@ -1572,6 +2240,7 @@ class AgentSession:
         return events
 
     def to_snapshot(self) -> Dict[str, Any]:
+        context_usage = self.context_usage()
         return {
             "session_id": self.session_id,
             "model_id": self.model_id,
@@ -1584,6 +2253,9 @@ class AgentSession:
             "chat_mode": self.chat_mode,
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
+            "compaction_summary": self.compaction_summary,
+            "context_usage": context_usage,
+            "checkpoints": self.build_checkpoints(),
         }
 
 
@@ -1621,9 +2293,20 @@ def get_or_create_session(session_id: str, model_id: str, role_id: str | None = 
     session = _sessions[session_id]
     changed = False
     if agent_type and session.agent_type != resolved_agent_type:
+        if _session_has_history(session):
+            raise ValueError(
+                f"Session {session_id} already belongs to {session.agent_type}; "
+                f"cannot reuse it as {resolved_agent_type}. Use /api/sessions/resolve for the target agent."
+            )
         session.switch_agent(resolved_agent_type)
         changed = True
     elif provided_role_id and role_id != session.role_id:
+        target_agent_type = AgentManager.get_agent_type_for_role(role_id)
+        if target_agent_type != session.agent_type and _session_has_history(session):
+            raise ValueError(
+                f"Session {session_id} already belongs to {session.agent_type}; "
+                f"cannot reuse it as {target_agent_type}. Use /api/sessions/resolve for the target agent."
+            )
         session.switch_role(role_id)
         changed = True
 
@@ -1641,6 +2324,92 @@ def get_or_create_session(session_id: str, model_id: str, role_id: str | None = 
     _touch(session_id)
     _evict_if_needed()
     return _sessions[session_id]
+
+
+def _new_coding_session_id() -> str:
+    while True:
+        session_id = f"session_coding_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        if session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists():
+            return session_id
+
+
+def _new_session_summary(
+    session: AgentSession,
+    *,
+    created: bool,
+    is_primary: bool,
+) -> Dict[str, Any]:
+    try:
+        project = ProjectManager.get_current()
+        project_path = project.get("path") if project else None
+    except Exception:
+        project_path = None
+    return {
+        "session_id": session.session_id,
+        "agent_type": session.agent_type,
+        "role_id": session.role_id,
+        "model_id": session.model_id,
+        "title": _session_title_from_messages(session.messages, session.plan_state),
+        "project_path": project_path,
+        "created": created,
+        "is_primary": is_primary,
+    }
+
+
+def _newest_matching_session_id(agent_type: str, project_path: str | None = None) -> str | None:
+    records = list_session_records(project_path=project_path or "", agent_type=agent_type)
+    return records[0]["id"] if records else None
+
+
+def resolve_agent_session(agent_type: str, policy: str, project_path: str | None = None) -> Dict[str, Any]:
+    """Resolve the session identity that should back an agent navigation action."""
+    if agent_type not in ("personal", "coding"):
+        raise ValueError(f"Unknown agent_type: {agent_type}")
+    if policy not in ("canonical", "last_or_create", "new"):
+        raise ValueError(f"Unknown session resolve policy: {policy}")
+
+    registry = _load_session_registry()
+    role_id = AgentManager.get_default_role(agent_type)
+    model_id = get_model_for_agent(agent_type)
+
+    if agent_type == "personal":
+        personal = registry.setdefault("personal", {})
+        session_id = personal.get("primary_session_id")
+        if not session_id or not _session_record_matches(session_id, agent_type="personal"):
+            session_id = _newest_matching_session_id("personal") or "session_personal_main"
+
+        created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
+        session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type="personal")
+        if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
+            session._save()
+
+        personal["primary_session_id"] = session.session_id
+        _save_session_registry(registry)
+        return _new_session_summary(session, created=created, is_primary=True)
+
+    coding = registry.setdefault("coding", {})
+    last_by_project = coding.setdefault("last_session_by_project", {})
+    project_key = _normalize_project_key(project_path)
+
+    session_id = ""
+    if policy != "new":
+        candidate = last_by_project.get(project_key)
+        if candidate and _session_record_matches(candidate, agent_type="coding", project_path=project_path):
+            session_id = candidate
+        else:
+            session_id = _newest_matching_session_id("coding", project_path)
+
+    if not session_id:
+        session_id = _new_coding_session_id()
+
+    created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
+    session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type="coding")
+    if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
+        session._save()
+
+    last_by_project[project_key] = session.session_id
+    _save_session_registry(registry)
+    return _new_session_summary(session, created=created, is_primary=False)
 
 
 def refresh_all_sessions_mcp_tools():

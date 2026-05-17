@@ -1,13 +1,14 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  Trash2, Zap, Monitor,
-  Globe, Plus, MessageSquare, X,
+  Trash2, Zap,
+  Globe, Plus, MessageSquare, X, Archive, RotateCcw,
   UserCog, Settings, BookOpen, Sun, Moon, Laptop,
   Brain, Activity, Moon as MoonIcon, Sparkles, FolderOpen
 } from 'lucide-react';
 import { ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
 import { ProjectPanel } from './ProjectPanel';
+import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
 import { AGENT_LABEL } from '../lib/agentProfiles';
 
@@ -22,9 +23,11 @@ interface SidebarProps {
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
-  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number}[];
+  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number; is_primary?: boolean}[];
   currentSession?: string;
   onNewSession?: () => void;
+  onCompactSession?: () => void;
+  onRewindSession?: () => void;
   onSwitchSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
   currentProjectPath?: string | null;
@@ -40,7 +43,7 @@ interface SidebarProps {
   onRefreshTree?: () => void;
 }
 
-type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number};
+type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number; is_primary?: boolean};
 
 function formatSessionLabel(s: SessionItem): string {
   if (s.title) return s.title.length > 40 ? s.title.slice(0, 40) + '…' : s.title;
@@ -53,14 +56,6 @@ function formatSessionLabel(s: SessionItem): string {
   }
   return s.id.replace('session_', '');
 }
-
-const QUICK_TOOLS = [
-  { name: 'screenshot', icon: Monitor, label: 'Screenshot' },
-  { name: 'get_screen_size', icon: Monitor, label: 'Screen Size' },
-  { name: 'browser_navigate', icon: Globe, label: 'Open Browser', defaultArgs: { url: 'https://www.google.com' } },
-  { name: 'browser_screenshot', icon: Globe, label: 'Web Screenshot' },
-  { name: 'app_list_windows', icon: Monitor, label: 'List Windows' },
-];
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
@@ -75,6 +70,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   sessions = [],
   currentSession,
   onNewSession,
+  onCompactSession,
+  onRewindSession,
   onSwitchSession,
   onDeleteSession,
   currentProjectPath,
@@ -207,21 +204,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
 
-        {activeSection === 'tools' && (
-          <div className="space-y-1">
-            <div className="text-xs font-medium text-fg-muted mb-2">Desktop Control</div>
-            {QUICK_TOOLS.map(tool => (
-              <button
-                key={tool.name}
-                type="button"
-                onClick={() => onExecuteTool(tool.name, tool.defaultArgs || {})}
-                className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
-              >
-                <tool.icon className="w-3.5 h-3.5" />
-                {tool.label}
-              </button>
-            ))}
-          </div>
+        {activeSection === 'skills' && (
+          <SkillsPanel activeAgent={activeAgent} />
         )}
 
         {activeSection === 'project' && (
@@ -247,8 +231,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
-              New Session
+              /new
             </button>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={onCompactSession}
+                className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-surface-alt text-fg-secondary hover:bg-surface-hover hover:text-fg transition-colors"
+                title="Compact current session context"
+              >
+                <Archive className="w-3.5 h-3.5" />
+                /compact
+              </button>
+              <button
+                type="button"
+                onClick={onRewindSession}
+                className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-surface-alt text-fg-secondary hover:bg-surface-hover hover:text-fg transition-colors"
+                title="Rewind to a previous checkpoint"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                /rewind
+              </button>
+            </div>
             <div className="flex items-center justify-between mt-2">
               <span className="text-xs font-medium text-fg-muted">History</span>
               {currentProjectPath && (
@@ -269,36 +273,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
               >
                 <div className="flex items-center gap-2 flex-1 min-w-0" onClick={() => onSwitchSession?.(s.id)}>
                   <MessageSquare className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{formatSessionLabel(s)}</span>
+                  <span className="truncate">{s.is_primary ? 'Personal Agent · Main' : formatSessionLabel(s)}</span>
+                  <span className={`text-[9px] px-1 py-0.5 rounded shrink-0 ${
+                    (s.agent_type || 'personal') === 'coding'
+                      ? 'bg-success/10 text-success'
+                      : 'bg-accent/10 text-accent'
+                  }`}>
+                    {(s.agent_type || 'personal') === 'coding' ? 'Coding' : 'Personal'}
+                  </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id); }}
-                  className="text-fg-muted hover:text-danger ml-1"
-                  aria-label="Delete session"
-                  title="Delete session"
-                >
-                  <X className="w-3 h-3" />
-                </button>
+                {!s.is_primary && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id); }}
+                    className="text-fg-muted hover:text-danger ml-1"
+                    aria-label="Delete session"
+                    title="Delete session"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
               </div>
             ))}
-          </div>
-        )}
-
-        {activeSection === 'knowledge' && (
-          <div className="space-y-3">
-            <div className="text-xs font-medium text-fg-muted">Knowledge Base</div>
-            <button
-              type="button"
-              onClick={() => onExecuteTool('knowledge_list', {})}
-              className="w-full flex items-center justify-center gap-2 py-2 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              View All Documents
-            </button>
-            <div className="text-[10px] text-fg-muted text-center">
-              Browse and search your indexed knowledge base documents.
-            </div>
           </div>
         )}
 
@@ -360,15 +356,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 ))}
               </div>
             </div>
-
-            <button
-              type="button"
-              onClick={() => onExecuteTool('knowledge_list', {})}
-              className="w-full flex items-center justify-center gap-2 py-2 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              View Knowledge Base
-            </button>
 
             <button
               type="button"

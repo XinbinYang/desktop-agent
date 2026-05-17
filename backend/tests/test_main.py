@@ -1,8 +1,19 @@
 import json
 import subprocess
+import uuid
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
+
+
+def receive_until(ws, expected_type: str, limit: int = 30):
+    seen = []
+    for _ in range(limit):
+        msg = ws.receive_json()
+        seen.append(msg.get("type"))
+        if msg.get("type") == expected_type:
+            return msg
+    raise AssertionError(f"Did not receive {expected_type}; saw {seen}")
 
 
 class TestAPIRoutes:
@@ -61,6 +72,131 @@ class TestAPIRoutes:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
+    def test_session_context_and_checkpoints_endpoints(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+        from app.agent import AgentSession
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+        session = AgentSession(model_id="gpt-4o", session_id="ctx_session")
+        session.messages.append({"role": "user", "content": "checkpoint prompt"})
+        session.messages.append({"role": "assistant", "content": "answer"})
+        agent_module._sessions["ctx_session"] = session
+
+        context = client.get("/api/sessions/ctx_session/context")
+        checkpoints = client.get("/api/sessions/ctx_session/checkpoints")
+
+        assert context.status_code == 200
+        assert context.json()["model_context"] > 0
+        assert checkpoints.status_code == 200
+        assert checkpoints.json()["checkpoints"][0]["preview"] == "checkpoint prompt"
+
+    def test_session_rewind_endpoint_trims_history(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+        from app.agent import AgentSession
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+        session = AgentSession(model_id="gpt-4o", session_id="rewind_session")
+        session.messages.append({"role": "user", "content": "target"})
+        session.messages.append({"role": "assistant", "content": "old answer"})
+        session.messages.append({"role": "user", "content": "later"})
+        checkpoint_id = session.build_checkpoints()[0]["id"]
+        agent_module._sessions["rewind_session"] = session
+
+        response = client.post("/api/sessions/rewind_session/rewind", json={
+            "checkpoint_id": checkpoint_id,
+            "retry": True,
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["checkpoint_id"] == checkpoint_id
+        assert [m.get("content") for m in data["snapshot"]["messages"] if m.get("role") != "system"] == ["target"]
+
+    def test_session_compact_endpoint_returns_snapshot(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+        from app.agent import AgentSession
+
+        async def fake_summary(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Compact summary"}}]}
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+        session = AgentSession(model_id="gpt-4o", session_id="compact_session")
+        for i in range(6):
+            session.messages.append({"role": "user", "content": f"user {i}"})
+            session.messages.append({"role": "assistant", "content": f"assistant {i}"})
+        session.router.chat_completion_non_stream = fake_summary
+        agent_module._sessions["compact_session"] = session
+
+        response = client.post("/api/sessions/compact_session/compact", json={"force": True})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["skipped"] is False
+        assert data["summary"] == "Compact summary"
+        assert data["snapshot"]["compaction_summary"] == "Compact summary"
+
+    def test_resolve_personal_session_returns_single_primary(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        first = client.post("/api/sessions/resolve", json={
+            "agent_type": "personal",
+            "policy": "canonical",
+        })
+        second = client.post("/api/sessions/resolve", json={
+            "agent_type": "personal",
+            "policy": "canonical",
+        })
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["session_id"] == "session_personal_main"
+        assert second.json()["session_id"] == "session_personal_main"
+        assert first.json()["is_primary"] is True
+        assert second.json()["created"] is False
+
+        listed = client.get("/api/sessions").json()["sessions"]
+        assert listed[0]["id"] == "session_personal_main"
+        assert listed[0]["is_primary"] is True
+
+    def test_resolve_coding_session_uses_last_or_create(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        first = client.post("/api/sessions/resolve", json={
+            "agent_type": "coding",
+            "policy": "last_or_create",
+        })
+        second = client.post("/api/sessions/resolve", json={
+            "agent_type": "coding",
+            "policy": "last_or_create",
+        })
+        third = client.post("/api/sessions/resolve", json={
+            "agent_type": "coding",
+            "policy": "new",
+        })
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert third.status_code == 200
+        assert first.json()["agent_type"] == "coding"
+        assert first.json()["session_id"] == second.json()["session_id"]
+        assert third.json()["session_id"] != first.json()["session_id"]
+        assert third.json()["created"] is True
+
     def test_upload_image(self, client):
         """POST /api/upload-image accepts file upload"""
         response = client.post(
@@ -117,7 +253,7 @@ class TestLocalAuth:
 
         with client.websocket_connect("/ws/auth_ok?token=test-token") as ws:
             ws.send_json({"type": "clear"})
-            msg = ws.receive_json()
+            msg = receive_until(ws, "cleared")
 
         assert msg["type"] == "cleared"
 
@@ -137,13 +273,14 @@ class TestWebSocket:
                 "model_id": "gpt-4o"
             })
             msgs = []
-            for _ in range(10):
+            for _ in range(30):
                 msg = ws.receive_json()
                 msgs.append(msg)
                 if msg.get("type") == "done":
                     break
 
             types = [m["type"] for m in msgs]
+            assert "skills_matched" in types
             assert "status" in types
             assert "done" in types
 
@@ -179,7 +316,7 @@ class TestWebSocket:
         }
 
         with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
-            with client.websocket_connect("/ws/test_plan_ws") as ws:
+            with client.websocket_connect(f"/ws/test_plan_ws_{uuid.uuid4().hex}") as ws:
                 ws.send_json({
                     "type": "chat",
                     "text": "plan this",
@@ -188,7 +325,7 @@ class TestWebSocket:
                     "thinking_intensity": "medium",
                 })
                 types = []
-                for _ in range(20):
+                for _ in range(35):
                     msg = ws.receive_json()
                     types.append(msg["type"])
                     if msg.get("type") == "done":
@@ -202,7 +339,7 @@ class TestWebSocket:
         from app.agent import PLAN_CONTINUE_MARKER
         from .conftest import _make_stream_mock
 
-        mock_response = {
+        plan_response = {
             "choices": [{
                 "message": {
                     "content": "Here is the plan.",
@@ -226,9 +363,26 @@ class TestWebSocket:
                 }
             }]
         }
+        # Second LLM call (build_plan → PLAN_CONTINUE_MARKER): simple text response
+        build_response = {
+            "choices": [{
+                "message": {
+                    "content": "Task completed.",
+                    "role": "assistant",
+                    "tool_calls": None
+                }
+            }]
+        }
 
-        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
-            with client.websocket_connect("/ws/test_plan_build_ws") as ws:
+        streams = [_make_stream_mock(plan_response), _make_stream_mock(build_response)]
+
+        async def stream_sequence(*args, **kwargs):
+            stream = streams.pop(0)
+            async for event in stream(*args, **kwargs):
+                yield event
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence):
+            with client.websocket_connect(f"/ws/test_plan_build_ws_{uuid.uuid4().hex}") as ws:
                 ws.send_json({
                     "type": "chat",
                     "text": "plan this work",
@@ -240,12 +394,12 @@ class TestWebSocket:
                     if msg.get("type") == "done":
                         break
 
+                # approve_plan sends 2 events: plan_approved_waiting_build + plan_status
                 ws.send_json({"type": "approve_plan"})
-                approve_types = []
-                for _ in range(10):
-                    msg = ws.receive_json()
-                    approve_types.append(msg["type"])
-                assert "plan_approved_waiting_build" in approve_types
+                msg = ws.receive_json()
+                assert msg["type"] == "plan_approved_waiting_build"
+                msg = ws.receive_json()
+                assert msg["type"] == "plan_status"
 
                 ws.send_json({"type": "build_plan"})
                 build_types = []
@@ -261,7 +415,7 @@ class TestWebSocket:
         """WebSocket clear message type"""
         with client.websocket_connect("/ws/test_clear") as ws:
             ws.send_json({"type": "clear"})
-            msg = ws.receive_json()
+            msg = receive_until(ws, "cleared")
             assert msg["type"] == "cleared"
 
     def test_websocket_tool_direct(self, client):
@@ -272,7 +426,7 @@ class TestWebSocket:
                 "tool_name": "get_screen_size",
                 "args": {}
             })
-            msg = ws.receive_json()
+            msg = receive_until(ws, "tool_result")
             assert msg["type"] == "tool_result"
             assert msg["data"]["name"] == "get_screen_size"
 
@@ -284,7 +438,7 @@ class TestWebSocket:
                 "tool_name": "nonexistent_tool",
                 "args": {}
             })
-            msg = ws.receive_json()
+            msg = receive_until(ws, "error")
             assert msg["type"] == "error"
 
     def test_websocket_tool_direct_reports_execution_error(self, client):
@@ -295,7 +449,7 @@ class TestWebSocket:
                 "tool_name": "browser_navigate",
                 "args": {}
             })
-            msg = ws.receive_json()
+            msg = receive_until(ws, "tool_result")
             assert msg["type"] == "tool_result"
             assert msg["data"]["name"] == "browser_navigate"
             assert "Tool execution failed" in msg["data"]["error"]
@@ -308,7 +462,7 @@ class TestWebSocket:
                 "tool_name": "shell_execute",
                 "args": {"cmd": "echo hi"}
             })
-            msg = ws.receive_json()
+            msg = receive_until(ws, "error")
             assert msg["type"] == "error"
             assert "not allowed" in msg["data"]["message"].lower()
 
@@ -320,7 +474,7 @@ class TestWebSocket:
                 "tool_name": "file_write",
                 "args": {"path": "/tmp/x", "content": "x"}
             })
-            msg = ws.receive_json()
+            msg = receive_until(ws, "error")
             assert msg["type"] == "error"
             assert "not allowed" in msg["data"]["message"].lower()
 
@@ -329,7 +483,7 @@ class TestWebSocket:
         sid = "test_ws_set_chat_mode_persist"
         with client.websocket_connect(f"/ws/{sid}") as ws:
             ws.send_json({"type": "set_chat_mode", "chat_mode": "plan"})
-            msg = ws.receive_json()
+            msg = receive_until(ws, "chat_mode")
             assert msg["type"] == "chat_mode"
             assert msg["data"]["chat_mode"] == "plan"
         snap = client.get(f"/api/sessions/{sid}").json()
@@ -339,7 +493,25 @@ class TestWebSocket:
         sid = "test_ws_set_chat_mode_invalid"
         with client.websocket_connect(f"/ws/{sid}") as ws:
             ws.send_json({"type": "set_chat_mode", "chat_mode": "bogus"})
-            msg = ws.receive_json()
+            msg = receive_until(ws, "error")
+            assert msg["type"] == "error"
+            assert "invalid" in msg["data"]["message"].lower()
+
+    def test_websocket_set_thinking_intensity_persists(self, client):
+        sid = "test_ws_set_thinking_intensity_persist"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "set_thinking_intensity", "thinking_intensity": "high"})
+            msg = receive_until(ws, "thinking_intensity")
+            assert msg["type"] == "thinking_intensity"
+            assert msg["data"]["thinking_intensity"] == "high"
+        snap = client.get(f"/api/sessions/{sid}").json()
+        assert snap.get("thinking_intensity") == "high"
+
+    def test_websocket_set_thinking_intensity_invalid(self, client):
+        sid = "test_ws_set_thinking_intensity_invalid"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "set_thinking_intensity", "thinking_intensity": "extreme"})
+            msg = receive_until(ws, "error")
             assert msg["type"] == "error"
             assert "invalid" in msg["data"]["message"].lower()
 
@@ -487,16 +659,44 @@ class TestProjectAPI:
 
 
 class TestSkillsAPI:
-    def test_list_skills(self, client):
+    def test_list_skills(self, client, monkeypatch, tmp_path):
         """GET /api/skills returns available skills"""
+        import app.skills as skills_module
+        monkeypatch.setattr(skills_module, "SKILL_PREFS_PATH", tmp_path / "skill_preferences.json")
+        skills_module.SkillManager.reload_skills()
+
         response = client.get("/api/skills")
         assert response.status_code == 200
         data = response.json()
         assert "skills" in data
+        assert "preferences" in data
+        assert "defaults" in data
+        assert "presets" in data
         assert len(data["skills"]) > 0
         names = [s["name"] for s in data["skills"]]
         assert "using-superpowers" in names
         assert "brainstorming" in names
+        skill_ids = {s["id"] for s in data["skills"]}
+        for preset in data["presets"]:
+            assert set(preset["skillIds"]).issubset(skill_ids)
+
+    def test_update_skill_preferences(self, client, monkeypatch, tmp_path):
+        """PUT /api/skills/preferences persists known IDs and ignores unknown IDs."""
+        import app.skills as skills_module
+        monkeypatch.setattr(skills_module, "SKILL_PREFS_PATH", tmp_path / "skill_preferences.json")
+        skills_module.SkillManager.reload_skills()
+
+        response = client.put("/api/skills/preferences", json={
+            "coding": {
+                "test-driven-development": False,
+                "unknown-skill": True,
+            }
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ignored"] == ["unknown-skill"]
+        assert data["preferences"]["coding"]["test-driven-development"] is False
 
 
 @pytest.mark.usefixtures("isolate_projects")

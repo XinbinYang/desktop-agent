@@ -7,10 +7,11 @@ import { useTranslation } from 'react-i18next';
 import { Sidebar } from './components/Sidebar';
 import { SessionView, type SessionViewHandle } from './components/session/SessionView';
 import { PaneRenderer } from './components/session/PaneRenderer';
-import type { PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
+import type { LeafNode, PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
 import {
   nextNodeId,
   collectLeaves,
+  collectLeafNodes,
   findLeafById,
   findLeafByPaneId,
   findFirstLeafId,
@@ -37,7 +38,7 @@ import {
   type PanelLayout,
 } from './hooks/useLayoutState';
 import { getLangFromFilename } from './lib/language';
-import { agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
+import { AGENT_LABEL, agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
@@ -55,6 +56,18 @@ interface SessionListItem {
   agent_type?: AgentType;
   message_count: number;
   updated_at?: number;
+  is_primary?: boolean;
+}
+
+interface ResolvedSession {
+  session_id: string;
+  agent_type: AgentType;
+  role_id: string;
+  model_id: string;
+  title?: string;
+  project_path?: string | null;
+  created?: boolean;
+  is_primary?: boolean;
 }
 
 type SplitPlacement = 'before' | 'after';
@@ -84,17 +97,24 @@ function normalizePath(path: string): string {
 
 const PANE_TREE_STORAGE_KEY = 'desktop-agent-pane-tree';
 
-function createSessionPane(agentType: AgentType, model: string, sessionId = `session_${Date.now()}`): SessionPane {
+function createDefaultSessionId(agentType: AgentType): string {
+  return agentType === 'personal'
+    ? 'session_personal_main'
+    : `session_coding_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function createSessionPane(agentType: AgentType, model: string, sessionId = createDefaultSessionId(agentType)): SessionPane {
   return {
     id: `pane_${Date.now()}`,
     sessionId,
     model,
     agentType,
     role: roleForAgent(agentType),
+    isPrimary: agentType === 'personal',
   };
 }
 
-function createLeaf(agentType: AgentType, model: string, sessionId?: string): PaneNode {
+function createLeaf(agentType: AgentType, model: string, sessionId?: string): LeafNode {
   return {
     type: 'leaf',
     id: nextNodeId(),
@@ -124,10 +144,44 @@ function loadPersistedPaneTree(activeAgent: AgentType): { paneRoot: PaneNode; fo
   }
 }
 
+function mapPaneTree(root: PaneNode, mapper: (pane: SessionPane) => SessionPane): PaneNode {
+  if (root.type === 'leaf') {
+    return { ...root, pane: mapper(root.pane) };
+  }
+  return { ...root, children: root.children.map((child) => mapPaneTree(child, mapper)) };
+}
+
+function sessionShortId(sessionId: string): string {
+  return sessionId
+    .replace(/^session_personal_/, '')
+    .replace(/^session_coding_/, '')
+    .replace(/^session_/, '#');
+}
+
+function sessionTitleForDisplay(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
+  if (!pane) return 'No Session';
+  const agentType = pane.agentType || normalizeAgentType(meta?.agent_type, meta?.role_id);
+  if (agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')) {
+    return 'Personal Agent · Main';
+  }
+  const title = (meta?.title || pane.title || '').trim();
+  const label = title || sessionShortId(pane.sessionId);
+  return `${AGENT_LABEL[agentType]} · ${label}`;
+}
+
+function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
+  return pane?.model || meta?.model_id || '';
+}
+
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
+  clearSession: () => {},
+  compactSession: () => {},
+  loadCheckpoints: async () => [],
+  rewindToCheckpoint: () => {},
   stopRunning: () => {},
   retryLast: () => {},
+  switchModel: () => {},
   executeToolDirect: () => {},
   addTerminalLog: (_msg: string) => {},
   approvePlan: () => {},
@@ -170,6 +224,17 @@ export default function App() {
 
   const layout = useLayoutState();
   const agentModel = agentModels[layout.activeAgent] || '';
+  const sessionMetaById = React.useMemo(() => {
+    const map: Record<string, SessionListItem> = {};
+    for (const session of sessions) map[session.id] = session;
+    return map;
+  }, [sessions]);
+  const focusedLeaf = React.useMemo(() => findLeafById(paneRoot, focusedLeafId), [paneRoot, focusedLeafId]);
+  const focusedPane = focusedLeaf?.pane ?? null;
+  const focusedSessionMeta = focusedPane ? sessionMetaById[focusedPane.sessionId] : undefined;
+  const focusedAgentType = focusedPane?.agentType || layout.activeAgent;
+  const focusedModel = sessionModelForPane(focusedPane, focusedSessionMeta) || agentModels[focusedAgentType] || agentModel;
+  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta);
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -192,6 +257,8 @@ export default function App() {
   }, [focusedSnapshot?.artifacts]);
 
   const sessionViewRefs = useRef<Map<string, SessionViewHandle>>(new Map());
+  const newSessionRef = useRef<() => void>(() => {});
+  const lastFocusedLeafByAgent = useRef<Partial<Record<AgentType, string>>>({});
   const didPromptModelSetup = React.useRef(false);
   const mainGroupRef = useRef<GroupImperativeHandle>(null);
   const centerGroupRef = useRef<GroupImperativeHandle>(null);
@@ -226,25 +293,97 @@ export default function App() {
     } catch { /* ignore */ }
   }, [paneRoot, focusedLeafId]);
 
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    setPaneRoot((prev) => {
+      let changed = false;
+      const next = mapPaneTree(prev, (pane) => {
+        const meta = sessionMetaById[pane.sessionId];
+        if (!meta) return pane;
+        const agentType = normalizeAgentType(meta.agent_type, meta.role_id);
+        const updated: SessionPane = {
+          ...pane,
+          model: meta.model_id || pane.model,
+          agentType,
+          role: meta.role_id || roleForAgent(agentType),
+          title: meta.title || pane.title,
+          isPrimary: !!meta.is_primary,
+        };
+        if (
+          updated.model !== pane.model ||
+          updated.agentType !== pane.agentType ||
+          updated.role !== pane.role ||
+          updated.title !== pane.title ||
+          updated.isPrimary !== pane.isPrimary
+        ) {
+          changed = true;
+        }
+        return updated;
+      });
+      return changed ? next : prev;
+    });
+  }, [sessions, sessionMetaById]);
+
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const addTerminalLog = useCallback((msg: string) => {
     setTerminalLogs((prev) => [...prev, msg]);
+  }, []);
+
+  const openFocusedRewind = useCallback(() => {
+    sessionViewRefs.current.get(focusedSessionId)?.openRewind();
+  }, [focusedSessionId]);
+
+  const loadSessions = useCallback((projectPath?: string | null) => {
+    const url = projectPath
+      ? `${API_BASE}/api/sessions?project_path=${encodeURIComponent(projectPath)}`
+      : `${API_BASE}/api/sessions`;
+    fetch(url)
+      .then((r) => r.json())
+      .then((data) => setSessions(data.sessions || []))
+      .catch(console.error);
   }, []);
 
   // Slash command handler — delegates to focused session actions
   const handleSlashCommand = useCallback((command: string, _args: string) => {
     const a = focusedActions;
     switch (command) {
+      case 'new':
+        if (focusedAgentType === 'personal') {
+          a.clearSession();
+          addTerminalLog('[Command] Started a fresh Personal Agent session');
+        } else {
+          newSessionRef.current();
+          addTerminalLog('[Command] Creating a new Coding Agent session');
+        }
+        break;
       case 'clear':
+        a.clearSession();
         addTerminalLog('[命令] 已清除会话');
         break;
       case 'help':
+        addTerminalLog('[Help] Commands: /new /clear /compact /rewind /context /help /model /role /project /config /screenshot /skills');
         addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
         break;
       case 'compact':
-        if (a) a.sendMessage('__compact__', undefined, { chatMode: 'agent' });
+        a.compactSession(false);
         addTerminalLog('[命令] 正在压缩对话上下文...');
         break;
+      case 'rewind':
+        openFocusedRewind();
+        addTerminalLog('[Command] Choose a checkpoint to rewind');
+        break;
+      case 'context': {
+        const usage = focusedSnapshot?.contextUsage;
+        if (!usage) {
+          addTerminalLog('[Context] Usage is still loading');
+          break;
+        }
+        const parts = Object.entries(usage.breakdown || {})
+          .map(([key, value]) => `${key}:${value}`)
+          .join(' ');
+        addTerminalLog(`[Context] ${usage.used_percent.toFixed(1)}% (${usage.used_tokens}/${usage.model_context}, ${usage.source}) ${parts}`);
+        break;
+      }
       case 'config':
         setShowSettings(true);
         break;
@@ -255,7 +394,7 @@ export default function App() {
       default:
         addTerminalLog(`[命令] 未知命令: /${command}`);
     }
-  }, [focusedActions, addTerminalLog]);
+  }, [focusedActions, focusedAgentType, focusedSnapshot?.contextUsage, openFocusedRewind, addTerminalLog]);
 
   // Load models, roles, sessions
   useEffect(() => {
@@ -339,6 +478,86 @@ export default function App() {
     });
     addTerminalLog(`[系统] 已切换到 ${agentType === 'personal' ? 'Personal Agent' : 'Coding Agent'}`);
   }, [layout, focusedLeafId, addTerminalLog, agentModels]);
+
+  const resolveAgentSessionClient = useCallback(async (
+    agentType: AgentType,
+    policy: 'canonical' | 'last_or_create' | 'new',
+  ): Promise<ResolvedSession> => {
+    const res = await fetch(`${API_BASE}/api/sessions/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent_type: agentType,
+        policy,
+        project_path: currentProject?.path || undefined,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || body.message || `Failed to resolve ${agentType} session`);
+    }
+    return res.json();
+  }, [currentProject?.path]);
+
+  const applyResolvedSessionToFocusedPane = useCallback((resolved: ResolvedSession) => {
+    const agentType = normalizeAgentType(resolved.agent_type, resolved.role_id);
+    layout.setActiveAgent(agentType);
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+    lastFocusedLeafByAgent.current[agentType] = focusedLeafId;
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf) return prev;
+      const newPane: SessionPane = {
+        ...leaf.pane,
+        sessionId: resolved.session_id,
+        model: resolved.model_id || agentModels[agentType] || '',
+        agentType,
+        role: resolved.role_id || roleForAgent(agentType),
+        title: resolved.title || undefined,
+        isPrimary: !!resolved.is_primary,
+      };
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+    });
+  }, [agentModels, focusedLeafId, layout]);
+
+  const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
+    layout.setActiveAgent(agentType);
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+
+    const leaves = collectLeafNodes(paneRoot);
+    const rememberedLeafId = lastFocusedLeafByAgent.current[agentType];
+    const rememberedLeaf = rememberedLeafId ? findLeafById(paneRoot, rememberedLeafId) : null;
+    const openLeaf = rememberedLeaf?.pane.agentType === agentType
+      ? rememberedLeaf
+      : leaves.find((entry) => entry.pane.agentType === agentType)?.node || null;
+
+    if (openLeaf) {
+      setFocusedLeafId(openLeaf.id);
+      lastFocusedLeafByAgent.current[agentType] = openLeaf.id;
+      return;
+    }
+
+    try {
+      const resolved = await resolveAgentSessionClient(
+        agentType,
+        agentType === 'personal' ? 'canonical' : 'last_or_create',
+      );
+      applyResolvedSessionToFocusedPane(resolved);
+      loadSessions(currentProject?.path ?? null);
+      addTerminalLog(`[系统] 已切换到 ${AGENT_LABEL[agentType]}`);
+    } catch (err) {
+      console.error('[App] Failed to navigate agent:', err);
+      addTerminalLog(`[系统] Agent 切换失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [addTerminalLog, applyResolvedSessionToFocusedPane, currentProject?.path, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+
+  const handleFocusLeaf = useCallback((leafId: string) => {
+    setFocusedLeafId(leafId);
+    const leaf = findLeafById(paneRoot, leafId);
+    if (!leaf) return;
+    lastFocusedLeafByAgent.current[leaf.pane.agentType] = leafId;
+    layout.setActiveAgent(leaf.pane.agentType);
+  }, [layout, paneRoot]);
 
   const saveAgentModelPreference = useCallback(async (agentType: string, modelId: string) => {
     try {
@@ -502,22 +721,20 @@ export default function App() {
     }
   }, [addTerminalLog, loadProjectTree]);
 
-  const loadSessions = useCallback((projectPath?: string | null) => {
-    const url = projectPath
-      ? `${API_BASE}/api/sessions?project_path=${encodeURIComponent(projectPath)}`
-      : `${API_BASE}/api/sessions`;
-    fetch(url)
-      .then((r) => r.json())
-      .then((data) => setSessions(data.sessions || []))
-      .catch(console.error);
-  }, []);
-
   // ---- Session pane management (tree-based) ----
 
   const switchSession = useCallback((newSessionId: string) => {
     const target = sessions.find((s) => s.id === newSessionId);
     const targetAgent = target ? normalizeAgentType(target.agent_type, target.role_id) : layout.activeAgent;
     layout.setActiveAgent(targetAgent);
+    if (targetAgent === 'personal') {
+      const existingPersonal = collectLeafNodes(paneRoot).find((entry) => entry.pane.agentType === 'personal');
+      if (existingPersonal) {
+        setFocusedLeafId(existingPersonal.leafId);
+        lastFocusedLeafByAgent.current.personal = existingPersonal.leafId;
+        return;
+      }
+    }
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
       if (!leaf) return prev;
@@ -527,47 +744,73 @@ export default function App() {
         model: target?.model_id || agentModels[targetAgent] || agentModel,
         agentType: targetAgent,
         role: target?.role_id || roleForAgent(targetAgent),
+        title: target?.title || undefined,
+        isPrimary: !!target?.is_primary,
       };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-  }, [focusedLeafId, sessions, agentModel, agentModels, layout]);
+  }, [focusedLeafId, sessions, agentModel, agentModels, layout, paneRoot]);
 
-  const newSession = useCallback(() => {
-    const id = `session_${Date.now()}`;
-    setPaneRoot((prev) => {
-      const leaf = findLeafById(prev, focusedLeafId);
-      if (!leaf) return prev;
-      const newPane: SessionPane = {
-        ...leaf.pane,
-        sessionId: id,
-        model: agentModel,
-        agentType: layout.activeAgent,
-        role: roleForAgent(layout.activeAgent),
-      };
-      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
-    });
-  }, [focusedLeafId, agentModel, layout.activeAgent]);
+  const newSession = useCallback(async () => {
+    try {
+      const resolved = await resolveAgentSessionClient('coding', 'new');
+      applyResolvedSessionToFocusedPane(resolved);
+      loadSessions(currentProject?.path ?? null);
+      addTerminalLog('[系统] 已创建 Coding Agent session');
+    } catch (err) {
+      console.error('[App] Failed to create coding session:', err);
+      const id = createDefaultSessionId('coding');
+      setPaneRoot((prev) => {
+        const leaf = findLeafById(prev, focusedLeafId);
+        if (!leaf) return prev;
+        const newPane: SessionPane = {
+          ...leaf.pane,
+          sessionId: id,
+          model: agentModels.coding || agentModel,
+          agentType: 'coding',
+          role: roleForAgent('coding'),
+          isPrimary: false,
+        };
+        return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+      });
+    }
+  }, [addTerminalLog, agentModel, agentModels.coding, applyResolvedSessionToFocusedPane, currentProject?.path, focusedLeafId, loadSessions, resolveAgentSessionClient]);
+
+  useEffect(() => {
+    newSessionRef.current = newSession;
+  }, [newSession]);
+
+  const startFocusedSession = useCallback(() => {
+    if (focusedAgentType === 'personal') {
+      focusedActions.clearSession();
+      addTerminalLog('[Command] Started a fresh Personal Agent session');
+      return;
+    }
+    newSession();
+  }, [focusedActions, focusedAgentType, newSession, addTerminalLog]);
 
   const deleteSession = useCallback(async (id: string) => {
     await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
     loadSessions();
     // If the deleted session is the focused one, create a new one in that leaf
     if (focusedSessionId === id) {
-      const newId = `session_${Date.now()}`;
+      const agentType: AgentType = layout.activeAgent === 'personal' ? 'personal' : 'coding';
+      const newId = createDefaultSessionId(agentType);
       setPaneRoot((prev) => {
         const leaf = findLeafById(prev, focusedLeafId);
         if (!leaf) return prev;
         const newPane: SessionPane = {
           ...leaf.pane,
           sessionId: newId,
-          model: agentModel,
-          agentType: layout.activeAgent,
-          role: roleForAgent(layout.activeAgent),
+          model: agentModels[agentType] || agentModel,
+          agentType,
+          role: roleForAgent(agentType),
+          isPrimary: agentType === 'personal',
         };
         return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
       });
     }
-  }, [focusedSessionId, focusedLeafId, agentModel, layout.activeAgent, loadSessions]);
+  }, [focusedSessionId, focusedLeafId, agentModel, agentModels, layout.activeAgent, loadSessions]);
 
   // Split a leaf into two panes (drag to edge)
   const handleSplitPane = useCallback((
@@ -575,9 +818,18 @@ export default function App() {
     direction: 'horizontal' | 'vertical',
     options: SplitPaneOptions = {},
   ) => {
-    const agentType = options.agentType || (options.role ? agentForRole(options.role) : layout.activeAgent);
-    const newLeaf = createLeaf(agentType, options.model || agentModel, options.sessionId);
+    const requestedAgent = options.agentType || (options.role ? agentForRole(options.role) : 'coding');
+    if (requestedAgent === 'personal') {
+      const existingPersonal = collectLeafNodes(paneRoot).find((entry) => entry.pane.agentType === 'personal');
+      if (existingPersonal) {
+        setFocusedLeafId(existingPersonal.leafId);
+        return;
+      }
+    }
+    const agentType: AgentType = requestedAgent === 'personal' ? 'personal' : 'coding';
+    const newLeaf = createLeaf(agentType, options.model || agentModels[agentType] || agentModel, options.sessionId);
     newLeaf.pane.role = options.role || roleForAgent(agentType);
+    newLeaf.pane.isPrimary = agentType === 'personal';
     const placement = options.placement || 'after';
 
     setPaneRoot((prev) => {
@@ -594,7 +846,8 @@ export default function App() {
       return replaceNode(prev, leafId, split);
     });
     setFocusedLeafId(newLeaf.id);
-  }, [agentModel, layout.activeAgent]);
+    lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
+  }, [agentModel, agentModels, paneRoot]);
 
   // Move a session from one leaf to another (drag to center of pane)
   const handleMoveSession = useCallback((fromLeafId: string, toLeafId: string) => {
@@ -627,6 +880,32 @@ export default function App() {
     });
     setFocusedLeafId(toLeafId);
   }, []);
+
+  const handlePaneModelChange = useCallback((leafId: string, modelId: string) => {
+    if (!modelId) return;
+    const targetLeaf = findLeafById(paneRoot, leafId);
+    if (!targetLeaf) return;
+    const targetSessionId = targetLeaf.pane.sessionId;
+    const targetAgent = targetLeaf.pane.agentType || layout.activeAgent;
+
+    setFocusedLeafId(leafId);
+    lastFocusedLeafByAgent.current[targetAgent] = leafId;
+    layout.setActiveAgent(targetAgent);
+
+    setPaneRoot((prev) => mapPaneTree(prev, (pane) => (
+      pane.sessionId === targetSessionId ? { ...pane, model: modelId } : pane
+    )));
+    setSessions((prev) => prev.map((session) => (
+      session.id === targetSessionId ? { ...session, model_id: modelId } : session
+    )));
+
+    const targetView = sessionViewRefs.current.get(targetSessionId);
+    if (targetView?.switchModel) {
+      targetView.switchModel(modelId);
+    } else if (leafId === focusedLeafId) {
+      focusedActions.switchModel(modelId);
+    }
+  }, [focusedActions, focusedLeafId, layout, paneRoot]);
 
   // Close a leaf pane
   const handleClosePane = useCallback((leafId: string) => {
@@ -776,10 +1055,14 @@ export default function App() {
   return (
     <div className="h-screen flex flex-col bg-app text-fg overflow-hidden">
       {/* Title bar */}
-      <div className="h-10 bg-surface border-b border-border flex items-center px-4 justify-between select-none app-drag">
+      <div className="h-10 bg-surface border-b border-border flex items-center px-4 justify-between select-none app-drag app-titlebar">
         <div className="flex items-center gap-2">
           <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-success' : 'bg-danger'}`} />
           <span className="text-sm font-semibold text-fg-secondary">Desktop Agent</span>
+          <span className="text-xs text-fg-muted">/</span>
+          <span className="text-xs font-medium text-fg truncate max-w-[320px]" title={focusedTitle}>
+            {focusedTitle}
+          </span>
           <span className="text-xs text-fg-muted ml-2">{isRunning ? '● Running' : '○ Ready'}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -791,19 +1074,11 @@ export default function App() {
             onResetLayout={handleResetLayout}
           />
           <select
-            value={agentModel}
+            value={focusedModel}
             title={`${layout.activeAgent === 'personal' ? 'Personal Agent' : 'Coding Agent'} 模型`}
             aria-label="切换模型"
             onChange={(e) => {
-              const newModel = e.target.value;
-              setAgentModels(prev => ({ ...prev, [layout.activeAgent]: newModel }));
-              setPaneRoot((prev) => {
-                const leaf = findLeafById(prev, focusedLeafId);
-                if (!leaf) return prev;
-                const newPane = { ...leaf.pane, model: newModel };
-                return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
-              });
-              saveAgentModelPreference(layout.activeAgent, newModel);
+              handlePaneModelChange(focusedLeafId, e.target.value);
             }}
             className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border outline-none cursor-pointer hover:bg-surface-hover transition-colors"
           >
@@ -830,7 +1105,7 @@ export default function App() {
           activeAgent={layout.activeAgent}
           sidebarCollapsed={layout.sidebarCollapsed}
           onSectionChange={layout.setActiveSection}
-          onAgentChange={handleAgentChange}
+          onAgentChange={handleAgentNavigate}
           onToggleSidebar={layout.toggleSidebar}
         />
 
@@ -841,19 +1116,21 @@ export default function App() {
               activeSection={layout.activeSection}
               activeAgent={layout.activeAgent}
               onSectionChange={layout.setActiveSection}
-              agentModel={agentModel}
-              onAgentChange={handleAgentChange}
+              agentModel={focusedModel}
+              onAgentChange={handleAgentNavigate}
               onOpenPersonalWorkspace={() => {
                 layout.setRightPanelVisible(true);
                 layout.setRightZone('workspace');
               }}
               onOpenSettings={() => setShowSettings(true)}
-              onClear={() => { if (focusedActions) focusedActions.sendMessage('__compact__', undefined, { chatMode: 'agent' }); }}
+              onClear={focusedActions.clearSession}
               onExecuteTool={focusedActions.executeToolDirect}
               isConnected={isConnected}
               sessions={sessions}
               currentSession={focusedSessionId}
-              onNewSession={newSession}
+              onNewSession={startFocusedSession}
+              onCompactSession={() => focusedActions.compactSession(false)}
+              onRewindSession={openFocusedRewind}
               onSwitchSession={switchSession}
               onDeleteSession={deleteSession}
               currentProjectPath={currentProject?.path ?? null}
@@ -884,7 +1161,7 @@ export default function App() {
           isOpen={showSettings}
           onClose={() => setShowSettings(false)}
           models={models}
-          currentModel={agentModel}
+          currentModel={focusedModel}
           onSettingsChanged={async () => {
             try {
               const res = await fetch(`${API_BASE}/api/models`);
@@ -917,7 +1194,7 @@ export default function App() {
           reason={switchSuggestion?.reason || ''}
           onSwitch={() => {
             if (switchSuggestion) {
-              handleAgentChange(switchSuggestion.to);
+              void handleAgentNavigate(switchSuggestion.to);
             }
             setSwitchSuggestion(null);
           }}
@@ -955,7 +1232,7 @@ export default function App() {
                   <PaneRenderer
                     node={paneRoot}
                     focusedLeafId={focusedLeafId}
-                    onFocus={setFocusedLeafId}
+                    onFocus={handleFocusLeaf}
                     onClosePane={handleClosePane}
                     onSplit={handleSplitPane}
                     onMoveSession={handleMoveSession}
@@ -966,9 +1243,12 @@ export default function App() {
                     onLeaveTeam={handleLeaveTeam}
                     sessionViewRefs={sessionViewRefs}
                     currentProject={currentProject}
-                    currentModel={agentModel}
-                    currentAgentType={layout.activeAgent}
-                    currentRole={roleForAgent(layout.activeAgent)}
+                    currentModel={focusedModel}
+                    currentAgentType={focusedAgentType}
+                    currentRole={roleForAgent(focusedAgentType)}
+                    models={models}
+                    sessionMetaById={sessionMetaById}
+                    onModelChange={handlePaneModelChange}
                     onSnapshot={handleSessionSnapshot}
                     onCommand={handleSlashCommand}
                     runAction={runAction}
@@ -1061,10 +1341,10 @@ export default function App() {
                 </button>
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
-                {layout.rightZone === 'workspace' && layout.activeAgent === 'personal' && (
+                {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
                   <PersonalWorkspacePanel />
                 )}
-                {layout.rightZone === 'workspace' && layout.activeAgent !== 'personal' && (
+                {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
                   <FocusedDataProvider value={focusedSnapshot}>
                     <FocusedActionsProvider value={focusedActions}>
                       <WorkspacePanel

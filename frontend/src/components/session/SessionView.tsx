@@ -40,6 +40,8 @@ interface SessionViewProps {
 
 export interface SessionViewHandle {
   openFile: (relativePath: string, content: string, language: string) => void;
+  switchModel: (modelId: string) => void;
+  openRewind: () => void;
 }
 
 // ---- Helpers ----
@@ -81,13 +83,19 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     toolCalls,
     fileEdits,
     runEvents,
+    contextUsage,
+    checkpoints,
     terminalLogs,
     isRunning,
     isConnected,
     sendMessage,
     clearSession,
+    compactSession,
+    loadCheckpoints,
+    rewindToCheckpoint,
     stopRunning,
     retryLast,
+    switchModel,
     executeToolDirect,
     resetSession,
     addTerminalLog,
@@ -120,6 +128,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
 
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
   const [latestToolCall, setLatestToolCall] = useState<ToolCall | null>(null);
+  const [rewindOpen, setRewindOpen] = useState(false);
   const [editorGroups, setEditorGroups] = useState<EditorGroup[]>([
     { id: 'main', activeFileId: null, openFiles: [] },
   ]);
@@ -175,7 +184,9 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     [layout],
   );
 
-  useImperativeHandle(ref, () => ({ openFile }), [openFile]);
+  const openRewind = useCallback(() => setRewindOpen(true), []);
+
+  useImperativeHandle(ref, () => ({ openFile, switchModel, openRewind }), [openFile, switchModel, openRewind]);
 
   // ---- Tool call → artifacts observer ----
 
@@ -364,6 +375,8 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       chatMode,
       thinkingIntensity,
       planState,
+      contextUsage,
+      checkpoints,
       suggestAgentSwitch,
       artifacts,
       editorGroups,
@@ -374,12 +387,17 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       runEvents,
     };
   }, [isFocused, sessionId, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
-      suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents]);
+      contextUsage, checkpoints, suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents]);
 
   const actions: SessionActions = useMemo(() => ({
     sendMessage,
+    clearSession,
+    compactSession,
+    loadCheckpoints,
+    rewindToCheckpoint,
     stopRunning,
     retryLast,
+    switchModel,
     executeToolDirect,
     addTerminalLog,
     approvePlan,
@@ -398,7 +416,8 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     handleOpenFileFromPanel,
     handleOpenFileFromPanelWithLine,
   }), [
-    sendMessage, stopRunning, retryLast, executeToolDirect, addTerminalLog,
+    sendMessage, clearSession, compactSession, loadCheckpoints, rewindToCheckpoint,
+    stopRunning, retryLast, switchModel, executeToolDirect, addTerminalLog,
     approvePlan, buildPlan, rejectPlan, updatePlanDecision,
     handleSelectFileInEditor, handleCloseFileInEditor, handleFileContentChange, handleSaveFile,
     saveInputDraft, loadInputDraft, clearInputDraft,
@@ -423,6 +442,14 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         messages={messages}
         toolCalls={toolCalls}
         onSend={sendMessage}
+        contextUsage={contextUsage}
+        checkpoints={checkpoints}
+        onCompact={compactSession}
+        onClearSession={clearSession}
+        onLoadCheckpoints={loadCheckpoints}
+        onRewindToCheckpoint={rewindToCheckpoint}
+        rewindOpen={rewindOpen}
+        onRewindOpenChange={setRewindOpen}
         onStop={stopRunning}
         onRetry={retryLast}
         isRunning={isRunning}

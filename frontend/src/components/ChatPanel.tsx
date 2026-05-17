@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff } from 'lucide-react';
+import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check } from 'lucide-react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import {
   ChatMessage,
@@ -11,6 +11,8 @@ import {
   PlanQuestion,
   PlanState,
   PlanTodo,
+  ContextUsage,
+  ConversationCheckpoint,
 } from '../types';
 import { API_BASE } from '../config';
 import { useTheme } from '../hooks/useTheme';
@@ -23,6 +25,9 @@ import { FileEditView } from './FileEditView';
 import { SlashCommandMenu } from './SlashCommandMenu';
 import { AtMentionMenu } from './AtMentionMenu';
 import { ChatMessageItem } from './ChatMessageItem';
+import { ContextMeter } from './ContextMeter';
+import { RewindModal } from './RewindModal';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
 
 interface ChatPanelProps {
   messages: ChatMessage[];
@@ -48,11 +53,26 @@ interface ChatPanelProps {
   onRejectPlan: () => void;
   onUpdatePlanDecision: (questionId: string, selected: string[]) => void;
   onCommand?: (command: string, args: string) => void;
+  contextUsage?: ContextUsage | null;
+  checkpoints?: ConversationCheckpoint[];
+  onCompact?: (force?: boolean, focus?: string) => void;
+  onClearSession?: () => void;
+  onLoadCheckpoints?: () => Promise<ConversationCheckpoint[]>;
+  onRewindToCheckpoint?: (checkpointId: string) => void;
+  rewindOpen?: boolean;
+  onRewindOpenChange?: (open: boolean) => void;
   projectOpen?: boolean;
   fileTree?: any[];
 }
 
 type OutputMode = 'concise' | 'balanced' | 'verbose';
+
+const THINKING_LEVELS: ThinkingIntensity[] = ['low', 'medium', 'high'];
+const THINKING_LABELS: Record<ThinkingIntensity, string> = {
+  low: 'LOW',
+  medium: 'MEDIUM',
+  high: 'HIGH',
+};
 
 function getInitialOutputMode(): OutputMode {
   try {
@@ -134,6 +154,45 @@ const ReasoningBlock: React.FC<{ text: string }> = ({ text }) => {
           style={{ maxHeight: '300px', lineHeight: 'var(--chat-line-height)' }}
         >
           {text}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const KnowledgeContextBlock: React.FC<{ sources: Extract<AssistantBlock, { type: 'knowledge_context' }>['sources'] }> = ({ sources }) => {
+  const [expanded, setExpanded] = useState(false);
+  const count = sources.length;
+
+  return (
+    <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/60 overflow-hidden border-l-2 border-l-accent/70">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-1.5 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm text-fg-secondary hover:text-fg hover:bg-surface-hover transition-colors"
+      >
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        <BookOpen className="w-3.5 h-3.5 text-accent" />
+        <span className="font-medium">Knowledge context</span>
+        <span className="text-fg-muted ml-1 chat-text-xs">
+          {count} source{count === 1 ? '' : 's'}
+        </span>
+      </button>
+      {expanded && (
+        <div className="border-t border-border-subtle divide-y divide-border-subtle">
+          {sources.map((source, index) => (
+            <div key={`${source.source_path}-${index}`} className="px-[var(--chat-bubble-px)] py-[var(--chat-space-sm)]">
+              <div className="flex items-center justify-between gap-2 chat-text-xs">
+                <span className="text-accent truncate" title={source.source_path}>{source.source_path}</span>
+                <span className="text-fg-muted shrink-0">{Math.round((source.score || 0) * 100)}%</span>
+              </div>
+              {source.preview && (
+                <div className="mt-1 chat-text-xs text-fg-muted line-clamp-2 whitespace-pre-wrap">
+                  {source.preview}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -519,6 +578,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onRejectPlan,
   onUpdatePlanDecision,
   onCommand,
+  contextUsage,
+  checkpoints = [],
+  onCompact,
+  onClearSession,
+  onLoadCheckpoints,
+  onRewindToCheckpoint,
+  rewindOpen = false,
+  onRewindOpenChange,
   projectOpen = false,
   fileTree = [],
 }) => {
@@ -661,11 +728,20 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     if (cmd.name === 'clear') {
       onCommand?.('clear', '');
       setInput('');
+    } else if (cmd.name === 'new') {
+      onCommand?.('new', '');
+      setInput('');
     } else if (cmd.name === 'help') {
       onCommand?.('help', '');
       setInput('');
     } else if (cmd.name === 'compact') {
-      onCommand?.('compact', '');
+      onCommand?.('compact', cmd.args || '');
+      setInput('');
+    } else if (cmd.name === 'rewind') {
+      onCommand?.('rewind', '');
+      setInput('');
+    } else if (cmd.name === 'context') {
+      onCommand?.('context', '');
       setInput('');
     } else if (cmd.name === 'config') {
       onCommand?.('config', '');
@@ -837,6 +913,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             </ReactMarkdown>
           </div>
         );
+      case 'knowledge_context':
+        return <KnowledgeContextBlock key={`kc-${block.timestamp}`} sources={block.sources} />;
       case 'tool_call':
         return (
           <ToolCallView
@@ -890,12 +968,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     if (!msg) return null;
     const lastMsg = messages[messages.length - 1];
     const lastAssistantMsgId = lastMsg?.role === 'assistant' && !lastMsg?.isTool ? lastMsg.id : null;
-    const contentHash = msg.blocks?.reduce((h, b) => {
-      if (b.type === 'text' || b.type === 'thinking') return h + ((b as { text: string }).text?.length ?? 0);
-      return h + 1;
-    }, 0) ?? 0;
+    // Stable per-message key: streamed token updates change the `msg`/`data`
+    // identity (appendBlock returns a fresh array + message object), which is
+    // what drives Virtuoso to re-render. Keying by content hash instead would
+    // remount the row on every token, destroying ReasoningBlock local state
+    // (expand/collapse, timer, auto-scroll) and causing the "blinking" bug.
     return (
-      <div key={`${msg.id}-${contentHash}`} className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
+      <div key={msg.id} className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
         <ChatMessageItem
           msg={msg}
           index={index}
@@ -1323,27 +1402,52 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="chat-text-xs text-fg-muted">Thinking</span>
-            {(['low', 'medium', 'high'] as ThinkingIntensity[]).map((level) => (
-              <button
-                key={level}
-                type="button"
-                onClick={() => onThinkingIntensityChange(level)}
-                className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
-                  thinkingIntensity === level
-                    ? 'bg-info/10 border-info/30 text-info'
-                    : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
-                }`}
-              >
-                {level}
-              </button>
-            ))}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="chat-text-xs inline-flex h-7 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-fg-secondary transition-colors hover:border-border hover:bg-surface-hover hover:text-fg"
+                  aria-label={`Thinking intensity ${THINKING_LABELS[thinkingIntensity]}`}
+                >
+                  <span className="text-fg-muted">Thinking</span>
+                  <span className="font-semibold text-info">{THINKING_LABELS[thinkingIntensity]}</span>
+                  <ChevronDown className="h-3 w-3 text-fg-muted" aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[128px]">
+                {THINKING_LEVELS.map((level) => (
+                  <DropdownMenuItem
+                    key={level}
+                    onSelect={() => onThinkingIntensityChange(level)}
+                    className={`justify-between ${
+                      thinkingIntensity === level ? 'text-info bg-info/10' : ''
+                    }`}
+                  >
+                    <span>{THINKING_LABELS[level]}</span>
+                    {thinkingIntensity === level && <Check className="h-3.5 w-3.5" aria-hidden />}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <span className="chat-text-xs text-fg-muted ml-1" title="Server plan phase">
               Status: {planPhaseLabel(planState.phase)}
             </span>
+            <ContextMeter
+              usage={contextUsage}
+              onCompact={() => onCompact?.(false)}
+              disabled={isRunning}
+            />
           </div>
         </div>
       </div>
+      <RewindModal
+        open={rewindOpen}
+        checkpoints={checkpoints}
+        onClose={() => onRewindOpenChange?.(false)}
+        onLoad={onLoadCheckpoints || (async () => [])}
+        onRewind={onRewindToCheckpoint || (() => {})}
+        isRunning={isRunning}
+      />
     </div>
   );
 };

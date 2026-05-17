@@ -13,6 +13,31 @@ export interface ModelInfo {
   context: number;
 }
 
+export interface ContextUsage {
+  session_id: string;
+  model_id: string;
+  model_context: number;
+  estimated_tokens: number;
+  used_tokens: number;
+  output_tokens?: number;
+  remaining_tokens: number;
+  used_percent: number;
+  exact: boolean;
+  source: 'provider' | 'estimate' | string;
+  status: 'ok' | 'warning' | 'critical' | string;
+  breakdown: Record<string, number>;
+}
+
+export interface ConversationCheckpoint {
+  id: string;
+  message_id?: string;
+  turn_id?: string;
+  index: number;
+  role: 'user';
+  preview: string;
+  created_at: number;
+}
+
 export interface RoleInfo {
   id: string;
   name: string;
@@ -135,11 +160,18 @@ export interface ToolSummary {
   toolBuckets: Array<{ label: string; count: number }>;
 }
 
+export interface KnowledgeContextSource {
+  source_path: string;
+  score: number;
+  preview?: string;
+}
+
 export interface RunEvent {
   id: string;
   type:
     | 'run_created'
     | 'context_pack'
+    | 'skills_matched'
     | 'guardrail_decision'
     | 'approval_required'
     | 'verification_start'
@@ -215,8 +247,19 @@ export interface PlanState {
 }
 
 export type AssistantBlock =
-  | { type: 'thinking'; text: string; timestamp: number }
+  | {
+      type: 'thinking';
+      text: string;
+      timestamp: number;
+      /** When the first reasoning token of this block arrived (frontend clock). */
+      startedAt?: number;
+      /** When this thinking block was sealed (a non-thinking block / turn end). */
+      endedAt?: number;
+      /** True once the thinking step has finished streaming. */
+      complete?: boolean;
+    }
   | { type: 'text'; text: string; timestamp: number }
+  | { type: 'knowledge_context'; sources: KnowledgeContextSource[]; timestamp: number }
   | { type: 'file_edit'; edit: FileEdit; timestamp: number }
   | {
       type: 'tool_call';
@@ -244,6 +287,10 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  messageId?: string;
+  turnId?: string;
+  checkpointId?: string;
+  createdAt?: number;
   imageBase64?: string;
   isTool: boolean;
   reasoning?: string;
@@ -293,7 +340,47 @@ export interface EditorGroup {
 }
 
 export type AgentType = 'personal' | 'coding';
-export type SidebarSection = 'personal' | 'coding' | 'tools' | 'project' | 'sessions' | 'knowledge' | 'settings';
+export type SidebarSection = 'personal' | 'coding' | 'skills' | 'project' | 'sessions' | 'settings';
+
+export interface SkillPreferences {
+  personal: Record<string, boolean>;
+  coding: Record<string, boolean>;
+}
+
+export interface SkillCatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  source: 'superpowers' | 'personal' | 'mcp' | 'a2a' | string;
+  enabledByAgent: Record<AgentType, boolean>;
+  recommendedFor: AgentType[];
+  category: string;
+  trustLevel: 'local' | 'trusted' | 'external' | string;
+}
+
+export interface SkillPreset {
+  id: string;
+  name: string;
+  description: string;
+  agentTypes: AgentType[];
+  skillIds: string[];
+}
+
+export interface MatchedSkillTrace {
+  id: string;
+  name: string;
+  category: string;
+  source: string;
+  reason: string;
+}
+
+export interface SkillCatalogResponse {
+  skills: SkillCatalogItem[];
+  preferences: SkillPreferences;
+  defaults: SkillPreferences;
+  presets: SkillPreset[];
+  ignored?: string[];
+}
 
 export interface AgentInfo {
   type: AgentType;
@@ -331,7 +418,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'compacted' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'skills_matched' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 
@@ -362,16 +449,4 @@ export interface ConnectorInfo {
   uptime_seconds: number;
   config: Record<string, any>;
   config_schema: Record<string, any>;
-}
-
-declare global {
-  interface Window {
-    electronAPI: {
-      selectFolder: () => Promise<string | undefined>;
-      selectFile: () => Promise<string | undefined>;
-      getAppVersion: () => Promise<string>;
-      getAuthToken: () => Promise<string>;
-      onNewSession: (cb: () => void) => () => void;
-    };
-  }
 }
