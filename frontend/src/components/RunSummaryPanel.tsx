@@ -29,6 +29,44 @@ function statusClass(status?: string): string {
   return 'text-fg-secondary';
 }
 
+function qualitySummary(completed?: RunEvent): { label: string; detail: string; tone: string } {
+  if (!completed) {
+    return {
+      label: 'Agent is working',
+      detail: 'The agent is still exploring, editing, or checking the result.',
+      tone: 'border-border bg-surface-alt text-fg-secondary',
+    };
+  }
+  const verification = completed.data?.verification_passed;
+  const review = completed.data?.review_passed;
+  if (verification === true && review !== false) {
+    return {
+      label: 'Ready for you',
+      detail: 'The agent says the change was checked and has no blocking review issue.',
+      tone: 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300',
+    };
+  }
+  if (verification === false) {
+    return {
+      label: 'Needs agent follow-up',
+      detail: 'The change is not verified yet. The agent should keep fixing and checking it.',
+      tone: 'border-amber-500/35 bg-amber-500/10 text-amber-300',
+    };
+  }
+  if (review === false) {
+    return {
+      label: 'Needs review fix',
+      detail: 'The automated review found a blocking issue that the agent should address.',
+      tone: 'border-amber-500/35 bg-amber-500/10 text-amber-300',
+    };
+  }
+  return {
+    label: 'Check pending',
+    detail: 'The run ended, but there is not enough quality evidence yet.',
+    tone: 'border-border bg-surface-alt text-fg-secondary',
+  };
+}
+
 export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun, onDiscardRun }: RunSummaryPanelProps) {
   const grouped = useMemo(() => {
     const map = new Map<string, RunEvent[]>();
@@ -56,6 +94,7 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
   const verifications = items.filter((e) => e.type === 'verification_result');
   const findings = items.filter((e) => e.type === 'review_finding');
   const status = completed?.data?.status || created?.data?.status || 'running';
+  const quality = qualitySummary(completed);
 
   if (grouped.length === 0) {
     return (
@@ -151,6 +190,16 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
             </dl>
           </div>
         )}
+
+        <div className={`border rounded p-3 ${quality.tone}`}>
+          <div className="text-xs font-semibold">{quality.label}</div>
+          <div className="mt-1 text-[11px] opacity-90">{quality.detail}</div>
+          {completed?.data?.verification_command && (
+            <div className="mt-2 text-[11px] text-fg-muted truncate" title={completed.data.verification_command}>
+              Checked with {completed.data.green_level || 'verification'}.
+            </div>
+          )}
+        </div>
 
         {context && (
           <div className="border border-border bg-surface-alt rounded p-3">

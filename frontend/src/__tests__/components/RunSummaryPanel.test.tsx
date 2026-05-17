@@ -61,6 +61,10 @@ const events: RunEvent[] = [
       run_id: 'run-1',
       status: 'completed',
       summary: 'done',
+      verification_passed: true,
+      verification_command: 'python -m pytest',
+      green_level: 'workspace',
+      review_passed: true,
     },
   },
 ]
@@ -73,6 +77,8 @@ describe('RunSummaryPanel', () => {
     expect(screen.getAllByText('run-1')[0]).toBeInTheDocument()
     expect(screen.getByText('worktree')).toBeInTheDocument()
     expect(screen.getByText(/Project: C:\/repo/)).toBeInTheDocument()
+    expect(screen.getByText('Ready for you')).toBeInTheDocument()
+    expect(screen.getByText('Checked with workspace.')).toBeInTheDocument()
     expect(screen.getByText(/passed: python -m pytest/)).toBeInTheDocument()
     expect(screen.getByText('Add one edge-case test later')).toBeInTheDocument()
   })

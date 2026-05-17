@@ -556,6 +556,20 @@ class TestAgentType:
         assert s.agent_type == "coding"
         assert s.role_id == "code-expert"
 
+    def test_get_or_create_does_not_default_role_overwrite_saved_agent_type(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        saved = AgentSession(model_id="gpt-4o", session_id="at_saved_coding", agent_type="coding")
+        saved._save()
+
+        loaded = get_or_create_session("at_saved_coding", "gpt-4o")
+
+        assert loaded.agent_type == "coding"
+        assert loaded.role_id == "code-expert"
+
     def test_session_save_and_load_preserves_agent_type(self, tmp_path, monkeypatch):
         import app.agent as agent_module
         monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)

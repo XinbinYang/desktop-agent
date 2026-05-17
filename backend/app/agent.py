@@ -261,6 +261,9 @@ class AgentSession:
                         system_msg += format_repo_map_summary(repo_map, max_chars=4500)
                         system_msg += (
                             "\n\n## Coding Agent Operating Rules\n"
+                            "- USER IS NON-PROGRAMMER: Treat the user's words as product intent, not an implementation spec. "
+                            "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
+                            "or destructive/security-sensitive choices.\n"
                             "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
                             "use `dispatch_parallel` to launch multiple `explorer` workers simultaneously — one per "
                             "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
@@ -276,6 +279,8 @@ class AgentSession:
                             "do not merge/apply/close out broad changes on stale or partial evidence.\n"
                             "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
                             "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
+                            "- AUTONOMOUS CLOSEOUT: Complete the engineering loop yourself: implement, verify, review, fix failures, "
+                            "and re-run verification. Do not ask the user to choose test commands, files, branch strategy, or code structure.\n"
                             "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
                             "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
                             "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
@@ -791,7 +796,7 @@ class AgentSession:
                             {
                                 "from": "personal",
                                 "to": "coding",
-                                "reason": "This task involves code development. The Coding Agent provides a professional engineering workflow with worktree isolation, verification, and review.",
+                                "reason": "This task involves code development. The Coding Agent can take over the technical details automatically: inspect the project, make the change, run verification, review the result, and report in plain language.",
                             },
                             run_id,
                         )

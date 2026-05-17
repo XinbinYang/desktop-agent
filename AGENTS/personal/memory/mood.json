@@ -1,16 +1,8 @@
 {
   "current": "neutral",
   "baseline": "positive",
-  "updated_at": "2026-05-17T16:42:41.504161",
+  "updated_at": "2026-05-17T16:51:26.390962",
   "history": [
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-17T14:43:41.710131"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-17T14:44:02.069772"
-    },
     {
       "mood": "neutral",
       "timestamp": "2026-05-17T14:44:02.082521"
@@ -202,6 +194,14 @@
     {
       "mood": "neutral",
       "timestamp": "2026-05-17T16:42:41.504161"
+    },
+    {
+      "mood": "neutral",
+      "timestamp": "2026-05-17T16:51:25.710166"
+    },
+    {
+      "mood": "neutral",
+      "timestamp": "2026-05-17T16:51:26.390962"
     }
   ]
 }

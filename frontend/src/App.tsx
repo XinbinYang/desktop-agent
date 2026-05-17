@@ -37,7 +37,7 @@ import {
   type PanelLayout,
 } from './hooks/useLayoutState';
 import { getLangFromFilename } from './lib/language';
-import { AGENT_LABEL, agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
+import { agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
