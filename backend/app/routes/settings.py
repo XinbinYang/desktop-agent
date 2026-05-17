@@ -6,7 +6,7 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import load_config, mask_api_key, save_config, reload_config
-from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig
+from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig, PersonalAgentConfig
 from app.roles import RoleManager
 from app.skills import SkillManager
 
@@ -27,6 +27,7 @@ class SettingsUpdateRequest(BaseModel):
     max_parallel_agents: Optional[int] = None
     review_gate_enabled: Optional[bool] = None
     coding_agent: Optional[dict[str, Any]] = None
+    personal_agent: Optional[dict[str, Any]] = None
     auto_approve_rules: Optional[list[dict[str, Any]]] = None
 
 
@@ -211,6 +212,7 @@ def get_settings():
         "providers": providers,
         "settings": cfg.settings.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
+        "personal_agent": cfg.personal_agent.model_dump(),
     }
 
 
@@ -220,6 +222,7 @@ def update_settings(req: SettingsUpdateRequest):
     cfg = load_config()
     update = req.model_dump(exclude_none=True)
     coding_update = update.pop("coding_agent", None)
+    personal_update = update.pop("personal_agent", None)
     current = cfg.settings.model_dump()
     current.update(update)
     cfg.settings = Settings(**current)
@@ -227,6 +230,10 @@ def update_settings(req: SettingsUpdateRequest):
         coding_current = cfg.coding_agent.model_dump()
         coding_current.update(coding_update)
         cfg.coding_agent = CodingAgentConfig(**coding_current)
+    if isinstance(personal_update, dict):
+        personal_current = cfg.personal_agent.model_dump()
+        personal_current.update(personal_update)
+        cfg.personal_agent = PersonalAgentConfig(**personal_current)
     save_config(cfg)
     return {"status": "ok"}
 

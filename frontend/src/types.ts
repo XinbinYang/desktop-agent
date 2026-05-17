@@ -42,6 +42,11 @@ export interface AppSettings {
   review_gate_enabled?: boolean;
 }
 
+export interface PersonalAgentSettings {
+  model: string;
+  thinking_intensity: ThinkingIntensity;
+}
+
 export interface CodingAgentSettings {
   enabled: boolean;
   default_execution_mode: "worktree" | "current_dir" | string;
@@ -50,12 +55,15 @@ export interface CodingAgentSettings {
   require_verification: boolean;
   require_review: boolean;
   auto_generate_repo_map: boolean;
+  model: string;
+  thinking_intensity: ThinkingIntensity;
 }
 
 export interface SettingsResponse {
   providers: Record<string, ProviderSettings>;
   settings: AppSettings;
   coding_agent?: CodingAgentSettings;
+  personal_agent?: PersonalAgentSettings;
 }
 
 export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video';
@@ -351,6 +359,7 @@ export interface ConnectorInfo {
   status: 'stopped' | 'running' | 'error';
   status_message: string;
   enabled: boolean;
+  uptime_seconds: number;
   config: Record<string, any>;
   config_schema: Record<string, any>;
 }

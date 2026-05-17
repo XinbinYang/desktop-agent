@@ -28,7 +28,7 @@ import { PersonalWorkspacePanel } from './components/PersonalWorkspace/PersonalW
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
-import { ModelInfo, RoleInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType } from './types';
+import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType } from './types';
 import { API_BASE } from './config';
 import {
   DEFAULT_MAIN_LAYOUT,
@@ -36,12 +36,11 @@ import {
   useLayoutState,
   type PanelLayout,
 } from './hooks/useLayoutState';
-import { loadRoles } from './lib/db';
 import { getLangFromFilename } from './lib/language';
+import { AGENT_LABEL, agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
-import { RoleEditor } from './components/RoleEditor';
 import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
@@ -53,6 +52,7 @@ interface SessionListItem {
   project_path?: string;
   model_id: string;
   role_id?: string;
+  agent_type?: AgentType;
   message_count: number;
   updated_at?: number;
 }
@@ -64,6 +64,7 @@ interface SplitPaneOptions {
   placement?: SplitPlacement;
   model?: string;
   role?: string;
+  agentType?: AgentType;
 }
 
 function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
@@ -83,28 +84,29 @@ function normalizePath(path: string): string {
 
 const PANE_TREE_STORAGE_KEY = 'desktop-agent-pane-tree';
 
-function createSessionPane(role: string, model: string, sessionId = `session_${Date.now()}`): SessionPane {
+function createSessionPane(agentType: AgentType, model: string, sessionId = `session_${Date.now()}`): SessionPane {
   return {
     id: `pane_${Date.now()}`,
     sessionId,
     model,
-    role,
+    agentType,
+    role: roleForAgent(agentType),
   };
 }
 
-function createLeaf(role: string, model: string, sessionId?: string): PaneNode {
+function createLeaf(agentType: AgentType, model: string, sessionId?: string): PaneNode {
   return {
     type: 'leaf',
     id: nextNodeId(),
-    pane: createSessionPane(role, model, sessionId),
+    pane: createSessionPane(agentType, model, sessionId),
   };
 }
 
-function createDefaultPaneTree(role: string): PaneNode {
-  return createLeaf(role, '');
+function createDefaultPaneTree(agentType: AgentType): PaneNode {
+  return createLeaf(agentType, '');
 }
 
-function loadPersistedPaneTree(currentRole: string): { paneRoot: PaneNode; focusedLeafId: string } {
+function loadPersistedPaneTree(activeAgent: AgentType): { paneRoot: PaneNode; focusedLeafId: string } {
   try {
     const raw = localStorage.getItem(PANE_TREE_STORAGE_KEY);
     if (!raw) throw new Error('no persisted tree');
@@ -117,7 +119,7 @@ function loadPersistedPaneTree(currentRole: string): { paneRoot: PaneNode; focus
     }
     return { paneRoot: data.paneRoot, focusedLeafId: data.focusedLeafId };
   } catch {
-    const def = createDefaultPaneTree(currentRole);
+    const def = createDefaultPaneTree(activeAgent);
     return { paneRoot: def, focusedLeafId: def.id };
   }
 }
@@ -148,19 +150,17 @@ const NOOP_ACTIONS: SessionActions = {
 export default function App() {
   const { t } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [currentModel, setCurrentModel] = useState<string>('');
-  const [roles, setRoles] = useState<RoleInfo[]>([]);
-  const [currentRole, setCurrentRole] = useState<string>(() => localStorage.getItem('agent_default_role') || 'desktop-agent');
+  const [agentModels, setAgentModels] = useState<Record<string, string>>({ personal: '', coding: '' });
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   // Pane tree — restored from localStorage or fresh default
-  const [paneRoot, setPaneRoot] = useState<PaneNode>(() => loadPersistedPaneTree(currentRole).paneRoot);
-  const [focusedLeafId, setFocusedLeafId] = useState<string>(() => loadPersistedPaneTree(currentRole).focusedLeafId);
+  const initialPaneTree = React.useMemo(() => loadPersistedPaneTree('personal'), []);
+  const [paneRoot, setPaneRoot] = useState<PaneNode>(() => initialPaneTree.paneRoot);
+  const [focusedLeafId, setFocusedLeafId] = useState<string>(() => initialPaneTree.focusedLeafId);
   const focusedSessionId = React.useMemo(() => {
     const leaf = findLeafById(paneRoot, focusedLeafId);
     return leaf?.pane.sessionId ?? collectLeaves(paneRoot)[0]?.sessionId ?? '';
   }, [paneRoot, focusedLeafId]);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
-  const [showRoleEditor, setShowRoleEditor] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
@@ -169,6 +169,7 @@ export default function App() {
   const [showProjectModal, setShowProjectModal] = useState(false);
 
   const layout = useLayoutState();
+  const agentModel = agentModels[layout.activeAgent] || '';
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -269,33 +270,21 @@ export default function App() {
           const modelsList = data.models || [];
           setModels(modelsList);
           const defaultModel = data.default || modelsList[0]?.id || '';
-          setCurrentModel(defaultModel);
-          const mdl = defaultModel;
+
+          // Also load settings to get per-agent model preferences
+          try {
+            const settingsRes = await fetch(`${API_BASE}/api/settings`);
+            const settingsData = await settingsRes.json();
+            setAgentModels({
+              personal: settingsData.personal_agent?.model || defaultModel,
+              coding: settingsData.coding_agent?.model || defaultModel,
+            });
+          } catch {
+            setAgentModels({ personal: defaultModel, coding: defaultModel });
+          }
         }
       } catch (err) {
         console.error('[App] Failed to load models:', err);
-      }
-    };
-
-    const loadRolesData = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/roles`);
-        const data = await res.json();
-        const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
-          id: r.id, name: r.name, description: r.description, isBuiltin: true,
-        }));
-        if (!cancelled) setRoles(builtinRoles);
-        try {
-          const custom = await loadRoles();
-          const customRoles: RoleInfo[] = custom.map((r) => ({
-            id: r.id, name: r.name, description: r.description, isBuiltin: false,
-          }));
-          if (!cancelled) setRoles([...builtinRoles, ...customRoles]);
-        } catch (dbErr) {
-          console.error('[App] Failed to load custom roles from IndexedDB:', dbErr);
-        }
-      } catch (err) {
-        console.error('[App] Failed to load roles:', err);
       }
     };
 
@@ -314,7 +303,7 @@ export default function App() {
     };
 
     const doLoad = async () => {
-      await Promise.all([loadModels(), loadRolesData(), loadSettingsReadiness()]);
+      await Promise.all([loadModels(), loadSettingsReadiness()]);
       if (!cancelled) setIsLoadingModels(false);
     };
 
@@ -335,45 +324,32 @@ export default function App() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleRoleChange = useCallback((newRole: string) => {
-    setCurrentRole(newRole);
-    localStorage.setItem('agent_default_role', newRole);
-  }, []);
-
   const handleAgentChange = useCallback((agentType: AgentType) => {
     layout.setActiveAgent(agentType);
     // Switch section to match agent
     layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
-    // Update session pane role to match
-    const defaultRole = agentType === 'personal' ? 'desktop-agent' : 'code-expert';
-    setCurrentRole(defaultRole);
+    // Update session pane role and model to match agent
+    const defaultRole = roleForAgent(agentType);
+    const newModel = agentModels[agentType] || '';
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
       if (!leaf) return prev;
-      const newPane = { ...leaf.pane, role: defaultRole };
+      const newPane = { ...leaf.pane, agentType, role: defaultRole, model: newModel };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
     addTerminalLog(`[系统] 已切换到 ${agentType === 'personal' ? 'Personal Agent' : 'Coding Agent'}`);
-  }, [layout, focusedSessionId, addTerminalLog]);
+  }, [layout, focusedLeafId, addTerminalLog, agentModels]);
 
-  const handleRolesChanged = useCallback(async () => {
+  const saveAgentModelPreference = useCallback(async (agentType: string, modelId: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/roles`);
-      const data = await res.json();
-      const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
-        id: r.id, name: r.name, description: r.description, isBuiltin: true,
-      }));
-      try {
-        const custom = await loadRoles();
-        const customRoles: RoleInfo[] = custom.map((r) => ({
-          id: r.id, name: r.name, description: r.description, isBuiltin: false,
-        }));
-        setRoles([...builtinRoles, ...customRoles]);
-      } catch {
-        setRoles(builtinRoles);
-      }
+      const field = agentType === 'personal' ? 'personal_agent' : 'coding_agent';
+      await fetch(`${API_BASE}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: { model: modelId } }),
+      });
     } catch (err) {
-      console.error('[App] Failed to reload roles:', err);
+      console.error('[App] Failed to save agent model preference:', err);
     }
   }, []);
 
@@ -540,28 +516,36 @@ export default function App() {
 
   const switchSession = useCallback((newSessionId: string) => {
     const target = sessions.find((s) => s.id === newSessionId);
+    const targetAgent = normalizeAgentType(target?.agent_type, target?.role_id);
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
       if (!leaf) return prev;
       const newPane: SessionPane = {
         ...leaf.pane,
         sessionId: newSessionId,
-        model: target?.model_id || currentModel,
-        role: target?.role_id || currentRole,
+        model: target?.model_id || agentModel,
+        agentType: targetAgent,
+        role: target?.role_id || roleForAgent(targetAgent),
       };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-  }, [focusedLeafId, sessions, currentModel, currentRole]);
+  }, [focusedLeafId, sessions, agentModel]);
 
   const newSession = useCallback(() => {
     const id = `session_${Date.now()}`;
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
       if (!leaf) return prev;
-      const newPane: SessionPane = { ...leaf.pane, sessionId: id, model: currentModel, role: currentRole };
+      const newPane: SessionPane = {
+        ...leaf.pane,
+        sessionId: id,
+        model: agentModel,
+        agentType: layout.activeAgent,
+        role: roleForAgent(layout.activeAgent),
+      };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-  }, [focusedLeafId, currentModel, currentRole]);
+  }, [focusedLeafId, agentModel, layout.activeAgent]);
 
   const deleteSession = useCallback(async (id: string) => {
     await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
@@ -572,47 +556,72 @@ export default function App() {
       setPaneRoot((prev) => {
         const leaf = findLeafById(prev, focusedLeafId);
         if (!leaf) return prev;
-        const newPane: SessionPane = { ...leaf.pane, sessionId: newId, model: currentModel, role: currentRole };
+        const newPane: SessionPane = {
+          ...leaf.pane,
+          sessionId: newId,
+          model: agentModel,
+          agentType: layout.activeAgent,
+          role: roleForAgent(layout.activeAgent),
+        };
         return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
       });
     }
-  }, [focusedSessionId, focusedLeafId, currentModel, currentRole, loadSessions]);
+  }, [focusedSessionId, focusedLeafId, agentModel, layout.activeAgent, loadSessions]);
 
   // Split a leaf into two panes (drag to edge)
-  const handleSplitPane = useCallback((leafId: string, direction: 'horizontal' | 'vertical', newSessionId?: string) => {
-    const newPane: SessionPane = {
-      id: `pane_${Date.now()}`,
-      sessionId: newSessionId || `session_${Date.now()}`,
-      model: currentModel,
-      role: currentRole,
-    };
-    const newLeaf: PaneNode = { type: 'leaf', id: nextNodeId(), pane: newPane };
+  const handleSplitPane = useCallback((
+    leafId: string,
+    direction: 'horizontal' | 'vertical',
+    options: SplitPaneOptions = {},
+  ) => {
+    const agentType = options.agentType || (options.role ? agentForRole(options.role) : layout.activeAgent);
+    const newLeaf = createLeaf(agentType, options.model || agentModel, options.sessionId);
+    newLeaf.pane.role = options.role || roleForAgent(agentType);
+    const placement = options.placement || 'after';
 
     setPaneRoot((prev) => {
       const existing = findLeafById(prev, leafId);
       if (!existing) return prev;
+      const children = placement === 'before' ? [newLeaf, existing] : [existing, newLeaf];
       const split: SplitNode = {
         type: 'split',
         id: nextNodeId(),
         direction,
-        children: [existing, newLeaf],
+        children,
         sizes: [50, 50],
       };
       return replaceNode(prev, leafId, split);
     });
     setFocusedLeafId(newLeaf.id);
-  }, [currentModel, currentRole]);
+  }, [agentModel, layout.activeAgent]);
 
   // Move a session from one leaf to another (drag to center of pane)
   const handleMoveSession = useCallback((fromLeafId: string, toLeafId: string) => {
     setPaneRoot((prev) => {
       const fromLeaf = findLeafById(prev, fromLeafId);
       const toLeaf = findLeafById(prev, toLeafId);
-      if (!fromLeaf || !toLeaf) return prev;
+      if (!fromLeaf || !toLeaf || fromLeaf.id === toLeaf.id) return prev;
       // Swap the session data — keep the pane structure
-      const tempPane = fromLeaf.pane;
-      let result = replaceNode(prev, fromLeafId, { ...fromLeaf, pane: toLeaf.pane });
-      result = replaceNode(result, toLeafId, { ...toLeaf, pane: tempPane });
+      const fromSession = {
+        sessionId: fromLeaf.pane.sessionId,
+        model: fromLeaf.pane.model,
+        agentType: fromLeaf.pane.agentType,
+        role: fromLeaf.pane.role,
+      };
+      const toSession = {
+        sessionId: toLeaf.pane.sessionId,
+        model: toLeaf.pane.model,
+        agentType: toLeaf.pane.agentType,
+        role: toLeaf.pane.role,
+      };
+      let result = replaceNode(prev, fromLeafId, {
+        ...fromLeaf,
+        pane: { ...fromLeaf.pane, ...toSession },
+      });
+      result = replaceNode(result, toLeafId, {
+        ...toLeaf,
+        pane: { ...toLeaf.pane, ...fromSession },
+      });
       return result;
     });
     setFocusedLeafId(toLeafId);
@@ -620,25 +629,38 @@ export default function App() {
 
   // Close a leaf pane
   const handleClosePane = useCallback((leafId: string) => {
-    // If this is the only leaf left, replace with a fresh session (don't remove)
-    if (paneRoot.type === 'leaf' && paneRoot.id === leafId) {
-      const newId = `session_${Date.now()}`;
-      const newPane: SessionPane = { id: `pane_${Date.now()}`, sessionId: newId, model: currentModel, role: currentRole };
-      const newLeaf: PaneNode = { type: 'leaf', id: nextNodeId(), pane: newPane };
-      setPaneRoot(newLeaf);
-      setFocusedLeafId(newLeaf.id);
-      sessionViewRefs.current.delete(paneRoot.pane.sessionId);
-      return;
-    }
+    setPaneRoot((prev) => {
+      if (prev.type === 'leaf' && prev.id === leafId) {
+        const removedPane = prev.pane;
+        const newLeaf = createLeaf(layout.activeAgent, agentModel);
+        sessionViewRefs.current.delete(removedPane.sessionId);
+        setFocusedLeafId(newLeaf.id);
+        setTeams((teams) => {
+          const next = removePaneFromTeam(teams, removedPane.id);
+          saveTeams(next);
+          return next;
+        });
+        return newLeaf;
+      }
 
-    const result = removeLeaf(paneRoot, leafId);
-    if (!result) return;
-    setPaneRoot(result.root);
-    if (result.focusId) setFocusedLeafId(result.focusId);
-    if (result.removedPane) {
-      sessionViewRefs.current.delete(result.removedPane.sessionId);
-    }
-  }, [paneRoot, currentModel, currentRole]);
+      const result = removeLeaf(prev, leafId);
+      if (!result) return prev;
+      if (result.focusId) setFocusedLeafId(result.focusId);
+      if (result.removedPane) {
+        sessionViewRefs.current.delete(result.removedPane.sessionId);
+        setTeams((teams) => {
+          const next = removePaneFromTeam(teams, result.removedPane!.id);
+          saveTeams(next);
+          return next;
+        });
+      }
+      return result.root;
+    });
+  }, [agentModel, layout.activeAgent]);
+
+  const handleSplitResize = useCallback((splitId: string, sizes: number[]) => {
+    setPaneRoot((prev) => updateSplitSizes(prev, splitId, sizes));
+  }, []);
 
   // ---- Team callbacks ----
 
@@ -648,23 +670,13 @@ export default function App() {
       saveTeams(next);
       return next;
     });
-    // Update pane tree to store teamId on the SessionPane
     setPaneRoot((prev) => {
-      const leaf = findLeafById(prev, focusedLeafId);
-      if (!leaf || leaf.pane.id !== paneId) {
-        // Find the leaf with matching pane.id
-        const allLeaves = collectLeaves(prev);
-        const target = allLeaves.find((l) => l.id === paneId);
-        if (!target) return prev;
-        const leafNode = findLeafById(prev, target.id);
-        if (!leafNode) return prev;
-        const updatedPane = { ...leafNode.pane, teamId };
-        return replaceNode(prev, leafNode.id, { ...leafNode, pane: updatedPane });
-      }
+      const leaf = findLeafByPaneId(prev, paneId);
+      if (!leaf) return prev;
       const updatedPane = { ...leaf.pane, teamId };
-      return replaceNode(prev, focusedLeafId, { ...leaf, pane: updatedPane });
+      return replaceNode(prev, leaf.id, { ...leaf, pane: updatedPane });
     });
-  }, [focusedLeafId]);
+  }, []);
 
   const handleCreateTeam = useCallback((name: string): Team => {
     const t = createTeam(name);
@@ -679,20 +691,12 @@ export default function App() {
       return next;
     });
     setPaneRoot((prev) => {
-      const leaf = findLeafById(prev, focusedLeafId);
-      if (!leaf || leaf.pane.id !== paneId) {
-        const allLeaves = collectLeaves(prev);
-        const target = allLeaves.find((l) => l.id === paneId);
-        if (!target) return prev;
-        const leafNode = findLeafById(prev, target.id);
-        if (!leafNode) return prev;
-        const { teamId: _, ...rest } = leafNode.pane;
-        return replaceNode(prev, leafNode.id, { ...leafNode, pane: rest });
-      }
+      const leaf = findLeafByPaneId(prev, paneId);
+      if (!leaf) return prev;
       const { teamId: _, ...rest } = leaf.pane;
-      return replaceNode(prev, focusedLeafId, { ...leaf, pane: rest });
+      return replaceNode(prev, leaf.id, { ...leaf, pane: rest });
     });
-  }, [focusedLeafId]);
+  }, []);
 
   // ---- Snapshot callback from SessionView ----
 
@@ -733,6 +737,27 @@ export default function App() {
     layout.toggleTerminal();
   }, [layout]);
 
+  const handleMainLayoutChanged = useCallback((next: PanelLayout) => {
+    if ((next.center ?? 0) > 1 && (next.right ?? 0) > 1) {
+      layout.setMainLayout(next);
+    }
+  }, [layout]);
+
+  const handleTerminalLayoutChanged = useCallback((next: PanelLayout) => {
+    if ((next.conversation ?? 0) > 1 && (next.terminal ?? 0) > 1) {
+      layout.setTerminalLayout(next);
+    }
+  }, [layout]);
+
+  const handleResetLayout = useCallback(() => {
+    layout.resetLayout();
+    mainGroupRef.current?.setLayout(DEFAULT_MAIN_LAYOUT);
+    centerGroupRef.current?.setLayout(DEFAULT_TERMINAL_LAYOUT);
+    rightPanelRef.current?.expand();
+    terminalPanelRef.current?.expand();
+    setPaneRoot((prev) => resetSplitSizes(prev));
+  }, [layout]);
+
   // ---- Derived: right panel props from focused snapshot ----
   const rpTools = focusedSnapshot?.toolCalls ?? [];
   const rpEdits = focusedSnapshot?.fileEdits ?? [];
@@ -762,21 +787,22 @@ export default function App() {
             rightPanelVisible={layout.rightPanelVisible}
             onToggleTerminal={layout.toggleTerminal}
             onToggleRightPanel={layout.toggleRightPanel}
-            onResetLayout={layout.resetLayout}
+            onResetLayout={handleResetLayout}
           />
           <select
-            value={currentModel}
-            title="切换模型"
+            value={agentModel}
+            title={`${layout.activeAgent === 'personal' ? 'Personal Agent' : 'Coding Agent'} 模型`}
             aria-label="切换模型"
             onChange={(e) => {
               const newModel = e.target.value;
-              setCurrentModel(newModel);
+              setAgentModels(prev => ({ ...prev, [layout.activeAgent]: newModel }));
               setPaneRoot((prev) => {
                 const leaf = findLeafById(prev, focusedLeafId);
                 if (!leaf) return prev;
                 const newPane = { ...leaf.pane, model: newModel };
                 return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
               });
+              saveAgentModelPreference(layout.activeAgent, newModel);
             }}
             className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border outline-none cursor-pointer hover:bg-surface-hover transition-colors"
           >
@@ -814,11 +840,12 @@ export default function App() {
               activeSection={layout.activeSection}
               activeAgent={layout.activeAgent}
               onSectionChange={layout.setActiveSection}
-              roles={roles}
-              currentRole={currentRole}
-              onRoleChange={handleRoleChange}
+              agentModel={agentModel}
               onAgentChange={handleAgentChange}
-              onOpenRoleEditor={() => setShowRoleEditor(true)}
+              onOpenPersonalWorkspace={() => {
+                layout.setRightPanelVisible(true);
+                layout.setRightZone('workspace');
+              }}
               onOpenSettings={() => setShowSettings(true)}
               onClear={() => { if (focusedActions) focusedActions.sendMessage('__compact__', undefined, { chatMode: 'agent' }); }}
               onExecuteTool={focusedActions.executeToolDirect}
@@ -856,7 +883,7 @@ export default function App() {
           isOpen={showSettings}
           onClose={() => setShowSettings(false)}
           models={models}
-          currentModel={currentModel}
+          currentModel={agentModel}
           onSettingsChanged={async () => {
             try {
               const res = await fetch(`${API_BASE}/api/models`);
@@ -864,17 +891,22 @@ export default function App() {
               const modelsList = data.models || [];
               setModels(modelsList);
               const defaultModel = data.default || modelsList[0]?.id || '';
-              setCurrentModel(defaultModel);
+
+              // Re-fetch per-agent model settings
+              try {
+                const settingsRes = await fetch(`${API_BASE}/api/settings`);
+                const settingsData = await settingsRes.json();
+                setAgentModels({
+                  personal: settingsData.personal_agent?.model || defaultModel,
+                  coding: settingsData.coding_agent?.model || defaultModel,
+                });
+              } catch {
+                setAgentModels({ personal: defaultModel, coding: defaultModel });
+              }
             } catch (err) {
               console.error('[App] Failed to refresh models after settings change:', err);
             }
           }}
-        />
-
-        <RoleEditor
-          isOpen={showRoleEditor}
-          onClose={() => setShowRoleEditor(false)}
-          onRolesChanged={handleRolesChanged}
         />
 
         <SwitchAgentModal
@@ -896,13 +928,29 @@ export default function App() {
         />
 
         {/* Center + right panel — horizontal Group */}
-        <Group orientation="horizontal" className="flex-1 min-w-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
+        <Group
+          id="desktop-agent-main-layout"
+          groupRef={mainGroupRef}
+          orientation="horizontal"
+          defaultLayout={layout.mainLayout}
+          onLayoutChanged={handleMainLayoutChanged}
+          className="flex-1 min-w-0"
+          resizeTargetMinimumSize={{ fine: 22, coarse: 34 }}
+        >
           {/* Center area */}
-          <Panel>
+          <Panel id="center" minSize="360px">
             <div className="flex flex-col h-full">
               {/* Vertical Group: Pane tree + Terminal */}
-              <Group orientation="vertical" className="flex-1 min-h-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
-                <Panel>
+              <Group
+                id="desktop-agent-center-layout"
+                groupRef={centerGroupRef}
+                orientation="vertical"
+                defaultLayout={layout.terminalLayout}
+                onLayoutChanged={handleTerminalLayoutChanged}
+                className="flex-1 min-h-0"
+                resizeTargetMinimumSize={{ fine: 22, coarse: 34 }}
+              >
+                <Panel id="conversation" minSize="280px">
                   <PaneRenderer
                     node={paneRoot}
                     focusedLeafId={focusedLeafId}
@@ -910,14 +958,16 @@ export default function App() {
                     onClosePane={handleClosePane}
                     onSplit={handleSplitPane}
                     onMoveSession={handleMoveSession}
+                    onSplitResize={handleSplitResize}
                     teams={teams}
                     onJoinTeam={handleJoinTeam}
                     onCreateTeam={handleCreateTeam}
                     onLeaveTeam={handleLeaveTeam}
                     sessionViewRefs={sessionViewRefs}
                     currentProject={currentProject}
-                    currentModel={currentModel}
-                    currentRole={currentRole}
+                    currentModel={agentModel}
+                    currentAgentType={layout.activeAgent}
+                    currentRole={roleForAgent(layout.activeAgent)}
                     onSnapshot={handleSessionSnapshot}
                     onCommand={handleSlashCommand}
                     runAction={runAction}
@@ -934,9 +984,8 @@ export default function App() {
                   panelRef={terminalPanelRef}
                   collapsible
                   collapsedSize={0}
-                  defaultSize={100}
-                  minSize={0}
-                  maxSize={800}
+                  minSize="96px"
+                  maxSize="70%"
                   onResize={(size) => {
                     if (size.asPercentage <= 1) layout.setShowTerminal(false);
                     else if (!layout.showTerminal) layout.setShowTerminal(true);
@@ -976,8 +1025,10 @@ export default function App() {
           {/* Right panel */}
           <Separator className="bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-col-resize" style={{ width: 3 }} />
           <Panel
+            id="right"
             panelRef={rightPanelRef}
-            defaultSize={800} minSize={0} maxSize={1600}
+            minSize="300px"
+            maxSize="70%"
             collapsible collapsedSize={0}
             onResize={(size) => {
               if (size.asPercentage <= 1) layout.setRightPanelVisible(false);

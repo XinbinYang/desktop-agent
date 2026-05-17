@@ -67,17 +67,13 @@ async def lifespan(app: FastAPI):
     # Register platform connectors
     from app.connectors import get_connector_manager
     from app.connectors.discord_connector import DiscordConnector
+    from app.connectors.feishu_connector import FeishuConnector
     connector_manager = get_connector_manager()
     connector_manager.register(DiscordConnector())
+    connector_manager.register(FeishuConnector())
     print(f"[Desktop Agent] Registered connectors: {[c['name'] for c in connector_manager.list_connectors()]}")
     # Restore enabled connectors from saved config
-    for c in connector_manager.list_connectors():
-        if c.get("enabled"):
-            try:
-                await connector_manager.start(c["name"])
-                print(f"[Desktop Agent] Connector started: {c['name']}")
-            except Exception as e:
-                print(f"[Desktop Agent] Connector start failed (non-fatal): {c['name']}: {e}")
+    await connector_manager.start_enabled()
 
     yield
     print("[Desktop Agent] Backend shutting down...")
@@ -154,7 +150,14 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     model_id: Optional[str] = None
     role_id: Optional[str] = None
+    agent_type: Optional[str] = None
     image_base64: Optional[str] = None
+
+
+def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> str:
+    if agent_type in ("personal", "coding"):
+        return agent_type
+    return AgentManager.get_agent_type_for_role(role_id or "desktop-agent")
 
 class StoreCredentialRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -196,8 +199,9 @@ def get_roles():
 async def chat(req: ChatRequest):
     """非流式聊天（测试用）"""
     model_id = req.model_id or load_config().settings.default_model
-    role_id = req.role_id or "desktop-agent"
-    session = get_or_create_session(req.session_id, model_id, role_id)
+    agent_type = _resolve_agent_type(req.agent_type, req.role_id)
+    role_id = req.role_id or AgentManager.get_default_role(agent_type)
+    session = get_or_create_session(req.session_id, model_id, role_id, agent_type=agent_type)
 
     results = []
     async for event in session.run(req.message, req.image_base64):
@@ -222,6 +226,7 @@ def list_sessions(project_path: str = ""):
                 "project_path": sp,
                 "model_id": data.get("model_id", ""),
                 "role_id": data.get("role_id", "desktop-agent"),
+                "agent_type": _resolve_agent_type(data.get("agent_type"), data.get("role_id", "desktop-agent")),
                 "message_count": len(data.get("messages", [])),
                 "updated_at": path.stat().st_mtime,
             })
@@ -683,11 +688,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     current_model = load_config().settings.default_model
     current_role_id = "desktop-agent"
+    current_agent_type = "personal"
 
     # 发送历史会话消息（如果有）
     session = get_or_create_session(session_id, current_model)
     current_model = session.model_id  # 恢复已保存的 model
     current_role_id = session.role_id  # 恢复已保存的 role
+    current_agent_type = session.agent_type  # 恢复已保存的 agent_type
     if any(m.get("role") != "system" for m in session.messages):
         await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
         await websocket.send_json({
@@ -714,14 +721,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if msg_type == "chat":
                 user_text = msg.get("text", "")
                 model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", current_role_id)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 image_b64 = msg.get("image_base64")
                 chat_mode = msg.get("chat_mode") or "agent"
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
                 current_role_id = role_id
+                current_agent_type = agent_type
 
-                session = get_or_create_session(session_id, model_id, role_id)
+                session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
 
                 # Cancel any in-progress run before starting a new one
                 if run_task and not run_task.done():
@@ -754,7 +763,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "set_chat_mode":
                 mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 if isinstance(mode, str) and session.set_session_chat_mode(mode):
                     await websocket.send_json({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
                     if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
@@ -763,7 +772,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_json({"type": "error", "data": validation_error("Invalid chat_mode")})
 
             elif msg_type == "stop":
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 session.cancel()
                 if run_task and not run_task.done():
                     run_task.cancel()
@@ -771,12 +780,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "retry":
                 model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", current_role_id)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 chat_mode = msg.get("chat_mode")
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
                 current_role_id = role_id
-                session = get_or_create_session(session_id, model_id, role_id)
+                current_agent_type = agent_type
+                session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
                 if session.retry_last():
                     # Cancel any in-progress run before retrying
                     if run_task and not run_task.done():
@@ -806,7 +817,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_json({"type": "error", "data": validation_error("没有可重试的消息")})
 
             elif msg_type == "approve_plan":
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 session.approve_plan()
                 await websocket.send_json({"type": "plan_approved_waiting_build", "data": {}})
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
@@ -815,23 +826,24 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 model_id = msg.get("model_id", current_model)
                 if model_id and model_id != current_model:
                     current_model = model_id
-                    session = get_or_create_session(session_id, model_id, current_role_id)
+                    session = get_or_create_session(session_id, model_id, current_role_id, agent_type=current_agent_type)
                     session.router = type(session.router)(model_id)  # Rebuild ModelRouter
                     session.model_id = model_id
+                    session._agent_models[current_agent_type] = model_id
                     session._refresh_system_prompt()
                     await websocket.send_json({
                         "type": "model_switched",
-                        "data": {"model_id": model_id},
+                        "data": {"model_id": model_id, "agent_type": current_agent_type},
                     })
 
             elif msg_type == "reject_plan":
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 session.reject_plan()
                 await websocket.send_json({"type": "plan_rejected", "data": {}})
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
 
             elif msg_type == "compact":
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 summary = await session.compact_context()
                 if summary:
                     await websocket.send_json({
@@ -845,7 +857,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
 
             elif msg_type == "build_plan":
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 if not session.build_plan():
                     await websocket.send_json({"type": "error", "data": validation_error("No plan is ready to build. Wait for the plan draft first.")})
                     continue
@@ -878,7 +890,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 selected = msg.get("selected") or []
                 if not isinstance(selected, list):
                     selected = [selected] if selected is not None else []
-                session = get_or_create_session(session_id, current_model, current_role_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 if qid is not None:
                     session.update_plan_decision(str(qid), [str(s) for s in selected])
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
@@ -921,15 +933,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 session = get_or_create_session(session_id, current_model, role_id=current_role_id, agent_type=agent_type)
                 session.switch_agent(agent_type)
                 current_role_id = session.role_id
+                current_agent_type = agent_type
+                current_model = session.model_id
                 await websocket.send_json({
                     "type": "agent_switched",
-                    "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
+                    "data": {
+                        "agent_type": agent_type,
+                        "name": "Personal Agent" if agent_type == "personal" else "Coding Agent",
+                        "model_id": session.model_id,
+                        "thinking_intensity": session.thinking_intensity,
+                    },
                 })
 
             elif msg_type == "switch_role":
                 role_id = msg.get("role_id", current_role_id)
                 agent_type = AgentManager.get_agent_type_for_role(role_id)
                 current_role_id = role_id
+                current_agent_type = agent_type
                 session = get_or_create_session(session_id, current_model, role_id=role_id, agent_type=agent_type)
                 session.switch_role(role_id)
                 await websocket.send_json({

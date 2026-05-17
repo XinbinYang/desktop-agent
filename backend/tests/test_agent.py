@@ -1,7 +1,14 @@
 import json
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
-from app.agent import AgentSession, get_or_create_session, clear_session
+from unittest.mock import patch, MagicMock
+from app.agent import (
+    AgentSession,
+    get_or_create_session,
+    clear_session,
+    _completion_quality_payload,
+    _shell_command_looks_like_verification,
+)
+from .conftest import _make_stream_mock
 
 
 class TestAgentSession:
@@ -16,6 +23,42 @@ class TestAgentSession:
         assert session.iteration == 0
         assert len(session.messages) == 1  # system prompt
         assert session.messages[0]["role"] == "system"
+
+    def test_completion_quality_payload_marks_missing_gates(self):
+        missing = _completion_quality_payload(
+            files_modified=True,
+            latest_verification=None,
+            latest_review=None,
+            unstructured_verification_seen=False,
+        )
+
+        assert missing["verification_passed"] is False
+        assert missing["verification_source"] == "missing"
+        assert missing["review_passed"] is False
+
+        evidenced = _completion_quality_payload(
+            files_modified=True,
+            latest_verification={
+                "passed": True,
+                "command": "python -m pytest",
+                "green_level": "workspace",
+            },
+            latest_review={
+                "findings": [{"severity": "minor", "message": "Non-blocking"}],
+                "blocking_findings": [],
+            },
+            unstructured_verification_seen=False,
+        )
+
+        assert evidenced["verification_passed"] is True
+        assert evidenced["verification_command"] == "python -m pytest"
+        assert evidenced["green_level"] == "workspace"
+        assert evidenced["review_passed"] is True
+
+    def test_shell_verification_detection_is_not_any_shell_command(self):
+        assert _shell_command_looks_like_verification("python -m pytest tests/test_agent.py")
+        assert _shell_command_looks_like_verification("npm run build")
+        assert not _shell_command_looks_like_verification("pwd")
 
     def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
         import app.agent as agent_module
@@ -45,7 +88,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("hi"):
                 events.append(event)
@@ -74,7 +117,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("screenshot please"):
                 events.append(event)
@@ -107,7 +150,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("write file"):
                 events.append(event)
@@ -141,7 +184,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("loop test"):
                 events.append(event)
@@ -166,13 +209,14 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("hi again"):
                 events.append(event)
 
         assert not any(e["type"] == "interrupted" for e in events)
-        assert any(e["type"] == "content" and e["data"]["text"] == "Recovered" for e in events)
+        streamed_text = "".join(e["data"]["text"] for e in events if e["type"] == "content")
+        assert streamed_text == "Recovered"
 
     @pytest.mark.asyncio
     async def test_invalid_tool_arguments_are_reported_as_tool_result(self, session):
@@ -194,7 +238,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("bad tool args"):
                 events.append(event)
@@ -228,7 +272,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for event in session.run("missing tool arg"):
                 events.append(event)
@@ -313,7 +357,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for ev in session.run("hi", None, chat_mode="plan"):
                 events.append(ev)
@@ -388,7 +432,7 @@ class TestAgentSession:
             }]
         }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", new_callable=AsyncMock, return_value=mock_response):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             events = []
             async for ev in session.run("implement csv export", None, chat_mode="plan"):
                 events.append(ev)
@@ -463,3 +507,83 @@ class TestSessionManagement:
         assert len(agent._sessions) == 3
         # Identity preserved when accessed within window.
         assert agent._sessions["lru1"] is first
+
+
+class TestAgentType:
+    """Verify agent_type support in AgentSession."""
+
+    def test_default_agent_type_is_personal(self):
+        session = AgentSession(model_id="gpt-4o", session_id="test_at")
+        assert session.agent_type == "personal"
+
+    def test_explicit_agent_type_coding(self):
+        session = AgentSession(model_id="gpt-4o", session_id="test_at", agent_type="coding")
+        assert session.agent_type == "coding"
+
+    def test_agent_type_from_role_id_compat(self):
+        """role_id 'code-expert' maps to agent_type 'coding'."""
+        session = AgentSession(model_id="gpt-4o", session_id="test_at", role_id="code-expert")
+        assert session.agent_type == "coding"
+        assert session.role_id == "code-expert"
+
+    def test_switch_agent_preserves_session(self):
+        """Switching agent type preserves the session ID and switches to agent-specific model."""
+        session = AgentSession(model_id="gpt-4o", session_id="test_at")
+        session.switch_agent("coding")
+        assert session.agent_type == "coding"
+        assert session.session_id == "test_at"
+        # model_id may change because switch_agent applies the agent's configured model
+        assert isinstance(session.model_id, str) and len(session.model_id) > 0
+
+    def test_switch_agent_updates_system_prompt(self):
+        """Switching agent type refreshes the system prompt."""
+        session = AgentSession(model_id="gpt-4o", session_id="test_at", agent_type="personal")
+        old_prompt = session.messages[0]["content"]
+        session.switch_agent("coding")
+        new_prompt = session.messages[0]["content"]
+        # The prompts should differ because coding excludes personal files
+        assert old_prompt != new_prompt
+
+    def test_switch_role_backward_compat(self):
+        """switch_role() still works and maps through agent_type."""
+        session = AgentSession(model_id="gpt-4o", session_id="test_at", agent_type="personal")
+        session.switch_role("code-expert")
+        assert session.agent_type == "coding"
+        assert session.role_id == "code-expert"
+
+    def test_get_or_create_session_with_agent_type(self):
+        s = get_or_create_session("at_s1", "gpt-4o", role_id="code-expert", agent_type="coding")
+        assert s.agent_type == "coding"
+        assert s.role_id == "code-expert"
+
+    def test_session_save_and_load_preserves_agent_type(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="at_save", agent_type="coding")
+        session._save()
+
+        loaded = AgentSession.load("at_save")
+        assert loaded is not None
+        assert loaded.agent_type == "coding"
+
+    def test_session_load_migrates_role_id_to_agent_type(self, tmp_path, monkeypatch):
+        """Sessions saved without agent_type should auto-migrate from role_id."""
+        import app.agent as agent_module
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="at_migrate", role_id="desktop-agent", agent_type="personal")
+        session._save()
+
+        # Simulate old save format (remove agent_type from JSON)
+        save_path = tmp_path / "at_migrate.json"
+        import json
+        data = json.loads(save_path.read_text(encoding="utf-8"))
+        del data["agent_type"]
+        save_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        loaded = AgentSession.load("at_migrate")
+        assert loaded is not None
+        assert loaded.agent_type == "personal"  # Migrated from role_id="desktop-agent"

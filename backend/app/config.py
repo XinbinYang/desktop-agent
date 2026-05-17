@@ -32,6 +32,10 @@ class RagConfig(BaseModel):
     min_score: float = 0.3
     top_k: int = 5
 
+class PersonalAgentConfig(BaseModel):
+    model: str = ""
+    thinking_intensity: str = "medium"
+
 class CodingAgentConfig(BaseModel):
     enabled: bool = True
     default_execution_mode: str = "worktree"
@@ -40,6 +44,8 @@ class CodingAgentConfig(BaseModel):
     require_verification: bool = True
     require_review: bool = True
     auto_generate_repo_map: bool = True
+    model: str = ""
+    thinking_intensity: str = "medium"
 
 class AutoApproveRule(BaseModel):
     """A permission rule for auto-approval of tool calls."""
@@ -67,6 +73,7 @@ class AppConfig(BaseModel):
     settings: Settings
     rag: RagConfig = RagConfig()
     coding_agent: CodingAgentConfig = CodingAgentConfig()
+    personal_agent: PersonalAgentConfig = PersonalAgentConfig()
 
 _config: Optional[AppConfig] = None
 
@@ -89,6 +96,10 @@ def load_config() -> AppConfig:
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+
+    # Backward compat: ensure personal_agent key exists
+    if "personal_agent" not in raw:
+        raw["personal_agent"] = {}
 
     # 保存原始 api_key（env var 解析前），用于 save_config 时写回
     raw_api_keys: Dict[str, str] = {}
@@ -124,6 +135,7 @@ def save_config(cfg: AppConfig) -> None:
         "settings": cfg.settings.model_dump(),
         "rag": cfg.rag.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
+        "personal_agent": cfg.personal_agent.model_dump(),
     }
 
     # 原子写入：先写临时文件，再 os.replace
@@ -164,4 +176,34 @@ def list_all_models() -> List[dict]:
                 "vision": m.vision,
                 "context": m.context
             })
+    return result
+
+def get_model_for_agent(agent_type: str) -> str:
+    """Resolve the effective model ID for a given agent type.
+
+    Priority: agent-specific override -> global default_model.
+    """
+    cfg = load_config()
+    default = cfg.settings.default_model
+    if agent_type == "coding":
+        override = cfg.coding_agent.model
+    elif agent_type == "personal":
+        override = cfg.personal_agent.model
+    else:
+        override = ""
+    return override if override else default
+
+def get_thinking_intensity_for_agent(agent_type: str) -> str:
+    """Resolve the effective thinking intensity for a given agent type."""
+    cfg = load_config()
+    default = cfg.settings.thinking_intensity_default or "medium"
+    if agent_type == "coding":
+        override = cfg.coding_agent.thinking_intensity
+    elif agent_type == "personal":
+        override = cfg.personal_agent.thinking_intensity
+    else:
+        override = ""
+    result = override if override else default
+    if result not in ("low", "medium", "high"):
+        result = "medium"
     return result

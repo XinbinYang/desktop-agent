@@ -1,9 +1,25 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   X, Plus, Trash2, Edit3, Save, Eye, EyeOff, Settings, Wifi, Download,
+  Database, Workflow, Server, Plug,
 } from 'lucide-react';
-import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel } from '../types';
+import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel, PersonalAgentSettings, CodingAgentSettings, ThinkingIntensity } from '../types';
 import { API_BASE } from '../config';
+import { KnowledgePanel } from './KnowledgePanel';
+import { WorkflowPanel } from './WorkflowPanel';
+import { McpPanel } from './McpPanel';
+import { ConnectionsPanel } from './ConnectionsPanel';
+
+type SettingsTab = 'general' | 'providers' | 'knowledge' | 'workflows' | 'mcp' | 'connections';
+
+const SETTINGS_NAV: { key: SettingsTab; label: string; icon: React.FC<{ className?: string }> }[] = [
+  { key: 'general', label: '通用', icon: Settings },
+  { key: 'providers', label: 'Providers', icon: Server },
+  { key: 'knowledge', label: '知识库', icon: Database },
+  { key: 'workflows', label: '工作流', icon: Workflow },
+  { key: 'mcp', label: 'MCP', icon: Wifi },
+  { key: 'connections', label: '连接', icon: Plug },
+];
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -14,14 +30,14 @@ interface SettingsModalProps {
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
-  openai: 'bg-green-600',
-  anthropic: 'bg-purple-600',
-  kimi: 'bg-blue-600',
-  local: 'bg-orange-500',
+  openai: 'bg-success/10 text-success border-success/25',
+  anthropic: 'bg-info/10 text-info border-info/25',
+  kimi: 'bg-accent/10 text-accent border-accent/25',
+  local: 'bg-warning/10 text-warning border-warning/25',
 };
 
 function providerColor(name: string): string {
-  return PROVIDER_COLORS[name] || 'bg-surface-hover';
+  return PROVIDER_COLORS[name] || 'bg-surface-alt text-fg-secondary border-border';
 }
 
 function providerInitial(name: string): string {
@@ -32,7 +48,7 @@ function getProviderIcon(name: string): React.ReactNode {
   const color = providerColor(name);
   const initial = providerInitial(name);
   return (
-    <div className={`w-7 h-7 rounded-full ${color} flex items-center justify-center text-white text-xs font-bold shrink-0`}>
+    <div className={`w-7 h-7 rounded-full border ${color} flex items-center justify-center text-xs font-bold shrink-0`}>
       {initial}
     </div>
   );
@@ -56,6 +72,11 @@ interface ProviderTestResult {
   model_count?: number;
 }
 
+interface GeneralFormState extends AppSettings {
+  personal_agent?: PersonalAgentSettings;
+  coding_agent?: CodingAgentSettings;
+}
+
 function providerToEditable(p: ProviderSettings): EditableProvider {
   return {
     name: p.name,
@@ -72,7 +93,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen, onClose, models, currentModel, onSettingsChanged,
 }) => {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
-  const [generalForm, setGeneralForm] = useState<AppSettings | null>(null);
+  const [generalForm, setGeneralForm] = useState<GeneralFormState | null>(null);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [providerForm, setProviderForm] = useState<EditableProvider | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -86,6 +107,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [fetchedModels, setFetchedModels] = useState<SuggestedModel[]>([]);
   const [pickerSelection, setPickerSelection] = useState<Record<string, boolean>>({});
   const [pickerSearch, setPickerSearch] = useState('');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
 
   useEffect(() => {
     if (isOpen) fetchSettings();
@@ -139,7 +161,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
       const ok = data as SettingsResponse;
       setSettings(ok);
-      setGeneralForm({ ...ok.settings });
+      setGeneralForm({
+        ...ok.settings,
+        personal_agent: ok.personal_agent || { model: '', thinking_intensity: 'medium' },
+        coding_agent: ok.coding_agent || { model: '', thinking_intensity: 'medium', enabled: true, default_execution_mode: 'worktree', max_fix_rounds: 2, max_parallel_workers: 3, require_verification: true, require_review: true, auto_generate_repo_map: true },
+      });
       setEditingProvider(null);
       setProviderForm(null);
       setIsCreating(false);
@@ -478,17 +504,37 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          {error && (
-            <div className="px-3 py-2 rounded text-xs bg-red-900/30 border border-red-800 text-red-300">
-              {error}
-            </div>
-          )}
+        <div className="flex-1 flex min-h-0 overflow-hidden">
+          {/* Left nav */}
+          <div className="w-36 shrink-0 border-r border-border bg-surface-alt/40 p-2 space-y-0.5">
+            {SETTINGS_NAV.map(({ key, label, icon: Icon }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setSettingsTab(key)}
+                className={`flex items-center gap-2 w-full px-2 py-1.5 rounded text-xs font-medium transition-colors ${
+                  settingsTab === key
+                    ? 'bg-surface text-fg'
+                    : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Right content */}
+          <div className="flex-1 overflow-y-auto p-4">
+            {error && (
+              <div className="px-3 py-2 rounded text-xs bg-danger/10 border border-danger/30 text-danger mb-4">
+                {error}
+              </div>
+            )}
 
-          {/* 全局设置 */}
-          {generalForm && (
+            {settingsTab === 'general' && generalForm && (
+            <>
             <section>
-              <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3">
                 全局设置
               </h3>
               <div className="grid grid-cols-2 gap-3">
@@ -580,6 +626,95 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     统一抽象：在支持的模型上影响推理预算或采样温度；不支持的提供商会自动降级。
                   </div>
                 </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3 mt-4">
+                Personal Agent 模型
+              </h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">模型</label>
+                  <select
+                    value={generalForm.personal_agent?.model || ''}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      personal_agent: { ...generalForm.personal_agent, model: e.target.value, thinking_intensity: generalForm.personal_agent?.thinking_intensity || 'medium' },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="">使用默认 ({generalForm.default_model})</option>
+                    {models.map(m => (
+                      <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
+                    ))}
+                  </select>
+                  <div className="text-[10px] text-fg-muted mt-1">
+                    留空使用全局默认。推荐多模态模型（GPT-4o、Claude）以获得视觉能力。
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Thinking 强度</label>
+                  <select
+                    value={generalForm.personal_agent?.thinking_intensity || 'medium'}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      personal_agent: { model: generalForm.personal_agent?.model || '', thinking_intensity: e.target.value as ThinkingIntensity },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3 mt-4">
+                Coding Agent 模型
+              </h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">模型</label>
+                  <select
+                    value={generalForm.coding_agent?.model || ''}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      coding_agent: { ...generalForm.coding_agent, model: e.target.value, thinking_intensity: generalForm.coding_agent?.thinking_intensity || 'medium', enabled: generalForm.coding_agent?.enabled ?? true, default_execution_mode: generalForm.coding_agent?.default_execution_mode || 'worktree', max_fix_rounds: generalForm.coding_agent?.max_fix_rounds ?? 2, max_parallel_workers: generalForm.coding_agent?.max_parallel_workers ?? 3, require_verification: generalForm.coding_agent?.require_verification ?? true, require_review: generalForm.coding_agent?.require_review ?? true, auto_generate_repo_map: generalForm.coding_agent?.auto_generate_repo_map ?? true },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="">使用默认 ({generalForm.default_model})</option>
+                    {models.map(m => (
+                      <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
+                    ))}
+                  </select>
+                  <div className="text-[10px] text-fg-muted mt-1">
+                    留空使用全局默认。推荐推理能力强的模型（DeepSeek、Claude）以获得更好的代码生成质量。
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Thinking 强度</label>
+                  <select
+                    value={generalForm.coding_agent?.thinking_intensity || 'medium'}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      coding_agent: { ...generalForm.coding_agent, thinking_intensity: e.target.value as ThinkingIntensity } as CodingAgentSettings,
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs text-fg-secondary block mb-1">多 Agent 协同</label>
                   <select
@@ -635,12 +770,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
             </section>
+          </>
           )}
 
-          {/* Provider 设置 */}
+          {settingsTab === 'providers' && (
           <section>
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider">
+              <h3 className="text-xs font-semibold text-fg-secondary">
                 Providers
               </h3>
               <button
@@ -797,7 +933,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         </label>
                         <button
                           onClick={() => removeModel(i)}
-                          className="p-0.5 text-fg-muted hover:text-red-400"
+                          className="p-0.5 text-fg-muted hover:text-danger"
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -886,7 +1022,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                     <button
                       onClick={handleAddSelectedModels}
-                      className="w-full py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-white transition-colors"
+                      className="w-full py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-fg-on-accent transition-colors"
                     >
                       添加 {Object.entries(pickerSelection).filter(([, v]) => v).length} 个模型
                     </button>
@@ -897,8 +1033,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div
                     className={`px-3 py-2 rounded text-xs border ${
                       testResult.ok
-                        ? 'bg-green-900/20 border-green-800 text-green-300'
-                        : 'bg-red-900/30 border-red-800 text-red-300'
+                        ? 'bg-success/10 border-success/30 text-success'
+                        : 'bg-danger/10 border-danger/30 text-danger'
                     }`}
                   >
                     {testResult.message}
@@ -954,7 +1090,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <div className="flex items-center gap-1.5">
                           <span className="text-xs font-medium text-fg">{pname}</span>
                           {isDefault && (
-                            <span className="text-[10px] bg-accent/12 text-accent px-1 py-0.5 rounded border border-accent/25">
+                            <span className="text-[10px] bg-accent/10 text-accent px-1 py-0.5 rounded border border-accent/25">
                               默认
                             </span>
                           )}
@@ -977,7 +1113,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <button
                         onClick={() => handleDeleteProvider(pname)}
                         disabled={isDefault || isDeleting}
-                        className="p-1 text-fg-secondary hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed"
+                        className="p-1 text-fg-secondary hover:text-danger disabled:opacity-30 disabled:cursor-not-allowed"
                         title={isDefault ? '不能删除默认 Provider' : '删除'}
                       >
                         <Trash2 className="w-3 h-3" />
@@ -988,6 +1124,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
           </section>
+          )}
+
+          {settingsTab === 'knowledge' && <KnowledgePanel />}
+          {settingsTab === 'workflows' && <WorkflowPanel />}
+          {settingsTab === 'mcp' && <McpPanel />}
+          {settingsTab === 'connections' && <ConnectionsPanel />}
+          </div>
         </div>
 
         {/* Footer */}
@@ -1005,7 +1148,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               onClick={handleSaveAll}
               disabled={saving}
-              className="flex items-center gap-1 px-4 py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-white transition-colors disabled:opacity-50"
+              className="flex items-center gap-1 px-4 py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-fg-on-accent transition-colors disabled:opacity-50"
             >
               {saving ? '保存中...' : '保存并关闭'}
             </button>

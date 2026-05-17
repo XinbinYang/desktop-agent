@@ -7,7 +7,7 @@ import uuid
 from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-from app.config import load_config, get_provider_for_model
+from app.config import load_config, get_provider_for_model, get_model_for_agent, get_thinking_intensity_for_agent
 from app.coding_context import build_repo_map, format_repo_map_summary
 from app.coding_runs import (
     complete_run,
@@ -54,17 +54,117 @@ READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
     "get_screen_size",
 })
 
+_BLOCKING_REVIEW_SEVERITIES: frozenset[str] = frozenset({"blocker", "critical", "error", "important"})
+_VERIFICATION_COMMAND_HINTS: tuple[str, ...] = (
+    "pytest",
+    "vitest",
+    "npm test",
+    "npm run test",
+    "npm run build",
+    "npm run lint",
+    "pnpm test",
+    "pnpm build",
+    "pnpm lint",
+    "yarn test",
+    "yarn build",
+    "yarn lint",
+    "tsc",
+    "mypy",
+    "ruff",
+    "eslint",
+    "cargo test",
+    "cargo check",
+    "go test",
+    "dotnet test",
+    "gradle test",
+    "mvn test",
+)
+
+
+def _shell_command_looks_like_verification(command: str) -> bool:
+    lowered = (command or "").lower()
+    return any(hint in lowered for hint in _VERIFICATION_COMMAND_HINTS)
+
+
+def _review_passed(review: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if review is None:
+        return None
+    blocking = review.get("blocking_findings")
+    if isinstance(blocking, list):
+        return len(blocking) == 0
+    findings = review.get("findings") or []
+    return not any(
+        str(finding.get("severity", "")).lower() in _BLOCKING_REVIEW_SEVERITIES
+        for finding in findings
+        if isinstance(finding, dict)
+    )
+
+
+def _completion_quality_payload(
+    *,
+    files_modified: bool,
+    latest_verification: Optional[Dict[str, Any]],
+    latest_review: Optional[Dict[str, Any]],
+    unstructured_verification_seen: bool,
+) -> Dict[str, Any]:
+    if latest_verification:
+        verification_passed: Optional[bool] = bool(latest_verification.get("passed"))
+        verification_source = "verify_project"
+    elif files_modified and unstructured_verification_seen:
+        verification_passed = None
+        verification_source = "shell_execute"
+    elif files_modified:
+        verification_passed = False
+        verification_source = "missing"
+    else:
+        verification_passed = None
+        verification_source = "not_required"
+
+    if latest_review:
+        review_passed = _review_passed(latest_review)
+        blocking_findings = latest_review.get("blocking_findings")
+        blocking_count = len(blocking_findings) if isinstance(blocking_findings, list) else None
+    elif files_modified:
+        review_passed = False
+        blocking_count = None
+    else:
+        review_passed = None
+        blocking_count = None
+
+    return {
+        "verification_passed": verification_passed,
+        "verification_source": verification_source,
+        "verification_command": latest_verification.get("command") if latest_verification else None,
+        "green_level": latest_verification.get("green_level") if latest_verification else None,
+        "review_passed": review_passed,
+        "review_blocking_findings": blocking_count,
+    }
+
 
 class AgentSession:
     MAX_HISTORY_MESSAGES = 20
 
     def __init__(self, model_id: str, session_id: str = "default", role_id: str = "desktop-agent", agent_type: str | None = None):
         self.session_id = session_id
-        self.model_id = model_id
         # agent_type is the new primary field; role_id kept for backward compat
         self._agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
-        self._role_id = role_id
-        self.router = ModelRouter(model_id)
+        self._role_id = (
+            role_id
+            if AgentManager.get_agent_type_for_role(role_id) == self._agent_type
+            else AgentManager.get_default_role(self._agent_type)
+        )
+
+        # Per-agent model and thinking intensity tracking (config defaults)
+        self._agent_models: Dict[str, str] = {}
+        self._agent_thinking: Dict[str, str] = {}
+        for at in ("personal", "coding"):
+            self._agent_models[at] = get_model_for_agent(at)
+            self._agent_thinking[at] = get_thinking_intensity_for_agent(at)
+
+        # Use the explicitly-provided model_id; per-agent config defaults are
+        # applied only on explicit switch_agent() calls, not here.
+        self.model_id = model_id
+        self.router = ModelRouter(self.model_id)
         self.messages: List[Dict[str, Any]] = []
         self.iteration = 0
         self.max_iterations = load_config().settings.max_iterations
@@ -76,11 +176,7 @@ class AgentSession:
         self._rag_cache_text: str = ""
         self.dynamic_registry = DynamicToolRegistry()
         self.chat_mode = "agent"
-        self.thinking_intensity = getattr(
-            load_config().settings, "thinking_intensity_default", "medium"
-        ) or "medium"
-        if self.thinking_intensity not in ("low", "medium", "high"):
-            self.thinking_intensity = "medium"
+        self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
@@ -109,6 +205,10 @@ class AgentSession:
         mapped = AgentManager.get_agent_type_for_role(value)
         if mapped != self._agent_type:
             self._agent_type = mapped
+
+    def _resolve_agent_model(self) -> str:
+        """Get the effective model ID for the current agent type from config."""
+        return get_model_for_agent(self._agent_type)
 
     def _build_system_prompt(self) -> str:
         tools_desc = build_tools_description(self.dynamic_registry, agent_type=self._agent_type)
@@ -168,6 +268,14 @@ class AgentSession:
                             "Never read files one-by-one inline when you could parallelize exploration.\n"
                             "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
                             "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
+                            "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "
+                            "acceptance criteria, verification plan, recovery policy, and reporting target explicit. "
+                            "If any field is unclear, infer conservatively or ask.\n"
+                            "- GREEN CONTRACT: Treat completion as evidence, not prose. `verify_project` produces the "
+                            "current green level (`targeted_tests`, `workspace`, `lint`, `typecheck`, or `build`); "
+                            "do not merge/apply/close out broad changes on stale or partial evidence.\n"
+                            "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
+                            "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
                             "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
                             "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
                             "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
@@ -641,10 +749,10 @@ class AgentSession:
         except Exception as e:
             logger.warning("Coding run initialization failed: %s", e)
 
-        def close_coding_run(status: str, summary: str = "") -> None:
+        def close_coding_run(status: str, summary: str = "", details: Optional[Dict[str, Any]] = None) -> None:
             nonlocal coding_run_closed, run_context_token
             if coding_run and not coding_run_closed:
-                complete_run(run_id, status, summary)
+                complete_run(run_id, status, summary, details=details)
                 coding_run_closed = True
             if run_context_token is not None:
                 reset_run_context(run_context_token)
@@ -745,7 +853,10 @@ class AgentSession:
         plan_turn_done = False
         _files_modified = False
         _verify_called = False
+        _unstructured_verification_seen = False
         _verify_gate_fired = False
+        _latest_verification: Optional[Dict[str, Any]] = None
+        _latest_review: Optional[Dict[str, Any]] = None
         while self.iteration < self.max_iterations:
             if self._cancelled:
                 yield self._event("interrupted", {"message": "User cancelled"}, run_id)
@@ -775,16 +886,41 @@ class AgentSession:
                         })
 
             tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type))
+
+            # Stream LLM response token-by-token for real-time frontend display
+            response = None
+            stream_error = None
             try:
-                response = await self.router.chat_completion_non_stream(
+                async for token in self.router.chat_completion_stream(
                     messages=self.messages,
                     tools=tool_schemas or None,
                     temperature=0.5,
                     max_tokens=8192,
                     thinking_intensity=ti,
-                )
+                ):
+                    ttype = token.get("type", "")
+                    if ttype == "thinking_delta":
+                        yield self._event(
+                            "reasoning",
+                            {"text": token["text"], "skill": active_skills[0] if active_skills else None},
+                            run_id,
+                        )
+                    elif ttype == "text_delta":
+                        yield self._event(
+                            "content",
+                            {"text": token["text"], "skill": active_skills[0] if active_skills else None},
+                            run_id,
+                        )
+                    elif ttype == "done":
+                        response = token["response"]
+                    elif ttype == "error":
+                        stream_error = token.get("message", "Stream error")
             except Exception as e:
-                error_msg = str(e)
+                stream_error = str(e)
+
+            # Handle stream failure with non-streaming fallback
+            if stream_error:
+                error_msg = stream_error.lower()
                 if "does not support tools" in error_msg or "tool" in error_msg.lower() or "tools" in error_msg.lower():
                     try:
                         response = await self.router.chat_completion_non_stream(
@@ -793,14 +929,20 @@ class AgentSession:
                             max_tokens=8192,
                             thinking_intensity=ti,
                         )
+                        stream_error = None
                     except Exception as e2:
                         yield self._event("error", {"message": f"Model call failed: {e2}"}, run_id)
                         finished = True
                         break
                 else:
-                    yield self._event("error", {"message": f"Model call failed: {e}"}, run_id)
+                    yield self._event("error", {"message": f"Model call failed: {stream_error}"}, run_id)
                     finished = True
                     break
+
+            if response is None:
+                yield self._event("error", {"message": "Model returned no response"}, run_id)
+                finished = True
+                break
 
             choice = response.get("choices", [{}])[0]
             message = choice.get("message", {})
@@ -814,23 +956,6 @@ class AgentSession:
             if message.get("reasoning_content"):
                 assistant_msg["reasoning_content"] = message["reasoning_content"]
             self.messages.append(assistant_msg)
-
-            reasoning = message.get("reasoning_content")
-            if reasoning:
-                chunk_size = max(1, len(reasoning) // 20)
-                for i in range(0, len(reasoning), chunk_size):
-                    yield self._event(
-                        "reasoning",
-                        {"text": reasoning[i:i + chunk_size], "skill": active_skills[0] if active_skills else None},
-                        run_id,
-                    )
-
-            if message.get("content"):
-                yield self._event(
-                    "content",
-                    {"text": message["content"], "skill": active_skills[0] if active_skills else None},
-                    run_id,
-                )
 
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
@@ -945,8 +1070,14 @@ class AgentSession:
                 # Track file modifications and verification calls for the auto-verification gate
                 if tool_name in ("file_patch", "file_write", "file_delete", "coding_file_write") and not tc_result.error:
                     _files_modified = True
-                if tool_name in ("verify_project", "shell_execute"):
+                if tool_name == "verify_project":
                     _verify_called = True
+                elif tool_name == "shell_execute" and _shell_command_looks_like_verification(
+                    str(tool_args.get("command") or "")
+                ):
+                    _verify_called = True
+                    if not tc_result.metadata.get("verification"):
+                        _unstructured_verification_seen = True
 
                 if self.chat_mode == "plan" and self.plan_state.approved:
                     if self._touch_plan_todo_after_tool(tool_name, tc_result.result_text):
@@ -970,10 +1101,12 @@ class AgentSession:
                         yield self._event("approval_required", decision, run_id)
 
                 if tc_result.metadata.get("verification"):
-                    yield self._event("verification_result", tc_result.metadata["verification"], run_id)
+                    _latest_verification = tc_result.metadata["verification"]
+                    yield self._event("verification_result", _latest_verification, run_id)
 
                 if tc_result.metadata.get("review"):
-                    for finding in tc_result.metadata["review"].get("findings", []):
+                    _latest_review = tc_result.metadata["review"]
+                    for finding in _latest_review.get("findings", []):
                         yield self._event("review_finding", finding, run_id)
 
                 recorder = get_recorder(self.session_id)
@@ -1060,13 +1193,19 @@ class AgentSession:
         completion_status = "cancelled" if self._cancelled else (
             "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
         )
+        completion_summary = f"Run {completion_status} after {self.iteration} iteration(s)."
+        completion_quality = _completion_quality_payload(
+            files_modified=_files_modified,
+            latest_verification=_latest_verification,
+            latest_review=_latest_review,
+            unstructured_verification_seen=_unstructured_verification_seen,
+        )
         yield self._event("run_completed", {
             "status": completion_status,
-            "summary": f"Run {completion_status} after {self.iteration} iteration(s).",
-            "verification_passed": None,
-            "review_passed": None,
+            "summary": completion_summary,
+            **completion_quality,
         }, run_id)
-        close_coding_run(completion_status, f"Run {completion_status} after {self.iteration} iteration(s).")
+        close_coding_run(completion_status, completion_summary, completion_quality)
         self._save()
 
     def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "") -> bool:
@@ -1251,8 +1390,23 @@ class AgentSession:
         self._save()
 
     def switch_agent(self, agent_type: str):
-        """Switch the active agent type and refresh the system prompt."""
+        """Switch the active agent type, model, thinking intensity, and refresh the system prompt."""
         AgentManager.switch_agent(self, agent_type)
+
+        # Switch to the agent's configured model
+        effective = self._resolve_agent_model()
+        if effective != self.model_id:
+            self.model_id = effective
+            try:
+                self.router = ModelRouter(effective)
+            except ValueError:
+                pass  # Keep existing router if new model is unrecognised
+
+        # Update thinking intensity for the new agent
+        ti = get_thinking_intensity_for_agent(agent_type)
+        if ti in ("low", "medium", "high"):
+            self.thinking_intensity = ti
+
         self._save()
 
     def switch_role(self, role_id: str):
@@ -1306,6 +1460,8 @@ class AgentSession:
             "model_id": self.model_id,
             "role_id": self.role_id,
             "agent_type": self._agent_type,
+            "agent_models": self._agent_models,
+            "agent_thinking": self._agent_thinking,
             "messages": self.messages,
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
@@ -1343,6 +1499,19 @@ class AgentSession:
             )
             session.messages = data.get("messages", [])
             session.iteration = 0
+
+            # Restore per-agent model and thinking intensity from persisted data
+            stored_agent_models = data.get("agent_models")
+            if isinstance(stored_agent_models, dict):
+                for at in ("personal", "coding"):
+                    if at in stored_agent_models:
+                        session._agent_models[at] = stored_agent_models[at]
+            stored_agent_thinking = data.get("agent_thinking")
+            if isinstance(stored_agent_thinking, dict):
+                for at in ("personal", "coding"):
+                    if at in stored_agent_thinking:
+                        session._agent_thinking[at] = stored_agent_thinking[at]
+
             cm = data.get("chat_mode", "agent")
             session.chat_mode = cm if cm in ("agent", "plan") else "agent"
             ti = data.get("thinking_intensity", "medium")
@@ -1403,6 +1572,8 @@ class AgentSession:
             "model_id": self.model_id,
             "role_id": self.role_id,
             "agent_type": self._agent_type,
+            "agent_models": self._agent_models,
+            "agent_thinking": self._agent_thinking,
             "messages": self.messages,
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
@@ -1430,16 +1601,35 @@ def _evict_if_needed() -> None:
 def get_or_create_session(session_id: str, model_id: str, role_id: str = "desktop-agent", agent_type: str | None = None) -> AgentSession:
     existing = _sessions.get(session_id)
     resolved_agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
+    loaded_from_disk = False
     if existing is None:
         loaded = AgentSession.load(session_id)
         if loaded:
             _sessions[session_id] = loaded
+            loaded_from_disk = True
         else:
             _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
             _sessions[session_id].refresh_mcp_tools()
-    elif existing.model_id != model_id or (agent_type and existing._agent_type != agent_type):
-        _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
-        _sessions[session_id].refresh_mcp_tools()
+
+    session = _sessions[session_id]
+    changed = False
+    if agent_type and session.agent_type != resolved_agent_type:
+        session.switch_agent(resolved_agent_type)
+        changed = True
+    elif role_id and role_id != session.role_id and AgentManager.get_agent_type_for_role(role_id) != session.agent_type:
+        session.switch_role(role_id)
+        changed = True
+
+    should_keep_loaded_model = loaded_from_disk and agent_type is None and role_id == "desktop-agent"
+    if model_id and session.model_id != model_id and not should_keep_loaded_model:
+        session.model_id = model_id
+        session.router = ModelRouter(model_id)
+        session._agent_models[session.agent_type] = model_id
+        session._refresh_system_prompt()
+        changed = True
+
+    if changed:
+        session._save()
 
     _touch(session_id)
     _evict_if_needed()
