@@ -37,7 +37,7 @@ describe('McpPanel', () => {
     expect(screen.getByText('fetch')).toBeInTheDocument();
     expect(screen.getByText('(stdio)')).toBeInTheDocument();
     expect(screen.getByText('(sse)')).toBeInTheDocument();
-    expect(screen.getByText('read_file')).toBeInTheDocument();
+    expect(screen.getByText(/read_file/)).toBeInTheDocument();
     expect(screen.getByText('Connection refused')).toBeInTheDocument();
   });
 

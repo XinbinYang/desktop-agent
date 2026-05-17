@@ -66,6 +66,7 @@ describe('useChatSession', () => {
       type: 'chat',
       text: 'hello',
       model_id: 'gpt-4o',
+      agent_type: 'personal',
       role_id: 'desktop-agent',
       image_base64: undefined,
       chat_mode: 'agent',

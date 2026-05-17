@@ -5,6 +5,9 @@ interface SessionData {
   messages: any[];
   toolCalls: any[];
   fileEdits?: any[];
+  chatMode?: string;
+  thinkingIntensity?: string;
+  planState?: any;
   timestamp: number;
 }
 
@@ -68,13 +71,22 @@ function getDB(): Promise<IDBPDatabase<AgentDB>> {
   return dbPromise;
 }
 
-export async function saveSession(sessionId: string, messages: any[], toolCalls: any[], fileEdits: any[] = []): Promise<void> {
+export async function saveSession(
+  sessionId: string,
+  messages: any[],
+  toolCalls: any[],
+  fileEdits: any[] = [],
+  meta?: { chatMode?: string; thinkingIntensity?: string; planState?: any },
+): Promise<void> {
   const db = await getDB();
   await db.put('sessions', {
     sessionId,
     messages,
     toolCalls,
     fileEdits,
+    chatMode: meta?.chatMode,
+    thinkingIntensity: meta?.thinkingIntensity,
+    planState: meta?.planState,
     timestamp: Date.now(),
   });
   // 清理旧会话，只保留最近 10 个

@@ -149,10 +149,11 @@ class TestWebSocket:
 
     def test_websocket_plan_chat_emits_plan_draft(self, client):
         """Plan mode: LLM calls plan_write_draft → frontend receives plan_draft."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
         from app.agent import PLAN_CONTINUE_MARKER
+        from .conftest import _make_stream_mock
 
-        mock_llm = AsyncMock(return_value={
+        mock_response = {
             "choices": [{
                 "message": {
                     "content": "Here is the plan.",
@@ -175,9 +176,9 @@ class TestWebSocket:
                     }]
                 }
             }]
-        })
+        }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", mock_llm):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             with client.websocket_connect("/ws/test_plan_ws") as ws:
                 ws.send_json({
                     "type": "chat",
@@ -197,10 +198,11 @@ class TestWebSocket:
                 assert "done" in types
 
     def test_websocket_plan_approve_then_build(self, client):
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
         from app.agent import PLAN_CONTINUE_MARKER
+        from .conftest import _make_stream_mock
 
-        mock_llm = AsyncMock(return_value={
+        mock_response = {
             "choices": [{
                 "message": {
                     "content": "Here is the plan.",
@@ -223,9 +225,9 @@ class TestWebSocket:
                     }]
                 }
             }]
-        })
+        }
 
-        with patch("app.agent.ModelRouter.chat_completion_non_stream", mock_llm):
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
             with client.websocket_connect("/ws/test_plan_build_ws") as ws:
                 ws.send_json({
                     "type": "chat",

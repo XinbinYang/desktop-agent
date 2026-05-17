@@ -9,14 +9,14 @@ export const ImageViewer: React.FC<ImageViewerProps> = ({ url, base64 }) => {
   const src = base64 ? `data:image/png;base64,${base64}` : url;
   if (!src) {
     return (
-      <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+      <div className="h-full flex items-center justify-center text-fg-muted text-sm">
         无图片数据
       </div>
     );
   }
 
   return (
-    <div className="h-full flex items-center justify-center bg-gray-950 p-4 overflow-auto">
+    <div className="h-full flex items-center justify-center bg-app p-4 overflow-auto">
       <img
         src={src}
         alt="preview"

@@ -14,6 +14,9 @@ from app.agents.manager import AgentManager
 from app.agents.dream import DreamEngine
 from app.agents.evolution import EvolutionEngine
 from app.agents.learnings import LearningsEngine
+from app.config import get_model_for_agent, get_thinking_intensity_for_agent, load_config
+from app.project_manager import ProjectManager
+from app.tools import get_tool_schemas
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
@@ -29,7 +32,41 @@ class MoodUpdate(BaseModel):
 @router.get("")
 async def list_agents():
     """List all agent types with status."""
-    return {"agents": AgentManager.list_agents()}
+    cfg = load_config()
+    project = ProjectManager.get_current()
+    recent_runs: List[Dict[str, Any]] = []
+    try:
+        from app.coding_runs import list_runs as list_coding_runs
+        recent_runs = list_coding_runs(limit=5)
+    except Exception:
+        recent_runs = []
+
+    agents: List[Dict[str, Any]] = []
+    for agent in AgentManager.list_agents():
+        agent_type = agent["type"]
+        tool_schemas = get_tool_schemas(agent_type=agent_type)
+        enriched = {
+            **agent,
+            "default_role": AgentManager.get_default_role(agent_type),
+            "model_id": get_model_for_agent(agent_type),
+            "thinking_intensity": get_thinking_intensity_for_agent(agent_type),
+            "tool_profile": {
+                "tool_count": len(tool_schemas),
+                "mode": "focused_coding" if agent_type == "coding" else "desktop_personal",
+            },
+            "workspace": {
+                "files": AgentManager.list_workspace_files(agent_type),
+            },
+        }
+        if agent_type == "personal":
+            enriched["bootstrap"] = {"bootstrapped": AgentManager.is_bootstrapped()}
+        if agent_type == "coding":
+            enriched["project"] = project
+            enriched["coding_config"] = cfg.coding_agent.model_dump()
+            enriched["recent_runs"] = recent_runs
+        agents.append(enriched)
+
+    return {"agents": agents}
 
 
 @router.get("/{agent_type}/files")

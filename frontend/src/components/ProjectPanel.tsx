@@ -94,12 +94,12 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
       {/* 项目信息卡片 */}
       <div className="bg-surface-alt/50 rounded p-2.5 space-y-1.5">
         <div className="flex items-center justify-between">
-          <div className="text-xs font-medium text-white truncate flex-1" title={currentProject.name}>
+          <div className="text-xs font-medium text-fg truncate flex-1" title={currentProject.name}>
             {currentProject.name}
           </div>
           <button
             onClick={onCloseProject}
-            className="text-fg-muted hover:text-red-400 ml-1 shrink-0"
+            className="text-fg-muted hover:text-danger ml-1 shrink-0"
             title="关闭项目"
           >
             <FolderX className="w-3 h-3" />
@@ -190,7 +190,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
       )}
 
       {/* 文件树 */}
-      <div className="text-xs text-fg-muted uppercase tracking-wider">文件</div>
+      <div className="text-xs font-medium text-fg-muted">文件</div>
       <div className="flex-1 overflow-y-auto min-h-0">
         <FileTree
           nodes={fileTree}

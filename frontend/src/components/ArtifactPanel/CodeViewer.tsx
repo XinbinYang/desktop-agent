@@ -74,18 +74,18 @@ function getLang(filename: string): string {
 export const CodeViewer: React.FC<CodeViewerProps> = ({ content, filename }) => {
   if (!content) {
     return (
-      <div className="h-full overflow-auto bg-gray-950">
-        <div className="sticky top-0 bg-gray-800 px-3 py-1 text-[10px] text-gray-400 border-b border-gray-700 z-10">
+      <div className="h-full overflow-auto bg-app">
+        <div className="sticky top-0 bg-surface px-3 py-1 text-[10px] text-fg-secondary border-b border-border z-10">
           {filename}
         </div>
-        <div className="p-4 text-sm text-gray-500">文件内容为空</div>
+        <div className="p-4 text-sm text-fg-muted">文件内容为空</div>
       </div>
     );
   }
 
   return (
-    <div className="h-full overflow-auto bg-gray-950">
-      <div className="sticky top-0 bg-gray-800 px-3 py-1 text-[10px] text-gray-400 border-b border-gray-700 z-10">
+    <div className="h-full overflow-auto bg-app">
+      <div className="sticky top-0 bg-surface px-3 py-1 text-[10px] text-fg-secondary border-b border-border z-10">
         {filename}
       </div>
       <SyntaxHighlighter

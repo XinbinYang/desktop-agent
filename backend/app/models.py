@@ -81,14 +81,14 @@ class ModelRouter:
             return min(1.0, max(base, 0.7))
         return base
 
-    async def _call_kimi_anthropic(
+    def _build_kimi_anthropic_request(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict]] = None,
         max_tokens: Optional[int] = None,
         thinking_intensity: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Kimi Code API 专用：使用 Anthropic 兼容端点获取 thinking 内容。"""
+    ) -> tuple[str, dict, dict]:
+        """Build (api_base, headers, payload) for Kimi Anthropic-compatible API."""
         _name, provider = self._get_provider()
         api_base = provider.base_url.replace("/coding/v1", "/coding")
         headers = {
@@ -98,7 +98,6 @@ class ModelRouter:
             "User-Agent": "Kilo-Code/1.0",
         }
 
-        # 分离 system message，并转换 OpenAI 格式消息为 Anthropic 格式
         system_text = ""
         anthropic_messages: list[dict] = []
         i = 0
@@ -121,7 +120,6 @@ class ModelRouter:
                     })
                 anthropic_messages.append({"role": "assistant", "content": content_blocks})
             elif role == "tool":
-                # 合并连续的 tool 消息为一个 user 消息（Anthropic API 要求）
                 tool_result_blocks = []
                 max_tool_result_len = 8000
                 while i < len(messages) and messages[i].get("role") == "tool":
@@ -135,9 +133,8 @@ class ModelRouter:
                     })
                     i += 1
                 anthropic_messages.append({"role": "user", "content": tool_result_blocks})
-                continue  # i 已在内层循环中递增
+                continue
             else:
-                # user 消息：处理 OpenAI vision 格式转换为 Anthropic 格式
                 content = m.get("content", "")
                 if isinstance(content, list):
                     anthropic_content = []
@@ -159,7 +156,6 @@ class ModelRouter:
                                 })
                             else:
                                 anthropic_content.append({"type": "text", "text": f"[Image: {url}]"})
-                    # 合并连续的 user 消息，避免 Anthropic API 400
                     if anthropic_messages and anthropic_messages[-1].get("role") == "user":
                         existing = anthropic_messages[-1]["content"]
                         if isinstance(existing, list):
@@ -169,7 +165,6 @@ class ModelRouter:
                     else:
                         anthropic_messages.append({"role": "user", "content": anthropic_content})
                 else:
-                    # 合并连续的 user 消息
                     if anthropic_messages and anthropic_messages[-1].get("role") == "user":
                         existing = anthropic_messages[-1]["content"]
                         if isinstance(existing, list):
@@ -180,7 +175,6 @@ class ModelRouter:
                         anthropic_messages.append({"role": "user", "content": content})
             i += 1
 
-        # 防御性校验：Anthropic API 要求 messages 必须以 user 开始且角色交替
         if anthropic_messages and anthropic_messages[0].get("role") != "user":
             anthropic_messages.insert(0, {"role": "user", "content": "(history truncated)"})
         payload: Dict[str, Any] = {
@@ -190,7 +184,6 @@ class ModelRouter:
         }
         if system_text:
             payload["system"] = system_text
-        # Always enable extended thinking so the frontend can show a collapsible Thinking block
         payload["thinking"] = {
             "type": "enabled",
             "budget_tokens": self._map_thinking_budget(thinking_intensity),
@@ -207,39 +200,11 @@ class ModelRouter:
                 })
             payload["tools"] = anthropic_tools
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
-            # If the API rejects thinking+tools, retry without thinking
-            if resp.status_code == 400 and tools:
-                resp_text = ""
-                try:
-                    resp_text = (resp.text or "")[:2000]
-                except Exception:
-                    pass
-                if "thinking" in resp_text.lower():
-                    logger.info("Kimi API rejected thinking+tools, retrying without thinking")
-                    payload.pop("thinking", None)
-                    resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
-            try:
-                resp.raise_for_status()
-            except httpx.HTTPStatusError:
-                resp_text2 = ""
-                try:
-                    resp_text2 = (resp.text or "")[:2000]
-                except Exception:
-                    pass
-                logger.warning(
-                    "Kimi API request failed: status=%s response_text=%s message_count=%s tool_count=%s message_summary=%s",
-                    resp.status_code,
-                    resp_text2,
-                    len(anthropic_messages),
-                    len(payload.get("tools", [])),
-                    _safe_message_summary(anthropic_messages),
-                )
-                raise
-            data = resp.json()
+        return api_base, headers, payload
 
-        # 解析 Anthropic 响应，转换为 OpenAI 格式
+    @staticmethod
+    def _parse_kimi_anthropic_response(data: dict) -> dict:
+        """Parse Anthropic-format response content blocks into an OpenAI-format message dict."""
         thinking_text = ""
         text_content = ""
         tool_calls = []
@@ -274,36 +239,205 @@ class ModelRouter:
                 "message": openai_msg,
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }],
-            "model": f"kimi/{self.model_id}",
-            "usage": data.get("usage", {}),
         }
+
+    async def _call_kimi_anthropic(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Kimi Code API 专用：使用 Anthropic 兼容端点获取 thinking 内容。"""
+        api_base, headers, payload = self._build_kimi_anthropic_request(
+            messages, tools, max_tokens, thinking_intensity,
+        )
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
+            if resp.status_code == 400 and tools:
+                resp_text = ""
+                try:
+                    resp_text = (resp.text or "")[:2000]
+                except Exception:
+                    pass
+                if "thinking" in resp_text.lower():
+                    logger.info("Kimi API rejected thinking+tools, retrying without thinking")
+                    payload.pop("thinking", None)
+                    resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError:
+                resp_text2 = ""
+                try:
+                    resp_text2 = (resp.text or "")[:2000]
+                except Exception:
+                    pass
+                logger.warning(
+                    "Kimi API request failed: status=%s response_text=%s message_count=%s tool_count=%s message_summary=%s",
+                    resp.status_code,
+                    resp_text2,
+                    len(payload.get("messages", [])),
+                    len(payload.get("tools", [])),
+                    _safe_message_summary(payload.get("messages", [])),
+                )
+                raise
+            data = resp.json()
+
+        result = self._parse_kimi_anthropic_response(data)
+        result["model"] = f"kimi/{self.model_id}"
+        result["usage"] = data.get("usage", {})
+        return result
+
+    async def _call_kimi_anthropic_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Kimi Anthropic-compatible SSE streaming."""
+        api_base, headers, payload = self._build_kimi_anthropic_request(
+            messages, tools, max_tokens, thinking_intensity,
+        )
+        payload["stream"] = True
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with client.stream("POST", f"{api_base}/v1/messages", headers=headers, json=payload) as resp:
+                if resp.status_code == 400 and tools:
+                    body = ""
+                    try:
+                        body = (await resp.aread()).decode("utf-8", errors="ignore")[:2000]
+                    except Exception:
+                        pass
+                    if "thinking" in body.lower():
+                        logger.info("Kimi stream rejected thinking+tools, retrying without thinking")
+                        payload.pop("thinking", None)
+                        payload.pop("stream", None)
+                        # Fall back to non-stream for the retry
+                        async with httpx.AsyncClient(timeout=120) as retry_client:
+                            retry_resp = await retry_client.post(
+                                f"{api_base}/v1/messages", headers=headers, json=payload,
+                            )
+                            retry_resp.raise_for_status()
+                            data = retry_resp.json()
+                        result = self._parse_kimi_anthropic_response(data)
+                        result["usage"] = data.get("usage", {})
+                        yield {"type": "done", "response": result}
+                        return
+
+                if resp.status_code != 200:
+                    body = ""
+                    try:
+                        body = (await resp.aread()).decode("utf-8", errors="ignore")[:2000]
+                    except Exception:
+                        pass
+                    raise httpx.HTTPStatusError(
+                        f"Kimi stream failed: {resp.status_code} {body}",
+                        request=resp.request,
+                        response=resp,
+                    )
+
+                # Parse SSE stream
+                thinking_text = ""
+                text_content = ""
+                tool_use_blocks: dict[int, dict] = {}  # index -> {id, name, input_json}
+
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type", "")
+                    if etype == "content_block_start":
+                        block = event.get("content_block", {})
+                        idx = event.get("index", 0)
+                        if block.get("type") == "tool_use":
+                            tool_use_blocks[idx] = {
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "input_json": "",
+                            }
+                    elif etype == "content_block_delta":
+                        delta = event.get("delta", {})
+                        dtype = delta.get("type", "")
+                        if dtype == "thinking_delta":
+                            token = delta.get("thinking", "")
+                            thinking_text += token
+                            yield {"type": "thinking_delta", "text": token}
+                        elif dtype == "text_delta":
+                            token = delta.get("text", "")
+                            text_content += token
+                            yield {"type": "text_delta", "text": token}
+                        elif dtype == "input_json_delta":
+                            idx = event.get("index", 0)
+                            if idx in tool_use_blocks:
+                                tool_use_blocks[idx]["input_json"] += delta.get("partial_json", "")
+                    elif etype == "content_block_stop":
+                        pass
+                    elif etype == "message_delta":
+                        pass
+                    elif etype == "message_stop":
+                        break
+
+                # Build final tool_calls from accumulated blocks
+                tool_calls = []
+                for idx in sorted(tool_use_blocks.keys()):
+                    tb = tool_use_blocks[idx]
+                    try:
+                        args = json.loads(tb["input_json"]) if tb["input_json"].strip() else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    tool_calls.append({
+                        "id": tb["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tb["name"],
+                            "arguments": json.dumps(args),
+                        },
+                    })
+
+                openai_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": text_content,
+                }
+                if thinking_text:
+                    openai_msg["reasoning_content"] = thinking_text
+                if tool_calls:
+                    openai_msg["tool_calls"] = tool_calls
+
+                response = {
+                    "choices": [{
+                        "index": 0,
+                        "message": openai_msg,
+                        "finish_reason": "tool_calls" if tool_calls else "stop",
+                    }],
+                }
+                yield {"type": "done", "response": response}
 
     def _is_deepseek(self) -> bool:
         provider_name, provider = self._get_provider()
         return provider_name == "deepseek" or provider.litellm_provider == "deepseek"
 
-    async def _call_deepseek(
+    def _build_deepseek_request(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         thinking_intensity: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Call DeepSeek API directly, preserving reasoning_content in both directions.
-
-        LiteLLM 1.52.0 does not recognise reasoning_content (a DeepSeek extension
-        to the OpenAI message schema), so it drops the field during response
-        deserialization.  DeepSeek thinking mode *requires* that reasoning_content
-        be passed back in subsequent turns, so we bypass LiteLLM entirely.
-        """
+    ) -> tuple[str, dict, dict]:
+        """Build (api_base, headers, payload) for DeepSeek API."""
         _, provider = self._get_provider()
         api_base = provider.base_url.rstrip("/")
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {provider.api_key}",
         }
-        # Convert OpenAI-format tool definitions for the API
         api_tools = None
         if tools:
             api_tools = []
@@ -327,6 +461,26 @@ class ModelRouter:
             payload["max_tokens"] = max_tokens
         if api_tools:
             payload["tools"] = api_tools
+        return api_base, headers, payload
+
+    async def _call_deepseek(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Call DeepSeek API directly, preserving reasoning_content in both directions.
+
+        LiteLLM 1.52.0 does not recognise reasoning_content (a DeepSeek extension
+        to the OpenAI message schema), so it drops the field during response
+        deserialization.  DeepSeek thinking mode *requires* that reasoning_content
+        be passed back in subsequent turns, so we bypass LiteLLM entirely.
+        """
+        api_base, headers, payload = self._build_deepseek_request(
+            messages, tools, temperature, max_tokens, thinking_intensity,
+        )
 
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload)
@@ -346,6 +500,123 @@ class ModelRouter:
                 )
                 raise
             return resp.json()
+
+    async def _call_deepseek_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """DeepSeek OpenAI-compatible SSE streaming."""
+        api_base, headers, payload = self._build_deepseek_request(
+            messages, tools, temperature, max_tokens, thinking_intensity,
+        )
+        payload["stream"] = True
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with client.stream("POST", f"{api_base}/chat/completions", headers=headers, json=payload) as resp:
+                if resp.status_code != 200:
+                    body = ""
+                    try:
+                        body = (await resp.aread()).decode("utf-8", errors="ignore")[:2000]
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "DeepSeek stream failed: status=%s response_text=%s",
+                        resp.status_code,
+                        body,
+                    )
+                    raise httpx.HTTPStatusError(
+                        f"DeepSeek stream failed: {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+
+                reasoning_text = ""
+                content_text = ""
+                tool_calls_by_idx: dict[int, dict] = {}
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line == "data: [DONE]":
+                        break
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+
+                    rc = delta.get("reasoning_content")
+                    if rc:
+                        reasoning_text += rc
+                        yield {"type": "thinking_delta", "text": rc}
+
+                    c = delta.get("content")
+                    if c:
+                        content_text += c
+                        yield {"type": "text_delta", "text": c}
+
+                    tc_list = delta.get("tool_calls")
+                    if tc_list:
+                        for tc in tc_list:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_by_idx:
+                                tool_calls_by_idx[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": "",
+                                }
+                            func = tc.get("function", {})
+                            if func.get("id"):
+                                tool_calls_by_idx[idx]["id"] = func["id"]
+                            if func.get("name"):
+                                tool_calls_by_idx[idx]["name"] = func["name"]
+                            tool_calls_by_idx[idx]["arguments"] += func.get("arguments", "")
+
+                # Build final tool_calls
+                tool_calls = []
+                for idx in sorted(tool_calls_by_idx.keys()):
+                    tb = tool_calls_by_idx[idx]
+                    try:
+                        args = json.loads(tb["arguments"]) if tb["arguments"].strip() else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    tool_calls.append({
+                        "id": tb["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tb["name"],
+                            "arguments": json.dumps(args),
+                        },
+                    })
+
+                openai_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content_text,
+                }
+                if reasoning_text:
+                    openai_msg["reasoning_content"] = reasoning_text
+                if tool_calls:
+                    openai_msg["tool_calls"] = tool_calls
+
+                response = {
+                    "choices": [{
+                        "index": 0,
+                        "message": openai_msg,
+                        "finish_reason": "tool_calls" if tool_calls else "stop",
+                    }],
+                }
+                yield {"type": "done", "response": response}
 
     async def _call_litellm(
         self,
@@ -407,6 +678,168 @@ class ModelRouter:
                     stream=stream
                 )
             raise
+
+    async def _call_litellm_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream via LiteLLM, yielding progressive deltas."""
+        provider_name, provider = self._get_provider()
+        litellm_provider = provider.litellm_provider or ("openai" if provider_name == "local" else provider_name)
+        api_base = provider.base_url
+
+        reasoning_text = ""
+        content_text = ""
+        tool_call_chunks: dict[int, dict] = {}
+
+        try:
+            stream = await acompletion(
+                model=f"{litellm_provider}/{self.model_id}",
+                messages=messages,
+                tools=tools,
+                temperature=self._map_generic_temperature(thinking_intensity, temperature),
+                max_tokens=max_tokens,
+                api_base=api_base if api_base else None,
+                api_key=provider.api_key if provider.api_key else None,
+                stream=True,
+            )
+        except BadRequestError as e:
+            error_text = str(e).lower()
+            if "reasoning_content" in error_text and messages:
+                if "must be passed back" in error_text:
+                    logger.warning(
+                        "reasoning_content required but missing — LiteLLM dropped it; "
+                        "retrying via direct DeepSeek stream"
+                    )
+                    async for event in self._call_deepseek_stream(
+                        messages=messages, tools=tools, temperature=temperature,
+                        max_tokens=max_tokens, thinking_intensity=thinking_intensity,
+                    ):
+                        yield event
+                    return
+                logger.warning(
+                    "reasoning_content rejected by upstream, stripping and retrying stream"
+                )
+                stripped = []
+                for msg in messages:
+                    if msg.get("role") == "assistant" and "reasoning_content" in msg:
+                        msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
+                    stripped.append(msg)
+                stream = await acompletion(
+                    model=f"{litellm_provider}/{self.model_id}",
+                    messages=stripped,
+                    tools=tools,
+                    temperature=self._map_generic_temperature(thinking_intensity, temperature),
+                    max_tokens=max_tokens,
+                    api_base=api_base if api_base else None,
+                    api_key=provider.api_key if provider.api_key else None,
+                    stream=True,
+                )
+            else:
+                raise
+
+        async for chunk in stream:
+            choices = chunk.choices if hasattr(chunk, "choices") else []
+            if not choices:
+                continue
+            delta = choices[0].delta if hasattr(choices[0], "delta") else None
+            if delta is None:
+                continue
+
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning_text += rc
+                yield {"type": "thinking_delta", "text": rc}
+
+            c = getattr(delta, "content", None)
+            if c:
+                content_text += c
+                yield {"type": "text_delta", "text": c}
+
+            tc_list = getattr(delta, "tool_calls", None)
+            if tc_list:
+                for tc in tc_list:
+                    idx = getattr(tc, "index", 0)
+                    if idx not in tool_call_chunks:
+                        tool_call_chunks[idx] = {
+                            "id": getattr(tc, "id", "") or "",
+                            "name": (getattr(tc, "function", None) or {}).get("name", "") if hasattr(tc, "function") else "",
+                            "arguments": "",
+                        }
+                    func = getattr(tc, "function", None)
+                    if func is not None:
+                        if getattr(func, "id", None):
+                            tool_call_chunks[idx]["id"] = func.id
+                        if getattr(func, "name", None):
+                            tool_call_chunks[idx]["name"] = func.name
+                        tool_call_chunks[idx]["arguments"] += getattr(func, "arguments", "") or ""
+
+        # Build final tool_calls
+        tool_calls = []
+        for idx in sorted(tool_call_chunks.keys()):
+            tb = tool_call_chunks[idx]
+            try:
+                args = json.loads(tb["arguments"]) if tb["arguments"].strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append({
+                "id": tb["id"],
+                "type": "function",
+                "function": {
+                    "name": tb["name"],
+                    "arguments": json.dumps(args),
+                },
+            })
+
+        openai_msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": content_text,
+        }
+        if reasoning_text:
+            openai_msg["reasoning_content"] = reasoning_text
+        if tool_calls:
+            openai_msg["tool_calls"] = tool_calls
+
+        response = {
+            "choices": [{
+                "index": 0,
+                "message": openai_msg,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
+            }],
+        }
+        yield {"type": "done", "response": response}
+
+    async def chat_completion_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        thinking_intensity: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Unified streaming completion. Yields delta events then a 'done' event with full response."""
+        provider_name = self._get_provider()[0]
+        if provider_name == "kimi":
+            async for event in self._call_kimi_anthropic_stream(
+                messages=messages, tools=tools, max_tokens=max_tokens, thinking_intensity=thinking_intensity,
+            ):
+                yield event
+        elif self._is_deepseek():
+            async for event in self._call_deepseek_stream(
+                messages=messages, tools=tools, temperature=temperature,
+                max_tokens=max_tokens, thinking_intensity=thinking_intensity,
+            ):
+                yield event
+        else:
+            async for event in self._call_litellm_stream(
+                messages=messages, tools=tools, temperature=temperature,
+                max_tokens=max_tokens, thinking_intensity=thinking_intensity,
+            ):
+                yield event
 
     async def chat_completion(
         self,

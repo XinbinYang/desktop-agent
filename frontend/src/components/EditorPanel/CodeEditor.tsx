@@ -52,13 +52,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const showModified = isModified || hasChanged;
 
   return (
-    <div className="h-full flex flex-col bg-gray-950">
+    <div className="h-full flex flex-col bg-app">
       {/* Header */}
-      <div className="flex items-center justify-between bg-gray-800 px-3 py-1 text-[10px] text-gray-400 border-b border-gray-700 z-10 shrink-0">
+      <div className="flex items-center justify-between bg-surface px-3 py-1 text-[10px] text-fg-secondary border-b border-border z-10 shrink-0">
         <div className="flex items-center gap-2">
           <span>{filename}</span>
           {showModified && (
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-400" title="已修改" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent" title="已修改" />
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -70,7 +70,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
                   setHasChanged(false);
                 }
               }}
-              className="px-2 py-0.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-[10px] transition-colors"
+              className="px-2 py-0.5 bg-accent/85 hover:bg-accent text-fg-on-accent rounded text-[10px] transition-colors"
             >
               保存
             </button>
@@ -103,7 +103,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             readOnly: false,
           }}
           loading={
-            <div className="h-full flex items-center justify-center text-gray-500 text-xs">
+            <div className="h-full flex items-center justify-center text-fg-muted text-xs">
               加载编辑器...
             </div>
           }

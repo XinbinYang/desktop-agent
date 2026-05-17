@@ -1,5 +1,6 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff } from 'lucide-react';
+import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import {
   ChatMessage,
   ToolCall,
@@ -9,6 +10,7 @@ import {
   ThinkingIntensity,
   PlanQuestion,
   PlanState,
+  PlanTodo,
 } from '../types';
 import { API_BASE } from '../config';
 import { useTheme } from '../hooks/useTheme';
@@ -20,6 +22,7 @@ import { ToolCallView } from './ToolCallView';
 import { FileEditView } from './FileEditView';
 import { SlashCommandMenu } from './SlashCommandMenu';
 import { AtMentionMenu } from './AtMentionMenu';
+import { ChatMessageItem } from './ChatMessageItem';
 
 interface ChatPanelProps {
   messages: ChatMessage[];
@@ -163,37 +166,290 @@ const ToolSummaryRow: React.FC<{
   );
 };
 
-const PlanQuestionCard: React.FC<{
-  question: PlanQuestion;
-  onChange: (selected: string[]) => void;
-}> = ({ question, onChange }) => {
-  const selected = question.selected || [];
-  const allowMultiple = question.allow_multiple === true;
+/**
+ * In-stream plan question card — rendered inside the chat timeline.
+ * Uses button-pill selection + a "Continue" confirmation step.
+ */
+const PlanQuestionsInlineCard: React.FC<{
+  questions: PlanQuestion[];
+  planState: PlanState;
+  onUpdate: (questionId: string, selected: string[]) => void;
+}> = ({ questions, planState, onUpdate }) => {
+  const isInteractive = planState.phase === 'awaiting_decision';
+  const [localSelections, setLocalSelections] = useState<Record<string, string[]>>(() => {
+    const init: Record<string, string[]> = {};
+    questions.forEach((q) => { init[q.id] = []; });
+    return init;
+  });
+  const [confirmed, setConfirmed] = useState(false);
+
+  const allAnswered = questions.every((q) => (localSelections[q.id] || []).length > 0);
+  const showInteractive = isInteractive && !confirmed;
+
+  const handleConfirm = () => {
+    if (!allAnswered) return;
+    questions.forEach((q) => onUpdate(q.id, localSelections[q.id] || []));
+    setConfirmed(true);
+  };
+
+  const getAnsweredLabels = (q: PlanQuestion): string[] => {
+    const ids = planState.decisions[q.id] || localSelections[q.id] || [];
+    return ids.map((id) => q.options.find((o) => o.id === id)?.label || id);
+  };
+
   return (
-    <div className="rounded-md border border-border-subtle bg-surface px-3 py-2">
-      <div className="chat-text-sm text-fg mb-1">{question.prompt}</div>
-      <div className="space-y-1">
-        {question.options.map((opt) => {
-          const checked = selected.includes(opt.id);
-          return (
-            <label key={opt.id} className="flex items-center gap-2 chat-text-xs text-fg-secondary cursor-pointer">
-              <input
-                type={allowMultiple ? 'checkbox' : 'radio'}
-                name={question.id}
-                checked={checked}
-                onChange={() => {
-                  if (allowMultiple) {
-                    onChange(checked ? selected.filter((s) => s !== opt.id) : [...selected, opt.id]);
-                    return;
-                  }
-                  onChange([opt.id]);
-                }}
-              />
-              <span>{opt.label}</span>
-            </label>
-          );
-        })}
+    <div className="my-2 rounded-xl border border-[color:var(--plan-pill-border)] overflow-hidden bg-[color-mix(in_srgb,var(--plan-pill-bg)_10%,var(--bg-surface))]">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[color:var(--plan-pill-border)]/40">
+        <PlanModeIcon className="text-[color:var(--plan-pill-fg)] opacity-80 shrink-0" />
+        <span className="chat-text-xs font-semibold text-[color:var(--plan-pill-fg)] uppercase tracking-wide">
+          Planning — Decision Required
+        </span>
+        {!showInteractive && (
+          <span className="ml-auto chat-text-xs text-fg-muted">Answered ✓</span>
+        )}
       </div>
+
+      {/* Questions */}
+      <div className="px-4 py-3 space-y-4">
+        {questions.map((q) => (
+          <div key={q.id} className="space-y-2">
+            <div className="chat-text-sm font-medium text-fg">{q.prompt}</div>
+            {!showInteractive ? (
+              <div className="flex flex-wrap gap-1.5">
+                {getAnsweredLabels(q).map((label) => (
+                  <span
+                    key={label}
+                    className="chat-text-xs px-2.5 py-1 rounded-md bg-accent/15 border border-accent/30 text-accent font-medium"
+                  >
+                    ✓ {label}
+                  </span>
+                ))}
+                {getAnsweredLabels(q).length === 0 && (
+                  <span className="chat-text-xs text-fg-muted italic">No selection recorded</span>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {q.options.map((opt) => {
+                  const isSelected = (localSelections[q.id] || []).includes(opt.id);
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => {
+                        setLocalSelections((prev) => {
+                          if (q.allow_multiple) {
+                            const curr = prev[q.id] || [];
+                            return {
+                              ...prev,
+                              [q.id]: curr.includes(opt.id)
+                                ? curr.filter((id) => id !== opt.id)
+                                : [...curr, opt.id],
+                            };
+                          }
+                          return { ...prev, [q.id]: [opt.id] };
+                        });
+                      }}
+                      className={`chat-text-sm px-3 py-1.5 rounded-lg border transition-all ${
+                        isSelected
+                          ? 'bg-accent/15 border-accent/60 text-accent font-medium shadow-sm'
+                          : 'bg-surface border-border text-fg-secondary hover:border-accent/40 hover:text-fg hover:bg-surface-alt'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ))}
+
+        {showInteractive && (
+          <button
+            type="button"
+            onClick={handleConfirm}
+            disabled={!allAnswered}
+            className={`w-full py-2 px-4 rounded-lg font-medium chat-text-sm transition flex items-center justify-center gap-2 ${
+              allAnswered
+                ? 'bg-accent text-fg-on-accent hover:brightness-110 active:scale-[0.99]'
+                : 'bg-surface-alt text-fg-muted border border-border cursor-not-allowed'
+            }`}
+          >
+            Continue →
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/**
+ * In-stream plan draft review card — rendered inside the chat timeline.
+ * Shows structured plan with collapsible sections and a prominent Build button.
+ */
+const PlanDraftInlineCard: React.FC<{
+  block: Extract<AssistantBlock, { type: 'plan_draft' }>;
+  planState: PlanState;
+  onBuild: () => void;
+}> = ({ block, planState, onBuild }) => {
+  const isExecuting = ['executing', 'completed', 'approved_waiting_build'].includes(planState.phase);
+  const canBuild = planState.phase === 'awaiting_approval' && !planState.approved;
+  const [open, setOpen] = useState<Record<string, boolean>>({ todos: true, risks: false, steps: false });
+  const toggle = (k: string) => setOpen((prev) => ({ ...prev, [k]: !prev[k] }));
+
+  // Use live todos from planState when executing for real-time status
+  const todos: PlanTodo[] = isExecuting && planState.todos.length > 0
+    ? planState.todos
+    : block.todos;
+  const sp = block.structured_plan;
+
+  return (
+    <div className="my-2 rounded-xl border border-[color:var(--plan-pill-border)] overflow-hidden">
+      {/* Header */}
+      <div className="px-4 py-3 bg-[color-mix(in_srgb,var(--plan-pill-bg)_18%,var(--bg-surface))] border-b border-[color:var(--plan-pill-border)]/40">
+        <div className="flex items-center gap-2 mb-1">
+          <PlanModeIcon className="text-[color:var(--plan-pill-fg)] opacity-80 shrink-0" />
+          <span className="chat-text-xs font-semibold text-[color:var(--plan-pill-fg)] uppercase tracking-wide">
+            Implementation Plan
+          </span>
+          {isExecuting && (
+            <span className="ml-auto flex items-center gap-1.5 chat-text-xs text-accent">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse inline-block" />
+              Building
+            </span>
+          )}
+          {canBuild && (
+            <span className="ml-auto chat-text-xs text-fg-muted">Ready to build</span>
+          )}
+        </div>
+        <div className="chat-text-sm font-semibold text-fg leading-snug">{block.goal}</div>
+      </div>
+
+      {/* Tasks section */}
+      {todos.length > 0 && (
+        <div className="border-b border-border-subtle">
+          <button
+            type="button"
+            onClick={() => toggle('todos')}
+            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
+          >
+            <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
+              Tasks ({todos.length})
+            </span>
+            {open.todos
+              ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
+              : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
+          </button>
+          {open.todos && (
+            <div className="px-4 pb-3 space-y-2">
+              {todos.map((t, i) => {
+                const s = t.status || 'pending';
+                return (
+                  <div key={t.id} className="flex items-start gap-2.5 chat-text-xs">
+                    <span className={`mt-0.5 w-4 h-4 rounded-full border flex-shrink-0 flex items-center justify-center text-[9px] font-bold ${
+                      s === 'completed' ? 'bg-success/20 border-success/60 text-success' :
+                      s === 'in_progress' ? 'bg-accent/20 border-accent text-accent' :
+                      s === 'blocked' ? 'bg-danger/20 border-danger/60 text-danger' :
+                      'bg-surface border-border text-fg-muted'
+                    }`}>
+                      {s === 'completed' ? '✓' : s === 'blocked' ? '!' : i + 1}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <span className={s === 'completed' ? 'line-through text-fg-muted' : 'text-fg'}>
+                        {t.title}
+                      </span>
+                      {t.acceptance_criteria && (
+                        <div className="mt-0.5 text-fg-muted text-[10px]">→ {t.acceptance_criteria}</div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Steps section */}
+      {sp && sp.steps && sp.steps.length > 0 && (
+        <div className="border-b border-border-subtle">
+          <button
+            type="button"
+            onClick={() => toggle('steps')}
+            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
+          >
+            <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
+              Steps ({sp.steps.length})
+            </span>
+            {open.steps
+              ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
+              : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
+          </button>
+          {open.steps && (
+            <div className="px-4 pb-3 space-y-1.5">
+              {sp.steps.map((s, i) => (
+                <div key={s.id} className="chat-text-xs text-fg-secondary">
+                  <span className="font-medium text-fg">{i + 1}.</span> {s.title}
+                  {s.details && <div className="mt-0.5 text-fg-muted text-[10px] pl-3">{s.details.slice(0, 120)}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Risks section */}
+      {sp && sp.risks && sp.risks.length > 0 && (
+        <div className="border-b border-border-subtle">
+          <button
+            type="button"
+            onClick={() => toggle('risks')}
+            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
+          >
+            <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
+              Risks ({sp.risks.length})
+            </span>
+            {open.risks
+              ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
+              : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
+          </button>
+          {open.risks && (
+            <div className="px-4 pb-3 space-y-1">
+              {sp.risks.map((r, i) => (
+                <div key={i} className="chat-text-xs text-warning/80 flex gap-1.5">
+                  <span className="shrink-0">⚠</span>
+                  <span>{r}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* CTA footer */}
+      {canBuild && (
+        <div className="px-4 py-3 bg-[color-mix(in_srgb,var(--plan-pill-bg)_8%,var(--bg-surface))] space-y-2">
+          <button
+            type="button"
+            onClick={onBuild}
+            className="w-full py-2.5 px-4 rounded-lg bg-accent text-fg-on-accent font-semibold chat-text-sm hover:brightness-110 active:scale-[0.99] transition flex items-center justify-center gap-2"
+          >
+            ▶ Build
+          </button>
+          <p className="text-center chat-text-xs text-fg-muted">
+            Not right? Describe changes in the chat below and I&apos;ll revise.
+          </p>
+        </div>
+      )}
+
+      {isExecuting && (
+        <div className="px-4 py-2.5 flex items-center gap-2 chat-text-xs text-accent bg-[color-mix(in_srgb,var(--plan-pill-bg)_8%,var(--bg-surface))]">
+          <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse inline-block" />
+          Plan approved — executing…
+        </div>
+      )}
     </div>
   );
 };
@@ -333,7 +589,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     }
   };
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -365,35 +621,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
   };
 
-  // 智能滚动检测
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const threshold = 50;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-    setIsNearBottom(nearBottom);
+  const scrollToBottom = useCallback(() => {
+    virtuosoRef.current?.scrollToIndex({
+      index: 'LAST',
+      behavior: 'smooth',
+      align: 'end',
+    });
+    setIsNearBottom(true);
   }, []);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.addEventListener('scroll', handleScroll);
-    return () => el.removeEventListener('scroll', handleScroll);
-  }, [handleScroll]);
-
-  // 新消息时自动滚动到底部
-  useEffect(() => {
-    if (isNearBottom && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages, isNearBottom]);
-
-  const scrollToBottom = () => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      setIsNearBottom(true);
-    }
-  };
 
   const handleSend = () => {
     if (planBlocksChatSend) return;
@@ -562,13 +797,15 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   // 搜索过滤
-  const filteredMessages = searchQuery.trim()
-    ? messages.filter((m) => m.content.toLowerCase().includes(searchQuery.toLowerCase()))
-    : messages;
+  const filteredMessages = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return messages;
+    return messages.filter((m) => m.content.toLowerCase().includes(q));
+  }, [messages, searchQuery]);
 
   // Markdown 自定义渲染
   // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
-  const markdownComponents = {
+  const markdownComponents = useMemo(() => ({
     pre({ node, children, ...props }: any) {
       const codeNode = node?.children?.[0];
       if (codeNode?.tagName === 'code') {
@@ -586,7 +823,143 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         </code>
       );
     },
-  };
+  }), [resolved]);
+
+  const renderBlock = useCallback((block: AssistantBlock, _bi: number) => {
+    switch (block.type) {
+      case 'thinking':
+        return <ReasoningBlock key={`t-${block.timestamp}`} text={block.text} />;
+      case 'text':
+        return (
+          <div key={`md-${block.timestamp}`} className="prose prose-sm chat-prose max-w-none">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {block.text}
+            </ReactMarkdown>
+          </div>
+        );
+      case 'tool_call':
+        return (
+          <ToolCallView
+            key={`tc-${block.toolCallId || block.timestamp}`}
+            name={block.name}
+            args={block.args}
+            result={block.result}
+            status={block.status}
+            durationMs={block.durationMs}
+            workerEvents={block.workerEvents}
+          />
+        );
+      case 'file_edit':
+        return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact />;
+      case 'image':
+        return (
+          <img
+            key={`img-${block.timestamp}`}
+            src={`data:image/png;base64,${block.base64}`}
+            alt="tool screenshot"
+            loading="lazy"
+            decoding="async"
+            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+          />
+        );
+      case 'plan_questions':
+        return (
+          <PlanQuestionsInlineCard
+            key={`pq-${block.timestamp}`}
+            questions={block.questions}
+            planState={planState}
+            onUpdate={onUpdatePlanDecision}
+          />
+        );
+      case 'plan_draft':
+        return (
+          <PlanDraftInlineCard
+            key={`pd-${block.timestamp}`}
+            block={block}
+            planState={planState}
+            onBuild={onBuildPlan}
+          />
+        );
+      default:
+        return null;
+    }
+  }, [planState, onUpdatePlanDecision, onBuildPlan, markdownComponents]);
+
+  const itemContent = useCallback((index: number) => {
+    const msg = filteredMessages[index];
+    if (!msg) return null;
+    const lastMsg = messages[messages.length - 1];
+    const lastAssistantMsgId = lastMsg?.role === 'assistant' && !lastMsg?.isTool ? lastMsg.id : null;
+    const contentHash = msg.blocks?.reduce((h, b) => {
+      if (b.type === 'text' || b.type === 'thinking') return h + ((b as { text: string }).text?.length ?? 0);
+      return h + 1;
+    }, 0) ?? 0;
+    return (
+      <div key={`${msg.id}-${contentHash}`} className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
+        <ChatMessageItem
+          msg={msg}
+          index={index}
+          totalCount={filteredMessages.length}
+          lastAssistantMsgId={lastAssistantMsgId}
+          onRetry={onRetry}
+          isRunning={isRunning}
+          expandedToolDetails={expandedToolDetails}
+          showAllToolDetails={showAllToolDetails}
+          onToggleToolDetails={(msgId) =>
+            setExpandedToolDetails((prev) => ({ ...prev, [msgId]: !prev[msgId] }))
+          }
+          onToggleShowAll={(msgId) =>
+            setShowAllToolDetails((prev) => ({ ...prev, [msgId]: true }))
+          }
+          hideToolNoise={hideToolNoise}
+          planState={planState}
+          onUpdatePlanDecision={onUpdatePlanDecision}
+          onBuildPlan={onBuildPlan}
+          markdownComponents={markdownComponents}
+          renderBlock={renderBlock}
+          isNoisyToolBlock={isNoisyToolBlock}
+          ToolSummaryRow={ToolSummaryRow}
+          ReasoningBlock={ReasoningBlock}
+        />
+      </div>
+    );
+  }, [filteredMessages, messages, onRetry, isRunning, expandedToolDetails, showAllToolDetails, hideToolNoise, planState, onUpdatePlanDecision, onBuildPlan, markdownComponents, renderBlock]);
+
+  const virtuosoComponents: any = useMemo(() => ({
+    Header: () => <div className="h-[var(--chat-space-md)]" />,
+    Footer: isRunning
+      ? () => (
+          <div className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
+            <div className="relative pl-[var(--chat-timeline-indent)] py-[var(--chat-space-xs)]">
+              <div className="absolute left-[5px] top-0 bottom-0 w-px bg-border-subtle" />
+              <div className="absolute left-[2px] top-1.5 w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+              <div className="pl-1 chat-text-xs text-fg-muted flex items-center gap-1.5">
+                <Loader2 className="w-3 h-3 animate-spin text-accent" />
+                <span>Agent is working...</span>
+              </div>
+            </div>
+          </div>
+        )
+      : undefined,
+    EmptyPlaceholder: messages.length === 0
+      ? () => (
+          <div className="flex flex-col items-center justify-center h-full text-fg-muted p-[var(--chat-space-lg)]">
+            <div className="text-4xl mb-4">&#x1f5a5;&#xfe0f;</div>
+            <div className="text-lg font-medium mb-2 text-fg">Desktop Agent Ready</div>
+            <div className="text-sm text-center max-w-md text-fg-secondary">
+              I can help you control your computer: manage files, run commands,<br />
+              control the browser, operate desktop keyboard &amp; mouse, and interact with other applications.
+            </div>
+            <div className="mt-6 grid grid-cols-2 gap-2 text-xs">
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Read / Write Files</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Browser Automation</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Keyboard &amp; Mouse</div>
+              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Window Management</div>
+            </div>
+          </div>
+        )
+      : null,
+  }), [isRunning, messages.length]);
 
   return (
     <div className="h-full flex flex-col bg-app" data-density={density}>
@@ -636,7 +1009,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           onClick={() => setHideToolNoise((v) => !v)}
           className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
             hideToolNoise
-              ? 'bg-info/12 border-info/30 text-info'
+              ? 'bg-info/10 border-info/30 text-info'
               : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
           }`}
         >
@@ -645,219 +1018,25 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       </div>
 
       {/* 消息列表 */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-[var(--chat-space-lg)] space-y-[var(--chat-message-gap)] relative">
+      <div className="flex-1 relative">
         {chatMode === 'plan' && (planState.goal || planState.draft) && (
-          <div className="sticky top-0 z-20 mb-2 rounded-md border border-accent/30 bg-surface/95 backdrop-blur px-3 py-2">
+          <div className="sticky top-0 z-20 mx-[var(--chat-space-lg)] mt-[var(--chat-space-md)] rounded-md border border-accent/30 bg-surface/95 backdrop-blur px-3 py-2">
             <div className="chat-text-xs text-fg-secondary">
               <span className="text-fg font-medium">Task requirement:</span>{' '}
               {planState.goal || planState.draft.split('\n')[0]?.replace(/^Goal:\s*/, '') || ''}
             </div>
           </div>
         )}
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-fg-muted">
-            <div className="text-4xl mb-4">🖥️</div>
-            <div className="text-lg font-medium mb-2 text-fg">Desktop Agent Ready</div>
-            <div className="text-sm text-center max-w-md text-fg-secondary">
-              I can help you control your computer: manage files, run commands,<br />
-              control the browser, operate desktop keyboard &amp; mouse, and interact with other applications.
-            </div>
-            <div className="mt-6 grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Read / Write Files</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Browser Automation</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Keyboard &amp; Mouse</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Window Management</div>
-            </div>
-          </div>
-        )}
-
-        {/* Render a single inline block (thinking / tool_call / image) */}
-        {(() => {
-          const renderBlock = (block: AssistantBlock, _bi: number) => {
-            switch (block.type) {
-              case 'thinking':
-                return <ReasoningBlock key={`t-${block.timestamp}`} text={block.text} />;
-              case 'text':
-                return (
-                  <div key={`md-${block.timestamp}`} className="prose prose-sm chat-prose max-w-none">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                      {block.text}
-                    </ReactMarkdown>
-                  </div>
-                );
-              case 'tool_call':
-                return (
-                  <ToolCallView
-                    key={`tc-${block.toolCallId || block.timestamp}`}
-                    name={block.name}
-                    args={block.args}
-                    result={block.result}
-                    status={block.status}
-                    durationMs={block.durationMs}
-                    workerEvents={block.workerEvents}
-                  />
-                );
-              case 'file_edit':
-                return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact />;
-              case 'image':
-                return (
-                  <img
-                    key={`img-${block.timestamp}`}
-                    src={`data:image/png;base64,${block.base64}`}
-                    alt="tool screenshot"
-                    className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
-                  />
-                );
-              default:
-                return null;
-            }
-          };
-
-          {/* 时间线消息列表 */}
-          return (
-            <div className="space-y-0.5">
-              {filteredMessages.map((msg, index) => (
-                <div key={msg.id} className="relative pl-[var(--chat-timeline-indent)]">
-                  {/* 左侧竖线 */}
-                  {index < filteredMessages.length - 1 && (
-                    <div className="absolute left-[5px] top-2.5 bottom-0 w-px bg-border-subtle" />
-                  )}
-                  {/* 小圆点 */}
-                  <div className={`absolute left-[2px] top-2 w-1.5 h-1.5 rounded-full ${
-                    msg.role === 'user' ? 'bg-accent' : msg.role === 'system' ? 'bg-danger' : 'bg-fg-muted'
-                  }`} />
-
-                  <div className={`relative group ${
-                    msg.role === 'user'
-                      ? 'bg-accent/15 text-fg rounded-lg px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] ml-auto max-w-[85%] border border-accent/20 chat-text-sm'
-                      : msg.role === 'system'
-                      ? 'bg-danger/10 text-danger rounded px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs border border-danger/20'
-                      : 'text-fg py-[var(--chat-space-xs)]'
-                  }`}>
-                    {/* Retry button */}
-                    {msg.role === 'assistant' && !msg.isTool && onRetry && !isRunning && msg.id === messages[messages.length - 1]?.id && (
-                      <button
-                        type="button"
-                        onClick={onRetry}
-                        title="Regenerate"
-                        className="absolute -top-2 -right-2 w-5 h-5 bg-surface-alt hover:bg-surface-hover border border-border rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                        aria-label="Regenerate"
-                      >
-                        <RotateCcw className="w-2.5 h-2.5 text-fg-secondary" />
-                      </button>
-                    )}
-
-                    {msg.imageBase64 && (
-                      <img
-                        src={`data:image/png;base64,${msg.imageBase64}`}
-                        alt="attached"
-                        className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
-                      />
-                    )}
-
-                    {msg.role === 'assistant' && msg.skill && !msg.isTool && (
-                      <div className="flex items-center gap-1 mb-[var(--chat-space-xs)]">
-                        <span className="text-[10px] bg-info/15 text-info px-1.5 py-0 rounded border border-info/30">
-                          {msg.skill}
-                        </span>
-                      </div>
-                    )}
-
-                    {/* New: render blocks inline (primary path for assistant messages) */}
-                    {msg.role === 'assistant' && msg.blocks && msg.blocks.length > 0 ? (
-                      <div className="space-y-[var(--chat-block-gap)]">
-                        {(() => {
-                          const toolBlocks = msg.blocks.filter(
-                            (block): block is Extract<AssistantBlock, { type: 'tool_call' }> => block.type === 'tool_call'
-                          );
-                          const nonToolBlocks = msg.blocks.filter((block) => block.type !== 'tool_call');
-                          const isExpanded = expandedToolDetails[msg.id] === true;
-                          const showAll = showAllToolDetails[msg.id] === true;
-                          const filteredToolBlocks =
-                            hideToolNoise && !showAll
-                              ? toolBlocks.filter((block) => !isNoisyToolBlock(block))
-                              : toolBlocks;
-                          const hiddenCount = Math.max(toolBlocks.length - filteredToolBlocks.length, 0);
-
-                          return (
-                            <>
-                              {nonToolBlocks.map((block, bi) => renderBlock(block, bi))}
-                              {msg.toolSummary && toolBlocks.length > 0 && (
-                                <ToolSummaryRow
-                                  summary={msg.toolSummary}
-                                  expanded={isExpanded}
-                                  onToggle={() =>
-                                    setExpandedToolDetails((prev) => ({ ...prev, [msg.id]: !isExpanded }))
-                                  }
-                                />
-                              )}
-                              {toolBlocks.length > 0 && (isExpanded || !msg.toolSummary) && (
-                                <div className="space-y-[var(--chat-block-gap)]">
-                                  {filteredToolBlocks.map((block, bi) => renderBlock(block, bi))}
-                                  {hiddenCount > 0 && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setShowAllToolDetails((prev) => ({ ...prev, [msg.id]: true }))
-                                      }
-                                      className="chat-text-xs text-fg-muted hover:text-fg-secondary border border-border-subtle rounded px-2 py-1 bg-surface"
-                                    >
-                                      Show {hiddenCount} hidden read/search/list calls
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </>
-                          );
-                        })()}
-                      </div>
-                    ) : msg.role === 'assistant' && msg.reasoning ? (
-                      /* Fallback: old sessions without blocks */
-                      <>
-                        <ReasoningBlock text={msg.reasoning} />
-                        {msg.content && (
-                          <div className="prose prose-sm chat-prose max-w-none">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                              {msg.content}
-                            </ReactMarkdown>
-                          </div>
-                        )}
-                      </>
-                    ) : msg.isTool ? (
-                      <div className="flex items-center gap-2 text-xs text-fg-muted">
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        <span>Working...</span>
-                      </div>
-                    ) : msg.role === 'assistant' && msg.content ? (
-                      <div className="prose prose-sm chat-prose max-w-none">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                          {msg.content}
-                        </ReactMarkdown>
-                      </div>
-                    ) : msg.role === 'user' && msg.content ? (
-                      <div className="prose prose-sm chat-prose chat-prose-plain max-w-none">
-                        <p className="whitespace-pre-wrap">{msg.content}</p>
-                      </div>
-                    ) : msg.content ? (
-                      <span>{msg.content}</span>
-                    ) : null}
-                  </div>
-                </div>
-              ))}
-
-              {isRunning && (
-                <div className="relative pl-[var(--chat-timeline-indent)] py-[var(--chat-space-xs)]">
-                  <div className="absolute left-[5px] top-0 bottom-0 w-px bg-border-subtle" />
-                  <div className="absolute left-[2px] top-1.5 w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-                  <div className="pl-1 chat-text-xs text-fg-muted flex items-center gap-1.5">
-                    <Loader2 className="w-3 h-3 animate-spin text-accent" />
-                    <span>Agent is working...</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })()}
+        <Virtuoso
+          ref={virtuosoRef}
+          className="h-full"
+          data={filteredMessages}
+          followOutput={isNearBottom ? 'smooth' : false}
+          atBottomStateChange={(atBottom) => setIsNearBottom(atBottom)}
+          overscan={200}
+          itemContent={itemContent}
+          components={virtuosoComponents}
+        />
       </div>
 
       {/* Scroll to bottom button */}
@@ -874,14 +1053,71 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
       {/* Input area */}
       <div className="border-t border-border p-[var(--chat-space-lg)] bg-surface">
+        {/* ── Plan mode status bar ── */}
         {chatMode === 'plan' && (
           <div
-            className="mb-2 rounded-lg border px-3 py-1.5 chat-text-xs text-fg border-[color-mix(in_srgb,var(--plan-pill-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--plan-pill-bg)_18%,var(--bg-surface))]"
+            className="mb-2 rounded-lg border px-3 py-1.5 chat-text-xs border-[color-mix(in_srgb,var(--plan-pill-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--plan-pill-bg)_12%,var(--bg-surface))]"
             role="status"
           >
-            <span className="font-medium">Plan mode</span>
-            {' — '}
-            Your next message follows the Plan flow (clarify → draft → approve → build).
+            <div className="flex items-center gap-2 text-fg flex-wrap">
+              <PlanModeIcon className="shrink-0 opacity-70" />
+              <span className="font-medium">Plan mode</span>
+              {planState.phase !== 'idle' && (
+                <>
+                  <span className="text-fg-muted">·</span>
+                  <span className="text-fg-secondary">{planPhaseLabel(planState.phase)}</span>
+                </>
+              )}
+              {planState.goal && planState.phase !== 'idle' && (
+                <>
+                  <span className="text-fg-muted">·</span>
+                  <span className="text-fg-muted truncate max-w-[240px]">{planState.goal.slice(0, 72)}</span>
+                </>
+              )}
+              {/* Open plan file link */}
+              {planState.plan_file_path && (
+                <button
+                  type="button"
+                  className="ml-auto chat-text-xs text-fg-muted hover:text-fg-secondary underline underline-offset-2 shrink-0"
+                  onClick={() => {
+                    if (typeof window !== 'undefined' && (window as any).electronAPI?.openPath) {
+                      (window as any).electronAPI.openPath(planState.plan_file_path);
+                    }
+                  }}
+                  title="Open plan file in editor"
+                >
+                  Open plan file
+                </button>
+              )}
+            </div>
+
+            {/* Executing: live todo progress strip */}
+            {planState.phase === 'executing' && planState.todos.length > 0 && (
+              <div className="mt-1.5 space-y-0.5">
+                {planState.todos.slice(0, 5).map((t) => (
+                  <div key={t.id} className="flex items-center gap-1.5">
+                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                      t.status === 'completed' ? 'bg-success' :
+                      t.status === 'in_progress' ? 'bg-accent animate-pulse' :
+                      t.status === 'blocked' ? 'bg-danger' :
+                      'bg-border'
+                    }`} />
+                    <span className={`chat-text-xs truncate ${
+                      t.status === 'completed' ? 'text-fg-muted line-through' :
+                      t.status === 'in_progress' ? 'text-fg' :
+                      'text-fg-muted'
+                    }`}>
+                      {t.title}
+                    </span>
+                  </div>
+                ))}
+                {planState.todos.length > 5 && (
+                  <div className="chat-text-xs text-fg-muted pl-3">
+                    +{planState.todos.length - 5} more
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
         {planBlocksChatSend && (
@@ -889,124 +1125,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             className="mb-2 rounded-lg border border-warning/35 bg-warning/10 px-3 py-1.5 chat-text-xs text-warning"
             role="alert"
           >
-            Please complete the questions above before sending a new chat message.
-          </div>
-        )}
-        {chatMode === 'plan' && (
-          <div className="mb-2 rounded-md border border-info/25 bg-info/8 px-3 py-2 space-y-2">
-            {/* ── Phase: clarifying / planning ── */}
-            {(planState.phase === 'clarifying' || planState.phase === 'planning') && (
-              <div className="flex items-center gap-2 chat-text-xs text-fg-muted">
-                <span className="inline-block w-2 h-2 rounded-full bg-accent animate-pulse" />
-                Researching & planning{planState.goal ? `: ${planState.goal.slice(0, 100)}` : '…'}
-              </div>
-            )}
-
-            {/* ── Phase: awaiting_decision (structured questions) ── */}
-            {planState.phase === 'awaiting_decision' && (
-              <>
-                {planState.pending_clarification && (
-                  <div className="chat-text-xs text-warning/90 border border-warning/25 rounded px-2 py-1 bg-warning/8">
-                    Please answer the questions below to continue.
-                  </div>
-                )}
-                {planState.questions.length > 0 && (
-                  <div className="space-y-2">
-                    {planState.questions.map((q) => (
-                      <PlanQuestionCard
-                        key={q.id}
-                        question={q}
-                        onChange={(selected) => onUpdatePlanDecision(q.id, selected)}
-                      />
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-
-            {/* ── Phase: awaiting_approval — plan draft + Build button ── */}
-            {planState.phase === 'awaiting_approval' && (
-              <>
-                {planState.plan_file_path && (
-                  <div className="flex items-center justify-between chat-text-xs text-fg-muted bg-surface rounded px-2 py-1">
-                    <span className="truncate" title={planState.plan_file_path}>
-                      Plan: {planState.plan_file_path}
-                    </span>
-                    <button
-                      type="button"
-                      className="ml-2 px-2 py-0.5 rounded border border-border text-fg-secondary hover:text-fg hover:border-fg-muted shrink-0"
-                      onClick={() => {
-                        if (typeof window !== 'undefined' && (window as any).electronAPI?.openPath) {
-                          (window as any).electronAPI.openPath(planState.plan_file_path);
-                        }
-                      }}
-                      title="Open plan file in editor"
-                    >
-                      Open
-                    </button>
-                  </div>
-                )}
-                {planState.draft && (
-                  <div className="chat-text-xs text-fg-secondary max-h-64 overflow-y-auto">
-                    <div className="prose prose-sm max-w-none dark:prose-invert">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {planState.draft.slice(0, 4000) + (planState.draft.length > 4000 ? '\n\n*[truncated]*' : '')}
-                      </ReactMarkdown>
-                    </div>
-                  </div>
-                )}
-                {planState.todos.length > 0 && (
-                  <details className="chat-text-xs text-fg-muted">
-                    <summary className="cursor-pointer text-fg-secondary">To-Do ({planState.todos.length})</summary>
-                    <div className="mt-1 space-y-1">
-                      {planState.todos.map((t) => (
-                        <div key={t.id} className="text-fg-muted">
-                          [{t.status}] {t.title}
-                          {t.depends_on && t.depends_on.length > 0 && (
-                            <span className="block text-[10px] text-fg-muted mt-0.5">
-                              Depends on: {t.depends_on.join(', ')}
-                            </span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-                <button
-                  type="button"
-                  onClick={onBuildPlan}
-                  className="chat-text-xs w-full px-3 py-2 rounded font-medium bg-accent text-fg-on-accent hover:brightness-110 transition"
-                  title="Approve plan and start execution"
-                >
-                  Start Build
-                </button>
-                <div className="chat-text-xs text-fg-muted text-center">
-                  Not what you expected? Describe changes in chat and I&apos;ll revise the plan.
-                </div>
-              </>
-            )}
-
-            {/* ── Phase: approved_waiting_build / executing ── */}
-            {(planState.phase === 'approved_waiting_build' || planState.phase === 'executing') && (
-              <>
-                <div className="flex items-center gap-2 chat-text-xs text-accent font-medium">
-                  <span className="inline-block w-2 h-2 rounded-full bg-accent animate-pulse" />
-                  Executing plan{planState.goal ? `: ${planState.goal.slice(0, 80)}` : '…'}
-                </div>
-                {planState.todos.length > 0 && (
-                  <div className="rounded border border-border-subtle bg-surface px-2 py-1">
-                    <div className="chat-text-xs text-fg-secondary mb-1">To-Do</div>
-                    <div className="space-y-1">
-                      {planState.todos.map((t) => (
-                        <div key={t.id} className="chat-text-xs text-fg-muted">
-                          <span className="text-fg-secondary">[{t.status}]</span> {t.title}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
+            Please complete the questions above before sending a new message.
           </div>
         )}
 
@@ -1020,7 +1139,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               />
               <button
                 onClick={() => setAttachedImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-white text-xs flex items-center justify-center"
+                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-fg-on-danger text-xs flex items-center justify-center"
                 aria-label="Remove image"
               >
                 ×
@@ -1053,7 +1172,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           {isRecording ? (
             <button
               onClick={stopRecording}
-              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-white animate-pulse"
+              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger animate-pulse"
               title="Click to stop recording"
               aria-label="Stop recording"
             >
@@ -1161,8 +1280,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             title={planBlocksChatSend ? 'Send disabled until plan questions are answered' : undefined}
             className={`p-2 rounded-lg transition-colors ${
               isRunning
-                ? 'bg-danger hover:bg-danger/85 text-white'
-                : 'bg-accent/85 hover:bg-accent text-white disabled:bg-surface-alt disabled:text-fg-muted'
+                ? 'bg-danger hover:bg-danger/85 text-fg-on-danger'
+                : 'bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted'
             }`}
           >
             {isRunning ? <Square className="w-5 h-5" /> : <Send className="w-5 h-5" />}
@@ -1212,7 +1331,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 onClick={() => onThinkingIntensityChange(level)}
                 className={`chat-text-xs px-2 py-0.5 rounded border transition-colors ${
                   thinkingIntensity === level
-                    ? 'bg-info/12 border-info/30 text-info'
+                    ? 'bg-info/10 border-info/30 text-info'
                     : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
                 }`}
               >

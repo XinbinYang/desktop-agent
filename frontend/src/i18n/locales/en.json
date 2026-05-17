@@ -114,6 +114,23 @@
     "newRole": "New Custom Role",
     "noRoles": "No custom roles yet"
   },
+  "connections": {
+    "title": "Platform Connections",
+    "addConnection": "Add Connection",
+    "noConnections": "No connections configured",
+    "start": "Start",
+    "stop": "Stop",
+    "running": "Running",
+    "stopped": "Stopped",
+    "error": "Error",
+    "botToken": "Bot Token",
+    "discord": "Discord",
+    "discordDesc": "Remote control your agent via Discord Bot, with DM and @mention support.",
+    "save": "Save",
+    "cancel": "Cancel",
+    "remove": "Remove",
+    "confirmRemove": "Are you sure you want to remove this connection?"
+  },
   "errors": {
     "title": "Something went wrong",
     "unknown": "Unknown error",

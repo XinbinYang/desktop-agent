@@ -1598,8 +1598,10 @@ def _evict_if_needed() -> None:
         _sessions.popitem(last=False)
 
 
-def get_or_create_session(session_id: str, model_id: str, role_id: str = "desktop-agent", agent_type: str | None = None) -> AgentSession:
+def get_or_create_session(session_id: str, model_id: str, role_id: str | None = None, agent_type: str | None = None) -> AgentSession:
     existing = _sessions.get(session_id)
+    provided_role_id = role_id
+    role_id = role_id or (AgentManager.get_default_role(agent_type) if agent_type else "desktop-agent")
     resolved_agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
     loaded_from_disk = False
     if existing is None:
@@ -1616,11 +1618,11 @@ def get_or_create_session(session_id: str, model_id: str, role_id: str = "deskto
     if agent_type and session.agent_type != resolved_agent_type:
         session.switch_agent(resolved_agent_type)
         changed = True
-    elif role_id and role_id != session.role_id and AgentManager.get_agent_type_for_role(role_id) != session.agent_type:
+    elif provided_role_id and role_id != session.role_id:
         session.switch_role(role_id)
         changed = True
 
-    should_keep_loaded_model = loaded_from_disk and agent_type is None and role_id == "desktop-agent"
+    should_keep_loaded_model = loaded_from_disk and agent_type is None and provided_role_id is None
     if model_id and session.model_id != model_id and not should_keep_loaded_model:
         session.model_id = model_id
         session.router = ModelRouter(model_id)

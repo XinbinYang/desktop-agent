@@ -1,21 +1,14 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { Sidebar } from '../../components/Sidebar'
-import type { RoleInfo } from '../../types'
 
 describe('Sidebar', () => {
-  const mockRoles: RoleInfo[] = [
-    { id: 'desktop-agent', name: '桌面助手', description: '全能助手', isBuiltin: true },
-    { id: 'code-expert', name: '代码专家', description: '专注代码', isBuiltin: true },
-  ]
-
   const defaultProps = {
     activeSection: 'tools' as const,
+    activeAgent: 'personal' as const,
     onSectionChange: vi.fn(),
-    roles: mockRoles,
-    currentRole: 'desktop-agent',
-    onRoleChange: vi.fn(),
-    onOpenRoleEditor: vi.fn(),
+    agentModel: 'gpt-4o',
+    onOpenPersonalWorkspace: vi.fn(),
     onOpenSettings: vi.fn(),
     onClear: vi.fn(),
     onExecuteTool: vi.fn(),
@@ -30,6 +23,7 @@ describe('Sidebar', () => {
 
   it('shows settings content when activeSection is settings', () => {
     render(<Sidebar {...defaultProps} activeSection="settings" />)
+    expect(screen.getByText('Active Agent')).toBeInTheDocument()
     expect(screen.getByText('Open Full Settings')).toBeInTheDocument()
   })
 
@@ -37,16 +31,15 @@ describe('Sidebar', () => {
     const onOpenSettings = vi.fn()
     render(<Sidebar {...defaultProps} activeSection="settings" onOpenSettings={onOpenSettings} />)
 
-    const openBtn = screen.getByText('Open Full Settings')
-    fireEvent.click(openBtn)
+    fireEvent.click(screen.getByText('Open Full Settings'))
 
     expect(onOpenSettings).toHaveBeenCalled()
   })
 
-  it('shows role selector in settings section', () => {
+  it('does not expose the legacy role selector in settings section', () => {
     render(<Sidebar {...defaultProps} activeSection="settings" />)
 
-    expect(screen.getByDisplayValue('桌面助手')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Select role')).not.toBeInTheDocument()
   })
 
   it('shows knowledge content when activeSection is knowledge', () => {
@@ -59,8 +52,7 @@ describe('Sidebar', () => {
     const onClear = vi.fn()
     render(<Sidebar {...defaultProps} onClear={onClear} />)
 
-    const clearButton = screen.getByText('Clear Session')
-    fireEvent.click(clearButton)
+    fireEvent.click(screen.getByText('Clear Session'))
 
     expect(onClear).toHaveBeenCalled()
   })
@@ -69,14 +61,13 @@ describe('Sidebar', () => {
     const onExecuteTool = vi.fn()
     render(<Sidebar {...defaultProps} onExecuteTool={onExecuteTool} />)
 
-    const screenshotBtn = screen.getByText('Screenshot')
-    fireEvent.click(screenshotBtn)
+    fireEvent.click(screen.getByText('Screenshot'))
 
     expect(onExecuteTool).toHaveBeenCalledWith('screenshot', {})
   })
 
   it('shows connected status', () => {
-    render(<Sidebar {...defaultProps} isConnected={true} />)
+    render(<Sidebar {...defaultProps} isConnected />)
     expect(screen.getByText('Connected')).toBeInTheDocument()
   })
 

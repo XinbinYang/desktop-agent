@@ -11,20 +11,21 @@ describe('ToolCallView', () => {
       result: 'file contents here',
       timestamp: Date.now(),
     }
-    render(<ToolCallView toolCall={toolCall} />)
+    render(<ToolCallView name={toolCall.name} args={toolCall.args} result={toolCall.result} status="success" />)
     expect(screen.getByText('file_read')).toBeInTheDocument()
-    expect(screen.getByText('成功')).toBeInTheDocument()
   })
 
-  it('shows error status for error results', () => {
+  it('shows error styling for error status', () => {
     const toolCall: ToolCall = {
       name: 'dangerous_op',
       args: {},
       result: '[ERROR] Something failed',
       timestamp: Date.now(),
     }
-    render(<ToolCallView toolCall={toolCall} />)
-    expect(screen.getByText('失败')).toBeInTheDocument()
+    const { container } = render(
+      <ToolCallView name={toolCall.name} args={toolCall.args} result={toolCall.result} status="error" />,
+    )
+    expect(container.querySelector('button .text-danger')).toBeTruthy()
   })
 
   it('expands to show args and result on click', () => {
@@ -34,14 +35,13 @@ describe('ToolCallView', () => {
       result: 'file contents here',
       timestamp: Date.now(),
     }
-    render(<ToolCallView toolCall={toolCall} />)
-    fireEvent.click(screen.getByLabelText('展开工具调用详情'))
-    expect(screen.getByText('参数:')).toBeInTheDocument()
-    expect(screen.getByText('结果:')).toBeInTheDocument()
+    render(<ToolCallView name={toolCall.name} args={toolCall.args} result={toolCall.result} status="success" />)
+    fireEvent.click(screen.getByLabelText('Expand tool call details'))
+    expect(screen.getByText(/"path":\s*"test.txt"/)).toBeInTheDocument()
     expect(screen.getByText('file contents here')).toBeInTheDocument()
   })
 
-  it('shows runId and toolCallId when present', () => {
+  it('does not surface runId or toolCallId in header-only layout', () => {
     const toolCall: ToolCall = {
       name: 'file_read',
       args: {},
@@ -50,10 +50,10 @@ describe('ToolCallView', () => {
       runId: 'run-123',
       toolCallId: 'call-456',
     }
-    render(<ToolCallView toolCall={toolCall} />)
-    fireEvent.click(screen.getByLabelText('展开工具调用详情'))
-    expect(screen.getByText(/run-123/)).toBeInTheDocument()
-    expect(screen.getByText(/call-456/)).toBeInTheDocument()
+    render(<ToolCallView name={toolCall.name} args={toolCall.args} result={toolCall.result} status="success" />)
+    fireEvent.click(screen.getByLabelText('Expand tool call details'))
+    expect(screen.queryByText(/run-123/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/call-456/)).not.toBeInTheDocument()
   })
 
   it('renders WorkerCard for dispatch_worker tool calls', () => {
@@ -63,27 +63,41 @@ describe('ToolCallView', () => {
       result: 'Worker completed',
       timestamp: Date.now(),
       workerEvents: [
-        { workerId: 'w1', type: 'worker_start', status: 'running' },
+        { workerId: 'w1', type: 'worker_start', status: 'running', task: 'Write tests' },
         { workerId: 'w1', type: 'worker_content', text: 'Writing tests...' },
         {
-          workerId: 'w1', type: 'worker_tool_call',
-          toolName: 'file_write', toolResult: 'File written',
+          workerId: 'w1',
+          type: 'worker_tool_call',
+          toolName: 'file_write',
+          toolResult: 'File written',
         },
         {
-          workerId: 'w1', type: 'worker_done',
-          status: 'completed', result: 'All done', iterations: 3, durationMs: 5000,
+          workerId: 'w1',
+          type: 'worker_done',
+          status: 'completed',
+          result: 'All done',
+          iterations: 3,
+          durationMs: 5000,
         },
       ] as WorkerEvent[],
-    };
-    render(<ToolCallView toolCall={toolCall} />);
-    fireEvent.click(screen.getByLabelText('展开工具调用详情'));
-    expect(screen.getByText('Worker: w1')).toBeInTheDocument();
-    expect(screen.getByText('Done')).toBeInTheDocument();
-    expect(screen.getByText('file_write')).toBeInTheDocument();
-    expect(screen.getByText('All done')).toBeInTheDocument();
-  });
+    }
+    render(
+      <ToolCallView
+        name={toolCall.name}
+        args={toolCall.args}
+        result={toolCall.result}
+        status="success"
+        workerEvents={toolCall.workerEvents}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Expand tool call details'))
+    expect(screen.getByText(/Agent: Write tests/)).toBeInTheDocument()
+    fireEvent.click(screen.getByText(/Agent: Write tests/).closest('button')!)
+    expect(screen.getByText('file_write')).toBeInTheDocument()
+    expect(screen.getByText('All done')).toBeInTheDocument()
+  })
 
-  it('renders multiple WorkerCards for dispatch_parallel', () => {
+  it('renders multiple workers for dispatch_parallel', () => {
     const toolCall = {
       name: 'dispatch_parallel',
       args: { tasks: [{ task: 'A' }, { task: 'B' }] },
@@ -93,23 +107,38 @@ describe('ToolCallView', () => {
         { workerId: 'w1', type: 'worker_done', status: 'completed', result: 'Done A' },
         { workerId: 'w2', type: 'worker_done', status: 'completed', result: 'Done B' },
       ] as WorkerEvent[],
-    };
-    render(<ToolCallView toolCall={toolCall} />);
-    expect(screen.getByText('2 worker(s)')).toBeInTheDocument();
-  });
+    }
+    render(
+      <ToolCallView
+        name={toolCall.name}
+        args={toolCall.args}
+        result={toolCall.result}
+        status="success"
+        workerEvents={toolCall.workerEvents}
+      />,
+    )
+    expect(screen.getByText('2 agents')).toBeInTheDocument()
+  })
 
-  it('shows error status for failed workers', () => {
+  it('shows failed worker result when expanded', () => {
     const toolCall = {
       name: 'dispatch_worker',
       args: { task: 'Bad task', profile: 'code' },
       result: 'Worker failed',
       timestamp: Date.now(),
-      workerEvents: [
-        { workerId: 'w1', type: 'worker_done', status: 'failed', result: 'Error occurred' },
-      ] as WorkerEvent[],
-    };
-    render(<ToolCallView toolCall={toolCall} />);
-    fireEvent.click(screen.getByLabelText('展开工具调用详情'));
-    expect(screen.getByText('failed')).toBeInTheDocument();
-  });
+      workerEvents: [{ workerId: 'w1', type: 'worker_done', status: 'failed', result: 'Error occurred' }] as WorkerEvent[],
+    }
+    render(
+      <ToolCallView
+        name={toolCall.name}
+        args={toolCall.args}
+        result={toolCall.result}
+        status="error"
+        workerEvents={toolCall.workerEvents}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Expand tool call details'))
+    fireEvent.click(screen.getByText(/Agent: w1/).closest('button')!)
+    expect(screen.getByText('Error occurred')).toBeInTheDocument()
+  })
 })

@@ -1,10 +1,11 @@
 import React, { createContext, useContext, useCallback, useRef } from 'react';
-import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, ClientChatMode, ThinkingIntensity } from '../types';
+import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, ClientChatMode, ThinkingIntensity, AgentType } from '../types';
 
 // ---- Types ----
 
 export interface SessionSnapshot {
   sessionId: string;
+  agentType: AgentType;
   isRunning: boolean;
   isConnected: boolean;
   chatMode: ClientChatMode;

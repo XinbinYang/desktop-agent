@@ -95,3 +95,53 @@ description: 全能桌面助手，支持文件操作、终端命令、浏览器�
 - backtest_run 参数: strategy_name(策略名), codes(资产代码), start_date/end_date, params(策略参数字典)。
 - 回测默认佣金万3，初始资金10万。建议先单标的测试。
 - 支持标的示例: 600519.SH(A股), ^GSPC(标普500), HSI(恒生), WTI_Crude(原油), EURUSD(欧元美元), US_Bond_10Y(美债10年)。
+
+## 编码工作流（Coding Workflow）— 涉及写代码的任务必须遵守
+
+**核心原则：并行探索、先读后写、写后必验、大任务分层分发。**
+
+### 1. 规模匹配策略
+
+| 任务规模 | 判断标准 | 执行方式 |
+|---------|---------|---------|
+| **小** | 1-2 个文件、已知位置的明确 bug | 直接内联编辑 → `verify_project` → 完成 |
+| **中** | 3-6 个文件 或 范围不确定 | `dispatch_parallel(explorer×N)` 并行探索各子系统 → `dispatch_worker(architect)` 产出计划 → `dispatch_worker(editor)` 实现 → `verify_project` |
+| **大** | 新功能 / 跨模块重构 / 架构变更 | 并行 explorer → architect → 多个并行 editor → verifier → reviewer，全流程 |
+
+### 2. 强制规则
+
+1. **并行探索优先**：面对不熟悉的代码库或需要读取 3+ 个文件时，**禁止逐个内联读取**。必须用 `dispatch_parallel` 同时派遣多个 `explorer` worker，每个覆盖一个子系统（如 API层、核心逻辑、前端、测试）。并行探索完成后再汇总进行决策。
+2. **验证是完成的前提**：修改了任何文件后，必须运行 `verify_project`（或 `shell_execute` 执行测试/类型检查命令）。不能说"应该可以"——必须用结果证明。
+3. **完成前运行 `run_review`**：提交成果前调用 `run_review` 检查风险，将阻塞性发现告知用户。
+4. **不改测试来通过测试**：如果测试失败，修复实现代码——除非用户明确要求修改测试。
+5. **链式分发上下文**：用 `dispatch_worker(editor, prior_context=<explorer/architect输出>)` 将前序 worker 的产出传给后序 worker，不要让 editor 凭空实现。
+
+### 3. Worker 分工说明
+
+- **explorer**（首先并行派遣）：只读指定代码区域，产出结构化报告（关键文件、核心符号、架构注释），绝不写代码
+- **architect**：读取 explorer 报告，产出精确执行计划（文件路径:行号 + 步骤 + 风险），绝不写代码
+- **editor**：先读 architect 计划，再读要修改的文件，用 `file_patch` 精确编辑，编辑后自己运行验证
+- **verifier**：先看 `git_diff` 了解改动，运行 `verify_project`，报告通过/失败及根本原因
+- **reviewer**：运行 `run_review`，检查代码质量和合规性，输出结构化发现
+
+### 示例：正确的探索方式
+
+```
+# 错误：逐个串行读文件（慢）
+file_read("app/agent.py") → file_read("app/worker.py") → file_read("app/tools/...") → ...
+
+# 正确：并行多 explorer（快）
+dispatch_parallel([
+  {task: "探索 backend/app/ 核心模块（agent, worker, config）", profile: "explorer"},
+  {task: "探索 backend/app/tools/ 所有工具实现",              profile: "explorer"},
+  {task: "探索 backend/app/routes/ + main.py API层",         profile: "explorer"},
+  {task: "探索 frontend/src/ 前端结构与状态管理",              profile: "explorer"},
+])
+```
+
+### 4. 任务完成标准
+
+只有同时满足以下条件才能声称任务完成：
+- [ ] 所有修改文件均已通过 `verify_project` 验证
+- [ ] `run_review` 无阻塞性发现（或已告知用户）
+- [ ] 没有遗留 TODO / 占位代码 / "待实现" 注释

@@ -63,7 +63,7 @@ export const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const renderContent = () => {
     if (!activeItem) {
       return (
-        <div className="h-full flex flex-col items-center justify-center text-gray-500">
+        <div className="h-full flex flex-col items-center justify-center text-fg-muted">
           <div className="text-sm">选择一个成果查看</div>
         </div>
       );
@@ -78,13 +78,13 @@ export const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
         return <CodeViewer content={activeItem.content || ''} filename={activeItem.title} />;
       case 'data':
         return activeItem.title.endsWith('.json')
-          ? <pre className="h-full overflow-auto p-4 text-xs font-mono text-gray-300">{activeItem.content}</pre>
+          ? <pre className="h-full overflow-auto p-4 text-xs font-mono text-fg-secondary">{activeItem.content}</pre>
           : <DataTable content={activeItem.content || ''} />;
       case 'terminal':
         return <TerminalOutput content={activeItem.content || ''} />;
       case 'video':
         return (
-          <div className="h-full flex items-center justify-center bg-gray-950 p-4">
+          <div className="h-full flex items-center justify-center bg-app p-4">
             <video
               src={activeItem.url}
               controls
@@ -98,9 +98,9 @@ export const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   };
 
   return (
-    <div ref={containerRef} className="h-full flex bg-gray-900 relative">
+    <div ref={containerRef} className="h-full flex bg-app relative">
       {/* 左侧成果列表 */}
-      <div className="w-44 border-r border-gray-700 shrink-0">
+      <div className="w-44 border-r border-border shrink-0">
         <ArtifactList
           artifacts={artifacts}
           activeId={activeId}

@@ -162,21 +162,21 @@ export function KnowledgePanel() {
     <div className="h-full flex flex-col text-sm">
       {/* Error banner */}
       {error && (
-        <div className="px-3 py-1.5 bg-red-900/30 border-b border-red-800 flex items-center justify-between">
-          <span className="text-xs text-red-400">{error}</span>
-          <button type="button" onClick={() => setError(null)} className="text-red-400 hover:text-red-300 text-xs"><X size={12} /></button>
+        <div className="px-3 py-1.5 bg-danger/10 border-b border-danger/30 flex items-center justify-between">
+          <span className="text-xs text-danger">{error}</span>
+          <button type="button" onClick={() => setError(null)} className="text-danger hover:text-danger/80 text-xs"><X size={12} /></button>
         </div>
       )}
 
       {/* Header */}
-      <div className="px-3 py-2 border-b border-gray-700">
+      <div className="px-3 py-2 border-b border-border">
         <div className="flex items-center gap-2 mb-1">
-          <BookOpen size={14} className="text-blue-400" />
-          <span className="font-semibold text-gray-200">知识库</span>
-          {loading && <Loader2 size={14} className="animate-spin text-gray-400" />}
+          <BookOpen size={14} className="text-accent" />
+          <span className="font-semibold text-fg">知识库</span>
+          {loading && <Loader2 size={14} className="animate-spin text-fg-secondary" />}
         </div>
         {stats && stats.total_chunks > 0 && (
-          <div className="text-[10px] text-gray-500 mb-1">
+          <div className="text-[10px] text-fg-muted mb-1">
             {stats.source_count} 文件 · {stats.total_chunks} 块 · {stats.db_size_mb} MB
           </div>
         )}
@@ -186,25 +186,25 @@ export function KnowledgePanel() {
             value={inputPath}
             onChange={(e) => setInputPath(e.target.value)}
             placeholder="输入文件或文件夹路径..."
-            className="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            className="flex-1 bg-surface border border-border-subtle rounded px-2 py-1 text-xs text-fg placeholder-fg-muted focus:outline-none focus:border-accent"
             onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
           />
           <button
             onClick={handlePickFolder}
             title="选择文件夹"
-            className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-gray-300"
+            className="px-2 py-1 bg-surface-alt hover:bg-surface-hover rounded text-fg-secondary"
           >
             <FolderOpen size={14} />
           </button>
           <button
             onClick={handleAdd}
             disabled={loading || !inputPath.trim()}
-            className="px-2 py-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded text-white"
+            className="px-2 py-1 bg-accent/85 hover:bg-accent disabled:opacity-50 rounded text-fg-on-accent"
           >
             <Plus size={14} />
           </button>
         </div>
-        <label className="flex items-center gap-1 mt-1 text-xs text-gray-400">
+        <label className="flex items-center gap-1 mt-1 text-xs text-fg-secondary">
           <input
             type="checkbox"
             checked={recursive}
@@ -216,20 +216,20 @@ export function KnowledgePanel() {
       </div>
 
       {/* Search */}
-      <div className="px-3 py-2 border-b border-gray-700">
+      <div className="px-3 py-2 border-b border-border">
         <div className="flex gap-1">
           <input
             type="text"
             value={query}
             onChange={(e) => handleQueryChange(e.target.value)}
             placeholder="搜索知识库..."
-            className="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            className="flex-1 bg-surface border border-border-subtle rounded px-2 py-1 text-xs text-fg placeholder-fg-muted focus:outline-none focus:border-accent"
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
           />
           <button
             onClick={handleSearch}
             disabled={searching || !query.trim()}
-            className="px-2 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded text-gray-300"
+            className="px-2 py-1 bg-surface-alt hover:bg-surface-hover disabled:opacity-50 rounded text-fg-secondary"
           >
             {searching ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
           </button>
@@ -238,18 +238,18 @@ export function KnowledgePanel() {
 
       {/* Search results */}
       {searchResults.length > 0 && (
-        <div className="px-3 py-2 border-b border-gray-700 max-h-48 overflow-y-auto">
-          <div className="text-xs font-semibold text-gray-400 mb-1">搜索结果</div>
+        <div className="px-3 py-2 border-b border-border max-h-48 overflow-y-auto">
+          <div className="text-xs font-semibold text-fg-secondary mb-1">搜索结果</div>
           {searchResults.map((r) => (
-            <div key={r.chunk_id} className="mb-2 p-2 bg-gray-800 rounded">
-              <div className="text-xs text-blue-400 truncate">{r.source_path}</div>
-              <div className="text-xs text-gray-500">相关度: {r.score}</div>
-              <div className="text-xs text-gray-300 mt-1 line-clamp-3 whitespace-pre-wrap">{r.content}</div>
+            <div key={r.chunk_id} className="mb-2 p-2 bg-surface rounded">
+              <div className="text-xs text-accent truncate">{r.source_path}</div>
+              <div className="text-xs text-fg-muted">相关度: {r.score}</div>
+              <div className="text-xs text-fg-secondary mt-1 line-clamp-3 whitespace-pre-wrap">{r.content}</div>
             </div>
           ))}
           <button
             onClick={() => setSearchResults([])}
-            className="text-xs text-gray-500 hover:text-gray-300"
+            className="text-xs text-fg-muted hover:text-fg-secondary"
           >
             清除结果
           </button>
@@ -258,14 +258,14 @@ export function KnowledgePanel() {
 
       {/* Saved paths — quick reindex */}
       {savedPaths.length > 0 && (
-        <div className="px-3 py-2 border-b border-gray-700">
-          <div className="text-xs font-semibold text-gray-400 mb-1">已保存路径</div>
+        <div className="px-3 py-2 border-b border-border">
+          <div className="text-xs font-semibold text-fg-secondary mb-1">已保存路径</div>
           <div className="space-y-1 max-h-32 overflow-y-auto">
             {savedPaths.map((sp) => (
-              <div key={sp.path} className="flex items-center justify-between bg-gray-800 rounded px-2 py-1">
+              <div key={sp.path} className="flex items-center justify-between bg-surface rounded px-2 py-1">
                 <div className="flex-1 min-w-0">
-                  <div className="text-xs text-gray-300 truncate" title={sp.path}>{sp.path}</div>
-                  <div className="text-[10px] text-gray-500">
+                  <div className="text-xs text-fg-secondary truncate" title={sp.path}>{sp.path}</div>
+                  <div className="text-[10px] text-fg-muted">
                     {sp.recursive ? '递归' : '非递归'} · {new Date(sp.addedAt).toLocaleDateString()}
                   </div>
                 </div>
@@ -274,7 +274,7 @@ export function KnowledgePanel() {
                     type="button"
                     onClick={() => handleReindex(sp.path, sp.recursive)}
                     disabled={reindexingPath === sp.path}
-                    className="px-1 py-0.5 text-blue-400 hover:text-blue-300 disabled:opacity-50"
+                    className="px-1 py-0.5 text-accent hover:text-accent/80 disabled:opacity-50"
                     title="重新索引"
                   >
                     {reindexingPath === sp.path ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
@@ -282,7 +282,7 @@ export function KnowledgePanel() {
                   <button
                     type="button"
                     onClick={() => handleRemovePath(sp.path)}
-                    className="px-1 py-0.5 text-red-400 hover:text-red-300"
+                    className="px-1 py-0.5 text-danger hover:text-danger/80"
                     title="移除路径"
                   >
                     <Trash2 size={12} />
@@ -297,23 +297,23 @@ export function KnowledgePanel() {
       {/* Doc list */}
       <div className="flex-1 overflow-y-auto px-3 py-2">
         {docs.length === 0 && savedPaths.length === 0 ? (
-          <div className="text-xs text-gray-500 text-center mt-4">知识库为空，添加文件或文件夹开始索引</div>
+          <div className="text-xs text-fg-muted text-center mt-4">知识库为空，添加文件或文件夹开始索引</div>
         ) : docs.length === 0 ? (
-          <div className="text-xs text-gray-500 text-center mt-4">点击上方路径旁的刷新按钮重新索引</div>
+          <div className="text-xs text-fg-muted text-center mt-4">点击上方路径旁的刷新按钮重新索引</div>
         ) : (
           <div className="space-y-1">
             {docs.map((doc) => (
               <div
                 key={doc.source_path}
-                className="flex items-center justify-between p-2 bg-gray-800 rounded hover:bg-gray-750 group"
+                className="flex items-center justify-between p-2 bg-surface rounded hover:bg-surface-hover group"
               >
                 <div className="flex-1 min-w-0">
-                  <div className="text-xs text-gray-300 truncate">{doc.source_path}</div>
-                  <div className="text-xs text-gray-500">{doc.chunk_count} chunks</div>
+                  <div className="text-xs text-fg-secondary truncate">{doc.source_path}</div>
+                  <div className="text-xs text-fg-muted">{doc.chunk_count} chunks</div>
                 </div>
                 <button
                   onClick={() => handleDelete(doc.source_path)}
-                  className="opacity-0 group-hover:opacity-100 px-1 py-1 text-red-400 hover:text-red-300 transition-opacity"
+                  className="opacity-0 group-hover:opacity-100 px-1 py-1 text-danger hover:text-danger/80 transition-opacity"
                 >
                   <Trash2 size={12} />
                 </button>

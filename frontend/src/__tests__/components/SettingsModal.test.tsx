@@ -106,6 +106,8 @@ describe('SettingsModal', () => {
       />
     );
 
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
     expect(await screen.findByText('sk-...BwOW')).toBeInTheDocument();
   });
 
@@ -122,6 +124,8 @@ describe('SettingsModal', () => {
       />
     );
 
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
     expect(await screen.findByText('2 个模型')).toBeInTheDocument();
     expect(screen.getByText('1 个模型')).toBeInTheDocument();
   });
@@ -139,6 +143,8 @@ describe('SettingsModal', () => {
       />
     );
 
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
     expect(await screen.findByText('默认')).toBeInTheDocument();
   });
 
@@ -180,7 +186,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
-    // "openai" appears in multiple places (dropdown + card)
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     const editButtons = screen.getAllByTitle('编辑');
     fireEvent.click(editButtons[0]);
 
@@ -206,6 +213,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     fireEvent.click(screen.getAllByTitle('编辑')[0]);
     await screen.findByText(/编辑 openai/);
     fireEvent.click(screen.getByText('保存 Provider'));
@@ -241,6 +250,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     fireEvent.click(screen.getAllByTitle('编辑')[0]);
     await screen.findByText(/编辑 openai/);
     fireEvent.click(screen.getByTitle('Test connection'));

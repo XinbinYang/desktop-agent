@@ -138,6 +138,60 @@ class TestDispatchParallelTool:
         assert "1 failed" in result.output
 
     @pytest.mark.asyncio
+    async def test_dispatch_parallel_per_task_model_context_and_acceptance(self):
+        from app.config import list_all_models
+        model_ids = [m["id"] for m in list_all_models()]
+        first_model = model_ids[0]
+        second_model = model_ids[-1]
+        seen = []
+
+        async def replacement_run(self):
+            seen.append({
+                "model_id": self.model_id,
+                "profile": self.profile.name,
+                "task": self.task,
+                "context_files": self._context_files,
+            })
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Task completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(
+                tasks=[
+                    {
+                        "task": "Explore API",
+                        "profile": "explorer",
+                        "model_id": first_model,
+                        "agent_type": "coding",
+                        "context_files": ["backend/app/main.py"],
+                        "prior_context": "Manager notes",
+                        "acceptance_criteria": ["Return key routes"],
+                    },
+                    {
+                        "task": "Review diff",
+                        "profile": "reviewer",
+                        "model_id": second_model,
+                    },
+                ],
+                model_id=first_model,
+            )
+
+        assert "2 succeeded" in result.output
+        assert seen[0]["model_id"] == first_model
+        assert seen[0]["profile"] == "explorer"
+        assert "Manager notes" in seen[0]["task"]
+        assert "Return key routes" in seen[0]["task"]
+        assert seen[0]["context_files"] == ["backend/app/main.py"]
+        assert seen[1]["model_id"] == second_model
+        assert seen[1]["profile"] == "reviewer"
+
+    @pytest.mark.asyncio
     async def test_dispatch_parallel_empty_tasks(self, mock_litellm):
         tool = DispatchParallelTool()
         result = await tool.execute(tasks=[])

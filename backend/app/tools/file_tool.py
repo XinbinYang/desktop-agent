@@ -73,6 +73,13 @@ def build_file_edit_metadata(path: Path, old_content: str, new_content: str, exi
 def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]:
     """Return (base_path, error_message). When error_message is set, base_path is the fallback."""
     if project_relative:
+        try:
+            from app.coding_runs import get_run_context
+            ctx = get_run_context()
+            if ctx and ctx.active_path:
+                return Path(ctx.active_path).resolve(), None
+        except Exception:
+            pass
         project = ProjectManager.get_current()
         if project:
             return Path(project["path"]).resolve(), None
@@ -85,6 +92,12 @@ def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Opt
     from app.config import load_config
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
+            candidate = Path(path)
+            if project_relative and not candidate.is_absolute():
+                base, base_err = _get_base_path(project_relative=True)
+                if base_err:
+                    return base, base_err
+                return (base / candidate).resolve(), None
             return Path(path).resolve(), None
         except (OSError, ValueError) as e:
             return Path(path), f"Invalid path: {path} ({e})"
@@ -112,7 +125,18 @@ class FileReadTool(BaseTool):
         "required": ["path"]
     }
 
-    async def execute(self, path: str, offset: int = 0, limit: int = 200, project_relative: bool = False) -> ToolResult:
+    async def execute(
+        self,
+        path: str = "",
+        offset: int = 0,
+        limit: int = 200,
+        project_relative: bool = False,
+        file_path: str = "",
+    ) -> ToolResult:
+        if not path:
+            path = file_path
+        if not path:
+            return ToolResult(error="Missing required argument: path")
         p, err = _validate_path(path, project_relative)
         if err:
             return ToolResult(error=err)

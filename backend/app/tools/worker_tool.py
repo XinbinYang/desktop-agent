@@ -81,6 +81,10 @@ class DispatchWorkerTool(BaseTool):
                 "items": {"type": "string"},
                 "description": "List of file paths to inject as context into the worker's system prompt.",
             },
+            "prior_context": {
+                "type": "string",
+                "description": "Output from previous workers (e.g. architect plan, prior summaries). Prepended to task so worker has full context.",
+            },
         },
         "required": ["task"],
     }
@@ -91,6 +95,7 @@ class DispatchWorkerTool(BaseTool):
         profile: str = "code",
         model_id: str = "",
         context_files: Optional[List[str]] = None,
+        prior_context: str = "",
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
@@ -99,10 +104,14 @@ class DispatchWorkerTool(BaseTool):
         if not model_id:
             model_id = load_config().settings.default_model
 
+        full_task = task
+        if prior_context:
+            full_task = f"## Prior Work Context\n{prior_context[:3000]}\n\n## Your Task\n{task}"
+
         worker_id = f"worker_{uuid.uuid4().hex[:8]}"
         worker = WorkerSession(
             worker_id=worker_id,
-            task=task,
+            task=full_task,
             profile_name=profile,
             model_id=model_id,
             context_files=context_files,
@@ -153,6 +162,19 @@ class DispatchParallelTool(BaseTool):
                     "properties": {
                         "task": {"type": "string", "description": "Task description for this worker."},
                         "profile": {"type": "string", "enum": list(WORKER_PROFILES.keys()), "default": "code"},
+                        "model_id": {"type": "string", "description": "Optional model ID for this worker only."},
+                        "agent_type": {"type": "string", "enum": ["coding", "personal"], "description": "Optional logical agent type for routing/trace context."},
+                        "context_files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional files to inject into this worker's context.",
+                        },
+                        "prior_context": {"type": "string", "description": "Prior worker output or manager notes for this worker."},
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Concrete criteria the worker must satisfy in its result.",
+                        },
                     },
                     "required": ["task"],
                 },
@@ -169,7 +191,7 @@ class DispatchParallelTool(BaseTool):
 
     async def execute(
         self,
-        tasks: List[Dict[str, str]],
+        tasks: List[Dict[str, Any]],
         model_id: str = "",
         session_id: str = "",
         run_id: str = "",
@@ -181,14 +203,27 @@ class DispatchParallelTool(BaseTool):
 
         started_at = time.time()
 
-        async def run_one(idx: int, task_spec: Dict[str, str]) -> Dict[str, Any]:
+        async def run_one(idx: int, task_spec: Dict[str, Any]) -> Dict[str, Any]:
             worker_id = f"worker_{uuid.uuid4().hex[:6]}_{idx}"
             profile_name = task_spec.get("profile", "code")
+            worker_model = task_spec.get("model_id") or model_id
+            worker_task = task_spec["task"]
+            prior_context = task_spec.get("prior_context") or ""
+            acceptance = task_spec.get("acceptance_criteria") or []
+            agent_type = task_spec.get("agent_type") or "coding"
+            if prior_context:
+                worker_task = f"## Prior Work Context\n{str(prior_context)[:3000]}\n\n## Your Task\n{worker_task}"
+            if acceptance:
+                criteria = "\n".join(f"- {item}" for item in acceptance if item)
+                worker_task = f"{worker_task}\n\n## Acceptance Criteria\n{criteria}"
+            if agent_type:
+                worker_task = f"## Agent Type\n{agent_type}\n\n{worker_task}"
             worker = WorkerSession(
                 worker_id=worker_id,
-                task=task_spec["task"],
+                task=worker_task,
                 profile_name=profile_name,
-                model_id=model_id,
+                model_id=worker_model,
+                context_files=task_spec.get("context_files"),
                 run_id=run_id,
                 parent_tool_call_id=tool_call_id,
             )
@@ -206,6 +241,8 @@ class DispatchParallelTool(BaseTool):
             return {
                 "worker_id": worker_id,
                 "profile": profile_name,
+                "model_id": worker_model,
+                "agent_type": agent_type,
                 "task": task_spec["task"],
                 "result": final,
                 "iterations": worker.iteration,
@@ -231,7 +268,7 @@ class DispatchParallelTool(BaseTool):
                 result: Dict[str, Any] = result_raw  # type: ignore[assignment]
                 success_count += 1
                 output_parts.append(
-                    f"  {result['worker_id']} ({result['profile']}): "
+                    f"  {result['worker_id']} ({result['profile']}, {result['model_id']}): "
                     f"{result['iterations']} iterations - {result['result'][:300]}"
                 )
 

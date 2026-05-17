@@ -1,12 +1,17 @@
 import base64
 import json
+import logging
 import os
 import platform
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from app.runtime_paths import runtime_dir
+
+logger = logging.getLogger(__name__)
 
 # 凭据存储文件
 PROJECTS_DIR = runtime_dir("projects")
@@ -36,7 +41,7 @@ def _encrypt_blob(plaintext: bytes) -> Tuple[bytes, bool]:
             )
             return bytes(blob), True
         except Exception as exc:
-            print(f"[CredentialManager] DPAPI encrypt failed, falling back to plaintext: {exc}")
+            logger.warning("[CredentialManager] DPAPI encrypt failed, falling back to plaintext: {exc}")
     return plaintext, False
 
 
@@ -64,6 +69,8 @@ class CredentialManager:
     """管理 Git 凭据：优先使用系统 GCM，fallback 到本地加密存储"""
 
     _credentials_cache: Optional[Dict[str, Dict[str, str]]] = None
+    _cache_loaded_at: float = 0.0
+    _CACHE_TTL: float = 300.0
 
     @classmethod
     def has_gcm(cls) -> bool:
@@ -114,12 +121,14 @@ class CredentialManager:
     @classmethod
     def _load_credentials(cls) -> Dict[str, Dict[str, str]]:
         """加载凭据：优先 DPAPI 文件；不存在时迁移旧明文文件。"""
-        if cls._credentials_cache is not None:
+        now = time.time()
+        if cls._credentials_cache is not None and (now - cls._cache_loaded_at) < cls._CACHE_TTL:
             return cls._credentials_cache
 
         data = cls._load_from_v2()
         if data is not None:
             cls._credentials_cache = data
+            cls._cache_loaded_at = time.time()
             return cls._credentials_cache
 
         # Legacy plaintext fallback + one-time migration.
@@ -137,11 +146,18 @@ class CredentialManager:
                         CREDENTIALS_BACKUP_FILE.unlink()
                     CREDENTIALS_FILE.rename(CREDENTIALS_BACKUP_FILE)
                 except OSError as exc:
-                    print(f"[CredentialManager] Plaintext backup rename failed: {exc}")
+                    logger.warning("[CredentialManager] Plaintext backup rename failed: {exc}")
                 return cls._credentials_cache
 
         cls._credentials_cache = {}
+        cls._cache_loaded_at = time.time()
         return cls._credentials_cache
+
+    @classmethod
+    def reload_credentials(cls) -> None:
+        """Invalidate cache and force reload on next access."""
+        cls._credentials_cache = None
+        cls._cache_loaded_at = 0.0
 
     @classmethod
     def _load_from_v2(cls) -> Optional[Dict[str, Dict[str, str]]]:
@@ -180,7 +196,7 @@ class CredentialManager:
         try:
             _atomic_write_text(CREDENTIALS_FILE_V2, json.dumps(envelope, indent=2))
         except OSError as exc:
-            print(f"[CredentialManager] Failed to save credentials: {exc}")
+            logger.warning("[CredentialManager] Failed to save credentials: {exc}")
 
     @classmethod
     def store_token(cls, host: str, username: str, token: str) -> None:
@@ -262,30 +278,15 @@ class CredentialManager:
     @classmethod
     def get_git_credentials(cls, remote_url: str) -> Optional[Tuple[str, str]]:
         """综合获取 Git 凭据：先尝试 GCM，fallback 到本地存储"""
-        # 解析 URL 获取 protocol 和 host
-        protocol = "https"
-        host = remote_url
-        path = ""
-
-        if remote_url.startswith("https://"):
-            protocol = "https"
-            rest = remote_url[len("https://"):]
-            if "/" in rest:
-                host = rest.split("/")[0]
-                path = "/".join(rest.split("/")[1:])
-            else:
-                host = rest
-        elif remote_url.startswith("http://"):
-            protocol = "http"
-            rest = remote_url[len("http://"):]
-            if "/" in rest:
-                host = rest.split("/")[0]
-                path = "/".join(rest.split("/")[1:])
-            else:
-                host = rest
+        parsed = urlparse(remote_url)
+        if parsed.scheme in ("http", "https"):
+            protocol = parsed.scheme
+            host = parsed.hostname or ""
+            path = parsed.path.lstrip("/") or ""
         elif "@" in remote_url and ":" in remote_url:
-            # SSH 格式：git@github.com:user/repo.git
             return None  # SSH 不需要 token
+        else:
+            return None
 
         # 1. 尝试 GCM
         if cls.has_gcm():

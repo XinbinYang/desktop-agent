@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFile: () => ipcRenderer.invoke('select-file'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getAuthToken: () => ipcRenderer.invoke('get-auth-token'),
+  captureRegion: (rect) => ipcRenderer.invoke('capture-region', rect),
   onNewSession: (cb) => {
     ipcRenderer.on('menu-new-session', cb);
     // 返回 unsubscribe 函数

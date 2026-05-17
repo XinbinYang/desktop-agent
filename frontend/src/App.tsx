@@ -516,20 +516,21 @@ export default function App() {
 
   const switchSession = useCallback((newSessionId: string) => {
     const target = sessions.find((s) => s.id === newSessionId);
-    const targetAgent = normalizeAgentType(target?.agent_type, target?.role_id);
+    const targetAgent = target ? normalizeAgentType(target.agent_type, target.role_id) : layout.activeAgent;
+    layout.setActiveAgent(targetAgent);
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
       if (!leaf) return prev;
       const newPane: SessionPane = {
         ...leaf.pane,
         sessionId: newSessionId,
-        model: target?.model_id || agentModel,
+        model: target?.model_id || agentModels[targetAgent] || agentModel,
         agentType: targetAgent,
         role: target?.role_id || roleForAgent(targetAgent),
       };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-  }, [focusedLeafId, sessions, agentModel]);
+  }, [focusedLeafId, sessions, agentModel, agentModels, layout]);
 
   const newSession = useCallback(() => {
     const id = `session_${Date.now()}`;

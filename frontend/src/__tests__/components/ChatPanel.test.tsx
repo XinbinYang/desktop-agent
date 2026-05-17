@@ -3,6 +3,25 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { ChatPanel } from '../../components/ChatPanel'
 import type { ChatMessage, PlanState } from '../../types'
 
+vi.mock('react-virtuoso', () => {
+  const Virtuoso = ({ data, itemContent, components, totalCount }: any) => {
+    const count = totalCount ?? data?.length ?? 0;
+    return (
+      <div>
+        {components?.Header?.()}
+        {count === 0 && components?.EmptyPlaceholder
+          ? components.EmptyPlaceholder()
+          : null}
+        {count > 0 && data?.map((_item: any, index: number) => (
+          <div key={index}>{itemContent(index)}</div>
+        ))}
+        {components?.Footer?.()}
+      </div>
+    );
+  };
+  return { Virtuoso, VirtuosoHandle: {} as any };
+});
+
 const idlePlanState: PlanState = {
   mode: 'agent',
   phase: 'idle',

@@ -30,6 +30,7 @@ let backendProcess = null;
 
 const isDev = process.argv.includes('--dev');
 const isPackaged = app.isPackaged;
+const shouldOpenDevTools = process.env.DESKTOP_AGENT_OPEN_DEVTOOLS === '1';
 let authToken = null;
 
 function getAuthStorePath() {
@@ -288,6 +289,7 @@ function createWindow() {
     minWidth: 1000,
     minHeight: 600,
     titleBarStyle: 'hiddenInset',
+    autoHideMenuBar: true,
     show: false, // 先隐藏，等加载完成再显示，避免闪烁
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -303,7 +305,9 @@ function createWindow() {
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
+    if (shouldOpenDevTools) {
+      mainWindow.webContents.openDevTools();
+    }
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
@@ -451,3 +455,13 @@ ipcMain.handle('select-file', async () => {
 ipcMain.handle('get-app-version', () => app.getVersion());
 
 ipcMain.handle('get-auth-token', () => getAuthToken());
+
+ipcMain.handle('capture-region', async (_event, rect) => {
+  try {
+    const img = await mainWindow.webContents.capturePage(rect);
+    return img.toDataURL();
+  } catch (err) {
+    console.error('[capture-region] failed:', err);
+    return null;
+  }
+});

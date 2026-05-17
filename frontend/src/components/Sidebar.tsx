@@ -6,24 +6,23 @@ import {
   UserCog, Settings, BookOpen, Sun, Moon, Laptop,
   Brain, Activity, Moon as MoonIcon, Sparkles, FolderOpen
 } from 'lucide-react';
-import { RoleInfo, ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
+import { ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
 import { ProjectPanel } from './ProjectPanel';
 import { useTheme } from '../hooks/useTheme';
+import { AGENT_LABEL } from '../lib/agentProfiles';
 
 interface SidebarProps {
   activeSection: SidebarSection;
   activeAgent?: AgentType;
   onSectionChange: (section: SidebarSection) => void;
-  roles: RoleInfo[];
-  currentRole: string;
-  onRoleChange: (role: string) => void;
   onAgentChange?: (agent: AgentType) => void;
-  onOpenRoleEditor: () => void;
+  agentModel?: string;
+  onOpenPersonalWorkspace?: () => void;
   onOpenSettings: () => void;
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
-  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; message_count: number; updated_at?: number}[];
+  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number}[];
   currentSession?: string;
   onNewSession?: () => void;
   onSwitchSession?: (id: string) => void;
@@ -41,7 +40,7 @@ interface SidebarProps {
   onRefreshTree?: () => void;
 }
 
-type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; message_count: number; updated_at?: number};
+type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number};
 
 function formatSessionLabel(s: SessionItem): string {
   if (s.title) return s.title.length > 40 ? s.title.slice(0, 40) + '…' : s.title;
@@ -65,11 +64,10 @@ const QUICK_TOOLS = [
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
+  activeAgent = 'personal',
   onSectionChange,
-  roles,
-  currentRole,
-  onRoleChange,
-  onOpenRoleEditor,
+  agentModel = '',
+  onOpenPersonalWorkspace,
   onOpenSettings,
   onClear,
   onExecuteTool,
@@ -125,7 +123,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => onOpenRoleEditor?.()}
+                onClick={onOpenPersonalWorkspace}
                 className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <UserCog className="w-3.5 h-3.5" />
@@ -307,29 +305,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {activeSection === 'settings' && (
           <div className="space-y-4">
             <div>
-              <label className="text-xs text-fg-secondary block mb-1">Role</label>
-              <div className="flex gap-1">
-                <select
-                  value={currentRole}
-                  onChange={(e) => onRoleChange(e.target.value)}
-                  className="flex-1 text-xs bg-surface-input border border-border rounded px-2 py-1.5 outline-none text-fg"
-                  aria-label="Select role"
-                >
-                  {roles.map(r => (
-                    <option key={r.id} value={r.id}>{r.name}</option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={onOpenRoleEditor}
-                  className="px-2 py-1.5 rounded text-xs bg-surface-hover border border-border text-fg-secondary hover:bg-surface-alt transition-colors"
-                  title="Custom roles"
-                >
-                  <UserCog className="w-3.5 h-3.5" />
-                </button>
-              </div>
-              <div className="text-[10px] text-fg-muted mt-1">
-                {roles.find(r => r.id === currentRole)?.description || ''}
+              <label className="text-xs text-fg-secondary block mb-1.5">Active Agent</label>
+              <div className="rounded border border-border bg-surface-alt px-2 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-fg">{AGENT_LABEL[activeAgent]}</span>
+                  <span className="text-[10px] text-fg-muted">ready</span>
+                </div>
+                {agentModel && (
+                  <div className="mt-1 truncate text-[10px] text-fg-muted" title={agentModel}>
+                    Model: {agentModel}
+                  </div>
+                )}
               </div>
             </div>
 

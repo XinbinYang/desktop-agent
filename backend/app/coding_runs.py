@@ -227,7 +227,12 @@ def record_event(run_id: str, event_type: str, data: Dict[str, Any]) -> None:
 
 
 
-def complete_run(run_id: str, status: str, summary: str = "") -> None:
+def complete_run(
+    run_id: str,
+    status: str,
+    summary: str = "",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
     if not run_id:
         return
     conn = _get_conn()
@@ -241,7 +246,10 @@ def complete_run(run_id: str, status: str, summary: str = "") -> None:
     finally:
         pass
 
-    record_event(run_id, "run_completed", {"run_id": run_id, "status": status, "summary": summary})
+    payload: Dict[str, Any] = {"run_id": run_id, "status": status, "summary": summary}
+    if details:
+        payload.update(details)
+    record_event(run_id, "run_completed", payload)
 
 
 def list_runs(limit: int = 100) -> List[Dict[str, Any]]:

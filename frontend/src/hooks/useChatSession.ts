@@ -16,6 +16,7 @@ import {
   PlanTodo,
   StructuredPlanDraft,
   RunEvent,
+  AgentType,
 } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { API_BASE } from '../config';
@@ -342,7 +343,23 @@ function sessionSnapshotToState(snapshot: any): {
   };
 }
 
-export function useChatSession(sessionId: string, currentModel: string, roleId: string = 'desktop-agent') {
+export function useChatSession(
+  sessionId: string,
+  currentModel: string,
+  agentTypeOrRole: AgentType | string = 'personal',
+  explicitRoleId?: string,
+) {
+  const agentType: AgentType =
+    agentTypeOrRole === 'coding' || agentTypeOrRole === 'personal'
+      ? agentTypeOrRole
+      : agentTypeOrRole === 'code-expert'
+        ? 'coding'
+        : 'personal';
+  const roleId = explicitRoleId || (
+    agentTypeOrRole === 'coding' || agentTypeOrRole === 'personal'
+      ? (agentType === 'coding' ? 'code-expert' : 'desktop-agent')
+      : agentTypeOrRole || (agentType === 'coding' ? 'code-expert' : 'desktop-agent')
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
@@ -1082,6 +1099,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
         type: 'chat',
         text: text.trim(),
         model_id: currentModel,
+        agent_type: agentType,
         role_id: roleId,
         image_base64: imageBase64,
         chat_mode: overrides?.chatMode || chatMode,
@@ -1092,7 +1110,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
         addTerminalLog('[错误] WebSocket 未连接，消息未发送');
       }
     },
-    [send, sessionId, currentModel, roleId, addTerminalLog, chatMode, thinkingIntensity]
+    [send, sessionId, currentModel, agentType, roleId, addTerminalLog, chatMode, thinkingIntensity]
   );
 
   const clearSession = useCallback(() => {
@@ -1107,12 +1125,13 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     send({
       type: 'retry',
       model_id: currentModel,
+      agent_type: agentType,
       role_id: roleId,
       chat_mode: chatMode,
       thinking_intensity: thinkingIntensity,
     });
     setIsRunning(true);
-  }, [send, currentModel, roleId, chatMode, thinkingIntensity]);
+  }, [send, currentModel, agentType, roleId, chatMode, thinkingIntensity]);
 
   const approvePlan = useCallback(() => {
     setIsRunning(false);

@@ -1,16 +1,20 @@
 """Coding-agent helper tools: search, outline, patch, verify, review, worktree status."""
 from __future__ import annotations
 
+import difflib
 import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.coding_context import build_repo_map, current_project_path, format_repo_map_summary, outline_file, run_code_search
 from app.coding_runs import get_run_context, record_event, worktree_status
 from app.tools.base import BaseTool, ToolResult
 from app.tools.file_tool import DIFF_TEXT_LIMIT, _validate_path, build_file_edit_metadata
+
+
+BLOCKING_REVIEW_SEVERITIES = {"blocker", "critical", "error", "important"}
 
 
 def _active_project_root() -> tuple[Optional[Path], Optional[str]]:
@@ -38,6 +42,22 @@ def _resolve_active_path(path: str) -> tuple[Optional[Path], Optional[str]]:
     except ValueError:
         return None, f"Path escapes active project: {path}"
     return resolved, None
+
+
+def _infer_green_level(command: str, scope: str) -> str:
+    """Classify verification evidence into a coarse completion contract level."""
+    cmd = command.lower()
+    if scope in {"lint", "typecheck", "build"}:
+        return scope
+    if "cargo test --workspace" in cmd or "test --workspace" in cmd:
+        return "workspace"
+    if "pytest" in cmd and not any(token in cmd for token in (" tests/", " tests\\", "::")):
+        return "workspace"
+    if "vitest run" in cmd or "npm test" in cmd or "pnpm test" in cmd or "yarn test" in cmd:
+        return "workspace"
+    if "cargo test -p" in cmd or "pytest" in cmd or "vitest" in cmd:
+        return "targeted_tests"
+    return "targeted_tests"
 
 
 class RepoMapTool(BaseTool):
@@ -123,6 +143,73 @@ class FileOutlineTool(BaseTool):
         return ToolResult(output=json.dumps(data, ensure_ascii=False, indent=2), metadata={"file_outline": data})
 
 
+def _normalize_lines(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.splitlines())
+
+
+def _strip_indent_lines(text: str) -> str:
+    return "\n".join(line.lstrip() for line in text.splitlines())
+
+
+def _find_patch_match(content: str, old_text: str) -> Tuple[Optional[str], str]:
+    """Try exact, then trailing-whitespace-normalized, then leading-whitespace-stripped match."""
+    # Level 1: Exact
+    if old_text in content:
+        return old_text, ""
+
+    # Level 2: Normalize trailing whitespace per line
+    norm_content = _normalize_lines(content)
+    norm_old = _normalize_lines(old_text)
+    if norm_old in norm_content:
+        # Find the actual substring in original that corresponds to this region
+        idx = norm_content.find(norm_old)
+        # Reconstruct by counting newlines before match to find line range
+        lines_before = norm_content[:idx].count("\n")
+        original_lines = content.splitlines()
+        norm_old_line_count = norm_old.count("\n") + 1
+        matched_original = "\n".join(original_lines[lines_before: lines_before + norm_old_line_count])
+        if matched_original in content:
+            return matched_original, "trailing-whitespace-normalized"
+
+    # Level 3: Strip leading whitespace (indentation tolerance)
+    strip_content = _strip_indent_lines(content)
+    strip_old = _strip_indent_lines(old_text)
+    if strip_old in strip_content:
+        idx = strip_content.find(strip_old)
+        lines_before = strip_content[:idx].count("\n")
+        original_lines = content.splitlines()
+        strip_old_line_count = strip_old.count("\n") + 1
+        matched_original = "\n".join(original_lines[lines_before: lines_before + strip_old_line_count])
+        if matched_original in content:
+            return matched_original, "indentation-normalized"
+
+    return None, ""
+
+
+def _build_patch_hint(content: str, old_text: str) -> str:
+    """Return a hint showing the most similar region in content for failed patch."""
+    old_lines = old_text.splitlines()
+    content_lines = content.splitlines()
+    if not old_lines or not content_lines:
+        return "Hint: old_text or file content is empty."
+
+    best_ratio = 0.0
+    best_start = 0
+    window = max(len(old_lines), 3)
+    for i in range(max(1, len(content_lines) - window + 1)):
+        candidate = content_lines[i: i + window]
+        ratio = difflib.SequenceMatcher(None, old_lines, candidate).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_start = i
+
+    snippet_lines = content_lines[best_start: best_start + window]
+    numbered = "\n".join(f"  {best_start + j + 1}: {line}" for j, line in enumerate(snippet_lines))
+    hint = f"Most similar region (line {best_start + 1}, similarity {best_ratio:.0%}):\n{numbered}"
+    hint += "\nTip: Check for leading/trailing whitespace differences in old_text."
+    return hint
+
+
 class FilePatchTool(BaseTool):
     name = "file_patch"
     description = "Patch an existing text file by replacing an exact old_text block with new_text. Prefer this over file_write for modifying code."
@@ -157,18 +244,14 @@ class FilePatchTool(BaseTool):
             if p.stat().st_size > DIFF_TEXT_LIMIT:
                 return ToolResult(error=f"File too large for exact patch: {p.stat().st_size} bytes")
             original = p.read_text(encoding="utf-8", errors="ignore")
-            count = original.count(old_text)
-            if count == 0:
-                needle = old_text.strip().splitlines()[0][:80] if old_text.strip() else ""
-                candidates = []
-                if needle:
-                    for idx, line in enumerate(original.splitlines(), start=1):
-                        if needle[:30] and needle[:30] in line:
-                            candidates.append(f"{idx}: {line[:180]}")
-                            if len(candidates) >= 5:
-                                break
-                hint = "\nNearby candidates:\n" + "\n".join(candidates) if candidates else ""
-                return ToolResult(error=f"old_text not found in {p}.{hint}")
+
+            # Three-level tolerant matching
+            matched_old, note = _find_patch_match(original, old_text)
+            if matched_old is None:
+                hint = _build_patch_hint(original, old_text)
+                return ToolResult(error=f"old_text not found in {p}.\n{hint}")
+
+            count = original.count(matched_old)
             if count > 1 and occurrence is None:
                 return ToolResult(error=f"old_text appears {count} times in {p}; provide occurrence (1-based)")
             target = occurrence or 1
@@ -177,12 +260,13 @@ class FilePatchTool(BaseTool):
             start = -1
             pos = 0
             for _ in range(target):
-                start = original.find(old_text, pos)
-                pos = start + len(old_text)
-            updated = original[:start] + new_text + original[start + len(old_text):]
+                start = original.find(matched_old, pos)
+                pos = start + len(matched_old)
+            updated = original[:start] + new_text + original[start + len(matched_old):]
             p.write_text(updated, encoding="utf-8")
             edit = build_file_edit_metadata(p, original, updated, True)
-            return ToolResult(output=f"Patched: {p}", metadata={"file_edit": edit})
+            result_note = f" (matched via {note})" if note else ""
+            return ToolResult(output=f"Patched: {p}{result_note}", metadata={"file_edit": edit})
         except OSError as exc:
             return ToolResult(error=f"File patch error: {exc}")
 
@@ -236,9 +320,14 @@ class VerifyProjectTool(BaseTool):
                 "exit_code": 124,
                 "duration_ms": duration_ms,
                 "passed": False,
+                "scope": scope,
+                "green_level": _infer_green_level(command, scope),
                 "summary": "Verification timed out after 120s",
                 "changed_files": changed_files or [],
             }
+            ctx = get_run_context()
+            if ctx:
+                record_event(ctx.run_id, "verification_result", data)
             return ToolResult(error=data["summary"], metadata={"verification": data})
 
         output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
@@ -249,9 +338,14 @@ class VerifyProjectTool(BaseTool):
             "exit_code": proc.returncode,
             "duration_ms": duration_ms,
             "passed": proc.returncode == 0,
+            "scope": scope,
+            "green_level": _infer_green_level(command, scope),
             "summary": summary,
             "changed_files": changed_files or [],
         }
+        ctx = get_run_context()
+        if ctx:
+            record_event(ctx.run_id, "verification_result", data)
         text = f"{'PASSED' if data['passed'] else 'FAILED'}: {command}\n{summary}"
         return ToolResult(output=text, metadata={"verification": data})
 
@@ -283,8 +377,19 @@ class RunReviewTool(BaseTool):
         for token in ("TODO", "FIXME", "console.log(", "debugger;"):
             if token in diff:
                 findings.append({"severity": "minor", "message": f"Diff contains {token}"})
-        data = {"run_id": rid, "findings": findings, "diff_stat": stat}
+        blocking_findings = [
+            finding for finding in findings
+            if str(finding.get("severity", "")).lower() in BLOCKING_REVIEW_SEVERITIES
+        ]
+        data = {
+            "run_id": rid,
+            "findings": findings,
+            "blocking_findings": blocking_findings,
+            "passed": not blocking_findings,
+            "diff_stat": stat,
+        }
         if rid:
+            record_event(rid, "review_result", data)
             for finding in findings:
                 record_event(rid, "review_finding", {"run_id": rid, **finding})
         output = "No blocking findings" if not findings else json.dumps(findings, ensure_ascii=False, indent=2)

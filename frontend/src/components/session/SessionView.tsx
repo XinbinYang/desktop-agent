@@ -13,6 +13,7 @@ import type {
   FileEdit,
   ClientChatMode,
   ThinkingIntensity,
+  AgentType,
 } from '../../types';
 import { API_BASE } from '../../config';
 import { getLangFromFilename } from '../../lib/language';
@@ -22,6 +23,7 @@ import { getLangFromFilename } from '../../lib/language';
 interface SessionViewProps {
   sessionId: string;
   model: string;
+  agentType: AgentType;
   role: string;
   teamId?: string;
   teamName?: string;
@@ -56,6 +58,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   {
     sessionId,
     model,
+    agentType,
     role,
     teamId,
     teamName,
@@ -106,7 +109,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     updatePlanDecision,
     suggestAgentSwitch,
     clearSuggestAgentSwitch,
-  } = useChatSession(sessionId, model, role);
+  } = useChatSession(sessionId, model, agentType, role);
 
   // ---- Send team info to backend on change ----
   useEffect(() => {
@@ -355,6 +358,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     if (!isFocused) return null;
     return {
       sessionId,
+      agentType,
       isRunning,
       isConnected,
       chatMode,
@@ -369,7 +373,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       toolCalls,
       runEvents,
     };
-  }, [isFocused, sessionId, isRunning, isConnected, chatMode, thinkingIntensity, planState,
+  }, [isFocused, sessionId, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
       suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents]);
 
   const actions: SessionActions = useMemo(() => ({

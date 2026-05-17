@@ -43,7 +43,7 @@ const FileTreeNode: React.FC<{
     <div>
       <div
         className={`flex items-center gap-1.5 px-1 py-0.5 rounded text-xs cursor-pointer transition-colors ${
-          node.type === 'dir' ? 'text-gray-300 hover:bg-gray-700' : 'text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+          node.type === 'dir' ? 'text-fg-secondary hover:bg-surface-hover' : 'text-fg-secondary hover:bg-surface-hover hover:text-fg'
         }`}
         style={{ paddingLeft: `${depth * 12 + 4}px` }}
         onClick={() => {
@@ -77,7 +77,7 @@ const FileTreeNode: React.FC<{
 export const FileTree: React.FC<FileTreeProps> = ({ nodes, onSelect, expandedPaths, onToggle }) => {
   if (nodes.length === 0) {
     return (
-      <div className="text-xs text-gray-500 text-center py-4">
+      <div className="text-xs text-fg-muted text-center py-4">
         暂无文件
       </div>
     );
