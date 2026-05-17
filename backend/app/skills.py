@@ -207,12 +207,15 @@ class SkillManager:
                     matched.update(rule["skills"])
                     break
 
-        # 如果有项目打开，且是编程任务，总是包含 using-superpowers
-        if has_project and role_id == "code-expert":
+        # 如果有项目打开，且是编码角色，总是包含 using-superpowers
+        if has_project and role_id in ("code-expert",):
             matched.add("using-superpowers")
         # code-expert 角色：永远包含验证技能（任何代码改动都要 verification）
-        if role_id == "code-expert":
+        if role_id in ("code-expert",):
             matched.add("verification-before-completion")
+        # Personal agent (desktop-agent): always include using-superpowers for skill discovery
+        if role_id in ("desktop-agent", "general-assistant", "quant-analyst"):
+            matched.add("using-superpowers")
 
         # 总是包含输出格式规范（如果 skill 存在）
         if "output-formatting" in cls.load_skills():

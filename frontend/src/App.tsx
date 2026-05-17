@@ -1,32 +1,48 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { Panel, Group, Separator } from 'react-resizable-panels';
-import type { PanelImperativeHandle } from 'react-resizable-panels';
+import type { GroupImperativeHandle, PanelImperativeHandle } from 'react-resizable-panels';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import { Sidebar } from './components/Sidebar';
-import { ChatPanel } from './components/ChatPanel';
+import { SessionView, type SessionViewHandle } from './components/session/SessionView';
+import { PaneRenderer } from './components/session/PaneRenderer';
+import type { PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
+import {
+  nextNodeId,
+  collectLeaves,
+  findLeafById,
+  findLeafByPaneId,
+  findFirstLeafId,
+  replaceNode,
+  removeLeaf,
+  serializePaneTree,
+  deserializePaneTree,
+  updateSplitSizes,
+  resetSplitSizes,
+} from './components/session/PaneTypes';
 import { TerminalPanel } from './components/TerminalPanel';
-import { ToolCallView } from './components/ToolCallView';
-import { ArtifactPanel } from './components/ArtifactPanel/ArtifactPanel';
-import { ChangesPanel } from './components/ChangesPanel';
-import { RunSummaryPanel } from './components/RunSummaryPanel';
-import { KnowledgePanel } from './components/KnowledgePanel';
-import { WorkflowPanel } from './components/WorkflowPanel';
-import { McpPanel } from './components/McpPanel';
-import { TestsPanel } from './components/TestsPanel';
-import { ProblemsPanel } from './components/ProblemsPanel';
-import { EvalPanel } from './components/EvalPanel';
-import { ModelInfo, RoleInfo, ToolCall, ArtifactItem, ProjectInfo, FileNode, OpenFile, EditorGroup, SettingsResponse, FileEdit } from './types';
+import { WorkspacePanel, type WorkspaceView } from './components/workspace/WorkspacePanel';
+import { ActivityPanel } from './components/activity/ActivityPanel';
+import { PersonalWorkspacePanel } from './components/PersonalWorkspace/PersonalWorkspacePanel';
+import { SwitchAgentModal } from './components/SwitchAgentModal';
+import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
+import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
+import { ModelInfo, RoleInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType } from './types';
 import { API_BASE } from './config';
-import { useChatSession } from './hooks/useChatSession';
-import { useLayoutState } from './hooks/useLayoutState';
+import {
+  DEFAULT_MAIN_LAYOUT,
+  DEFAULT_TERMINAL_LAYOUT,
+  useLayoutState,
+  type PanelLayout,
+} from './hooks/useLayoutState';
 import { loadRoles } from './lib/db';
 import { getLangFromFilename } from './lib/language';
-import { Settings, ChevronDown, ChevronUp, ChevronLeft } from 'lucide-react';
+import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
+import type { Team } from './lib/teamStore';
+import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
 import { RoleEditor } from './components/RoleEditor';
 import { ProjectModal } from './components/ProjectModal';
-import { EditorPanel } from './components/EditorPanel/EditorPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
@@ -39,6 +55,15 @@ interface SessionListItem {
   role_id?: string;
   message_count: number;
   updated_at?: number;
+}
+
+type SplitPlacement = 'before' | 'after';
+
+interface SplitPaneOptions {
+  sessionId?: string;
+  placement?: SplitPlacement;
+  model?: string;
+  role?: string;
 }
 
 function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
@@ -56,6 +81,70 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, '/').toLowerCase();
 }
 
+const PANE_TREE_STORAGE_KEY = 'desktop-agent-pane-tree';
+
+function createSessionPane(role: string, model: string, sessionId = `session_${Date.now()}`): SessionPane {
+  return {
+    id: `pane_${Date.now()}`,
+    sessionId,
+    model,
+    role,
+  };
+}
+
+function createLeaf(role: string, model: string, sessionId?: string): PaneNode {
+  return {
+    type: 'leaf',
+    id: nextNodeId(),
+    pane: createSessionPane(role, model, sessionId),
+  };
+}
+
+function createDefaultPaneTree(role: string): PaneNode {
+  return createLeaf(role, '');
+}
+
+function loadPersistedPaneTree(currentRole: string): { paneRoot: PaneNode; focusedLeafId: string } {
+  try {
+    const raw = localStorage.getItem(PANE_TREE_STORAGE_KEY);
+    if (!raw) throw new Error('no persisted tree');
+    const data = deserializePaneTree(raw);
+    if (!data) throw new Error('deserialize failed');
+    // Validate: focusedLeafId should exist in tree
+    const leaf = findLeafById(data.paneRoot, data.focusedLeafId);
+    if (!leaf) {
+      data.focusedLeafId = findFirstLeafId(data.paneRoot) ?? data.focusedLeafId;
+    }
+    return { paneRoot: data.paneRoot, focusedLeafId: data.focusedLeafId };
+  } catch {
+    const def = createDefaultPaneTree(currentRole);
+    return { paneRoot: def, focusedLeafId: def.id };
+  }
+}
+
+const NOOP_ACTIONS: SessionActions = {
+  sendMessage: () => {},
+  stopRunning: () => {},
+  retryLast: () => {},
+  executeToolDirect: () => {},
+  addTerminalLog: (_msg: string) => {},
+  approvePlan: () => {},
+  buildPlan: () => {},
+  rejectPlan: () => {},
+  updatePlanDecision: () => {},
+  onSelectFileInEditor: () => {},
+  onCloseFileInEditor: () => {},
+  onFileContentChange: () => {},
+  onSaveFile: () => {},
+  saveInputDraft: async () => {},
+  loadInputDraft: async () => undefined,
+  clearInputDraft: async () => {},
+  runAction: async () => {},
+  openRunWorktree: async () => {},
+  handleOpenFileFromPanel: () => {},
+  handleOpenFileFromPanelWithLine: () => {},
+};
+
 export default function App() {
   const { t } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -63,35 +152,51 @@ export default function App() {
   const [roles, setRoles] = useState<RoleInfo[]>([]);
   const [currentRole, setCurrentRole] = useState<string>(() => localStorage.getItem('agent_default_role') || 'desktop-agent');
   const [isLoadingModels, setIsLoadingModels] = useState(true);
-  const [sessionId, setSessionId] = useState(() => `session_${Date.now()}`);
+  // Pane tree — restored from localStorage or fresh default
+  const [paneRoot, setPaneRoot] = useState<PaneNode>(() => loadPersistedPaneTree(currentRole).paneRoot);
+  const [focusedLeafId, setFocusedLeafId] = useState<string>(() => loadPersistedPaneTree(currentRole).focusedLeafId);
+  const focusedSessionId = React.useMemo(() => {
+    const leaf = findLeafById(paneRoot, focusedLeafId);
+    return leaf?.pane.sessionId ?? collectLeaves(paneRoot)[0]?.sessionId ?? '';
+  }, [paneRoot, focusedLeafId]);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [showRoleEditor, setShowRoleEditor] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
-  // 项目状态
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [showProjectModal, setShowProjectModal] = useState(false);
 
-  // 布局状态 — centralized hook
   const layout = useLayoutState();
 
-  // 成果状态
-  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
-  const [latestToolCall, setLatestToolCall] = useState<ToolCall | null>(null);
+  // Agent switch suggestion from backend auto-dispatch
+  const [switchSuggestion, setSwitchSuggestion] = useState<{
+    from: AgentType; to: AgentType; reason: string;
+  } | null>(null);
 
-  // 编辑器状态
-  const [editorGroups, setEditorGroups] = useState<EditorGroup[]>([
-    { id: 'main', activeFileId: null, openFiles: [] },
-  ]);
-  const [activeEditorGroup, setActiveEditorGroup] = useState('main');
+  const [teams, setTeams] = useState<Team[]>(loadTeams);
 
+  const [focusedSnapshot, setFocusedSnapshot] = useState<SessionSnapshot | null>(null);
+  const [focusedActions, setFocusedActions] = useState<SessionActions>(NOOP_ACTIONS);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('editor');
+
+  const previewUrl = React.useMemo(() => {
+    const arts = focusedSnapshot?.artifacts;
+    if (!arts) return undefined;
+    for (let i = arts.length - 1; i >= 0; i--) {
+      if (arts[i].type === 'web') return arts[i].url;
+    }
+    return undefined;
+  }, [focusedSnapshot?.artifacts]);
+
+  const sessionViewRefs = useRef<Map<string, SessionViewHandle>>(new Map());
   const didPromptModelSetup = React.useRef(false);
+  const mainGroupRef = useRef<GroupImperativeHandle>(null);
+  const centerGroupRef = useRef<GroupImperativeHandle>(null);
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
 
-  // Sync right panel collapse/expand with layout state
   useEffect(() => {
     const panel = rightPanelRef.current;
     if (!panel) return;
@@ -102,7 +207,6 @@ export default function App() {
     }
   }, [layout.rightPanelVisible]);
 
-  // Sync terminal collapse/expand with layout state
   useEffect(() => {
     const panel = terminalPanelRef.current;
     if (!panel) return;
@@ -113,68 +217,46 @@ export default function App() {
     }
   }, [layout.showTerminal]);
 
-  const {
-    messages,
-    toolCalls,
-    fileEdits,
-    runEvents,
-    terminalLogs,
-    isRunning,
-    isConnected,
-    sendMessage,
-    clearSession,
-    stopRunning,
-    retryLast,
-    executeToolDirect,
-    resetSession,
-    addTerminalLog,
-    onToolCallRef,
-    onFileEditRef,
-    recordFileEdit,
-    sendRaw,
-    saveInputDraft,
-    loadInputDraft,
-    clearInputDraft,
-    chatMode,
-    setChatMode,
-    thinkingIntensity,
-    setThinkingIntensity,
-    planState,
-    approvePlan,
-    buildPlan,
-    rejectPlan,
-    updatePlanDecision,
-  } = useChatSession(sessionId, currentModel, currentRole);
+  // Persist pane tree to localStorage on change
+  useEffect(() => {
+    try {
+      const raw = serializePaneTree(paneRoot, focusedLeafId);
+      localStorage.setItem(PANE_TREE_STORAGE_KEY, raw);
+    } catch { /* ignore */ }
+  }, [paneRoot, focusedLeafId]);
 
-  // Slash command handler
-  const handleSlashCommand = useCallback((command: string, args: string) => {
+  const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
+  const addTerminalLog = useCallback((msg: string) => {
+    setTerminalLogs((prev) => [...prev, msg]);
+  }, []);
+
+  // Slash command handler — delegates to focused session actions
+  const handleSlashCommand = useCallback((command: string, _args: string) => {
+    const a = focusedActions;
     switch (command) {
       case 'clear':
-        clearSession();
         addTerminalLog('[命令] 已清除会话');
         break;
       case 'help':
         addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
-        addTerminalLog('[帮助] 在输入框中输入 / 可查看命令菜单');
         break;
       case 'compact':
-        // Send compact message over WebSocket
-        sendMessage('__compact__', undefined, { chatMode: 'agent' });
+        if (a) a.sendMessage('__compact__', undefined, { chatMode: 'agent' });
         addTerminalLog('[命令] 正在压缩对话上下文...');
         break;
       case 'config':
         setShowSettings(true);
         break;
       case 'screenshot':
-        executeToolDirect('screenshot', {});
+        if (a) a.executeToolDirect('screenshot', {});
         addTerminalLog('[命令] 正在截图...');
         break;
       default:
         addTerminalLog(`[命令] 未知命令: /${command}`);
     }
-  }, [clearSession, addTerminalLog, executeToolDirect]);
+  }, [focusedActions, addTerminalLog]);
 
-  // 加载模型列表、角色列表和会话列表
+  // Load models, roles, sessions
   useEffect(() => {
     let cancelled = false;
     setIsLoadingModels(true);
@@ -188,6 +270,7 @@ export default function App() {
           setModels(modelsList);
           const defaultModel = data.default || modelsList[0]?.id || '';
           setCurrentModel(defaultModel);
+          const mdl = defaultModel;
         }
       } catch (err) {
         console.error('[App] Failed to load models:', err);
@@ -199,26 +282,15 @@ export default function App() {
         const res = await fetch(`${API_BASE}/api/roles`);
         const data = await res.json();
         const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
-          id: r.id,
-          name: r.name,
-          description: r.description,
-          isBuiltin: true,
+          id: r.id, name: r.name, description: r.description, isBuiltin: true,
         }));
-        if (!cancelled) {
-          setRoles(builtinRoles);
-        }
-        // 再尝试加载自定义角色并合并
+        if (!cancelled) setRoles(builtinRoles);
         try {
           const custom = await loadRoles();
           const customRoles: RoleInfo[] = custom.map((r) => ({
-            id: r.id,
-            name: r.name,
-            description: r.description,
-            isBuiltin: false,
+            id: r.id, name: r.name, description: r.description, isBuiltin: false,
           }));
-          if (!cancelled) {
-            setRoles([...builtinRoles, ...customRoles]);
-          }
+          if (!cancelled) setRoles([...builtinRoles, ...customRoles]);
         } catch (dbErr) {
           console.error('[App] Failed to load custom roles from IndexedDB:', dbErr);
         }
@@ -250,12 +322,9 @@ export default function App() {
     loadSessions();
     loadCurrentProject();
 
-    // 2秒后检查，如果仍为空则重试一次
     const retryTimer = setTimeout(() => {
       setModels((prevModels) => {
-        if (prevModels.length === 0 && !cancelled) {
-          doLoad();
-        }
+        if (prevModels.length === 0 && !cancelled) doLoad();
         return prevModels;
       });
     }, 2000);
@@ -264,14 +333,56 @@ export default function App() {
       cancelled = true;
       clearTimeout(retryTimer);
     };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleRoleChange = useCallback((newRole: string) => {
+    setCurrentRole(newRole);
+    localStorage.setItem('agent_default_role', newRole);
+  }, []);
+
+  const handleAgentChange = useCallback((agentType: AgentType) => {
+    layout.setActiveAgent(agentType);
+    // Switch section to match agent
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+    // Update session pane role to match
+    const defaultRole = agentType === 'personal' ? 'desktop-agent' : 'code-expert';
+    setCurrentRole(defaultRole);
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf) return prev;
+      const newPane = { ...leaf.pane, role: defaultRole };
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+    });
+    addTerminalLog(`[系统] 已切换到 ${agentType === 'personal' ? 'Personal Agent' : 'Coding Agent'}`);
+  }, [layout, focusedSessionId, addTerminalLog]);
+
+  const handleRolesChanged = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/roles`);
+      const data = await res.json();
+      const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
+        id: r.id, name: r.name, description: r.description, isBuiltin: true,
+      }));
+      try {
+        const custom = await loadRoles();
+        const customRoles: RoleInfo[] = custom.map((r) => ({
+          id: r.id, name: r.name, description: r.description, isBuiltin: false,
+        }));
+        setRoles([...builtinRoles, ...customRoles]);
+      } catch {
+        setRoles(builtinRoles);
+      }
+    } catch (err) {
+      console.error('[App] Failed to reload roles:', err);
+    }
   }, []);
 
   const loadCurrentProject = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/projects/current`);
-      const project = await res.json();
-      if (project && project.path) {
-        setCurrentProject(project);
+      const data = await res.json();
+      if (data.path && !data.error) {
+        setCurrentProject(data);
         loadProjectTree();
       }
     } catch (err) {
@@ -304,10 +415,8 @@ export default function App() {
           return;
         }
         setCurrentProject(project);
-        setEditorGroups([{ id: 'main', activeFileId: null, openFiles: [] }]);
-        setActiveEditorGroup('main');
         loadProjectTree();
-        loadSessions(project.path);  // 自动加载该项目的历史会话
+        loadSessions(project.path);
         addTerminalLog(`[系统] 已打开项目: ${project.name}`);
       } catch (err) {
         console.error('[App] Open project error:', err);
@@ -321,212 +430,55 @@ export default function App() {
         setCurrentProject(null);
         setFileTree([]);
         setExpandedPaths(new Set());
-        setEditorGroups([{ id: 'main', activeFileId: null, openFiles: [] }]);
-        setActiveEditorGroup('main');
-        loadSessions();  // 恢复显示全部会话
-        addTerminalLog('[系统] 已关闭项目');
+        loadSessions();
       })
       .catch(console.error);
-  }, [addTerminalLog]);
+  }, []);
 
   const handleTogglePath = useCallback((path: string) => {
     setExpandedPaths((prev) => {
       const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
       return next;
     });
   }, []);
 
+  // handleSelectFile → opens file in focused session's editor
   const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir') => {
-    if (type !== 'file') return;
-    if (!currentProject) {
-      console.error('[App] No project open');
-      return;
-    }
+    if (type !== 'file' || !currentProject) return;
     try {
-      // 使用绝对路径，避免后端重启后 project_relative 失效
       const filePath = currentProject.path.replace(/\\/g, '/') + '/' + path;
-      const res = await fetch(
-        `${API_BASE}/api/file/read?path=${encodeURIComponent(filePath)}`
-      );
+      const res = await fetch(`${API_BASE}/api/file/read?path=${encodeURIComponent(filePath)}`);
+      if (!res.ok) return;
       const data = await res.json();
-      if (data.error) {
-        console.error('[App] Read file failed:', data.error);
-        return;
+      const content = data.content ?? '';
+      const name = path.split('/').pop() || path;
+      const language = getLangFromFilename(name);
+      const h = sessionViewRefs.current.get(focusedSessionId);
+      if (h) {
+        h.openFile(path, content, language);
+        layout.setRightZone('workspace');
+        setWorkspaceView('editor');
       }
-      const filename = path.split('/').pop() || path;
-      const openFile: OpenFile = {
-        id: `file:${path}`,
-        path,
-        name: filename,
-        content: data.content || '',
-        language: getLangFromFilename(filename),
-      };
-
-      setEditorGroups((prev) => {
-        const groupIdx = prev.findIndex((g) => g.id === activeEditorGroup);
-        if (groupIdx < 0) return prev;
-        const group = prev[groupIdx];
-        const existingIdx = group.openFiles.findIndex((f) => f.id === openFile.id);
-
-        let newOpenFiles: OpenFile[];
-        let newActiveId: string;
-
-        if (existingIdx >= 0) {
-          // 已打开，刷新内容并切换
-          newOpenFiles = group.openFiles.map((f, i) =>
-            i === existingIdx ? { ...f, content: openFile.content } : f
-          );
-          newActiveId = openFile.id;
-        } else {
-          // 限制最多 10 个文件，关闭最早未固定的
-          let files = group.openFiles;
-          if (files.length >= 10) {
-            const firstUnpinned = files.findIndex((f) => !f.isPinned);
-            if (firstUnpinned >= 0) {
-              files = files.filter((_, i) => i !== firstUnpinned);
-            }
-          }
-          newOpenFiles = [...files, openFile];
-          newActiveId = openFile.id;
-        }
-
-        const newGroups = [...prev];
-        newGroups[groupIdx] = { ...group, openFiles: newOpenFiles, activeFileId: newActiveId };
-        return newGroups;
-      });
-
-      layout.setRightTab('editor');
     } catch (err) {
       console.error('[App] Read file error:', err);
     }
-  }, [activeEditorGroup, getLangFromFilename, currentProject]);
+  }, [currentProject, focusedSessionId, layout]);
 
-  // 编辑器操作
-  const handleSelectFileInEditor = useCallback((groupId: string, fileId: string) => {
-    setEditorGroups((prev) =>
-      prev.map((g) => (g.id === groupId ? { ...g, activeFileId: fileId } : g))
-    );
-    setActiveEditorGroup(groupId);
-  }, []);
+  const handleOpenFileFromPanel = useCallback((path: string) => {
+    if (!currentProject) return;
+    const normalized = (path || '').replace(/\\/g, '/');
+    const projectRoot = (currentProject.path || '').replace(/\\/g, '/');
+    const relative = normalized.startsWith(projectRoot + '/')
+      ? normalized.slice(projectRoot.length + 1)
+      : normalized;
+    handleSelectFile(relative, 'file');
+  }, [currentProject, handleSelectFile]);
 
-  const handleCloseFileInEditor = useCallback((groupId: string, fileId: string) => {
-    setEditorGroups((prev) =>
-      prev.map((g) => {
-        if (g.id !== groupId) return g;
-        const idx = g.openFiles.findIndex((f) => f.id === fileId);
-        if (idx < 0) return g;
-        const newFiles = g.openFiles.filter((f) => f.id !== fileId);
-        let newActive = g.activeFileId;
-        if (newActive === fileId) {
-          newActive = newFiles[idx]?.id || newFiles[idx - 1]?.id || null;
-        }
-        return { ...g, openFiles: newFiles, activeFileId: newActive };
-      })
-    );
-  }, []);
-
-  const handleSplitEditor = useCallback(() => {
-    setEditorGroups((prev) => {
-      if (prev.length >= 2) return prev;
-      return [
-        ...prev,
-        { id: 'secondary', activeFileId: null, openFiles: [] },
-      ];
-    });
-  }, []);
-
-  const handleCloseSplit = useCallback(() => {
-    setEditorGroups((prev) => prev.filter((g) => g.id === 'main'));
-    setActiveEditorGroup('main');
-  }, []);
-
-  const handleMoveToGroup = useCallback((fileId: string, fromGroupId: string, toGroupId: string) => {
-    setEditorGroups((prev) => {
-      const fromGroup = prev.find((g) => g.id === fromGroupId);
-      if (!fromGroup) return prev;
-      const file = fromGroup.openFiles.find((f) => f.id === fileId);
-      if (!file) return prev;
-
-      return prev.map((g) => {
-        if (g.id === fromGroupId) {
-          const newFiles = g.openFiles.filter((f) => f.id !== fileId);
-          const newActive = g.activeFileId === fileId
-            ? (newFiles[0]?.id || null)
-            : g.activeFileId;
-          return { ...g, openFiles: newFiles, activeFileId: newActive };
-        }
-        if (g.id === toGroupId) {
-          const exists = g.openFiles.find((f) => f.id === fileId);
-          if (exists) return { ...g, activeFileId: fileId };
-          return { ...g, openFiles: [...g.openFiles, file], activeFileId: fileId };
-        }
-        return g;
-      });
-    });
-  }, []);
-
-  // 编辑器内容变更（仅更新本地状态，不保存）
-  const handleFileContentChange = useCallback((groupId: string, fileId: string, content: string) => {
-    setEditorGroups((prev) =>
-      prev.map((g) =>
-        g.id === groupId
-          ? {
-            ...g,
-            openFiles: g.openFiles.map((f) =>
-              f.id === fileId ? { ...f, content, isModified: true } : f
-            ),
-          }
-          : g
-      )
-    );
-  }, []);
-
-  // 保存文件到磁盘
-  const handleSaveFile = useCallback(async (groupId: string, fileId: string, content: string) => {
-    const file = editorGroups.find(g => g.id === groupId)?.openFiles.find(f => f.id === fileId);
-    if (!file) return;
-
-    try {
-      const filePath = currentProject?.path.replace(/\\/g, '/') + '/' + file.path;
-      const res = await fetch(`${API_BASE}/api/file/write`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: filePath, content }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        console.error('[App] Save file failed:', data.error);
-        addTerminalLog(`[错误] 保存文件失败: ${data.error}`);
-        return;
-      }
-
-      // 更新状态：清除修改标记
-      setEditorGroups((prev) =>
-        prev.map((g) =>
-          g.id === groupId
-            ? {
-              ...g,
-              openFiles: g.openFiles.map((f) =>
-                f.id === fileId ? { ...f, content, isModified: false, hasConflict: false } : f
-              ),
-            }
-            : g
-        )
-      );
-      addTerminalLog(`[系统] 文件已保存: ${file.name}`);
-      if (data.file_edit) {
-        recordFileEdit(data.file_edit as FileEdit, false);
-      }
-    } catch (err) {
-      console.error('[App] Save file error:', err);
-      addTerminalLog(`[错误] 保存文件出错: ${err}`);
-    }
-  }, [editorGroups, currentProject, addTerminalLog, recordFileEdit]);
+  const handleOpenFileFromPanelWithLine = useCallback((path: string, _line?: number) => {
+    handleOpenFileFromPanel(path);
+  }, [handleOpenFileFromPanel]);
 
   const runAction = useCallback(async (runId: string, action: 'apply' | 'merge' | 'discard') => {
     try {
@@ -541,9 +493,7 @@ export default function App() {
         return;
       }
       addTerminalLog(`[Run] ${action} ${data.status || 'ok'}: ${runId}`);
-      if (action === 'apply') {
-        loadProjectTree();
-      }
+      if (action === 'apply') loadProjectTree();
     } catch (err) {
       addTerminalLog(`[Run] ${action} error: ${err}`);
     }
@@ -586,269 +536,224 @@ export default function App() {
       .catch(console.error);
   }, []);
 
-  // 监听工具调用，检测产物并创建成果
+  // ---- Session pane management (tree-based) ----
+
+  const switchSession = useCallback((newSessionId: string) => {
+    const target = sessions.find((s) => s.id === newSessionId);
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf) return prev;
+      const newPane: SessionPane = {
+        ...leaf.pane,
+        sessionId: newSessionId,
+        model: target?.model_id || currentModel,
+        role: target?.role_id || currentRole,
+      };
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+    });
+  }, [focusedLeafId, sessions, currentModel, currentRole]);
+
+  const newSession = useCallback(() => {
+    const id = `session_${Date.now()}`;
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf) return prev;
+      const newPane: SessionPane = { ...leaf.pane, sessionId: id, model: currentModel, role: currentRole };
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+    });
+  }, [focusedLeafId, currentModel, currentRole]);
+
+  const deleteSession = useCallback(async (id: string) => {
+    await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
+    loadSessions();
+    // If the deleted session is the focused one, create a new one in that leaf
+    if (focusedSessionId === id) {
+      const newId = `session_${Date.now()}`;
+      setPaneRoot((prev) => {
+        const leaf = findLeafById(prev, focusedLeafId);
+        if (!leaf) return prev;
+        const newPane: SessionPane = { ...leaf.pane, sessionId: newId, model: currentModel, role: currentRole };
+        return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+      });
+    }
+  }, [focusedSessionId, focusedLeafId, currentModel, currentRole, loadSessions]);
+
+  // Split a leaf into two panes (drag to edge)
+  const handleSplitPane = useCallback((leafId: string, direction: 'horizontal' | 'vertical', newSessionId?: string) => {
+    const newPane: SessionPane = {
+      id: `pane_${Date.now()}`,
+      sessionId: newSessionId || `session_${Date.now()}`,
+      model: currentModel,
+      role: currentRole,
+    };
+    const newLeaf: PaneNode = { type: 'leaf', id: nextNodeId(), pane: newPane };
+
+    setPaneRoot((prev) => {
+      const existing = findLeafById(prev, leafId);
+      if (!existing) return prev;
+      const split: SplitNode = {
+        type: 'split',
+        id: nextNodeId(),
+        direction,
+        children: [existing, newLeaf],
+        sizes: [50, 50],
+      };
+      return replaceNode(prev, leafId, split);
+    });
+    setFocusedLeafId(newLeaf.id);
+  }, [currentModel, currentRole]);
+
+  // Move a session from one leaf to another (drag to center of pane)
+  const handleMoveSession = useCallback((fromLeafId: string, toLeafId: string) => {
+    setPaneRoot((prev) => {
+      const fromLeaf = findLeafById(prev, fromLeafId);
+      const toLeaf = findLeafById(prev, toLeafId);
+      if (!fromLeaf || !toLeaf) return prev;
+      // Swap the session data — keep the pane structure
+      const tempPane = fromLeaf.pane;
+      let result = replaceNode(prev, fromLeafId, { ...fromLeaf, pane: toLeaf.pane });
+      result = replaceNode(result, toLeafId, { ...toLeaf, pane: tempPane });
+      return result;
+    });
+    setFocusedLeafId(toLeafId);
+  }, []);
+
+  // Close a leaf pane
+  const handleClosePane = useCallback((leafId: string) => {
+    // If this is the only leaf left, replace with a fresh session (don't remove)
+    if (paneRoot.type === 'leaf' && paneRoot.id === leafId) {
+      const newId = `session_${Date.now()}`;
+      const newPane: SessionPane = { id: `pane_${Date.now()}`, sessionId: newId, model: currentModel, role: currentRole };
+      const newLeaf: PaneNode = { type: 'leaf', id: nextNodeId(), pane: newPane };
+      setPaneRoot(newLeaf);
+      setFocusedLeafId(newLeaf.id);
+      sessionViewRefs.current.delete(paneRoot.pane.sessionId);
+      return;
+    }
+
+    const result = removeLeaf(paneRoot, leafId);
+    if (!result) return;
+    setPaneRoot(result.root);
+    if (result.focusId) setFocusedLeafId(result.focusId);
+    if (result.removedPane) {
+      sessionViewRefs.current.delete(result.removedPane.sessionId);
+    }
+  }, [paneRoot, currentModel, currentRole]);
+
+  // ---- Team callbacks ----
+
+  const handleJoinTeam = useCallback((paneId: string, teamId: string) => {
+    setTeams((prev) => {
+      const next = addPaneToTeam(prev, teamId, paneId);
+      saveTeams(next);
+      return next;
+    });
+    // Update pane tree to store teamId on the SessionPane
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf || leaf.pane.id !== paneId) {
+        // Find the leaf with matching pane.id
+        const allLeaves = collectLeaves(prev);
+        const target = allLeaves.find((l) => l.id === paneId);
+        if (!target) return prev;
+        const leafNode = findLeafById(prev, target.id);
+        if (!leafNode) return prev;
+        const updatedPane = { ...leafNode.pane, teamId };
+        return replaceNode(prev, leafNode.id, { ...leafNode, pane: updatedPane });
+      }
+      const updatedPane = { ...leaf.pane, teamId };
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: updatedPane });
+    });
+  }, [focusedLeafId]);
+
+  const handleCreateTeam = useCallback((name: string): Team => {
+    const t = createTeam(name);
+    setTeams((prev) => { const next = [...prev, t]; saveTeams(next); return next; });
+    return t;
+  }, []);
+
+  const handleLeaveTeam = useCallback((paneId: string) => {
+    setTeams((prev) => {
+      const next = removePaneFromTeam(prev, paneId);
+      saveTeams(next);
+      return next;
+    });
+    setPaneRoot((prev) => {
+      const leaf = findLeafById(prev, focusedLeafId);
+      if (!leaf || leaf.pane.id !== paneId) {
+        const allLeaves = collectLeaves(prev);
+        const target = allLeaves.find((l) => l.id === paneId);
+        if (!target) return prev;
+        const leafNode = findLeafById(prev, target.id);
+        if (!leafNode) return prev;
+        const { teamId: _, ...rest } = leafNode.pane;
+        return replaceNode(prev, leafNode.id, { ...leafNode, pane: rest });
+      }
+      const { teamId: _, ...rest } = leaf.pane;
+      return replaceNode(prev, focusedLeafId, { ...leaf, pane: rest });
+    });
+  }, [focusedLeafId]);
+
+  // ---- Snapshot callback from SessionView ----
+
+  const handleSessionSnapshot = useCallback((snapshot: SessionSnapshot | null, actions: SessionActions) => {
+    setFocusedSnapshot(snapshot);
+    setFocusedActions(actions);
+  }, []);
+
+  // Sync suggestAgentSwitch from focused session to modal
   useEffect(() => {
-    onToolCallRef.current = (tc: ToolCall) => {
-      setLatestToolCall(tc);
+    const suggestion = focusedSnapshot?.suggestAgentSwitch;
+    if (suggestion && !localStorage.getItem('desktop-agent-never-suggest-switch')) {
+      setSwitchSuggestion({
+        from: (suggestion.from as AgentType) || 'personal',
+        to: (suggestion.to as AgentType) || 'coding',
+        reason: suggestion.reason || '',
+      });
+    }
+  }, [focusedSnapshot?.suggestAgentSwitch]);
 
-      if (tc.name === 'file_write') {
-        const path: string = tc.args?.path || '';
-
-        if (!path.startsWith('preview/')) return;
-
-        const filename = path.replace('preview/', '');
-        const ext = filename.split('.').pop()?.toLowerCase();
-        const id = `artifact_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
-
-        let type: ArtifactItem['type'] = 'code';
-        let content = tc.result || '';
-        let url: string | undefined;
-        let base64: string | undefined;
-
-        if (ext === 'html') {
-          type = 'web';
-          url = `${API_BASE}/preview/${filename}`;
-        } else if (['png', 'jpg', 'jpeg', 'svg', 'gif', 'webp'].includes(ext || '')) {
-          type = 'image';
-          url = `${API_BASE}/preview/${filename}`;
-        } else if (ext === 'csv') {
-          type = 'data';
-          content = tc.result || '';
-        } else if (ext === 'json') {
-          type = 'data';
-          content = tc.result || '';
-        } else if (['mp4', 'webm', 'mov'].includes(ext || '')) {
-          type = 'video';
-          url = `${API_BASE}/preview/${filename}`;
-        } else {
-          type = 'code';
-          content = tc.result || '';
-        }
-
-        const item: ArtifactItem = {
-          id,
-          type,
-          title: filename,
-          content,
-          url,
-          base64,
-          timestamp: Date.now(),
-          sourceTool: 'file_write',
-        };
-
-        setArtifacts((prev) => [...prev, item]);
-        layout.setRightTab('artifacts');
-      }
-
-      if (tc.name === 'shell_execute') {
-        const id = `artifact_term_${Date.now()}`;
-        const command = tc.args?.command || '';
-        const result = tc.result || '';
-        const existingIdx = artifacts.findIndex((a) => a.type === 'terminal' && a.sourceTool === 'shell_execute');
-
-        if (existingIdx >= 0) {
-          // 追加到现有终端成果
-          setArtifacts((prev) => {
-            const next = [...prev];
-            next[existingIdx] = {
-              ...next[existingIdx],
-              content: next[existingIdx].content + `\n$ ${command}\n${result}`,
-              timestamp: Date.now(),
-            };
-            return next;
-          });
-        } else {
-          const item: ArtifactItem = {
-            id,
-            type: 'terminal',
-            title: '终端输出',
-            content: `$ ${command}\n${result}`,
-            timestamp: Date.now(),
-            sourceTool: 'shell_execute',
-          };
-          setArtifacts((prev) => [...prev, item]);
-        }
-        layout.setRightTab('artifacts');
-      }
-
-      // browser_screenshot 的截图通过独立的 image 事件传递，此处不处理
-    };
-  }, [onToolCallRef, artifacts]);
-
-  useEffect(() => {
-    onFileEditRef.current = (edit: FileEdit) => {
-      const editPath = normalizePath(edit.path);
-      const projectRoot = currentProject ? normalizePath(currentProject.path) : '';
-      const relativePath = projectRoot && editPath.startsWith(projectRoot + '/')
-        ? edit.path.replace(/\\/g, '/').slice(currentProject!.path.replace(/\\/g, '/').length + 1)
-        : edit.path.replace(/\\/g, '/');
-
-      setEditorGroups((prev) =>
-        prev.map((g) => ({
-          ...g,
-          openFiles: g.openFiles.map((f) => {
-            const filePath = normalizePath(f.path);
-            const matches = filePath === normalizePath(relativePath) || editPath.endsWith('/' + filePath);
-            if (!matches) return f;
-
-            const hasLocalConflict = !!f.isModified && edit.old_text != null && f.content !== edit.old_text;
-            if (hasLocalConflict) {
-              return { ...f, hasConflict: true, isModified: true };
-            }
-            return {
-              ...f,
-              content: edit.new_text ?? f.content,
-              isModified: false,
-              hasConflict: false,
-            };
-          }),
-        }))
-      );
-
-      if (edit.truncated) {
-        addTerminalLog(`[Edit] ${edit.path} changed; full text was too large for inline diff`);
-      }
-    };
-    return () => {
-      onFileEditRef.current = null;
-    };
-  }, [onFileEditRef, currentProject, layout, addTerminalLog]);
-
-  // Electron 菜单事件
+  // Electron menu events
   useEffect(() => {
     if (window.electronAPI?.onNewSession) {
       const handler = () => newSession();
       const unsubscribe = window.electronAPI.onNewSession(handler);
-      return () => {
-        unsubscribe?.();
-      };
+      return () => { unsubscribe?.(); };
     }
-  }, []);
+  }, [newSession]);
 
-  const switchSession = useCallback(
-    (newSessionId: string) => {
-      const target = sessions.find((s) => s.id === newSessionId);
-      if (target?.model_id) {
-        setCurrentModel(target.model_id);
-      }
-      if (target?.role_id) {
-        setCurrentRole(target.role_id);
-        localStorage.setItem('agent_default_role', target.role_id);
-      }
-      resetSession();
-      setSessionId(newSessionId);
-    },
-    [resetSession, sessions]
-  );
-
-  const newSession = useCallback(() => {
-    switchSession(`session_${Date.now()}`);
-  }, [switchSession]);
-
-  const handleRoleChange = useCallback((roleId: string) => {
-    setCurrentRole(roleId);
-    localStorage.setItem('agent_default_role', roleId);
-    // 切换角色时自动新建会话
-    resetSession();
-    setSessionId(`session_${Date.now()}`);
-    addTerminalLog(`[系统] 已切换到角色: ${roles.find(r => r.id === roleId)?.name || roleId}，新建会话`);
-  }, [resetSession, roles, addTerminalLog]);
-
-  const handleRolesChanged = useCallback(async () => {
-    try {
-      const r = await fetch(`${API_BASE}/api/roles`);
-      const data = await r.json();
-      const builtinRoles: RoleInfo[] = (data.roles || []).map((r: any) => ({
-        id: r.id,
-        name: r.name,
-        description: r.description,
-        isBuiltin: true,
-      }));
-      setRoles(builtinRoles);
-      try {
-        const custom = await loadRoles();
-        const customRoles: RoleInfo[] = custom.map((r) => ({
-          id: r.id,
-          name: r.name,
-          description: r.description,
-          isBuiltin: false,
-        }));
-        setRoles([...builtinRoles, ...customRoles]);
-      } catch (dbErr) {
-        console.error('[App] Failed to load custom roles:', dbErr);
-      }
-    } catch (err) {
-      console.error('[App] Failed to reload roles:', err);
-    }
-  }, []);
-
-  const deleteSession = useCallback(
-    async (id: string) => {
-      await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
-      loadSessions();
-      if (id === sessionId) {
-        newSession();
-      }
-    },
-    [sessionId, newSession, loadSessions]
-  );
-
-  // 全局快捷键
-  useHotkeys('ctrl+k, cmd+k', (e) => {
+  // ---- Hotkeys ----
+  useHotkeys('ctrl+\\, cmd+\\', (e) => {
     e.preventDefault();
-    // 聚焦到搜索框的逻辑由 ChatPanel 内部处理
-    // 这里通过 ref 或直接操作 DOM 触发
-    const searchInput = document.querySelector('[data-search-input]') as HTMLInputElement;
-    searchInput?.focus();
-  }, { enableOnFormTags: true });
-
-  useHotkeys('ctrl+l, cmd+l', (e) => {
-    e.preventDefault();
-    clearSession();
-  });
-
-  useHotkeys('ctrl+b, cmd+b', (e) => {
-    e.preventDefault();
-    layout.setSidebarCollapsed((v) => !v);
-  });
-
-  useHotkeys('ctrl+backslash, cmd+backslash', (e) => {
-    e.preventDefault();
-    layout.setRightPanelVisible((v) => !v);
-  });
+    layout.toggleRightPanel();
+  }, [layout]);
 
   useHotkeys('ctrl+j, cmd+j', (e) => {
     e.preventDefault();
-    layout.setShowTerminal((v) => !v);
-  });
+    layout.toggleTerminal();
+  }, [layout]);
 
-  useHotkeys('esc', () => {
-    if (isRunning) {
-      stopRunning();
-    }
-  });
+  // ---- Derived: right panel props from focused snapshot ----
+  const rpTools = focusedSnapshot?.toolCalls ?? [];
+  const rpEdits = focusedSnapshot?.fileEdits ?? [];
+  const rpRuns = focusedSnapshot?.runEvents ?? [];
+  const rpArtifacts = focusedSnapshot?.artifacts ?? [];
+  const rpIsRunning = focusedSnapshot?.isRunning ?? false;
+  const rpLatestToolCall = focusedSnapshot?.latestToolCall ?? null;
+  const rpEditorGroups = focusedSnapshot?.editorGroups ?? [{ id: 'main', activeFileId: null, openFiles: [] }];
+  const rpActiveEditorGroup = focusedSnapshot?.activeEditorGroup ?? 'main';
 
-  useHotkeys('shift+tab', (e) => {
-    e.preventDefault();
-    setChatMode(chatMode === 'plan' ? 'agent' : 'plan');
-  }, { enableOnFormTags: true });
-
-  // 连接状态变化时记录日志
-  useEffect(() => {
-    if (isConnected) {
-      addTerminalLog('[系统] WebSocket 已连接');
-    } else {
-      addTerminalLog('[系统] WebSocket 已断开，尝试重连...');
-    }
-  }, [isConnected, addTerminalLog]);
+  // ---- Render ----
+  const isConnected = focusedSnapshot?.isConnected ?? false;
+  const isRunning = rpIsRunning;
 
   return (
     <div className="h-screen flex flex-col bg-app text-fg overflow-hidden">
-      {/* 顶部标题栏 */}
+      {/* Title bar */}
       <div className="h-10 bg-surface border-b border-border flex items-center px-4 justify-between select-none app-drag">
         <div className="flex items-center gap-2">
-          <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
-          <span className="text-sm font-medium">Desktop Agent</span>
+          <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-success' : 'bg-danger'}`} />
+          <span className="text-sm font-semibold text-fg-secondary">Desktop Agent</span>
           <span className="text-xs text-fg-muted ml-2">{isRunning ? '● Running' : '○ Ready'}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -866,7 +771,12 @@ export default function App() {
             onChange={(e) => {
               const newModel = e.target.value;
               setCurrentModel(newModel);
-              sendRaw({ type: 'switch_model', model_id: newModel });
+              setPaneRoot((prev) => {
+                const leaf = findLeafById(prev, focusedLeafId);
+                if (!leaf) return prev;
+                const newPane = { ...leaf.pane, model: newModel };
+                return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+              });
             }}
             className="text-xs text-fg-secondary bg-surface-hover/80 px-2 py-1 rounded border border-border outline-none cursor-pointer hover:bg-surface-hover transition-colors"
           >
@@ -885,32 +795,36 @@ export default function App() {
         </div>
       </div>
 
-      {/* 主内容区 */}
+      {/* Main content area */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Activity Bar — always visible */}
+        {/* Activity Bar */}
         <ActivityBar
           activeSection={layout.activeSection}
+          activeAgent={layout.activeAgent}
           sidebarCollapsed={layout.sidebarCollapsed}
           onSectionChange={layout.setActiveSection}
+          onAgentChange={handleAgentChange}
           onToggleSidebar={layout.toggleSidebar}
         />
 
-        {/* 左侧边栏 */}
+        {/* Left sidebar */}
         {!layout.sidebarCollapsed && (
           <>
             <Sidebar
               activeSection={layout.activeSection}
+              activeAgent={layout.activeAgent}
               onSectionChange={layout.setActiveSection}
               roles={roles}
               currentRole={currentRole}
               onRoleChange={handleRoleChange}
+              onAgentChange={handleAgentChange}
               onOpenRoleEditor={() => setShowRoleEditor(true)}
               onOpenSettings={() => setShowSettings(true)}
-              onClear={clearSession}
-              onExecuteTool={executeToolDirect}
+              onClear={() => { if (focusedActions) focusedActions.sendMessage('__compact__', undefined, { chatMode: 'agent' }); }}
+              onExecuteTool={focusedActions.executeToolDirect}
               isConnected={isConnected}
               sessions={sessions}
-              currentSession={sessionId}
+              currentSession={focusedSessionId}
               onNewSession={newSession}
               onSwitchSession={switchSession}
               onDeleteSession={deleteSession}
@@ -930,8 +844,6 @@ export default function App() {
               onClose={() => setShowProjectModal(false)}
               onProjectCreated={(project) => {
                 setCurrentProject(project);
-                setEditorGroups([{ id: 'main', activeFileId: null, openFiles: [] }]);
-                setActiveEditorGroup('main');
                 loadProjectTree();
                 setShowProjectModal(false);
                 addTerminalLog(`[系统] 已创建项目: ${project.name}`);
@@ -965,40 +877,58 @@ export default function App() {
           onRolesChanged={handleRolesChanged}
         />
 
-        {/* 中间 + 右侧面板 — horizontal Group */}
+        <SwitchAgentModal
+          isOpen={!!switchSuggestion}
+          from={switchSuggestion?.from || 'personal'}
+          to={switchSuggestion?.to || 'coding'}
+          reason={switchSuggestion?.reason || ''}
+          onSwitch={() => {
+            if (switchSuggestion) {
+              handleAgentChange(switchSuggestion.to);
+            }
+            setSwitchSuggestion(null);
+          }}
+          onDismiss={() => setSwitchSuggestion(null)}
+          onNeverAsk={() => {
+            localStorage.setItem('desktop-agent-never-suggest-switch', 'true');
+            setSwitchSuggestion(null);
+          }}
+        />
+
+        {/* Center + right panel — horizontal Group */}
         <Group orientation="horizontal" className="flex-1 min-w-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
-          {/* 中间 + 底部面板 */}
+          {/* Center area */}
           <Panel>
             <div className="flex flex-col h-full">
+              {/* Vertical Group: Pane tree + Terminal */}
               <Group orientation="vertical" className="flex-1 min-h-0" resizeTargetMinimumSize={{ fine: 16, coarse: 24 }}>
                 <Panel>
-                  <ChatPanel
-                    messages={messages}
-                    toolCalls={toolCalls}
-                    onSend={sendMessage}
-                    onStop={stopRunning}
-                    onRetry={retryLast}
-                    isRunning={isRunning}
-                    onDraftSave={saveInputDraft}
-                    onDraftLoad={loadInputDraft}
-                    onDraftClear={clearInputDraft}
-                    chatMode={chatMode}
-                    onChatModeChange={setChatMode}
-                    thinkingIntensity={thinkingIntensity}
-                    onThinkingIntensityChange={setThinkingIntensity}
-                    planState={planState}
-                    onApprovePlan={approvePlan}
-                    onBuildPlan={buildPlan}
-                    onRejectPlan={rejectPlan}
-                    onUpdatePlanDecision={updatePlanDecision}
+                  <PaneRenderer
+                    node={paneRoot}
+                    focusedLeafId={focusedLeafId}
+                    onFocus={setFocusedLeafId}
+                    onClosePane={handleClosePane}
+                    onSplit={handleSplitPane}
+                    onMoveSession={handleMoveSession}
+                    teams={teams}
+                    onJoinTeam={handleJoinTeam}
+                    onCreateTeam={handleCreateTeam}
+                    onLeaveTeam={handleLeaveTeam}
+                    sessionViewRefs={sessionViewRefs}
+                    currentProject={currentProject}
+                    currentModel={currentModel}
+                    currentRole={currentRole}
+                    onSnapshot={handleSessionSnapshot}
                     onCommand={handleSlashCommand}
-                    projectOpen={!!currentProject}
-                    fileTree={fileTree}
+                    runAction={runAction}
+                    openRunWorktree={openRunWorktree}
+                    handleOpenFileFromPanel={handleOpenFileFromPanel}
+                    handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
                   />
                 </Panel>
 
+                {/* Terminal (shared) */}
                 <Separator className="h-px bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-row-resize" />
-
                 <Panel
                   id="terminal"
                   panelRef={terminalPanelRef}
@@ -1008,11 +938,8 @@ export default function App() {
                   minSize={0}
                   maxSize={800}
                   onResize={(size) => {
-                    if (size.asPercentage <= 1) {
-                      layout.setShowTerminal(false);
-                    } else if (!layout.showTerminal) {
-                      layout.setShowTerminal(true);
-                    }
+                    if (size.asPercentage <= 1) layout.setShowTerminal(false);
+                    else if (!layout.showTerminal) layout.setShowTerminal(true);
                   }}
                 >
                   <div className="relative h-full">
@@ -1046,192 +973,98 @@ export default function App() {
             </div>
           </Panel>
 
-          {/* Right panel — always in Group, uses collapsible */}
-          <Separator className="w-px bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-col-resize" />
+          {/* Right panel */}
+          <Separator className="bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-col-resize" style={{ width: 3 }} />
           <Panel
             panelRef={rightPanelRef}
             defaultSize={800} minSize={0} maxSize={1600}
             collapsible collapsedSize={0}
             onResize={(size) => {
-              if (size.asPercentage <= 1) {
-                layout.setRightPanelVisible(false);
-              } else if (!layout.rightPanelVisible) {
-                layout.setRightPanelVisible(true);
-              }
+              if (size.asPercentage <= 1) layout.setRightPanelVisible(false);
+              else if (!layout.rightPanelVisible) layout.setRightPanelVisible(true);
             }}
           >
             <div className="bg-surface flex flex-col h-full min-w-0">
-              <div className="flex border-b border-border overflow-x-auto max-w-full min-w-0">
+              {/* Two-zone tab bar */}
+              <div className="flex border-b border-border shrink-0">
                 <button
-                  onClick={() => layout.setRightTab('tools')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'tools' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
+                  type="button"
+                  onClick={() => layout.setRightZone('workspace')}
+                  className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
+                    layout.rightZone === 'workspace' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                  }`}
                 >
-                  Tool Calls
+                  <Monitor className="w-3.5 h-3.5" />
+                  工作区
                 </button>
                 <button
-                  onClick={() => layout.setRightTab('changes')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'changes' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
+                  type="button"
+                  onClick={() => layout.setRightZone('activity')}
+                  className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
+                    layout.rightZone === 'activity' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                  }`}
                 >
-                  Changes
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('runs')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'runs' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Runs
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('tests')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'tests' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Tests
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('problems')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'problems' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Problems
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('eval')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'eval' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Eval
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('artifacts')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'artifacts' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Artifacts
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('editor')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'editor' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Editor
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('knowledge')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'knowledge' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Knowledge
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('workflow')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'workflow' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  Workflows
-                </button>
-                <button
-                  onClick={() => layout.setRightTab('mcp')}
-                  className={`shrink-0 px-3 py-2 text-xs font-semibold uppercase tracking-wider ${layout.rightTab === 'mcp' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                    }`}
-                >
-                  MCP
+                  <Activity className="w-3.5 h-3.5" />
+                  活动
                 </button>
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
-                {layout.rightTab === 'tools' && (
-                  <div className="h-full overflow-y-auto p-2">
-                    {toolCalls.length === 0 && (
-                      <div className="text-xs text-fg-muted text-center mt-4">No tool calls yet</div>
-                    )}
-                    {toolCalls.map((tc, i) => (
-                      <ToolCallView
-                        key={tc.timestamp + i}
-                        name={tc.name}
-                        args={tc.args}
-                        result={tc.result}
-                        status={tc.result.startsWith('[ERROR]') ? 'error' : 'success'}
-                        durationMs={tc.durationMs}
-                        workerEvents={tc.workerEvents}
+                {layout.rightZone === 'workspace' && layout.activeAgent === 'personal' && (
+                  <PersonalWorkspacePanel />
+                )}
+                {layout.rightZone === 'workspace' && layout.activeAgent !== 'personal' && (
+                  <FocusedDataProvider value={focusedSnapshot}>
+                    <FocusedActionsProvider value={focusedActions}>
+                      <WorkspacePanel
+                        activeView={workspaceView}
+                        onActiveViewChange={setWorkspaceView}
+                        editorGroups={rpEditorGroups}
+                        activeEditorGroup={rpActiveEditorGroup}
+                        projectName={currentProject?.name || '未打开项目'}
+                        onSelectFile={focusedActions.onSelectFileInEditor}
+                        onCloseFile={focusedActions.onCloseFileInEditor}
+                        onMoveToGroup={() => {}}
+                        onSplitEditor={() => {}}
+                        onCloseSplit={() => {}}
+                        onSetActiveGroup={() => {}}
+                        onFileContentChange={focusedActions.onFileContentChange}
+                        onSaveFile={focusedActions.onSaveFile}
+                        artifacts={rpArtifacts}
+                        isRunning={rpIsRunning}
+                        latestToolCall={rpLatestToolCall}
+                        previewUrl={previewUrl}
+                        onAnnotate={(a) => {
+                          const msg = `[标注] [${a.url || '预览页面'}] 区域(${a.rect.x}%,${a.rect.y}%,${a.rect.w}%x${a.rect.h}%): ${a.note}`;
+                          focusedActions.sendMessage(msg, a.base64);
+                        }}
                       />
-                    ))}
-                  </div>
+                    </FocusedActionsProvider>
+                  </FocusedDataProvider>
                 )}
-                {layout.rightTab === 'artifacts' && (
-                  <ArtifactPanel artifacts={artifacts} isRunning={isRunning} latestToolCall={latestToolCall} />
+                {layout.rightZone === 'activity' && (
+                  <FocusedDataProvider value={focusedSnapshot}>
+                    <FocusedActionsProvider value={focusedActions}>
+                      <ActivityPanel
+                        toolCalls={rpTools}
+                        fileEdits={rpEdits}
+                        runEvents={rpRuns}
+                        onOpenFileFromChanges={focusedActions.handleOpenFileFromPanel}
+                        onOpenFileFromTests={focusedActions.handleOpenFileFromPanel}
+                        onOpenFileFromProblems={focusedActions.handleOpenFileFromPanelWithLine}
+                        onOpenWorktree={focusedActions.openRunWorktree}
+                        onApplyRun={(runId) => focusedActions.runAction(runId, 'apply')}
+                        onMergeRun={(runId) => focusedActions.runAction(runId, 'merge')}
+                        onDiscardRun={(runId) => focusedActions.runAction(runId, 'discard')}
+                      />
+                    </FocusedActionsProvider>
+                  </FocusedDataProvider>
                 )}
-                {layout.rightTab === 'editor' && (
-                  <EditorPanel
-                    groups={editorGroups}
-                    activeGroupId={activeEditorGroup}
-                    projectName={currentProject?.name || '未打开项目'}
-                    onSelectFile={handleSelectFileInEditor}
-                    onCloseFile={handleCloseFileInEditor}
-                    onMoveToGroup={handleMoveToGroup}
-                    onSplitEditor={handleSplitEditor}
-                    onCloseSplit={handleCloseSplit}
-                    onSetActiveGroup={setActiveEditorGroup}
-                    onFileContentChange={handleFileContentChange}
-                    onSaveFile={handleSaveFile}
-                  />
-                )}
-                {layout.rightTab === 'changes' && (
-                  <ChangesPanel edits={fileEdits} onOpenFile={(path) => {
-                    if (!currentProject) return;
-                    const projectRoot = currentProject.path.replace(/\\/g, '/');
-                    const normalized = path.replace(/\\/g, '/');
-                    const relative = normalizePath(normalized).startsWith(normalizePath(projectRoot) + '/')
-                      ? normalized.slice(projectRoot.length + 1)
-                      : normalized;
-                    handleSelectFile(relative, 'file');
-                  }} />
-                )}
-                {layout.rightTab === 'runs' && (
-                  <RunSummaryPanel
-                    events={runEvents}
-                    onOpenWorktree={openRunWorktree}
-                    onApplyRun={(runId) => runAction(runId, 'apply')}
-                    onMergeRun={(runId) => runAction(runId, 'merge')}
-                    onDiscardRun={(runId) => runAction(runId, 'discard')}
-                  />
-                )}
-                {layout.rightTab === 'tests' && (
-                  <TestsPanel onOpenFile={(path) => {
-                    const normalized = path.replace(/\\/g, '/');
-                    const projectPrefix = currentProject?.path.replace(/\\/g, '/') || '';
-                    const relative = normalized.startsWith(projectPrefix)
-                      ? normalized.slice(projectPrefix.length + 1)
-                      : normalized;
-                    handleSelectFile(relative, 'file');
-                  }} />
-                )}
-                {layout.rightTab === 'problems' && (
-                  <ProblemsPanel onOpenFile={(path, line) => {
-                    const normalized = path.replace(/\\/g, '/');
-                    const projectPrefix = currentProject?.path.replace(/\\/g, '/') || '';
-                    const relative = normalized.startsWith(projectPrefix)
-                      ? normalized.slice(projectPrefix.length + 1)
-                      : normalized;
-                    handleSelectFile(relative, 'file');
-                    if (line) {
-                      setTimeout(() => {
-                        // Jump to line — editor will auto-scroll on open
-                      }, 300);
-                    }
-                  }} />
-                )}
-                {layout.rightTab === 'eval' && <EvalPanel />}
-                {layout.rightTab === 'knowledge' && <KnowledgePanel />}
-                {layout.rightTab === 'workflow' && <WorkflowPanel />}
-                {layout.rightTab === 'mcp' && <McpPanel />}
               </div>
             </div>
           </Panel>
         </Group>
 
-        {/* Right panel expand strip — shown when panel is collapsed */}
+        {/* Right panel expand strip */}
         {!layout.rightPanelVisible && (
           <div className="w-9 flex-shrink-0 border-l border-border bg-surface flex flex-col items-center py-2 gap-3">
             <button
@@ -1244,28 +1077,16 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => { layout.setRightTab('tools'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'tools' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="Tool Calls"
-            >T</button>
+              onClick={() => { layout.setRightZone('workspace'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'workspace' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="工作区"
+            >W</button>
             <button
               type="button"
-              onClick={() => { layout.setRightTab('editor'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'editor' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="Editor"
-            >E</button>
-            <button
-              type="button"
-              onClick={() => { layout.setRightTab('runs'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'runs' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="Runs"
-            >R</button>
-            <button
-              type="button"
-              onClick={() => { layout.setRightTab('knowledge'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightTab === 'knowledge' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="Knowledge"
-            >K</button>
+              onClick={() => { layout.setRightZone('activity'); layout.setRightPanelVisible(true); }}
+              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'activity' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+              title="活动"
+            >A</button>
           </div>
         )}
       </div>

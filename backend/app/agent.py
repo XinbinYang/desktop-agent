@@ -20,7 +20,8 @@ from app.models import ModelRouter
 from app.memory import build_memory_prompt
 from app.project_manager import ProjectManager
 from app.project_rules import build_rules_prompt
-from app.roles import RoleManager
+from app.roles import RoleManager  # deprecated — kept for backward compat
+from app.agents.manager import AgentManager
 from app.runtime_paths import runtime_dir, backend_root
 from app.skills import SkillManager
 from app.tools import build_tools_description, get_tool, get_tool_schemas, list_tool_names, DynamicToolRegistry
@@ -57,10 +58,12 @@ READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
 class AgentSession:
     MAX_HISTORY_MESSAGES = 20
 
-    def __init__(self, model_id: str, session_id: str = "default", role_id: str = "desktop-agent"):
+    def __init__(self, model_id: str, session_id: str = "default", role_id: str = "desktop-agent", agent_type: str | None = None):
         self.session_id = session_id
         self.model_id = model_id
-        self.role_id = role_id
+        # agent_type is the new primary field; role_id kept for backward compat
+        self._agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
+        self._role_id = role_id
         self.router = ModelRouter(model_id)
         self.messages: List[Dict[str, Any]] = []
         self.iteration = 0
@@ -81,11 +84,35 @@ class AgentSession:
         self.plan_state = PlanState()
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
+        self.team_id: str | None = None
+        self.team_name: str = ""
         self._setup_system_prompt()
 
+    @property
+    def agent_type(self) -> str:
+        return self._agent_type
+
+    @agent_type.setter
+    def agent_type(self, value: str) -> None:
+        self._agent_type = value
+        self._role_id = AgentManager.get_default_role(value)
+
+    @property
+    def role_id(self) -> str:
+        """Backward-compatible alias for _role_id."""
+        return self._role_id
+
+    @role_id.setter
+    def role_id(self, value: str) -> None:
+        self._role_id = value
+        # If the role maps to a different agent_type, update it
+        mapped = AgentManager.get_agent_type_for_role(value)
+        if mapped != self._agent_type:
+            self._agent_type = mapped
+
     def _build_system_prompt(self) -> str:
-        tools_desc = build_tools_description(self.dynamic_registry)
-        system_msg = RoleManager.render_prompt(self.role_id, tools_desc)
+        tools_desc = build_tools_description(self.dynamic_registry, agent_type=self._agent_type)
+        system_msg = AgentManager.render_prompt(self._agent_type, tools_desc, self._last_user_message)
 
         model_name = self.model_id
         try:
@@ -122,26 +149,43 @@ class AgentSession:
             if memory_text:
                 system_msg += "\n\n" + memory_text
 
-            try:
-                coding_cfg = load_config().coding_agent
-                if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
-                    if self._repo_map_cache is None:
-                        self._repo_map_cache = build_repo_map(project["path"])
-                    repo_map = self._repo_map_cache
-                    system_msg += "\n\n## Coding Agent Context\n"
-                    system_msg += format_repo_map_summary(repo_map, max_chars=4500)
-                    system_msg += (
-                        "\n\n## Coding Agent Operating Rules\n"
-                        "- For codebase discovery, prefer `repo_map`, `code_search`, and `file_outline` over ad-hoc shell search.\n"
-                        "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
-                        "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks to add or modify tests.\n"
-                        "- This runs on Windows: avoid Unix-only helpers such as `tail`, `head`, `grep`, `sed`, and `awk`; use PowerShell cmdlets or `rg`.\n"
-                        "- Use project-relative paths by default. When a coding run has a worktree, tools operate inside that worktree.\n"
-                        "- Split larger coding work into architect/read-only analysis, editor/minimal edits, verifier/tests, and reviewer/final diff review workers.\n"
-                        "- Run `verify_project` before completion when practical, then inspect `git_diff`/`run_review` for the final change set.\n"
-                    )
-            except Exception as e:
-                logger.warning("Coding repo map injection failed: %s", e)
+            # Coding Agent: inject repo map and operating rules
+            if self._agent_type == "coding":
+                try:
+                    coding_cfg = load_config().coding_agent
+                    if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
+                        if self._repo_map_cache is None:
+                            self._repo_map_cache = build_repo_map(project["path"])
+                        repo_map = self._repo_map_cache
+                        system_msg += "\n\n## Coding Agent Context\n"
+                        system_msg += format_repo_map_summary(repo_map, max_chars=4500)
+                        system_msg += (
+                            "\n\n## Coding Agent Operating Rules\n"
+                            "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
+                            "use `dispatch_parallel` to launch multiple `explorer` workers simultaneously — one per "
+                            "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
+                            "and reports back. Synthesize their reports before dispatching an architect. "
+                            "Never read files one-by-one inline when you could parallelize exploration.\n"
+                            "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
+                            "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
+                            "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
+                            "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
+                            "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
+                            "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
+                            "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks.\n"
+                            "- Windows: avoid Unix-only helpers (tail, head, grep, sed, awk); use PowerShell or `rg`.\n"
+                            "- Use project-relative paths. In worktree mode, tools operate inside the worktree.\n"
+                            "- Worker roles: explorer=parallel read-only area scan, architect=read-only plan, editor=minimal edits+verify, verifier=run tests+report, reviewer=diff review.\n"
+                        )
+                except Exception as e:
+                    logger.warning("Coding repo map injection failed: %s", e)
+
+            # Personal Agent: update PROJECT.md for Coding Agent reference
+            if self._agent_type == "personal":
+                try:
+                    AgentManager.update_project_context(project)
+                except Exception as e:
+                    logger.warning("Project context update failed: %s", e)
 
         if self.chat_mode == "plan" and not self.plan_state.approved:
             try:
@@ -204,7 +248,31 @@ class AgentSession:
         except Exception as e:
             logger.warning("RAG auto-retrieval failed: %s", e)
 
+        # Inject team shared context
+        if self.team_id:
+            from .teams import build_team_context_prompt
+            team_ctx = build_team_context_prompt(self.team_id, self.team_name or "Team")
+            if team_ctx:
+                system_msg += team_ctx
+
         return system_msg
+
+    def set_team(self, team_id: str | None, team_name: str = ""):
+        """Set or clear the team for this session. Refreshes system prompt and tools."""
+        from app.tools.team_context_tool import create_team_context_tool
+
+        was_in_team = bool(self.team_id)
+        self.team_id = team_id
+        self.team_name = team_name
+
+        # Register or remove team_context tool
+        if team_id:
+            tool = create_team_context_tool(team_id, team_name)
+            self.dynamic_registry.register(tool)
+        elif was_in_team:
+            self.dynamic_registry.unregister("team_context")
+
+        self._refresh_system_prompt()
 
     def _setup_system_prompt(self):
         self.messages.append({"role": "system", "content": self._build_system_prompt()})
@@ -369,6 +437,9 @@ class AgentSession:
         lines.append("- Process todos in dependency order. Mark as in_progress before starting, completed when done.")
         lines.append("- If blocked, mark the todo as blocked and explain why.")
         lines.append("- After implementation, run verify_project and git_diff for review.")
+        lines.append("- When dispatching a worker for a todo, include the todo's acceptance_criteria in the task description.")
+        lines.append("- Ask each worker to end its response with exactly: ACCEPTANCE: PASS or ACCEPTANCE: FAIL")
+        lines.append("- Only mark a todo as completed if the worker reports ACCEPTANCE: PASS.")
         self.messages.append({"role": "system", "content": "\n".join(lines)})
         self._plan_exec_hint_sent = True
 
@@ -534,11 +605,13 @@ class AgentSession:
         is_plan_continue = user_input == PLAN_CONTINUE_MARKER
 
         try:
-            coding_run = create_coding_run(
-                session_id=self.session_id,
-                run_id=run_id,
-                prompt=self._last_user_message if is_plan_continue else user_input,
-            )
+            coding_run = None
+            if self._agent_type == "coding":
+                coding_run = create_coding_run(
+                    session_id=self.session_id,
+                    run_id=run_id,
+                    prompt=self._last_user_message if is_plan_continue else user_input,
+                )
             if coding_run:
                 run_context_token = set_run_context(coding_run)
                 yield self._event(
@@ -600,6 +673,21 @@ class AgentSession:
             project_path = project["path"] if project else ""
             resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
 
+            # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
+            if self._agent_type == "personal" and project and self.chat_mode != "plan":
+                if not getattr(self, "_dispatch_suggested_this_session", False):
+                    if AgentSession._detect_code_intent(user_input):
+                        self._dispatch_suggested_this_session = True
+                        yield self._event(
+                            "suggest_agent_switch",
+                            {
+                                "from": "personal",
+                                "to": "coding",
+                                "reason": "This task involves code development. The Coding Agent provides a professional engineering workflow with worktree isolation, verification, and review.",
+                            },
+                            run_id,
+                        )
+
             self._last_user_message = user_input  # Keep original for skill matching
             self._refresh_system_prompt()
             if image_base64:
@@ -655,6 +743,9 @@ class AgentSession:
 
         finished = False
         plan_turn_done = False
+        _files_modified = False
+        _verify_called = False
+        _verify_gate_fired = False
         while self.iteration < self.max_iterations:
             if self._cancelled:
                 yield self._event("interrupted", {"message": "User cancelled"}, run_id)
@@ -683,7 +774,7 @@ class AgentSession:
                             "content": ss_content
                         })
 
-            tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry))
+            tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type))
             try:
                 response = await self.router.chat_completion_non_stream(
                     messages=self.messages,
@@ -743,6 +834,26 @@ class AgentSession:
 
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
+                # Auto-verification gate: block completion if files were edited without verify
+                _proj = ProjectManager.get_current()
+                if (
+                    _proj
+                    and _files_modified
+                    and not _verify_called
+                    and not _verify_gate_fired
+                    and self.chat_mode != "plan"
+                ):
+                    _verify_gate_fired = True
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[VERIFICATION REQUIRED] You modified files this session but have not run "
+                            "verify_project. You MUST run verify_project (or the project test/typecheck "
+                            "command) before claiming the task is done. Do not say the task is complete "
+                            "without showing verification output."
+                        ),
+                    })
+                    continue
                 self._trim_messages()
                 self._save()
                 yield self._event("status", {"status": "completed"}, run_id)
@@ -831,8 +942,14 @@ class AgentSession:
                     get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
                 )
 
+                # Track file modifications and verification calls for the auto-verification gate
+                if tool_name in ("file_patch", "file_write", "file_delete", "coding_file_write") and not tc_result.error:
+                    _files_modified = True
+                if tool_name in ("verify_project", "shell_execute"):
+                    _verify_called = True
+
                 if self.chat_mode == "plan" and self.plan_state.approved:
-                    if self._touch_plan_todo_after_tool(tool_name):
+                    if self._touch_plan_todo_after_tool(tool_name, tc_result.result_text):
                         yield self._event(
                             "todo_update",
                             {"todos": [t.model_dump() for t in self.plan_state.todos]},
@@ -952,7 +1069,7 @@ class AgentSession:
         close_coding_run(completion_status, f"Run {completion_status} after {self.iteration} iteration(s).")
         self._save()
 
-    def _touch_plan_todo_after_tool(self, tool_name: str) -> bool:
+    def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "") -> bool:
         """Best-effort todo progression after worker dispatch tools (plan execution). Returns True if todos changed."""
         if self.chat_mode != "plan" or not self.plan_state.todos:
             return False
@@ -960,21 +1077,29 @@ class AgentSession:
             return False
         todos = self.plan_state.todos
         changed = False
+        # Only advance in_progress → completed when worker signals success, or no acceptance signal at all
+        acceptance_fail = "ACCEPTANCE: FAIL" in result_text
+        acceptance_pass = "ACCEPTANCE: PASS" in result_text
         for t in todos:
             if t.status == "in_progress":
-                t.status = "completed"
+                if acceptance_fail:
+                    t.status = "blocked"
+                else:
+                    # Mark completed if ACCEPTANCE: PASS or no acceptance token (legacy workers)
+                    t.status = "completed"
                 changed = True
                 break
-        for t in todos:
-            if t.status != "pending":
-                continue
-            deps = t.depends_on or []
-            if not deps or all(
-                (self._todo_by_id(d) and self._todo_by_id(d).status == "completed") for d in deps
-            ):
-                t.status = "in_progress"
-                changed = True
-                break
+        if not acceptance_fail:
+            for t in todos:
+                if t.status != "pending":
+                    continue
+                deps = t.depends_on or []
+                if not deps or all(
+                    (self._todo_by_id(d) and self._todo_by_id(d).status == "completed") for d in deps
+                ):
+                    t.status = "in_progress"
+                    changed = True
+                    break
         return changed
 
     def _todo_by_id(self, todo_id: str) -> Optional[PlanTodo]:
@@ -982,6 +1107,37 @@ class AgentSession:
             if t.id == todo_id:
                 return t
         return None
+
+    _CODE_INTENT_PATTERNS = [
+        # Chinese patterns
+        r"(写|帮我写|编写|实现|开发|新建|创建)\s*(一个|个|代码|程序|脚本|功能|模块|组件|页面|API|接口)",
+        r"(修复|修|fix|debug|调试)\s*(这个|那个|bug|问题|错误|报错|异常)",
+        r"(重构|refactor|重写|rewrite|优化|optimize)\s*(这个|代码|函数|方法|模块)",
+        r"(添加|增加|新增|add)\s*(功能|feature|测试|test|单元测试)",
+        r"(修改|改|modify|change|update)\s*(代码|文件|配置|逻辑|实现)",
+        r"(帮我|请|能不能|可以|能否).*(写|改|修|实现|开发|重构|优化|添加).*(代码|功能|文件|程序)",
+        r"(run|运行)\s*(test|测试|pytest|vitest)",
+        r"(git|Git)\s*(commit|push|merge|rebase|branch)",
+        r"(review|审查|检查)\s*(代码|code|PR|pull request)",
+        # English patterns
+        r"(write|create|build|implement|develop|code|make)\s+(a|an|the|some)?\s*(code|function|module|component|feature|script|page|API|endpoint|service|class|test)",
+        r"(fix|debug|resolve|patch|repair)\s+(the|a|an|this|that)?\s*(bug|issue|error|problem|exception|crash)",
+        r"(refactor|rewrite|optimize|improve|clean\s*up)\s+(the|this|code|function|method|module|class)",
+        r"(add|implement|create)\s+(a|an|the|some)?\s*(feature|test|unit\s*test|integration\s*test|endpoint|API)",
+        r"(modify|change|update|edit|alter)\s+(the|this|code|file|config|logic|implementation)",
+        r"(can|could|would)\s+you\s+(write|fix|create|build|implement|refactor|change|update|add)",
+        r"^(fix|write|create|build|add|update|refactor|implement)\b",
+    ]
+
+    @classmethod
+    def _detect_code_intent(cls, user_input: str) -> bool:
+        """Detect if a user message expresses code development intent."""
+        import re
+        user_lower = user_input.lower()
+        for pattern in cls._CODE_INTENT_PATTERNS:
+            if re.search(pattern, user_input) or re.search(pattern, user_lower):
+                return True
+        return False
 
     def _should_screenshot(self) -> bool:
         desktop_tools = ["mouse_click", "mouse_move", "type_text", "press_key", "scroll", "app_click"]
@@ -1094,8 +1250,16 @@ class AgentSession:
         self._setup_system_prompt()
         self._save()
 
+    def switch_agent(self, agent_type: str):
+        """Switch the active agent type and refresh the system prompt."""
+        AgentManager.switch_agent(self, agent_type)
+        self._save()
+
     def switch_role(self, role_id: str):
+        """Backward-compatible alias for switch_agent."""
+        agent_type = AgentManager.get_agent_type_for_role(role_id)
         self.role_id = role_id
+        self._agent_type = agent_type
         self._refresh_system_prompt()
         self._save()
 
@@ -1141,6 +1305,7 @@ class AgentSession:
             "session_id": self.session_id,
             "model_id": self.model_id,
             "role_id": self.role_id,
+            "agent_type": self._agent_type,
             "messages": self.messages,
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
@@ -1164,10 +1329,17 @@ class AgentSession:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # agent_type: prefer stored value, else migrate from role_id
+            stored_agent_type = data.get("agent_type")
+            stored_role_id = data.get("role_id", "desktop-agent")
+            if not stored_agent_type:
+                stored_agent_type = AgentManager.get_agent_type_for_role(stored_role_id)
+
             session = cls(
                 model_id=data.get("model_id", "kimi-for-coding"),
                 session_id=session_id,
-                role_id=data.get("role_id", "desktop-agent"),
+                role_id=stored_role_id,
+                agent_type=stored_agent_type,
             )
             session.messages = data.get("messages", [])
             session.iteration = 0
@@ -1230,6 +1402,7 @@ class AgentSession:
             "session_id": self.session_id,
             "model_id": self.model_id,
             "role_id": self.role_id,
+            "agent_type": self._agent_type,
             "messages": self.messages,
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
@@ -1254,17 +1427,18 @@ def _evict_if_needed() -> None:
         _sessions.popitem(last=False)
 
 
-def get_or_create_session(session_id: str, model_id: str, role_id: str = "desktop-agent") -> AgentSession:
+def get_or_create_session(session_id: str, model_id: str, role_id: str = "desktop-agent", agent_type: str | None = None) -> AgentSession:
     existing = _sessions.get(session_id)
+    resolved_agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
     if existing is None:
         loaded = AgentSession.load(session_id)
         if loaded:
             _sessions[session_id] = loaded
         else:
-            _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id)
+            _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
             _sessions[session_id].refresh_mcp_tools()
-    elif existing.model_id != model_id or existing.role_id != role_id:
-        _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id)
+    elif existing.model_id != model_id or (agent_type and existing._agent_type != agent_type):
+        _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
         _sessions[session_id].refresh_mcp_tools()
 
     _touch(session_id)

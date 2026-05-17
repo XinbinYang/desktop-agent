@@ -43,6 +43,7 @@ from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool
 from app.tools.test_tool import RunTestsTool
 from app.tools.diagnostics_tool import ListDiagnosticsTool
 from app.tools.ocr_tool import OCRClickTool, OCRFindTool, OCRReadTool
+from app.tools.memory_tool import MemorySearchTool, MemoryHandoffTool, MemoryListTool
 
 # 全局工具注册表
 ALL_TOOLS: list[BaseTool] = [
@@ -125,9 +126,53 @@ ALL_TOOLS: list[BaseTool] = [
     OCRClickTool(),
     OCRFindTool(),
     OCRReadTool(),
+    # 记忆管理工具
+    MemorySearchTool(),
+    MemoryHandoffTool(),
+    MemoryListTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
+
+# ── Per-agent tool profiles ──
+
+# Tools available to the Coding Agent (focused on development).
+CODING_AGENT_TOOLS: frozenset[str] = frozenset({
+    # File tools
+    "file_read", "file_write", "file_patch", "file_list", "file_search", "file_delete",
+    # Shell
+    "shell_execute", "shell_start",
+    # Git
+    "git_clone", "git_status", "git_diff", "git_commit",
+    "git_pull", "git_push", "git_branch", "git_remote",
+    # Coding-specific
+    "repo_map", "code_search", "file_outline",
+    "verify_project", "run_review", "worktree_status",
+    # Worker dispatch
+    "dispatch_worker", "dispatch_parallel",
+    # Knowledge base
+    "knowledge_search", "knowledge_list",
+    # Plan mode
+    "plan_ask_questions", "plan_write_draft",
+    # Testing & diagnostics
+    "run_tests", "list_diagnostics",
+    # Screenshot / browser (for debugging UI)
+    "screenshot", "browser_navigate", "browser_screenshot",
+    "get_screen_size",
+    # OCR (for reading error dialogs, etc.)
+    "ocr_read", "ocr_click", "ocr_find",
+})
+
+# Personal Agent gets all tools (no filtering).
+# Coding Agent is restricted to CODING_AGENT_TOOLS.
+
+
+def _filter_tools_by_agent(agent_type: str | None) -> frozenset[str] | None:
+    """Return the allowed tool name set for an agent type, or None for all tools."""
+    if agent_type == "coding":
+        return CODING_AGENT_TOOLS
+    return None  # personal → all tools
+
 
 # Tools the frontend may invoke via WebSocket `tool_direct`. Restricted to
 # read-only or user-visible actions that match the Sidebar QUICK_TOOLS list,
@@ -170,16 +215,18 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     ],
     "Worker 派发": ["dispatch_worker", "dispatch_parallel"],
     "Plan Mode": ["plan_ask_questions", "plan_write_draft"],
+    "记忆管理": ["memory_search", "memory_list", "memory_handoff_write"],
 }
 
 
-def build_tools_description(dynamic_registry: "DynamicToolRegistry | None" = None) -> str:
-    """构建按类别分组的工具描述文本。"""
+def build_tools_description(dynamic_registry: "DynamicToolRegistry | None" = None, agent_type: str | None = None) -> str:
+    """构建按类别分组的工具描述文本。支持 per-agent 过滤。"""
+    allowed = _filter_tools_by_agent(agent_type)
     categorized: dict[str, list[str]] = {cat: [] for cat in TOOL_CATEGORIES}
     uncategorized: list[str] = []
     handled: set[str] = set()
 
-    all_schemas = get_tool_schemas(dynamic_registry)
+    all_schemas = get_tool_schemas(dynamic_registry, agent_type=agent_type)
     for t in all_schemas:
         name = t["function"]["name"]
         desc = t["function"]["description"]
@@ -197,6 +244,9 @@ def build_tools_description(dynamic_registry: "DynamicToolRegistry | None" = Non
     parts = []
     for cat, lines in categorized.items():
         if lines:
+            # Skip categories that are empty for coding agent
+            if allowed and not any(name in allowed for name in TOOL_CATEGORIES.get(cat, [])):
+                continue
             parts.append(f"### {cat}\n" + "\n".join(lines))
 
     if uncategorized:
@@ -215,6 +265,12 @@ class DynamicToolRegistry:
     def register(self, tool: BaseTool):
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> bool:
+        if name in self._tools:
+            del self._tools[name]
+            return True
+        return False
+
     def get(self, name: str) -> BaseTool | None:
         return self._tools.get(name)
 
@@ -228,9 +284,13 @@ class DynamicToolRegistry:
         self._tools.clear()
 
 
-def get_tool_schemas(dynamic_registry: DynamicToolRegistry | None = None) -> list[dict]:
-    """获取所有工具的 OpenAI function schema（含动态工具）"""
-    schemas = [t.get_openai_schema() for t in ALL_TOOLS]
+def get_tool_schemas(dynamic_registry: DynamicToolRegistry | None = None, agent_type: str | None = None) -> list[dict]:
+    """获取所有工具的 OpenAI function schema（含动态工具），支持 per-agent 过滤。"""
+    allowed = _filter_tools_by_agent(agent_type)
+    if allowed:
+        schemas = [t.get_openai_schema() for t in ALL_TOOLS if t.name in allowed]
+    else:
+        schemas = [t.get_openai_schema() for t in ALL_TOOLS]
     if dynamic_registry:
         schemas.extend(dynamic_registry.get_schemas())
     return schemas

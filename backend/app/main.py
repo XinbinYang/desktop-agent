@@ -38,6 +38,8 @@ from app.errors import (
 from app.mcp.manager import MCP_CONFIG_PATH, get_mcp_manager
 from app.project_manager import ProjectManager
 from app.roles import RoleManager
+from app.agents.manager import AgentManager
+from app.agents.heartbeat import HeartbeatEngine
 from app.runtime_paths import runtime_dir
 from app.commands import get_commands
 from app.security import AUTH_HEADER, is_auth_enabled, is_valid_auth_token, resolve_current_project_file
@@ -62,9 +64,25 @@ async def lifespan(app: FastAPI):
     if n > 0:
         print(f"[Desktop Agent] Loaded {n} plugin(s)")
 
+    # Register platform connectors
+    from app.connectors import get_connector_manager
+    from app.connectors.discord_connector import DiscordConnector
+    connector_manager = get_connector_manager()
+    connector_manager.register(DiscordConnector())
+    print(f"[Desktop Agent] Registered connectors: {[c['name'] for c in connector_manager.list_connectors()]}")
+    # Restore enabled connectors from saved config
+    for c in connector_manager.list_connectors():
+        if c.get("enabled"):
+            try:
+                await connector_manager.start(c["name"])
+                print(f"[Desktop Agent] Connector started: {c['name']}")
+            except Exception as e:
+                print(f"[Desktop Agent] Connector start failed (non-fatal): {c['name']}: {e}")
+
     yield
     print("[Desktop Agent] Backend shutting down...")
     get_plugin_manager().unload_all()
+    await connector_manager.shutdown()
     await get_mcp_manager().disconnect_all()
 
 app = FastAPI(title="Desktop Agent API", lifespan=lifespan)
@@ -115,12 +133,16 @@ from app.routes.projects import router as projects_router
 from app.routes.knowledge import router as knowledge_router
 from app.routes.workflows import router as workflows_router
 from app.routes.runs import router as runs_router
+from app.routes.agents import router as agents_router
+from app.routes.connectors import router as connectors_router
 
 app.include_router(settings_router)
 app.include_router(projects_router)
 app.include_router(knowledge_router)
 app.include_router(workflows_router)
 app.include_router(runs_router)
+app.include_router(agents_router)
+app.include_router(connectors_router)
 
 
 # ====== REST API ======
@@ -232,6 +254,31 @@ def delete_session(session_id: str):
         except OSError:
             pass
     return {"status": "ok", "message": f"Session {session_id} deleted"}
+
+# ---- Team shared context ----
+
+@app.get("/api/teams/{team_id}/context")
+def get_team_context(team_id: str):
+    from app.teams import read_team_context
+    content = read_team_context(team_id)
+    return {"team_id": team_id, "content": content}
+
+@app.post("/api/teams/{team_id}/context")
+def post_team_context(team_id: str, request: Request):
+    from app.teams import append_team_context
+    import asyncio
+    body = asyncio.run(_read_json_body(request))
+    content = (body or {}).get("content", "")
+    if not content:
+        raise validation_error("content is required")
+    append_team_context(team_id, content)
+    return {"status": "ok", "team_id": team_id}
+
+async def _read_json_body(request: Request) -> dict | None:
+    try:
+        return await request.json()
+    except Exception:
+        return None
 
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
@@ -635,10 +682,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     await websocket.accept()
     current_model = load_config().settings.default_model
+    current_role_id = "desktop-agent"
 
     # 发送历史会话消息（如果有）
     session = get_or_create_session(session_id, current_model)
     current_model = session.model_id  # 恢复已保存的 model
+    current_role_id = session.role_id  # 恢复已保存的 role
     if any(m.get("role") != "system" for m in session.messages):
         await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
         await websocket.send_json({
@@ -665,11 +714,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if msg_type == "chat":
                 user_text = msg.get("text", "")
                 model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", "desktop-agent")
+                role_id = msg.get("role_id", current_role_id)
                 image_b64 = msg.get("image_base64")
                 chat_mode = msg.get("chat_mode") or "agent"
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
+                current_role_id = role_id
 
                 session = get_or_create_session(session_id, model_id, role_id)
 
@@ -704,7 +754,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "set_chat_mode":
                 mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 if isinstance(mode, str) and session.set_session_chat_mode(mode):
                     await websocket.send_json({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
                     if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
@@ -713,7 +763,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_json({"type": "error", "data": validation_error("Invalid chat_mode")})
 
             elif msg_type == "stop":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 session.cancel()
                 if run_task and not run_task.done():
                     run_task.cancel()
@@ -721,10 +771,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "retry":
                 model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", "desktop-agent")
+                role_id = msg.get("role_id", current_role_id)
                 chat_mode = msg.get("chat_mode")
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
+                current_role_id = role_id
                 session = get_or_create_session(session_id, model_id, role_id)
                 if session.retry_last():
                     # Cancel any in-progress run before retrying
@@ -755,7 +806,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_json({"type": "error", "data": validation_error("没有可重试的消息")})
 
             elif msg_type == "approve_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 session.approve_plan()
                 await websocket.send_json({"type": "plan_approved_waiting_build", "data": {}})
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
@@ -764,7 +815,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 model_id = msg.get("model_id", current_model)
                 if model_id and model_id != current_model:
                     current_model = model_id
-                    session = get_or_create_session(session_id, model_id)
+                    session = get_or_create_session(session_id, model_id, current_role_id)
                     session.router = type(session.router)(model_id)  # Rebuild ModelRouter
                     session.model_id = model_id
                     session._refresh_system_prompt()
@@ -774,13 +825,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
 
             elif msg_type == "reject_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 session.reject_plan()
                 await websocket.send_json({"type": "plan_rejected", "data": {}})
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
 
             elif msg_type == "compact":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 summary = await session.compact_context()
                 if summary:
                     await websocket.send_json({
@@ -794,7 +845,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
 
             elif msg_type == "build_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 if not session.build_plan():
                     await websocket.send_json({"type": "error", "data": validation_error("No plan is ready to build. Wait for the plan draft first.")})
                     continue
@@ -827,7 +878,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 selected = msg.get("selected") or []
                 if not isinstance(selected, list):
                     selected = [selected] if selected is not None else []
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id)
                 if qid is not None:
                     session.update_plan_decision(str(qid), [str(s) for s in selected])
                 await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
@@ -862,11 +913,29 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                     run_task = asyncio.create_task(_plan_clarify_agent())
 
+            elif msg_type == "switch_agent":
+                agent_type = msg.get("agent_type", "personal")
+                if agent_type not in ("personal", "coding"):
+                    await websocket.send_json({"type": "error", "data": {"message": f"Unknown agent_type: {agent_type}"}})
+                    continue
+                session = get_or_create_session(session_id, current_model, role_id=current_role_id, agent_type=agent_type)
+                session.switch_agent(agent_type)
+                current_role_id = session.role_id
+                await websocket.send_json({
+                    "type": "agent_switched",
+                    "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
+                })
+
             elif msg_type == "switch_role":
-                role_id = msg.get("role_id", "desktop-agent")
-                session = get_or_create_session(session_id, current_model, role_id)
+                role_id = msg.get("role_id", current_role_id)
+                agent_type = AgentManager.get_agent_type_for_role(role_id)
+                current_role_id = role_id
+                session = get_or_create_session(session_id, current_model, role_id=role_id, agent_type=agent_type)
                 session.switch_role(role_id)
-                await websocket.send_json({"type": "status", "data": {"status": "role_switched", "role_id": role_id}})
+                await websocket.send_json({
+                    "type": "agent_switched",
+                    "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
+                })
 
             elif msg_type == "switch_project":
                 project_path = msg.get("path")
@@ -882,6 +951,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 else:
                     ProjectManager.close_project()
                     await websocket.send_json({"type": "project_changed", "data": {"project": None}})
+
+            elif msg_type == "set_team":
+                team_id = msg.get("team_id") or None
+                team_name = msg.get("team_name", "")
+                session.set_team(team_id, team_name)
+                await websocket.send_json({"type": "team_set", "data": {"team_id": team_id, "team_name": team_name}})
 
             elif msg_type == "tool_direct":
                 # 前端直接调用工具（仅限 SAFE_DIRECT_TOOLS 白名单中的只读/可见操作）
@@ -919,6 +994,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         if run_task and not run_task.done():
             run_task.cancel()
         print(f"[WS] Client disconnected: {session_id}")
+        # Trigger HEARTBEAT memory maintenance for Personal Agent
+        try:
+            import asyncio as _asyncio
+            _asyncio.create_task(HeartbeatEngine.on_session_end(session.messages, session_id))
+        except Exception:
+            pass
     except Exception as e:
         print(f"[WS] Error: {e}")
         try:

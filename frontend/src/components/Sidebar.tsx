@@ -3,18 +3,21 @@ import { useTranslation } from 'react-i18next';
 import {
   Trash2, Zap, Monitor,
   Globe, Plus, MessageSquare, X,
-  UserCog, Settings, BookOpen, Sun, Moon, Laptop
+  UserCog, Settings, BookOpen, Sun, Moon, Laptop,
+  Brain, Activity, Moon as MoonIcon, Sparkles, FolderOpen
 } from 'lucide-react';
-import { RoleInfo, ProjectInfo, FileNode, SidebarSection } from '../types';
+import { RoleInfo, ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
 import { ProjectPanel } from './ProjectPanel';
 import { useTheme } from '../hooks/useTheme';
 
 interface SidebarProps {
   activeSection: SidebarSection;
+  activeAgent?: AgentType;
   onSectionChange: (section: SidebarSection) => void;
   roles: RoleInfo[];
   currentRole: string;
   onRoleChange: (role: string) => void;
+  onAgentChange?: (agent: AgentType) => void;
   onOpenRoleEditor: () => void;
   onOpenSettings: () => void;
   onClear: () => void;
@@ -111,9 +114,104 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* 内容区 — section switching controlled by ActivityBar */}
       <div className="flex-1 overflow-y-auto p-3">
+        {activeSection === 'personal' && (
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-fg-muted">Personal Agent</div>
+
+            {/* Persona section */}
+            <div>
+              <div className="text-[10px] text-fg-muted uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                <UserCog className="w-3 h-3" /> Persona
+              </div>
+              <button
+                type="button"
+                onClick={() => onOpenRoleEditor?.()}
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
+              >
+                <UserCog className="w-3.5 h-3.5" />
+                Edit SOUL / INNER / IDENTITY / USER
+              </button>
+            </div>
+
+            {/* Memory section */}
+            <div>
+              <div className="text-[10px] text-fg-muted uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                <Brain className="w-3 h-3" /> Memory
+              </div>
+              <button
+                type="button"
+                onClick={() => onExecuteTool?.('memory_list', {})}
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                Search Memory
+              </button>
+            </div>
+
+            {/* Cognitive system status */}
+            <div>
+              <div className="text-[10px] text-fg-muted uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                <Activity className="w-3 h-3" /> Cognitive System
+              </div>
+              <div className="space-y-0.5 text-[10px] text-fg-muted">
+                <div className="flex items-center gap-1.5 px-2 py-0.5">
+                  <Activity className="w-2.5 h-2.5 text-green-400" />
+                  HEARTBEAT: active
+                </div>
+                <div className="flex items-center gap-1.5 px-2 py-0.5">
+                  <MoonIcon className="w-2.5 h-2.5 text-fg-muted" />
+                  DREAM: on trigger
+                </div>
+                <div className="flex items-center gap-1.5 px-2 py-0.5">
+                  <Sparkles className="w-2.5 h-2.5 text-fg-muted" />
+                  EVOLUTION: on trigger
+                </div>
+              </div>
+            </div>
+
+            {/* Open full panel */}
+            <div className="text-[10px] text-fg-muted text-center pt-2 border-t border-border">
+              Full workspace panel available in the right panel (Ctrl+\)
+            </div>
+          </div>
+        )}
+
+        {activeSection === 'coding' && (
+          <div className="space-y-3">
+            <div className="text-xs font-medium text-fg-muted">Coding Agent</div>
+            {currentProject ? (
+              <div className="h-full flex flex-col">
+                <ProjectPanel
+                  currentProject={currentProject}
+                  fileTree={fileTree}
+                  expandedPaths={expandedPaths}
+                  onTogglePath={onTogglePath || (() => {})}
+                  onSelectFile={onSelectFile || (() => {})}
+                  onOpenFolder={onOpenFolder || (() => {})}
+                  onOpenModal={onOpenProjectModal || (() => {})}
+                  onCloseProject={onCloseProject || (() => {})}
+                  onRefreshTree={onRefreshTree || (() => {})}
+                />
+              </div>
+            ) : (
+              <div className="text-xs text-fg-muted text-center py-4">
+                <FolderOpen className="w-5 h-5 mx-auto mb-2 opacity-30" />
+                <p>No project open.</p>
+                <button
+                  type="button"
+                  onClick={onOpenFolder}
+                  className="mt-2 text-accent hover:underline text-[11px]"
+                >
+                  Open a folder
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {activeSection === 'tools' && (
           <div className="space-y-1">
-            <div className="text-xs text-fg-muted uppercase tracking-wider mb-2">Desktop Control</div>
+            <div className="text-xs font-medium text-fg-muted mb-2">Desktop Control</div>
             {QUICK_TOOLS.map(tool => (
               <button
                 key={tool.name}
@@ -154,9 +252,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
               New Session
             </button>
             <div className="flex items-center justify-between mt-2">
-              <span className="text-xs text-fg-muted uppercase tracking-wider">History</span>
+              <span className="text-xs font-medium text-fg-muted">History</span>
               {currentProjectPath && (
-                <span className="text-[10px] text-accent/80 bg-accent/8 px-1.5 py-0.5 rounded" title={`Filtered: ${currentProjectPath}`}>
+                <span className="text-[10px] text-accent/80 bg-accent/10 px-1.5 py-0.5 rounded" title={`Filtered: ${currentProjectPath}`}>
                   Project
                 </span>
               )}
@@ -191,7 +289,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {activeSection === 'knowledge' && (
           <div className="space-y-3">
-            <div className="text-xs text-fg-muted uppercase tracking-wider">Knowledge Base</div>
+            <div className="text-xs font-medium text-fg-muted">Knowledge Base</div>
             <button
               type="button"
               onClick={() => onExecuteTool('knowledge_list', {})}

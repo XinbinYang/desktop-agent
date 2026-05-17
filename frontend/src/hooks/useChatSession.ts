@@ -14,6 +14,7 @@ import {
   PlanQuestion,
   PlanState,
   PlanTodo,
+  StructuredPlanDraft,
   RunEvent,
 } from '../types';
 import { useWebSocket } from './useWebSocket';
@@ -348,6 +349,9 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [suggestAgentSwitch, setSuggestAgentSwitch] = useState<{
+    from: string; to: string; reason: string;
+  } | null>(null);
   const [chatMode, setChatModeState] = useState<ClientChatMode>(() => initialChatModeFromStorage());
   const sendRef = useRef<(obj: object) => boolean>(() => false);
   const chatModeRef = useRef<ClientChatMode>(initialChatModeFromStorage());
@@ -766,34 +770,54 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           }));
           break;
 
-        case 'plan_draft':
+        case 'plan_draft': {
+          const draftTodos = Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : [];
+          const draftStructured = (event.data.structured_plan ?? null) as StructuredPlanDraft | null;
           setPlanState((prev) => ({
             ...prev,
             mode: 'plan',
             draft: event.data.draft || '',
-            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+            todos: draftTodos.length > 0 ? draftTodos : prev.todos,
             phase: event.data.phase || prev.phase,
             goal: event.data.goal || prev.goal,
-            structured_plan: event.data.structured_plan ?? prev.structured_plan,
+            structured_plan: draftStructured ?? prev.structured_plan,
             pending_clarification:
               typeof event.data.pending_clarification === 'boolean'
                 ? event.data.pending_clarification
                 : prev.pending_clarification,
           }));
+          // Inject plan draft card into the chat stream
+          setMessages((prev) => appendBlock(prev, {
+            type: 'plan_draft',
+            goal: event.data.goal || '',
+            draft: event.data.draft || '',
+            todos: draftTodos,
+            structured_plan: draftStructured,
+            timestamp: Date.now(),
+          }, false));
           break;
+        }
 
-        case 'plan_questions':
+        case 'plan_questions': {
+          const questions = Array.isArray(event.data.questions) ? event.data.questions as PlanQuestion[] : [];
           setPlanState((prev) => ({
             ...prev,
             mode: 'plan',
-            questions: Array.isArray(event.data.questions) ? event.data.questions as PlanQuestion[] : [],
+            questions,
             phase: event.data.phase || 'awaiting_decision',
             pending_clarification:
               typeof event.data.pending_clarification === 'boolean'
                 ? event.data.pending_clarification
                 : prev.pending_clarification,
           }));
+          // Inject interactive question card into the chat stream
+          setMessages((prev) => appendBlock(prev, {
+            type: 'plan_questions',
+            questions,
+            timestamp: Date.now(),
+          }, false));
           break;
+        }
 
         case 'plan_approved_waiting_build':
           setPlanState((prev) => ({
@@ -899,6 +923,14 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
           setIsRunning(false);
           setMessages((prev) => markTurnComplete(prev));
           addTerminalLog('[系统] 用户中断');
+          break;
+
+        case 'suggest_agent_switch':
+          setSuggestAgentSwitch({
+            from: event.data?.from || 'personal',
+            to: event.data?.to || 'coding',
+            reason: event.data?.reason || '',
+          });
           break;
       }
     },
@@ -1149,6 +1181,8 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     await deleteDraft(sessionId);
   }, [sessionId]);
 
+  const clearSuggestAgentSwitch = useCallback(() => setSuggestAgentSwitch(null), []);
+
   return {
     messages,
     toolCalls,
@@ -1180,5 +1214,7 @@ export function useChatSession(sessionId: string, currentModel: string, roleId: 
     buildPlan,
     rejectPlan,
     updatePlanDecision,
+    suggestAgentSwitch,
+    clearSuggestAgentSwitch,
   };
 }

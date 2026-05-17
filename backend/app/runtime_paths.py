@@ -15,6 +15,11 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def agents_dir() -> Path:
+    """Agent workspace directory at the project root (AGENTS/)."""
+    return repo_root() / "AGENTS"
+
+
 def bundled_root() -> Path:
     if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):  # type: ignore[attr-defined]
         return Path(sys._MEIPASS)  # type: ignore[attr-defined]
@@ -46,6 +51,11 @@ def runtime_dir(name: str) -> Path:
 
 
 def runtime_file(*parts: str) -> Path:
+    """Return a path under the runtime root, creating parent directories.
+
+    Despite the name, this returns a Path, not an open file handle.
+    Parent directories are created as a side effect.
+    """
     path = runtime_root().joinpath(*parts)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -63,5 +73,8 @@ def default_config_path() -> Path:
     if not source.exists():
         raise FileNotFoundError(f"Default model config template not found: {source}")
 
-    shutil.copyfile(source, target)
+    try:
+        shutil.copy2(source, target)
+    except shutil.SameFileError:
+        pass
     return target

@@ -221,7 +221,16 @@ export type AssistantBlock =
       workerEvents?: WorkerEvent[];
       timestamp: number;
     }
-  | { type: 'image'; base64: string; timestamp: number };
+  | { type: 'image'; base64: string; timestamp: number }
+  | { type: 'plan_questions'; questions: PlanQuestion[]; timestamp: number }
+  | {
+      type: 'plan_draft';
+      goal: string;
+      draft: string;
+      todos: PlanTodo[];
+      structured_plan?: StructuredPlanDraft | null;
+      timestamp: number;
+    };
 
 export interface ChatMessage {
   id: string;
@@ -231,6 +240,7 @@ export interface ChatMessage {
   isTool: boolean;
   reasoning?: string;
   skill?: string;
+  agentType?: AgentType;
   blocks?: AssistantBlock[];
   toolSummary?: ToolSummary;
   turnComplete?: boolean;
@@ -274,7 +284,14 @@ export interface EditorGroup {
   openFiles: OpenFile[];
 }
 
-export type SidebarSection = 'tools' | 'project' | 'sessions' | 'knowledge' | 'settings';
+export type AgentType = 'personal' | 'coding';
+export type SidebarSection = 'personal' | 'coding' | 'tools' | 'project' | 'sessions' | 'knowledge' | 'settings';
+
+export interface AgentInfo {
+  type: AgentType;
+  name: string;
+  description: string;
+}
 
 export interface KnowledgeDoc {
   source_path: string;
@@ -306,7 +323,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'compacted' | 'model_switched';
+  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'compacted' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 
@@ -325,6 +342,17 @@ export function isRetryableError(data: any): boolean {
 /** Get the error category, falling back to 'unknown'. */
 export function errorCategory(data: any): string {
   return data?.category || 'unknown';
+}
+
+export interface ConnectorInfo {
+  name: string;
+  display_name: string;
+  description: string;
+  status: 'stopped' | 'running' | 'error';
+  status_message: string;
+  enabled: boolean;
+  config: Record<string, any>;
+  config_schema: Record<string, any>;
 }
 
 declare global {
