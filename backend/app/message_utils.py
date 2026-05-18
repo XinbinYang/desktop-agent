@@ -284,6 +284,7 @@ async def execute_tool(
             tool_call_id=tool_call_id,
             result_text=result.to_text(),
             duration_ms=duration_ms,
+            error=result.error or None,
             base64_image=result.base64_image,
             metadata=metadata,
         )
@@ -360,6 +361,7 @@ def resolve_mentions(user_text: str, project_path: str = "") -> str:
                     ["git", "status", "--short"],
                     cwd=project_path,
                     capture_output=True, text=True, timeout=10,
+                    encoding="utf-8", errors="replace",
                 )
                 if r.returncode == 0:
                     context_parts.append(f"## @git status\n```\n{r.stdout.strip()[:2000]}\n```")

@@ -59,7 +59,15 @@
     "send": "发送",
     "stop": "停止",
     "regenerate": "重新生成",
-    "scrollToBottom": "滚动到底部"
+    "scrollToBottom": "滚动到底部",
+    "empty": {
+      "ready": "准备好了",
+      "projectReady": "{{projectName}} 已就绪",
+      "personalAgent": "Personal Agent",
+      "codingAgent": "Coding Agent",
+      "agentMode": "Agent",
+      "planMode": "Plan"
+    }
   },
   "terminal": {
     "title": "执行日志",

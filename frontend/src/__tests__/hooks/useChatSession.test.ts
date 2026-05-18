@@ -89,6 +89,26 @@ describe('useChatSession', () => {
     expect(result.current.terminalLogs.some((line) => line.includes('WebSocket'))).toBe(true)
   })
 
+  it('marks the session running when reconnect receives live run status', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+    })
+
+    expect(result.current.isRunning).toBe(true)
+  })
+
   it('handles content event by appending to assistant message', async () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -150,6 +170,126 @@ describe('useChatSession', () => {
     expect(result.current.runEvents[0].type).toBe('skills_matched')
     expect(result.current.runEvents[0].data.skills).toHaveLength(1)
     expect(result.current.terminalLogs.some((line) => line.includes('[Skills] 1 matched, 1 disabled'))).toBe(true)
+  })
+
+  it('submits plan decisions in one websocket message without appending Answers block', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'plan_questions',
+        data: {
+          phase: 'awaiting_decision',
+          pending_clarification: true,
+          questions: [{
+            id: 'scope',
+            prompt: 'What scope?',
+            allow_multiple: false,
+            options: [{ id: 'small', label: 'Small' }, { id: 'large', label: 'Large' }],
+          }],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('plan')
+    expect(result.current.planState.questions).toHaveLength(1)
+    expect(result.current.messages.some((msg) => msg.blocks?.some((block) => block.type === 'plan_questions'))).toBe(false)
+
+    act(() => {
+      result.current.submitPlanDecisions([{
+        question_id: 'scope',
+        selected: ['small'],
+        other_text: 'Keep manual fallback',
+        skipped: false,
+      }])
+    })
+
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'submit_plan_decisions',
+      answers: [{
+        question_id: 'scope',
+        selected: ['small'],
+        other_text: 'Keep manual fallback',
+        skipped: false,
+      }],
+    })
+    expect(result.current.planState.phase).toBe('planning')
+    expect(result.current.isRunning).toBe(true)
+    expect(result.current.messages.some((msg) => msg.blocks?.some((block) => block.type === 'plan_answers'))).toBe(false)
+  })
+
+  it('plan_status clears stale plan goal when backend resets plan mode', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'plan_status',
+        data: {
+          mode: 'plan',
+          phase: 'awaiting_approval',
+          goal: 'old goal',
+          draft: '# old plan',
+          structured_plan: {
+            goal: 'old goal',
+            assumptions: [],
+            steps: [],
+            todos: [],
+            risks: [],
+            acceptance_criteria: [],
+          },
+          questions: [],
+          todos: [],
+          decisions: {},
+          approved: false,
+          pending_clarification: false,
+        },
+      })
+    })
+
+    expect(result.current.planState.goal).toBe('old goal')
+    expect(result.current.planState.structured_plan?.goal).toBe('old goal')
+
+    act(() => {
+      messageHandler?.({
+        type: 'plan_status',
+        data: {
+          mode: 'plan',
+          phase: 'idle',
+          goal: '',
+          draft: '',
+          structured_plan: null,
+          questions: [],
+          todos: [],
+          decisions: {},
+          approved: false,
+          pending_clarification: false,
+        },
+      })
+    })
+
+    expect(result.current.planState.phase).toBe('idle')
+    expect(result.current.planState.goal).toBe('')
+    expect(result.current.planState.structured_plan).toBeNull()
   })
 
   it('hydrates a full backend history snapshot', () => {
@@ -234,6 +374,49 @@ describe('useChatSession', () => {
     expect(result.current.messages).toHaveLength(1)
     expect(result.current.messages[0].blocks).toBeDefined()
     expect(result.current.messages[0].blocks![0].type).toBe('tool_call')
+  })
+
+  it('seals an open thinking block when a tool lands and starts a new one after', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return { isConnected: true, send: mockSend, disconnect: vi.fn() }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'reasoning', data: { text: 'first thought ' } })
+      messageHandler?.({ type: 'reasoning', data: { text: 'continued' } })
+    })
+
+    let blocks = result.current.messages[0].blocks!
+    const thinking0 = blocks.find((b) => b.type === 'thinking') as any
+    expect(thinking0.text).toBe('first thought continued')
+    expect(thinking0.complete).toBeFalsy()
+    expect(typeof thinking0.startedAt).toBe('number')
+
+    act(() => {
+      messageHandler?.({
+        type: 'tool_call',
+        data: { name: 'shell_execute', args: { command: 'ls' }, result: 'ok', tool_call_id: 'c1', duration_ms: 5 },
+      })
+    })
+
+    blocks = result.current.messages[0].blocks!
+    const sealed = blocks.find((b) => b.type === 'thinking') as any
+    expect(sealed.complete).toBe(true)
+    expect(typeof sealed.endedAt).toBe('number')
+
+    act(() => {
+      messageHandler?.({ type: 'reasoning', data: { text: 'second thought' } })
+    })
+
+    blocks = result.current.messages[0].blocks!
+    const thinkingBlocks = blocks.filter((b) => b.type === 'thinking') as any[]
+    expect(thinkingBlocks).toHaveLength(2)
+    expect(thinkingBlocks[1].text).toBe('second thought')
+    expect(thinkingBlocks[1].complete).toBeFalsy()
   })
 
   it('handles tool_result event', async () => {
@@ -489,6 +672,26 @@ describe('useChatSession', () => {
     expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
   })
 
+  it('sends the next message in plan mode immediately after clicking Plan', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('plan')
+      result.current.sendMessage('plan this')
+    })
+
+    expect(mockSend).toHaveBeenLastCalledWith({
+      type: 'chat',
+      text: 'plan this',
+      model_id: 'gpt-4o',
+      agent_type: 'personal',
+      role_id: 'desktop-agent',
+      image_base64: undefined,
+      chat_mode: 'plan',
+      thinking_intensity: 'medium',
+    })
+  })
+
   it('setThinkingIntensity sends set_thinking_intensity to the server', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
@@ -498,6 +701,69 @@ describe('useChatSession', () => {
 
     expect(result.current.thinkingIntensity).toBe('high')
     expect(mockSend).toHaveBeenCalledWith({ type: 'set_thinking_intensity', thinking_intensity: 'high' })
+  })
+
+  it('sends build pause/end controls', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.pauseBuild()
+      result.current.endBuild()
+    })
+
+    expect(mockSend).toHaveBeenCalledWith({ type: 'pause_build' })
+    expect(mockSend).toHaveBeenCalledWith({ type: 'end_build' })
+    expect(result.current.isRunning).toBe(false)
+  })
+
+  it('sends plan snapshot with build and ignores build when no draft is ready', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.buildPlan()
+    })
+    expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'build_plan' }))
+
+    act(() => {
+      messageHandler?.({
+        type: 'plan_draft',
+        data: {
+          phase: 'awaiting_approval',
+          goal: 'Build the plan',
+          draft: '# Plan',
+          todos: [{ id: 't1', title: 'First todo', status: 'pending' }],
+          structured_plan: null,
+        },
+      })
+    })
+
+    act(() => {
+      result.current.buildPlan()
+    })
+
+    act(() => {
+      result.current.buildPlan()
+    })
+
+    expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'build_plan',
+      plan_state: expect.objectContaining({
+        phase: 'awaiting_approval',
+        draft: '# Plan',
+      }),
+    }))
+    expect(mockSend.mock.calls.filter(([payload]) => payload?.type === 'build_plan')).toHaveLength(1)
+    expect(result.current.planState.phase).toBe('approved_waiting_build')
   })
 
   it('sends compact and rewind session control messages', () => {

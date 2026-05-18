@@ -58,11 +58,13 @@ class PlanStep(BaseModel):
 
 class PlanDraft(BaseModel):
     goal: str = ""
+    context: str = ""
     assumptions: List[str] = Field(default_factory=list)
     steps: List[PlanStep] = Field(default_factory=list)
     todos: List[PlanTodo] = Field(default_factory=list)
     risks: List[str] = Field(default_factory=list)
     acceptance_criteria: List[str] = Field(default_factory=list)
+    critical_files: List[Dict[str, str]] = Field(default_factory=list)
 
 
 _VALID_TRANSITIONS: Dict[str, set[str]] = {
@@ -94,6 +96,7 @@ class PlanState(BaseModel):
     questions: List[PlanQuestion] = Field(default_factory=list)
     todos: List[PlanTodo] = Field(default_factory=list)
     decisions: Dict[str, List[str]] = Field(default_factory=dict)
+    decision_notes: Dict[str, str] = Field(default_factory=dict)
     structured_plan: Optional[PlanDraft] = None
     approved: bool = False
     # True while the user must answer clarification questions before a full structured plan exists.

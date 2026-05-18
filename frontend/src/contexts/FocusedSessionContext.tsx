@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useCallback, useRef } from 'react';
-import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, ClientChatMode, ThinkingIntensity, AgentType, ContextUsage, ConversationCheckpoint } from '../types';
+import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, PlanDecisionAnswer, ClientChatMode, ThinkingIntensity, AgentType, ContextUsage, ConversationCheckpoint } from '../types';
 
 // ---- Types ----
 
@@ -32,12 +32,16 @@ export interface SessionActions {
   stopRunning: () => void;
   retryLast: () => void;
   switchModel: (modelId: string) => void;
+  switchRole: (roleId: string) => void;
   executeToolDirect: (toolName: string, args: any) => void;
   addTerminalLog: (msg: string) => void;
   approvePlan: () => void;
   buildPlan: () => void;
+  pauseBuild: () => void;
+  endBuild: () => void;
   rejectPlan: () => void;
   updatePlanDecision: (questionId: string, selected: string[]) => void;
+  submitPlanDecisions: (answers: PlanDecisionAnswer[]) => void;
   onSelectFileInEditor: (groupId: string, fileId: string) => void;
   onCloseFileInEditor: (groupId: string, fileId: string) => void;
   onFileContentChange: (groupId: string, fileId: string, content: string) => void;
@@ -60,12 +64,16 @@ const NOOP_ACTIONS: SessionActions = {
   stopRunning: () => {},
   retryLast: () => {},
   switchModel: () => {},
+  switchRole: () => {},
   executeToolDirect: () => {},
   addTerminalLog: () => {},
   approvePlan: () => {},
   buildPlan: () => {},
+  pauseBuild: () => {},
+  endBuild: () => {},
   rejectPlan: () => {},
   updatePlanDecision: () => {},
+  submitPlanDecisions: () => {},
   onSelectFileInEditor: () => {},
   onCloseFileInEditor: () => {},
   onFileContentChange: () => {},

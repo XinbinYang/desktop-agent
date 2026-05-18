@@ -2,6 +2,7 @@ import json
 import logging
 import ntpath
 import os
+import re
 import time
 import uuid
 import copy
@@ -17,6 +18,17 @@ from app.coding_runs import (
     reset_run_context,
     set_run_context,
 )
+from app.collaboration.executor import result_from_execute_events, run_consult_worker, run_execute_agent_events
+from app.collaboration.manager import (
+    add_task as collab_add_task,
+    complete_run as collab_complete_run,
+    create_run as collab_create_run,
+    list_events as collab_list_events,
+    record_event as collab_record_event,
+    update_task as collab_update_task,
+)
+from app.collaboration.models import ResultPacket, TaskPacket
+from app.collaboration.parser import CodingMention, classify_coding_intent, parse_coding_mention
 from app.models import ModelRouter
 from app.memory import build_memory_prompt
 from app.project_manager import ProjectManager
@@ -660,6 +672,265 @@ class AgentSession:
         event_data.setdefault("timestamp", time.time())
         return {"type": event_type, "data": event_data}
 
+    def _collaboration_event(self, event: Any) -> Dict[str, Any]:
+        """Convert a stored CollaborationEvent into the WebSocket event shape."""
+        data = dict(getattr(event, "data", {}) or {})
+        collab_run_id = getattr(event, "run_id", "")
+        task_id = getattr(event, "task_id", "") or ""
+        data.setdefault("run_id", collab_run_id)
+        data.setdefault("collaboration_run_id", collab_run_id)
+        if task_id:
+            data.setdefault("task_id", task_id)
+            data.setdefault("collaboration_task_id", task_id)
+        data.setdefault("timestamp", getattr(event, "timestamp", time.time()))
+        return self._event(getattr(event, "type", "collaboration_task_update"), data)
+
+    def _collaboration_packet(
+        self,
+        mention: CodingMention,
+        *,
+        original_input: str,
+        resolved_input: str,
+        image_base64: Optional[str] = None,
+    ) -> TaskPacket:
+        project = ProjectManager.get_current()
+        project_path = str(project.get("path") or "") if project else ""
+        task = mention.task.strip() or "Open or create a Coding Agent session."
+        mode = "execute" if mention.mode == "execute" else "consult"
+        context: Dict[str, Any] = {
+            "requested_via": mention.raw,
+            "original_message": original_input,
+            "project_path": project_path,
+            "personal_ownership": "Personal Agent owns the final user-facing answer.",
+        }
+        if resolved_input and resolved_input != original_input:
+            context["resolved_context"] = resolved_input[:8000]
+        if image_base64:
+            context["image_attached"] = True
+
+        if mode == "consult":
+            return TaskPacket(
+                goal=task,
+                mode="consult",
+                user_intent=task,
+                context=context,
+                constraints=[
+                    "Read-only consultation. Do not edit files or run destructive commands.",
+                    "Focus on diagnosis, options, and the safest next engineering step.",
+                ],
+                acceptance_criteria=[
+                    "Provide concise technical findings.",
+                    "State whether code changes are needed.",
+                    "End with ACCEPTANCE: PASS or ACCEPTANCE: FAIL.",
+                ],
+                allowed_tools=[
+                    "repo_map",
+                    "code_search",
+                    "file_outline",
+                    "file_read",
+                    "file_list",
+                    "file_search",
+                    "git_status",
+                    "git_diff",
+                ],
+            )
+
+        return TaskPacket(
+            goal=task,
+            mode="execute",
+            user_intent=task,
+            context=context,
+            constraints=[
+                "Keep changes scoped to the requested engineering task.",
+                "Preserve existing user changes and do not revert unrelated work.",
+                "Report blockers instead of guessing through destructive or private decisions.",
+            ],
+            acceptance_criteria=[
+                "Implementation satisfies the user goal.",
+                "Verification evidence is reported.",
+                "Review findings or residual blockers are reported.",
+                "End with ACCEPTANCE: PASS or ACCEPTANCE: FAIL.",
+            ],
+        )
+
+    async def _handle_coding_mention(
+        self,
+        mention: CodingMention,
+        *,
+        original_input: str,
+        resolved_input: str,
+        image_base64: Optional[str],
+        outer_run_id: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Handle explicit `@coding agent` delegation before the Personal LLM turn."""
+        active_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        active_checkpoint_id = f"chk_{uuid.uuid4().hex[:12]}"
+        user_msg = (
+            self.router.build_vision_message(original_input, image_base64)
+            if image_base64
+            else {"role": "user", "content": original_input}
+        )
+        user_msg["source"] = "user"
+        self._stamp_message(user_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+        self.messages.append(user_msg)
+        self._trim_messages()
+        yield self._event("context_usage", self.context_usage(), outer_run_id)
+
+        if mention.mode == "handoff":
+            text = (
+                "我已经识别到你想直接进入 Coding Agent。这个会话里 Personal 仍保持主入口，"
+                "我会把后续明确的代码任务通过 `@coding agent ...` 委托给 Coding；"
+                "如果要完整切到 Coding Agent，请使用界面的 Agent 切换。"
+            )
+            assistant_msg = {"role": "assistant", "content": text}
+            self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+            self.messages.append(assistant_msg)
+            yield self._event(
+                "suggest_agent_switch",
+                {
+                    "from": "personal",
+                    "to": "coding",
+                    "reason": "User explicitly requested @coding agent without a task.",
+                },
+                outer_run_id,
+            )
+            yield self._event("content", {"text": text}, outer_run_id)
+            yield self._event("status", {"status": "completed"}, outer_run_id)
+            yield self._event("run_completed", {
+                "status": "completed",
+                "summary": "Coding Agent handoff suggested.",
+                "verification_passed": None,
+                "review_passed": None,
+            }, outer_run_id)
+            self._save()
+            return
+
+        project = ProjectManager.get_current()
+        project_path = str(project.get("path") or "") if project else ""
+        packet = self._collaboration_packet(
+            mention,
+            original_input=original_input,
+            resolved_input=resolved_input,
+            image_base64=image_base64,
+        )
+        collab_run = collab_create_run(
+            session_id=self.session_id,
+            goal=packet.goal,
+            mode=packet.mode,
+            project_path=project_path,
+            source_agent="personal",
+            target_agent="coding",
+        )
+        task = collab_add_task(collab_run.run_id, packet)
+        emitted = 0
+
+        def new_collab_events() -> List[Dict[str, Any]]:
+            nonlocal emitted
+            events = collab_list_events(collab_run.run_id)
+            new_events = events[emitted:]
+            emitted = len(events)
+            return [self._collaboration_event(event) for event in new_events]
+
+        for event in new_collab_events():
+            yield event
+
+        collab_update_task(task.task_id, status="running")
+        for event in new_collab_events():
+            yield event
+
+        yield self._event(
+            "status",
+            {
+                "status": "executing",
+                "tool": "consult_coding_agent" if packet.mode == "consult" else "delegate_to_coding_agent",
+                "tool_call_id": task.task_id,
+            },
+            outer_run_id,
+        )
+
+        result: ResultPacket
+        child_events: List[Dict[str, Any]] = []
+        started_at = time.time()
+        if packet.mode == "consult":
+            result, child_events = await run_consult_worker(packet, run_id=collab_run.run_id, task_id=task.task_id)
+            for event in child_events:
+                yield event
+        else:
+            async for event in run_execute_agent_events(
+                packet,
+                session_id=self.session_id,
+                run_id=collab_run.run_id,
+            ):
+                child_events.append(event)
+                yield event
+            result = result_from_execute_events(child_events)
+
+        task_status = "completed" if result.status == "pass" else ("blocked" if result.status == "blocked" else "failed")
+        collab_update_task(task.task_id, status=task_status, result=result)
+        collab_record_event(
+            collab_run.run_id,
+            "agent_message",
+            {
+                "run_id": collab_run.run_id,
+                "agent_type": "coding",
+                "text": result.summary or result.details,
+                "status": result.status,
+            },
+            task.task_id,
+        )
+        if result.artifacts:
+            for artifact in result.artifacts:
+                collab_record_event(
+                    collab_run.run_id,
+                    "artifact_ready",
+                    {
+                        "run_id": collab_run.run_id,
+                        "artifact": artifact.model_dump(),
+                        "status": result.status,
+                    },
+                    task.task_id,
+                )
+        collab_complete_run(
+            collab_run.run_id,
+            "completed" if result.status == "pass" else "failed",
+            result.summary or result.details,
+            artifacts=result.artifacts,
+        )
+        for event in new_collab_events():
+            yield event
+
+        prefix = "Coding Agent 诊断结果" if packet.mode == "consult" else "Coding Agent 执行结果"
+        status_word = "通过" if result.status == "pass" else ("受阻" if result.status == "blocked" else "未通过")
+        summary = (result.summary or result.details or "Coding Agent 没有返回可用摘要。").strip()
+        yield self._event(
+            "tool_call",
+            {
+                "name": "consult_coding_agent" if packet.mode == "consult" else "delegate_to_coding_agent",
+                "args": {"goal": packet.goal, "mode": packet.mode},
+                "result": summary,
+                "tool_call_id": task.task_id,
+                "duration_ms": round((time.time() - started_at) * 1000),
+            },
+            outer_run_id,
+        )
+        final_text = f"{prefix}（{status_word}）：\n\n{summary}"
+        assistant_msg = {"role": "assistant", "content": final_text}
+        self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+        self.messages.append(assistant_msg)
+        self._trim_messages()
+        yield self._event("content", {"text": final_text}, outer_run_id)
+        yield self._event("context_usage", self.context_usage(), outer_run_id)
+        yield self._event("status", {"status": "completed"}, outer_run_id)
+        yield self._event("run_completed", {
+            "status": "completed" if result.status == "pass" else "failed",
+            "summary": final_text[:1000],
+            "verification_passed": result.verification_passed,
+            "review_passed": result.review_passed,
+            "collaboration_run_id": collab_run.run_id,
+            "collaboration_task_id": task.task_id,
+        }, outer_run_id)
+        self._save()
+
     def _stamp_message(
         self,
         message: Dict[str, Any],
@@ -723,6 +994,16 @@ class AgentSession:
         except Exception:
             pass
         return 32000
+
+    def _completion_max_tokens(self) -> int:
+        try:
+            provider_info = get_provider_for_model(self.model_id)
+            provider_name = provider_info[0] if provider_info else ""
+            if provider_name == "kimi" and self._agent_type == "personal":
+                return 2048
+        except Exception:
+            pass
+        return 8192
 
     def _update_usage_from_response(self, response: Dict[str, Any] | None) -> None:
         usage = response.get("usage") if isinstance(response, dict) else None
@@ -857,6 +1138,7 @@ class AgentSession:
             "questions": [q.model_dump() for q in self.plan_state.questions],
             "todos": [t.model_dump() for t in self.plan_state.todos],
             "decisions": self.plan_state.decisions,
+            "decision_notes": self.plan_state.decision_notes,
             "plan_file_path": self.plan_state.plan_file_path,
             "research_notes": self.plan_state.research_notes,
         }
@@ -869,7 +1151,22 @@ class AgentSession:
         """Persist UI-selected agent/plan mode before the next chat message (WebSocket `set_chat_mode`)."""
         if mode not in ("agent", "plan"):
             return False
+        previous = self.chat_mode
         self.chat_mode = mode
+        if mode == "plan" and previous != "plan":
+            if self.plan_state.phase != "executing":
+                self.plan_state = PlanState(mode="plan")
+                self._plan_exec_hint_sent = False
+            else:
+                self.plan_state.mode = "plan"
+        elif mode == "agent" and previous == "plan":
+            if self.plan_state.phase != "executing":
+                self.plan_state = PlanState(mode="agent")
+                self._plan_exec_hint_sent = False
+            else:
+                self.plan_state.mode = "agent"
+        else:
+            self.plan_state.mode = mode
         self._save()
         return True
 
@@ -933,22 +1230,41 @@ class AgentSession:
         ]
 
     def _build_plan_draft_text(self, user_input: str) -> str:
+        """Fallback four-block plan text (used only if writing the plan file
+        fails). Mirrors plan_files._render_markdown's structure."""
         if not self.plan_state.structured_plan:
             return ""
         plan = self.plan_state.structured_plan
         lines = [
-            f"Goal: {plan.goal or user_input.strip()[:800]}",
+            f"# {plan.goal or user_input.strip()[:800]}",
             "",
-            "Structured steps:",
+            "## 任务目标 / Goal",
+            (plan.context.strip() or plan.goal.strip() or user_input.strip()[:800]),
+            "",
+            "## 任务方案 / Approach",
         ]
-        for t in plan.todos:
-            deps = f" (depends_on: {', '.join(t.depends_on)})" if t.depends_on else ""
-            grp = f" [parallel_group: {t.parallel_group}]" if t.parallel_group else ""
-            lines.append(f"- [{t.id}] {t.title}{deps}{grp}")
+        for i, t in enumerate(plan.todos, 1):
+            deps = f" (depends: {', '.join(t.depends_on)})" if t.depends_on else ""
+            grp = f" [{t.parallel_group}]" if t.parallel_group else ""
+            lines.append(f"### PART {i} — {t.title}{deps}{grp}")
+            if t.acceptance_criteria:
+                lines.append(f"- 验收 / Acceptance: {t.acceptance_criteria}")
+        lines.extend(["", "## 关键文件清单 / Critical Files"])
+        if plan.critical_files:
+            for cf in plan.critical_files:
+                path = str(cf.get("path", "")).strip()
+                if not path:
+                    continue
+                change = str(cf.get("change", "")).strip()
+                lines.append(f"- `{path}`" + (f" — {change}" if change else ""))
+        else:
+            lines.append("_探索阶段确认 / determined during exploration_")
+        lines.extend(["", "## 验证 / Verification"])
         if plan.acceptance_criteria:
-            lines.extend(["", "Acceptance criteria:"])
             for item in plan.acceptance_criteria:
                 lines.append(f"- {item}")
+        else:
+            lines.append("- _见各 PART 的验收标准 / see each PART's acceptance criteria_")
         return "\n".join(lines)
 
     def _inject_plan_execution_hint(self) -> None:
@@ -957,7 +1273,14 @@ class AgentSession:
         cfg = load_config().settings
         mode = getattr(cfg, "collaboration_mode", "serial") or "serial"
         lines = [
-            "[Plan execution — follow the approved plan below]",
+            "[Plan execution — the user clicked Build]",
+            "The user clicked Build. This is FULL APPROVAL of the plan below. "
+            "Do NOT ask any further clarifying questions, do NOT re-confirm any decisions, "
+            "do NOT restate or rewrite the plan. Begin executing the first todo immediately. "
+            "For any open questions left in the plan, proceed using the assumptions/defaults "
+            "recorded in the plan; only mark a todo as blocked (with a reason) if you hit a real blocker.",
+            "",
+            "[Follow the approved plan below]",
             f"Collaboration mode: {mode}. Max parallel agents: {getattr(cfg, 'max_parallel_agents', 3)}.",
         ]
         if mode == "parallel":
@@ -986,23 +1309,87 @@ class AgentSession:
             lines.append(plan_md)
 
         lines.append("")
-        lines.append("## Execution Rules")
-        lines.append("- Process todos in dependency order. Mark as in_progress before starting, completed when done.")
-        lines.append("- If blocked, mark the todo as blocked and explain why.")
+        lines.append("## Execution Rules — drive the todo list explicitly (like Claude Code)")
+        lines.append(
+            "- Work the todos in dependency order, ONE at a time. Before you start a "
+            "todo, call `plan_update_todos` to set it `in_progress`."
+        )
+        lines.append(
+            "- The MOMENT a todo is done, call `plan_update_todos` to set it "
+            "`completed` (you may set the next todo `in_progress` in the SAME call). "
+            "Do NOT batch many completions at the end — the user watches progress "
+            "tick item-by-item, so update after EACH todo finishes."
+        )
+        lines.append(
+            "- If you hit a real blocker, call `plan_update_todos` to set that todo "
+            "`blocked` with a `note` explaining why, then continue with todos that "
+            "don't depend on it."
+        )
         lines.append("- After implementation, run verify_project and git_diff for review.")
-        lines.append("- When dispatching a worker for a todo, include the todo's acceptance_criteria in the task description.")
-        lines.append("- Ask each worker to end its response with exactly: ACCEPTANCE: PASS or ACCEPTANCE: FAIL")
-        lines.append("- Only mark a todo as completed if the worker reports ACCEPTANCE: PASS.")
+        lines.append(
+            "- Optional: if you delegate a todo via dispatch_worker, include its "
+            "acceptance_criteria in the task and ask the worker to end with exactly "
+            "`ACCEPTANCE: PASS` or `ACCEPTANCE: FAIL`; only mark it `completed` on PASS. "
+            "Direct execution is fine too — either way, you MUST keep the todo "
+            "statuses current via `plan_update_todos`."
+        )
         self.messages.append({"role": "system", "content": "\n".join(lines)})
         self._plan_exec_hint_sent = True
+
+    @staticmethod
+    def _looks_like_stale_build_prompt(text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized.strip():
+            return False
+        stale_terms = (
+            "click build",
+            "press build",
+            "tap build",
+            "select build",
+            "hit build",
+            "ready to build",
+            "wait for build",
+            "waiting for build",
+            "plan is ready",
+            "plan generated",
+            "点击 build",
+            "点 build",
+            "按 build",
+            "选择 build",
+            "等待 build",
+            "准备 build",
+            "计划已生成",
+            "计划已经生成",
+            "计划已提交",
+        )
+        if any(term in normalized for term in stale_terms):
+            return True
+        return "build" in normalized and any(term in normalized for term in ("click", "press", "ready", "waiting", "approve"))
+
+    def _append_build_already_clicked_correction(self, turn_id: str, checkpoint_id: str) -> None:
+        msg = {
+            "role": "user",
+            "source": "internal",
+            "content": (
+                "[BUILD ALREADY CLICKED] The user already clicked Build and the plan is approved. "
+                "Do not ask the user to click Build again, do not restate the plan, and do not wait. "
+                "Immediately execute the first pending/in-progress task using the available tools. "
+                "If a task is genuinely blocked, mark it blocked with the concrete reason."
+            ),
+        }
+        self._stamp_message(msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
+        self.messages.append(msg)
 
     def _start_plan_execution(self) -> None:
         self.plan_state.transition_to("executing")
         self._plan_exec_hint_sent = False
-        if self.plan_state.todos:
-            first = self.plan_state.todos[0]
-            if first.status == "pending":
-                first.status = "in_progress"
+        for todo in self.plan_state.todos:
+            if todo.status == "in_progress":
+                return
+        for todo in self.plan_state.todos:
+            if todo.status == "pending":
+                todo.status = "in_progress"
+                break
 
     def approve_plan(self) -> None:
         """Deprecated: kept for old session compatibility. Use build_plan() directly."""
@@ -1019,7 +1406,16 @@ class AgentSession:
 
     def build_plan(self) -> bool:
         """One-click Build: approves + starts execution + switches to agent mode."""
+        if self.plan_state.phase == "executing" and self.plan_state.approved:
+            self.chat_mode = "agent"
+            self.plan_state.mode = "agent"
+            self._save()
+            return True
+        has_plan = bool(self.plan_state.draft or self.plan_state.structured_plan or self.plan_state.todos)
         valid_phase = self.plan_state.phase in ("awaiting_approval", "approved_waiting_build")
+        if not valid_phase and has_plan and self.plan_state.phase not in ("executing", "completed"):
+            self.plan_state.phase = "awaiting_approval"
+            valid_phase = True
         if not valid_phase:
             return False
         self.plan_state.approved = True
@@ -1029,10 +1425,71 @@ class AgentSession:
         self._save()
         return True
 
-    def update_plan_decision(self, question_id: str, selected: List[str]) -> None:
-        self.plan_state.decisions[question_id] = list(selected)
-        all_answered = all(q.id in self.plan_state.decisions for q in self.plan_state.questions)
-        if not all_answered or self.plan_state.phase != "awaiting_decision":
+    def restore_plan_state_snapshot(self, payload: Dict[str, Any]) -> bool:
+        """Restore a UI-held plan snapshot when a Build click races session state."""
+        if not isinstance(payload, dict):
+            return False
+        try:
+            restored = PlanState.model_validate(payload)
+        except Exception:
+            return False
+        has_plan = bool(restored.draft or restored.structured_plan or restored.todos)
+        if not has_plan or restored.phase not in ("awaiting_approval", "approved_waiting_build", "executing"):
+            return False
+        restored.approved = restored.phase in ("approved_waiting_build", "executing")
+        restored.pending_clarification = False
+        self.plan_state = restored
+        self.chat_mode = "agent" if restored.phase == "executing" else "plan"
+        self.plan_state.mode = self.chat_mode
+        self._save()
+        return True
+
+    def pause_plan_build(self) -> bool:
+        """Pause Build execution so the user can resume from the next unfinished todo."""
+        if self.plan_state.phase != "executing":
+            return False
+        for todo in self.plan_state.todos:
+            if todo.status == "in_progress":
+                todo.status = "pending"
+        self.plan_state.approved = True
+        self.plan_state.pending_clarification = False
+        self._plan_exec_hint_sent = False
+        self.chat_mode = "agent"
+        self.plan_state.mode = "agent"
+        self.plan_state.phase = "approved_waiting_build"
+        self._save()
+        return True
+
+    def exit_plan_build(self) -> bool:
+        """End Build execution while keeping the draft available for review/rebuild."""
+        if self.plan_state.phase not in ("executing", "approved_waiting_build"):
+            return False
+        for todo in self.plan_state.todos:
+            if todo.status in ("pending", "in_progress"):
+                todo.status = "cancelled"
+        self.plan_state.approved = False
+        self.plan_state.pending_clarification = False
+        self._plan_exec_hint_sent = False
+        self.chat_mode = "plan" if (self.plan_state.draft or self.plan_state.structured_plan) else "agent"
+        self.plan_state.mode = self.chat_mode
+        self.plan_state.phase = (
+            "awaiting_approval"
+            if (self.plan_state.draft or self.plan_state.structured_plan)
+            else "idle"
+        )
+        self._save()
+        return True
+
+    def _plan_question_has_answer(self, question_id: str) -> bool:
+        return bool(self.plan_state.decisions.get(question_id)) or bool(self.plan_state.decision_notes.get(question_id))
+
+    def _continue_after_plan_decisions(self) -> None:
+        if self.plan_state.phase != "awaiting_decision":
+            self._save()
+            return
+
+        all_answered = all(self._plan_question_has_answer(q.id) for q in self.plan_state.questions)
+        if not all_answered:
             self._save()
             return
 
@@ -1042,8 +1499,15 @@ class AgentSession:
             picks = self.plan_state.decisions.get(q.id, [])
             label_by_id = {o.id: o.label for o in q.options}
             labels = [label_by_id.get(p, p) for p in picks]
+            note = (self.plan_state.decision_notes.get(q.id) or "").strip()
+            answer_parts = []
             if labels:
-                lines.append(f"- {q.prompt} => {', '.join(labels)}")
+                answer_parts.append(", ".join(labels))
+            if note:
+                answer_parts.append(note)
+            if not answer_parts:
+                answer_parts.append("Skipped; use the best default and state the assumption in the plan.")
+            lines.append(f"- {q.prompt} => {'; '.join(answer_parts)}")
         lines.append("")
         lines.append("Please synthesize these decisions with your research and call plan_write_draft.")
         msg = {"role": "user", "content": "\n".join(lines), "source": "internal"}
@@ -1052,11 +1516,142 @@ class AgentSession:
         self.messages.append(msg)
         self.plan_state.pending_clarification = False
         self.plan_state.questions = []
-        self.plan_state.decisions = {}
         self.plan_state.transition_to("planning")
         self._save()
 
+    def update_plan_decision(self, question_id: str, selected: List[str]) -> None:
+        self.submit_plan_decisions([{
+            "question_id": question_id,
+            "selected": selected,
+        }])
+
+    def submit_plan_decisions(self, answers: List[Dict[str, Any]]) -> None:
+        """Apply one or more structured plan answers and resume planning once all are answered."""
+        for answer in answers:
+            if not isinstance(answer, dict):
+                continue
+            question_id = str(answer.get("question_id") or answer.get("questionId") or "").strip()
+            if not question_id:
+                continue
+
+            selected_raw = answer.get("selected") or []
+            if not isinstance(selected_raw, list):
+                selected_raw = [selected_raw]
+            selected = [
+                str(item)
+                for item in selected_raw
+                if item is not None and str(item).strip() and str(item) != "__other__"
+            ]
+            self.plan_state.decisions[question_id] = selected
+
+            notes: List[str] = []
+            other_text = str(answer.get("other_text") or answer.get("otherText") or "").strip()
+            if other_text:
+                notes.append(f"Other: {other_text}")
+            if bool(answer.get("skipped", False)):
+                notes.append("Skipped; use the best default and state the assumption in the plan.")
+            if notes:
+                self.plan_state.decision_notes[question_id] = "; ".join(notes)
+            else:
+                self.plan_state.decision_notes.pop(question_id, None)
+
+        self._continue_after_plan_decisions()
+
     # ── LLM-driven plan tool application ──
+
+    _PLAN_OPTION_LINE_RE = re.compile(
+        r"^\s*(?:[-*]\s*)?(?:(?:\d{1,2})|(?:[A-Ha-h]))[\.\)、)]\s+(?P<label>.+?)\s*$"
+    )
+
+    @staticmethod
+    def _clean_plan_choice_text(text: str) -> str:
+        cleaned = re.sub(r"`([^`]+)`", r"\1", str(text))
+        cleaned = cleaned.replace("**", "").replace("__", "")
+        cleaned = re.sub(r"(?:选项|options?|choices?)\s*[:：]\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" \t:-")
+
+    def _extract_plan_questions_from_text(self, text: str) -> List[Dict[str, Any]]:
+        """Best-effort guardrail for models that print fixed options instead of calling plan_ask_questions."""
+        if not text or len(text) > 12000:
+            return []
+
+        lines = [line.strip() for line in text.replace("\r\n", "\n").split("\n")]
+        option_start = -1
+        raw_options: List[str] = []
+
+        i = 0
+        while i < len(lines):
+            match = self._PLAN_OPTION_LINE_RE.match(lines[i])
+            if not match:
+                i += 1
+                continue
+
+            current: List[str] = []
+            start = i
+            while i < len(lines):
+                option_match = self._PLAN_OPTION_LINE_RE.match(lines[i])
+                if not option_match:
+                    break
+                label = self._clean_plan_choice_text(option_match.group("label"))
+                if label:
+                    current.append(label)
+                i += 1
+
+            if len(current) >= 2:
+                option_start = start
+                raw_options = current[:5]
+                break
+            i = start + 1
+
+        if option_start < 0 or len(raw_options) < 2:
+            return []
+
+        nearby_before = lines[max(0, option_start - 4):option_start]
+        has_choice_cue = any(
+            re.search(r"(选项|可选|选择|options?|choices?|choose|select)", line, re.IGNORECASE)
+            for line in nearby_before
+        )
+        has_question_cue = any(("?" in line or "？" in line) for line in nearby_before)
+        if not has_choice_cue and not has_question_cue:
+            return []
+
+        prompt_candidates: List[str] = []
+        j = option_start - 1
+        while j >= 0 and len(prompt_candidates) < 4:
+            line = lines[j]
+            if not line:
+                if prompt_candidates:
+                    break
+                j -= 1
+                continue
+            if re.fullmatch(r"(?:选项|options?|choices?)\s*[:：]?", line, flags=re.IGNORECASE):
+                j -= 1
+                continue
+            if not self._PLAN_OPTION_LINE_RE.match(line):
+                prompt_candidates.append(line)
+            j -= 1
+
+        prompt_candidates.reverse()
+        prompt = ""
+        for candidate in reversed(prompt_candidates):
+            if "?" in candidate or "？" in candidate:
+                prompt = candidate
+                break
+        if not prompt and prompt_candidates:
+            prompt = prompt_candidates[-1]
+        if not prompt:
+            prompt = "Please choose one option before I draft the plan."
+
+        return [{
+            "id": "clarification_1",
+            "prompt": self._clean_plan_choice_text(prompt),
+            "allow_multiple": False,
+            "options": [
+                {"id": f"option_{idx + 1}", "label": label}
+                for idx, label in enumerate(raw_options)
+            ],
+        }]
 
     def _apply_plan_questions(self, raw_questions: List[Dict[str, Any]]) -> None:
         """Apply questions submitted by the LLM via plan_ask_questions tool."""
@@ -1069,9 +1664,16 @@ class AgentSession:
                 allow_multiple=rq.get("allow_multiple", False),
                 options=opts,
             ))
+        self.chat_mode = "plan"
+        self.plan_state.mode = "plan"
+        if self.plan_state.phase in ("idle", "completed"):
+            self.plan_state.transition_to("clarifying")
         self.plan_state.questions = qs
+        self.plan_state.decisions = {}
+        self.plan_state.decision_notes = {}
         self.plan_state.pending_clarification = True
-        self.plan_state.transition_to("awaiting_decision")
+        if not self.plan_state.transition_to("awaiting_decision"):
+            self.plan_state.phase = "awaiting_decision"
         self._save()
 
     def _apply_plan_draft(self, payload: Dict[str, Any]) -> None:
@@ -1099,36 +1701,57 @@ class AgentSession:
             )
             for i, t in enumerate(payload.get("todos", []))
         ]
+        critical_files = [
+            {"path": str(cf.get("path", "")), "change": str(cf.get("change", ""))}
+            for cf in (payload.get("critical_files", []) or [])
+            if isinstance(cf, dict) and cf.get("path")
+        ]
         draft = PlanDraft(
             goal=payload.get("goal", ""),
+            context=payload.get("context", "") or "",
             assumptions=payload.get("assumptions", []) or [],
             steps=steps,
             todos=todos,
             risks=payload.get("risks", []) or [],
             acceptance_criteria=payload.get("verification", []) or [],
+            critical_files=critical_files,
         )
 
-        # Build draft text from markdown body
-        draft_text = payload.get("markdown_body", "")
-        if not draft_text:
-            draft_text = self._build_plan_draft_text(payload.get("goal", ""))
+        self.chat_mode = "plan"
+        self.plan_state.mode = "plan"
+        self.plan_state.structured_plan = draft
+        self.plan_state.todos = todos
+
+        # Persist the canonical task-first markdown file and use it for review.
+        # Model-provided markdown_body is ignored here to prevent duplicate
+        # Steps/Todos sections from leaking back into the user-facing plan.
+        draft_text = ""
 
         # Persist plan file
         research_notes = payload.get("research_notes", "")
         self.plan_state.research_notes = research_notes
         try:
-            path = write_plan_file(self.session_id, draft, raw_markdown=draft_text)
+            path = write_plan_file(
+                self.session_id,
+                draft,
+                raw_markdown=payload.get("markdown_body", ""),
+                research_notes=research_notes,
+            )
             self.plan_state.plan_file_path = str(path)
             if self.plan_state.plan_file_path not in self.plan_state.plan_file_versions:
                 self.plan_state.plan_file_versions.append(self.plan_state.plan_file_path)
+            draft_text = path.read_text(encoding="utf-8")
         except Exception as e:
             logger.warning("Failed to write plan file: %s", e)
+            if not draft_text.strip():
+                draft_text = self._build_plan_draft_text(payload.get("goal", ""))
 
-        self.plan_state.structured_plan = draft
-        self.plan_state.todos = todos
         self.plan_state.draft = draft_text
         self.plan_state.pending_clarification = False
-        self.plan_state.transition_to("awaiting_approval")
+        if self.plan_state.phase in ("idle", "completed"):
+            self.plan_state.transition_to("planning")
+        if not self.plan_state.transition_to("awaiting_approval"):
+            self.plan_state.phase = "awaiting_approval"
         self.plan_state.approved = False
         self._save()
 
@@ -1145,7 +1768,10 @@ class AgentSession:
         ``PLAN_CONTINUE_MARKER`` resumes execution after the user clicks Build (server-gated).
         """
         if chat_mode in ("agent", "plan"):
-            self.chat_mode = chat_mode
+            if chat_mode != self.chat_mode:
+                self.set_session_chat_mode(chat_mode)
+            else:
+                self.chat_mode = chat_mode
         if thinking_intensity in ("low", "medium", "high"):
             self.set_session_thinking_intensity(thinking_intensity)
 
@@ -1229,10 +1855,55 @@ class AgentSession:
             project_path = project["path"] if project else ""
             resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
 
+            # Explicit delegation has priority over Personal's normal reasoning turn.
+            settings = load_config().settings
+            coding_mention = parse_coding_mention(user_input)
+            if (
+                self._agent_type == "personal"
+                and self.chat_mode != "plan"
+                and getattr(settings, "collaboration_enabled", True)
+                and coding_mention is not None
+            ):
+                self._last_user_message = user_input
+                async for event in self._handle_coding_mention(
+                    coding_mention,
+                    original_input=user_input,
+                    resolved_input=resolved_input,
+                    image_base64=image_base64,
+                    outer_run_id=run_id,
+                ):
+                    yield event
+                close_coding_run("completed", "Explicit Coding Agent delegation handled.")
+                return
+
             # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
             if self._agent_type == "personal" and project and self.chat_mode != "plan":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
+                        inferred_mode = classify_coding_intent(user_input)
+                        auto_delegate = getattr(settings, "auto_delegate_coding", "suggest") or "suggest"
+                        should_auto_delegate = (
+                            auto_delegate == "always_for_code"
+                            or (auto_delegate == "safe_only" and inferred_mode == "consult")
+                        )
+                        if should_auto_delegate and getattr(settings, "collaboration_enabled", True):
+                            self._dispatch_suggested_this_session = True
+                            synthetic_mention = CodingMention(
+                                raw="@coding agent",
+                                task=user_input,
+                                mode="execute" if inferred_mode == "execute" else "consult",
+                            )
+                            self._last_user_message = user_input
+                            async for event in self._handle_coding_mention(
+                                synthetic_mention,
+                                original_input=user_input,
+                                resolved_input=resolved_input,
+                                image_base64=image_base64,
+                                outer_run_id=run_id,
+                            ):
+                                yield event
+                            close_coding_run("completed", "Automatic Coding Agent delegation handled.")
+                            return
                         self._dispatch_suggested_this_session = True
                         yield self._event(
                             "suggest_agent_switch",
@@ -1273,6 +1944,7 @@ class AgentSession:
                     self.plan_state.mode = "plan"
                     self.plan_state.goal = user_input.strip()[:800]
                     self.plan_state.decisions = {}
+                    self.plan_state.decision_notes = {}
                     self.plan_state.pending_clarification = False
                     self.plan_state.research_notes = ""
                     self.plan_state.structured_plan = None
@@ -1334,6 +2006,7 @@ class AgentSession:
         _verify_gate_fired = False
         _latest_verification: Optional[Dict[str, Any]] = None
         _latest_review: Optional[Dict[str, Any]] = None
+        stale_build_prompt_guarded = False
         while self.iteration < self.max_iterations:
             if self._cancelled:
                 yield self._event("interrupted", {"message": "User cancelled"}, run_id)
@@ -1370,18 +2043,21 @@ class AgentSession:
                         self.messages.append(screenshot_msg)
 
             tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type))
+            completion_max_tokens = self._completion_max_tokens()
 
             # Stream LLM response token-by-token for real-time frontend display
             response = None
             stream_error = None
             streamed_reasoning_text = ""
             streamed_content_text = ""
+            buffer_execution_content = self.plan_state.approved and self.plan_state.phase == "executing"
+            streamed_content_visible = False
             try:
                 async for token in self.router.chat_completion_stream(
                     messages=self._messages_for_llm(),
                     tools=tool_schemas or None,
                     temperature=0.5,
-                    max_tokens=8192,
+                    max_tokens=completion_max_tokens,
                     thinking_intensity=ti,
                 ):
                     ttype = token.get("type", "")
@@ -1394,11 +2070,13 @@ class AgentSession:
                         )
                     elif ttype == "text_delta":
                         streamed_content_text += token["text"]
-                        yield self._event(
-                            "content",
-                            {"text": token["text"], "skill": active_skills[0] if active_skills else None},
-                            run_id,
-                        )
+                        if not buffer_execution_content:
+                            streamed_content_visible = True
+                            yield self._event(
+                                "content",
+                                {"text": token["text"], "skill": active_skills[0] if active_skills else None},
+                                run_id,
+                            )
                     elif ttype == "done":
                         response = token["response"]
                     elif ttype == "error":
@@ -1414,7 +2092,7 @@ class AgentSession:
                         response = await self.router.chat_completion_non_stream(
                             messages=self._messages_for_llm(),
                             temperature=0.5,
-                            max_tokens=8192,
+                            max_tokens=completion_max_tokens,
                             thinking_intensity=ti,
                         )
                         stream_error = None
@@ -1428,9 +2106,35 @@ class AgentSession:
                     break
 
             if response is None:
-                yield self._event("error", {"message": "Model returned no response"}, run_id)
-                finished = True
-                break
+                try:
+                    response = await self.router.chat_completion_non_stream(
+                        messages=self._messages_for_llm(),
+                        tools=tool_schemas or None,
+                        temperature=0.5,
+                        max_tokens=completion_max_tokens,
+                        thinking_intensity=ti,
+                    )
+                except Exception as no_response_fallback_error:
+                    yield self._event(
+                        "error",
+                        {
+                            "message": (
+                                "Model stream ended without a final response and fallback failed: "
+                                f"{no_response_fallback_error}"
+                            )
+                        },
+                        run_id,
+                    )
+                    finished = True
+                    break
+                if response is None:
+                    yield self._event(
+                        "error",
+                        {"message": "Model returned no response. Please retry or switch models."},
+                        run_id,
+                    )
+                    finished = True
+                    break
             self._update_usage_from_response(response)
             yield self._event("context_usage", self.context_usage(), run_id)
 
@@ -1447,7 +2151,7 @@ class AgentSession:
                         messages=self._messages_for_llm(),
                         tools=tool_schemas or None,
                         temperature=0.5,
-                        max_tokens=8192,
+                        max_tokens=completion_max_tokens,
                         thinking_intensity=ti,
                     )
                     fallback_message = fallback_response.get("choices", [{}])[0].get("message", {})
@@ -1476,11 +2180,13 @@ class AgentSession:
                         )
                     if message.get("content"):
                         streamed_content_text += message["content"]
-                        yield self._event(
-                            "content",
-                            {"text": message["content"], "skill": active_skills[0] if active_skills else None},
-                            run_id,
-                        )
+                        if not buffer_execution_content:
+                            streamed_content_visible = True
+                            yield self._event(
+                                "content",
+                                {"text": message["content"], "skill": active_skills[0] if active_skills else None},
+                                run_id,
+                            )
                 except Exception as empty_fallback_error:
                     yield self._event(
                         "error",
@@ -1502,18 +2208,40 @@ class AgentSession:
                 )
             if message.get("content") and not streamed_content_text:
                 streamed_content_text = message["content"]
+                if not buffer_execution_content:
+                    streamed_content_visible = True
+                    yield self._event(
+                        "content",
+                        {"text": message["content"], "skill": active_skills[0] if active_skills else None},
+                        run_id,
+                    )
+
+            tool_calls = message.get("tool_calls", [])
+            assistant_content = message.get("content") or ""
+            if (
+                buffer_execution_content
+                and not tool_calls
+                and not stale_build_prompt_guarded
+                and self._looks_like_stale_build_prompt(assistant_content or streamed_content_text)
+            ):
+                stale_build_prompt_guarded = True
+                self._append_build_already_clicked_correction(active_turn_id, active_checkpoint_id)
+                yield self._event("context_usage", self.context_usage(), run_id)
+                continue
+            if buffer_execution_content and assistant_content and not streamed_content_visible:
+                streamed_content_visible = True
                 yield self._event(
                     "content",
-                    {"text": message["content"], "skill": active_skills[0] if active_skills else None},
+                    {"text": assistant_content, "skill": active_skills[0] if active_skills else None},
                     run_id,
                 )
 
             assistant_msg = {
                 "role": "assistant",
-                "content": message.get("content") or ""
+                "content": assistant_content
             }
-            if message.get("tool_calls"):
-                assistant_msg["tool_calls"] = message["tool_calls"]
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
             if message.get("reasoning_content"):
                 assistant_msg["reasoning_content"] = message["reasoning_content"]
             self._stamp_message(
@@ -1524,8 +2252,31 @@ class AgentSession:
             self.messages.append(assistant_msg)
             yield self._event("context_usage", self.context_usage(), run_id)
 
-            tool_calls = message.get("tool_calls", [])
             if not tool_calls:
+                if (
+                    self.chat_mode == "plan"
+                    and not self.plan_state.approved
+                    and self.plan_state.phase in ("clarifying", "planning")
+                ):
+                    fallback_questions = self._extract_plan_questions_from_text(
+                        str(message.get("content") or streamed_content_text or "")
+                    )
+                    if fallback_questions:
+                        self._apply_plan_questions(fallback_questions)
+                        yield self._event("plan_questions", {
+                            "questions": [q.model_dump() for q in self.plan_state.questions],
+                            "phase": self.plan_state.phase,
+                            "pending_clarification": self.plan_state.pending_clarification,
+                        }, run_id)
+                        yield self._event("plan_status", self._plan_event_payload(), run_id)
+                        self._trim_messages()
+                        self._save()
+                        yield self._event("context_usage", self.context_usage(), run_id)
+                        yield self._event("status", {"status": "completed"}, run_id)
+                        plan_turn_done = True
+                        finished = True
+                        break
+
                 # Auto-verification gate: block completion if files were edited without verify
                 _proj = ProjectManager.get_current()
                 if (
@@ -1655,8 +2406,8 @@ class AgentSession:
                     if not tc_result.metadata.get("verification"):
                         _unstructured_verification_seen = True
 
-                if self.chat_mode == "plan" and self.plan_state.approved:
-                    if self._touch_plan_todo_after_tool(tool_name, tc_result.result_text):
+                if self.plan_state.approved and self.plan_state.phase == "executing":
+                    if self._touch_plan_todo_after_tool(tool_name, tc_result.result_text, tc_result.error or ""):
                         yield self._event(
                             "todo_update",
                             {"todos": [t.model_dump() for t in self.plan_state.todos]},
@@ -1670,6 +2421,11 @@ class AgentSession:
                     file_edit = dict(tc_result.metadata["file_edit"])
                     file_edit.setdefault("tool_call_id", tool_id)
                     yield self._event("file_edit", file_edit, run_id)
+
+                if tc_result.metadata.get("skill_draft"):
+                    draft = dict(tc_result.metadata["skill_draft"])
+                    draft.setdefault("tool_call_id", tool_id)
+                    yield self._event("skill_draft_ready", draft, run_id)
 
                 for decision in tc_result.metadata.get("guardrail_decisions", []):
                     yield self._event("guardrail_decision", decision, run_id)
@@ -1692,6 +2448,7 @@ class AgentSession:
                 # ── plan tool result processing ──
                 plan_action = tc_result.metadata.get("plan_action")
                 if plan_action == "questions_submitted":
+                    assistant_msg["content"] = ""
                     self._apply_plan_questions(tc_result.metadata.get("questions") or [])
                     yield self._event("plan_questions", {
                         "questions": [q.model_dump() for q in self.plan_state.questions],
@@ -1702,6 +2459,7 @@ class AgentSession:
                     plan_turn_done = True
 
                 elif plan_action == "draft_submitted":
+                    assistant_msg["content"] = ""
                     self._apply_plan_draft(tc_result.metadata.get("payload") or {})
                     yield self._event("plan_draft", {
                         "goal": self.plan_state.goal,
@@ -1722,6 +2480,31 @@ class AgentSession:
                     yield self._event("plan_status", self._plan_event_payload(), run_id)
                     plan_turn_done = True
 
+                elif plan_action == "todos_updated":
+                    # Model-driven todo progression during BUILD execution.
+                    # Apply the explicit status changes, auto-advance the next
+                    # pending todo, and emit todo_update RIGHT NOW so the plan
+                    # card ticks item-by-item (do not batch / wait for turn end).
+                    self._apply_todo_updates(tc_result.metadata.get("payload") or {})
+                    self._auto_advance_pending_todos()
+                    self._save()
+                    yield self._event("todo_update", {
+                        "todos": [t.model_dump() for t in self.plan_state.todos],
+                    }, run_id)
+                    if (
+                        self.plan_state.phase == "executing"
+                        and self.plan_state.todos
+                        and all(
+                            t.status in ("completed", "cancelled")
+                            for t in self.plan_state.todos
+                        )
+                    ):
+                        self.plan_state.transition_to("completed")
+                        self._save()
+                        yield self._event("plan_status", self._plan_event_payload(), run_id)
+                    # NOTE: deliberately NOT setting plan_turn_done — execution
+                    # must continue to the next todo within the same run.
+
                 yield self._event(
                     "tool_call",
                     {
@@ -1733,6 +2516,24 @@ class AgentSession:
                     },
                     run_id,
                 )
+
+                for collaboration_event in tc_result.metadata.get("collaboration_events", []) or []:
+                    if not isinstance(collaboration_event, dict):
+                        continue
+                    event_data = dict(collaboration_event.get("data") or {})
+                    collab_run_id = collaboration_event.get("run_id") or event_data.get("run_id") or ""
+                    collab_task_id = collaboration_event.get("task_id") or event_data.get("task_id") or ""
+                    if collab_run_id:
+                        event_data.setdefault("run_id", collab_run_id)
+                        event_data.setdefault("collaboration_run_id", collab_run_id)
+                    if collab_task_id:
+                        event_data.setdefault("task_id", collab_task_id)
+                        event_data.setdefault("collaboration_task_id", collab_task_id)
+                    event_data.setdefault("timestamp", collaboration_event.get("timestamp") or time.time())
+                    yield self._event(
+                        collaboration_event.get("type", "collaboration_task_update"),
+                        event_data,
+                    )
 
                 result_text = tc_result.result_text
                 max_tool_result_len = 8000
@@ -1783,6 +2584,18 @@ class AgentSession:
             latest_review=_latest_review,
             unstructured_verification_seen=_unstructured_verification_seen,
         )
+        if self.plan_state.phase == "executing" and completion_status == "completed":
+            # The run finished naturally. The plan card spinner is bound to
+            # phase == "executing", so phase MUST leave "executing" here or it
+            # spins forever. User-chosen behavior: mark every non-blocked /
+            # non-cancelled todo completed and transition to a terminal phase;
+            # blocked todos stay visible as blocked.
+            for t in self.plan_state.todos:
+                if t.status in ("in_progress", "pending"):
+                    t.status = "completed"
+            self.plan_state.transition_to("completed")
+            yield self._event("todo_update", {"todos": [t.model_dump() for t in self.plan_state.todos]}, run_id)
+            yield self._event("plan_status", self._plan_event_payload(), run_id)
         yield self._event("run_completed", {
             "status": completion_status,
             "summary": completion_summary,
@@ -1791,16 +2604,17 @@ class AgentSession:
         close_coding_run(completion_status, completion_summary, completion_quality)
         self._save()
 
-    def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "") -> bool:
+    def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "", tool_error: str = "") -> bool:
         """Best-effort todo progression after worker dispatch tools (plan execution). Returns True if todos changed."""
-        if self.chat_mode != "plan" or not self.plan_state.todos:
+        if not self.plan_state.approved or self.plan_state.phase != "executing" or not self.plan_state.todos:
             return False
         if tool_name not in ("dispatch_worker", "dispatch_parallel"):
             return False
         todos = self.plan_state.todos
         changed = False
         # Only advance in_progress → completed when worker signals success, or no acceptance signal at all
-        acceptance_fail = "ACCEPTANCE: FAIL" in result_text
+        dispatch_failed = bool(tool_error) or result_text.startswith("[ERROR]")
+        acceptance_fail = dispatch_failed or "ACCEPTANCE: FAIL" in result_text
         acceptance_pass = "ACCEPTANCE: PASS" in result_text
         for t in todos:
             if t.status == "in_progress":
@@ -1812,16 +2626,55 @@ class AgentSession:
                 changed = True
                 break
         if not acceptance_fail:
-            for t in todos:
-                if t.status != "pending":
-                    continue
-                deps = t.depends_on or []
-                if not deps or all(
-                    (self._todo_by_id(d) and self._todo_by_id(d).status == "completed") for d in deps
-                ):
-                    t.status = "in_progress"
-                    changed = True
-                    break
+            if self._auto_advance_pending_todos():
+                changed = True
+        return changed
+
+    def _auto_advance_pending_todos(self) -> bool:
+        """Promote the next dependency-ready pending todo to in_progress when
+        nothing is currently running. Returns True if a todo changed.
+
+        Shared by the worker-dispatch fallback (_touch_plan_todo_after_tool)
+        and the explicit plan_update_todos path so direct execution also keeps
+        a single todo active at a time.
+        """
+        todos = self.plan_state.todos
+        if not todos:
+            return False
+        if any(t.status == "in_progress" for t in todos):
+            return False
+        for t in todos:
+            if t.status != "pending":
+                continue
+            deps = t.depends_on or []
+            if not deps or all(
+                (self._todo_by_id(d) and self._todo_by_id(d).status == "completed") for d in deps
+            ):
+                t.status = "in_progress"
+                return True
+        return False
+
+    def _apply_todo_updates(self, payload: Dict[str, Any]) -> bool:
+        """Apply explicit {id, status} changes from the plan_update_todos tool.
+
+        Returns True if any todo status actually changed. Unknown ids and
+        invalid statuses are skipped (the tool already validated shape).
+        """
+        updates = payload.get("updates") or []
+        if not isinstance(updates, list) or not self.plan_state.todos:
+            return False
+        valid = {"pending", "in_progress", "completed", "blocked", "cancelled"}
+        changed = False
+        for u in updates:
+            if not isinstance(u, dict):
+                continue
+            todo = self._todo_by_id(str(u.get("id", "")))
+            status = u.get("status")
+            if todo is None or status not in valid:
+                continue
+            if todo.status != status:
+                todo.status = status
+                changed = True
         return changed
 
     def _todo_by_id(self, todo_id: str) -> Optional[PlanTodo]:

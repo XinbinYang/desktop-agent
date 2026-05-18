@@ -34,7 +34,9 @@ class AppOpenTool(BaseTool):
             proc = subprocess.Popen(
                 cmd_list,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="replace",
             )
             
             if wait and HAS_PYWINAUTO:

@@ -106,6 +106,18 @@ def close_project():
     return {"status": "closed"}
 
 
+@router.post("/api/projects/refresh")
+def refresh_project():
+    """Refresh current project metadata and file tree."""
+    try:
+        project = ProjectManager.refresh_current()
+    except ValueError as e:
+        return {"project": None, "nodes": [], "error": str(e)}
+    if not project:
+        return {"project": None, "nodes": [], "error": "No current project"}
+    return {"project": project, "nodes": ProjectManager.get_tree()}
+
+
 @router.post("/api/projects/create")
 def create_project(req: CreateProjectRequest):
     """创建新项目"""

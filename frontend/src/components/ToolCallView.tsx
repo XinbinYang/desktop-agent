@@ -11,6 +11,21 @@ interface ToolCallViewProps {
   workerEvents?: WorkerEvent[];
 }
 
+/** Shell/bash-style tools get a compact IN/OUT terminal view. */
+function isShellTool(name: string): boolean {
+  const n = (name || '').toLowerCase();
+  return n.includes('shell') || n.includes('bash') || n === 'run_command' || n.includes('terminal');
+}
+
+/** Best-effort extraction of the command string from shell tool args. */
+function shellCommand(args: Record<string, any>): string {
+  if (!args || typeof args !== 'object') return '';
+  const raw =
+    args.command ?? args.cmd ?? args.script ?? args.shell ?? args.input ?? '';
+  if (Array.isArray(raw)) return raw.join(' ');
+  return typeof raw === 'string' ? raw : '';
+}
+
 function groupWorkerEvents(events: WorkerEvent[] = []): Record<string, WorkerEvent[]> {
   return events.reduce<Record<string, WorkerEvent[]>>((acc, event) => {
     const id = event.workerId || 'worker';
@@ -93,6 +108,8 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
   const [expanded, setExpanded] = useState(false);
   const workerGroups = groupWorkerEvents(workerEvents);
   const workerCount = Object.keys(workerGroups).length;
+  const isShell = isShellTool(name);
+  const command = isShell ? shellCommand(args) : '';
 
   return (
     <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/40 overflow-hidden">
@@ -111,7 +128,16 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
           <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
         )}
         <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-        <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
+        {isShell ? (
+          <span className="flex items-baseline gap-1.5 truncate flex-1 text-left">
+            <span className="text-fg-secondary font-medium shrink-0">Bash</span>
+            {command && (
+              <span className="text-fg-muted font-mono chat-text-xs truncate">{command}</span>
+            )}
+          </span>
+        ) : (
+          <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
+        )}
         {typeof durationMs === 'number' && (
           <span className="text-fg-muted tabular-nums">{durationMs}ms</span>
         )}
@@ -128,13 +154,34 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
       </button>
       {expanded && (status !== 'running' || workerCount > 0) && (
         <div className="px-[var(--chat-bubble-px)] pb-[var(--chat-space-lg)] space-y-[var(--chat-space-md)] chat-text-sm font-mono border-t border-border-subtle pt-[var(--chat-space-md)]">
-          <div className="text-fg-muted bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] overflow-x-auto">
-            {JSON.stringify(args, null, 2)}
-          </div>
-          {result != null && (
-            <div className={`bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] whitespace-pre-wrap max-h-80 overflow-auto ${status === 'error' ? 'text-danger' : 'text-fg-secondary'}`} style={{lineHeight:'var(--chat-line-height)'}}>
-              {result}
-            </div>
+          {isShell ? (
+            <>
+              <div className="bg-surface-alt rounded-md overflow-hidden border-l-2 border-l-info/70">
+                <div className="px-[var(--chat-space-lg)] pt-[var(--chat-space-xs)] chat-text-xs text-fg-muted select-none">IN</div>
+                <div className="px-[var(--chat-space-lg)] pb-[var(--chat-space-md)] pt-[var(--chat-space-xs)] whitespace-pre-wrap text-fg-secondary overflow-x-auto" style={{ lineHeight: 'var(--chat-line-height)' }}>
+                  {command || JSON.stringify(args)}
+                </div>
+              </div>
+              {result != null && (
+                <div className={`bg-surface-alt rounded-md overflow-hidden border-l-2 ${status === 'error' ? 'border-l-danger/70' : 'border-l-success/60'}`}>
+                  <div className="px-[var(--chat-space-lg)] pt-[var(--chat-space-xs)] chat-text-xs text-fg-muted select-none">OUT</div>
+                  <div className={`px-[var(--chat-space-lg)] pb-[var(--chat-space-md)] pt-[var(--chat-space-xs)] whitespace-pre-wrap max-h-80 overflow-auto ${status === 'error' ? 'text-danger' : 'text-fg-secondary'}`} style={{ lineHeight: 'var(--chat-line-height)' }}>
+                    {result}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="text-fg-muted bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] overflow-x-auto">
+                {JSON.stringify(args, null, 2)}
+              </div>
+              {result != null && (
+                <div className={`bg-surface-alt rounded-md px-[var(--chat-space-lg)] py-[var(--chat-space-md)] whitespace-pre-wrap max-h-80 overflow-auto ${status === 'error' ? 'text-danger' : 'text-fg-secondary'}`} style={{lineHeight:'var(--chat-line-height)'}}>
+                  {result}
+                </div>
+              )}
+            </>
           )}
           {workerCount > 0 && (
             <div className="space-y-[var(--chat-space-md)]">

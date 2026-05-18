@@ -36,10 +36,12 @@ interface SessionViewProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onOpenPlanInWorkspace?: () => void;
+  onProjectFileEdit?: (edit: FileEdit) => void;
 }
 
 export interface SessionViewHandle {
-  openFile: (relativePath: string, content: string, language: string) => void;
+  openFile: (relativePath: string, content: string, language: string, options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>>) => void;
   switchModel: (modelId: string) => void;
   openRewind: () => void;
 }
@@ -73,6 +75,8 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     openRunWorktree,
     handleOpenFileFromPanel,
     handleOpenFileFromPanelWithLine,
+    onOpenPlanInWorkspace,
+    onProjectFileEdit,
   },
   ref,
 ) {
@@ -96,6 +100,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     stopRunning,
     retryLast,
     switchModel,
+    switchRole,
     executeToolDirect,
     resetSession,
     addTerminalLog,
@@ -113,16 +118,20 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     planState,
     approvePlan,
     buildPlan,
+    pauseBuild,
+    endBuild,
     rejectPlan,
     updatePlanDecision,
+    submitPlanDecisions,
     suggestAgentSwitch,
     clearSuggestAgentSwitch,
   } = useChatSession(sessionId, model, agentType, role);
 
   // ---- Send team info to backend on change ----
   useEffect(() => {
+    if (!isConnected) return;
     sendRaw({ type: 'set_team', team_id: teamId || null, team_name: teamName || '' });
-  }, [teamId, teamName, sendRaw]);
+  }, [isConnected, teamId, teamName, sendRaw]);
 
   // ---- Per-session derived state ----
 
@@ -137,31 +146,41 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   // ---- openFile (exposed via ref for sidebar → focused session) ----
 
   const openFile = useCallback(
-    (relativePath: string, content: string, language: string) => {
+    (
+      relativePath: string,
+      content: string,
+      language: string,
+      options: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> = {},
+    ) => {
+      const normalizedPath = relativePath.replace(/\\/g, '/');
       const openFile: OpenFile = {
         id: generateId(),
-        path: relativePath,
-        name: relativePath.split('/').pop() || relativePath,
+        path: normalizedPath,
+        name: normalizedPath.split('/').pop() || normalizedPath,
         content,
         language,
         isModified: false,
+        source: options.source || 'project',
+        readOnly: options.readOnly,
+        isPinned: options.isPinned,
       };
 
       setEditorGroups((prev) => {
         const groupIdx = 0; // main group
         const group = prev[groupIdx];
         const existingIdx = group.openFiles.findIndex(
-          (f) => f.path.replace(/\\/g, '/') === relativePath.replace(/\\/g, '/'),
+          (f) => f.path.replace(/\\/g, '/') === normalizedPath,
         );
 
         let newOpenFiles: OpenFile[];
         let newActiveId: string;
 
         if (existingIdx >= 0) {
+          const existing = group.openFiles[existingIdx];
           newOpenFiles = group.openFiles.map((f, i) =>
-            i === existingIdx ? { ...f, content: openFile.content } : f,
+            i === existingIdx ? { ...f, ...openFile, id: existing.id } : f,
           );
-          newActiveId = openFile.id;
+          newActiveId = existing.id;
         } else {
           let files = group.openFiles;
           if (files.length >= 10) {
@@ -183,6 +202,19 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     },
     [layout],
   );
+
+  const openPlanInEditor = useCallback(() => {
+    const rawPath = (planState.plan_file_path || 'plan.md').replace(/\\/g, '/');
+    const name = rawPath.split('/').pop() || 'plan.md';
+    const content = planState.draft || '# Plan\n\nNo markdown body was provided.';
+    openFile(rawPath, content, 'markdown', {
+      readOnly: true,
+      source: 'plan',
+      isPinned: true,
+    });
+    onOpenPlanInWorkspace?.();
+    addTerminalLog(`[Plan] Opened ${name} in the editor`);
+  }, [addTerminalLog, onOpenPlanInWorkspace, openFile, planState.draft, planState.plan_file_path]);
 
   const openRewind = useCallback(() => setRewindOpen(true), []);
 
@@ -291,11 +323,12 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       if (edit.truncated) {
         addTerminalLog(`[Edit] ${edit.path} changed; full text was too large for inline diff`);
       }
+      onProjectFileEdit?.(edit);
     };
     return () => {
       onFileEditRef.current = null;
     };
-  }, [onFileEditRef, currentProject, addTerminalLog]);
+  }, [onFileEditRef, currentProject, addTerminalLog, onProjectFileEdit]);
 
   // ---- Editor callbacks ----
 
@@ -335,6 +368,10 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   const handleSaveFile = useCallback(async (groupId: string, fileId: string, content: string) => {
     const file = editorGroups.find((g) => g.id === groupId)?.openFiles.find((f) => f.id === fileId);
     if (!file || !currentProject) return;
+    if (file.readOnly) {
+      addTerminalLog(`[Plan] ${file.name} is read-only`);
+      return;
+    }
     try {
       const filePath = currentProject.path.replace(/\\/g, '/') + '/' + file.path;
       const res = await fetch(`${API_BASE}/api/file/write`, {
@@ -398,12 +435,16 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     stopRunning,
     retryLast,
     switchModel,
+    switchRole,
     executeToolDirect,
     addTerminalLog,
     approvePlan,
     buildPlan,
+    pauseBuild,
+    endBuild,
     rejectPlan,
     updatePlanDecision,
+    submitPlanDecisions,
     onSelectFileInEditor: handleSelectFileInEditor,
     onCloseFileInEditor: handleCloseFileInEditor,
     onFileContentChange: handleFileContentChange,
@@ -417,8 +458,8 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     handleOpenFileFromPanelWithLine,
   }), [
     sendMessage, clearSession, compactSession, loadCheckpoints, rewindToCheckpoint,
-    stopRunning, retryLast, switchModel, executeToolDirect, addTerminalLog,
-    approvePlan, buildPlan, rejectPlan, updatePlanDecision,
+    stopRunning, retryLast, switchModel, switchRole, executeToolDirect, addTerminalLog,
+    approvePlan, buildPlan, pauseBuild, endBuild, rejectPlan, updatePlanDecision, submitPlanDecisions,
     handleSelectFileInEditor, handleCloseFileInEditor, handleFileContentChange, handleSaveFile,
     saveInputDraft, loadInputDraft, clearInputDraft,
     runAction, openRunWorktree, handleOpenFileFromPanel, handleOpenFileFromPanelWithLine,
@@ -437,7 +478,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="h-full flex flex-col" onClick={onFocus}>
+    <div className="h-full min-h-0 flex flex-col" onClick={onFocus}>
       <ChatPanel
         messages={messages}
         toolCalls={toolCalls}
@@ -463,10 +504,16 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         planState={planState}
         onApprovePlan={approvePlan}
         onBuildPlan={buildPlan}
+        onPauseBuild={pauseBuild}
+        onEndBuild={endBuild}
         onRejectPlan={rejectPlan}
         onUpdatePlanDecision={updatePlanDecision}
+        onSubmitPlanDecisions={submitPlanDecisions}
+        onViewPlan={openPlanInEditor}
         onCommand={onCommand}
         projectOpen={!!currentProject}
+        agentType={agentType}
+        projectName={currentProject?.name}
       />
     </div>
   );

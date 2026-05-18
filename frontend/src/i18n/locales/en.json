@@ -59,7 +59,15 @@
     "send": "Send",
     "stop": "Stop",
     "regenerate": "Regenerate",
-    "scrollToBottom": "Scroll to bottom"
+    "scrollToBottom": "Scroll to bottom",
+    "empty": {
+      "ready": "Ready",
+      "projectReady": "{{projectName}} is ready",
+      "personalAgent": "Personal Agent",
+      "codingAgent": "Coding Agent",
+      "agentMode": "Agent",
+      "planMode": "Plan"
+    }
   },
   "terminal": {
     "title": "Execution Log",

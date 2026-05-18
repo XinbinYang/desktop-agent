@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { API_BASE } from '../config';
-import { Terminal, X, FolderOpen, HelpCircle, Settings, Camera, Zap, FileText, User } from 'lucide-react';
+import { Terminal, FolderOpen, HelpCircle, Camera, Zap } from 'lucide-react';
 
 interface Command {
   name: string;
@@ -36,6 +36,7 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ query, onSel
   const [commands, setCommands] = useState<Command[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/commands`)
@@ -44,46 +45,73 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ query, onSel
       .catch(() => setCommands([]));
   }, []);
 
-  const filtered = commands.filter(
-    (c) => c.name.includes(query.replace('/', '').toLowerCase()) ||
-           c.description.toLowerCase().includes(query.replace('/', '').toLowerCase())
+  const queryText = query.replace('/', '').toLowerCase();
+  const filtered = useMemo(
+    () => commands.filter(
+      (c) => c.name.toLowerCase().includes(queryText) ||
+             c.description.toLowerCase().includes(queryText)
+    ),
+    [commands, queryText]
   );
 
   // Group by category
-  const grouped: Record<string, Command[]> = {};
-  for (const cmd of filtered) {
-    const cat = cmd.category || 'other';
-    if (!grouped[cat]) grouped[cat] = [];
-    grouped[cat].push(cmd);
-  }
+  const groupedEntries = useMemo(() => {
+    const grouped: Record<string, Command[]> = {};
+    for (const cmd of filtered) {
+      const cat = cmd.category || 'other';
+      if (!grouped[cat]) grouped[cat] = [];
+      grouped[cat].push(cmd);
+    }
+    return Object.entries(grouped);
+  }, [filtered]);
+
+  const visibleCommands = useMemo(
+    () => groupedEntries.flatMap(([, cmds]) => cmds),
+    [groupedEntries]
+  );
 
   useEffect(() => {
     setSelectedIndex(0);
   }, [query]);
+
+  useEffect(() => {
+    setSelectedIndex((idx) => {
+      if (visibleCommands.length === 0) return 0;
+      return Math.min(idx, visibleCommands.length - 1);
+    });
+  }, [visibleCommands.length]);
+
+  useEffect(() => {
+    itemRefs.current[selectedIndex]?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex]);
 
   // Keyboard navigation
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+        e.stopPropagation();
+        setSelectedIndex((i) => Math.min(i + 1, visibleCommands.length - 1));
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedIndex((i) => Math.max(i - 1, 0));
-      } else if (e.key === 'Enter' && filtered.length > 0) {
+      } else if (e.key === 'Enter' && visibleCommands.length > 0) {
         e.preventDefault();
-        onSelect(filtered[selectedIndex]);
+        e.stopPropagation();
+        onSelect(visibleCommands[Math.min(selectedIndex, visibleCommands.length - 1)]);
       } else if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         onClose();
       }
     };
     const el = inputRef.current;
     el?.addEventListener('keydown', handler);
     return () => el?.removeEventListener('keydown', handler);
-  }, [filtered, selectedIndex, onSelect, onClose, inputRef]);
+  }, [visibleCommands, selectedIndex, onSelect, onClose, inputRef]);
 
-  if (filtered.length === 0) return null;
+  if (visibleCommands.length === 0) return null;
 
   // Calculate position relative to textarea
   const rect = inputRef.current?.getBoundingClientRect();
@@ -99,21 +127,24 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ query, onSel
 
   return (
     <div ref={menuRef} style={style} className="bg-surface border border-border rounded-lg shadow-xl p-1">
-      {Object.entries(grouped).map(([category, cmds]) => (
+      {groupedEntries.map(([category, cmds]) => (
         <div key={category}>
           <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-fg-muted uppercase tracking-wide">
             {CATEGORY_ICONS[category]}
             {CATEGORY_LABELS[category] || category}
           </div>
-          {cmds.map((cmd, idx) => {
-            const globalIdx = filtered.indexOf(cmd);
+          {cmds.map((cmd) => {
+            const globalIdx = visibleCommands.indexOf(cmd);
             const isSelected = globalIdx === selectedIndex;
             return (
               <button
                 key={cmd.name}
+                ref={(node) => { itemRefs.current[globalIdx] = node; }}
                 type="button"
                 onClick={() => onSelect(cmd)}
                 onMouseEnter={() => setSelectedIndex(globalIdx)}
+                aria-selected={isSelected}
+                data-command-name={cmd.name}
                 className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-xs text-left transition-colors ${
                   isSelected ? 'bg-accent/10 text-accent' : 'text-fg hover:bg-surface-hover'
                 }`}

@@ -118,13 +118,14 @@ const EditorContent: React.FC<EditorContentProps> = ({ file, groupId, onFileCont
       content={file.content}
       filename={file.name}
       isModified={file.isModified}
+      readOnly={file.readOnly}
       onChange={(content) => {
-        if (groupId && onFileContentChange) {
+        if (!file.readOnly && groupId && onFileContentChange) {
           onFileContentChange(groupId, file.id, content);
         }
       }}
       onSave={(content) => {
-        if (groupId && onSaveFile) {
+        if (!file.readOnly && groupId && onSaveFile) {
           onSaveFile(groupId, file.id, content);
         }
       }}

@@ -20,7 +20,7 @@ providers:
       context: 200000
       vision: true
   kimi:
-    base_url: https://api.kimi.com/coding/v1
+    base_url: https://api.kimi.com/coding
     api_key: ${KIMI_API_KEY}
     models:
     - id: kimi-for-coding
@@ -57,6 +57,9 @@ settings:
   auto_approve: false
   screenshot_on_step: true
   sandbox_mode: sandbox
+  collaboration_enabled: true
+  default_collaboration_mode: hybrid
+  auto_delegate_coding: suggest
 
 coding_agent:
   enabled: true

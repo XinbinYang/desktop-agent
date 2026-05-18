@@ -114,21 +114,27 @@ _WRITE_DRAFT_SCHEMA: Dict[str, Any] = {
     "properties": {
         "goal": {
             "type": "string",
-            "description": "One-sentence goal describing what the plan achieves.",
+            "description": "Required. One-sentence goal describing what the plan achieves.",
+        },
+        "context": {
+            "type": "string",
+            "description": (
+                "Optional but recommended. Why this change is needed — the problem/need, "
+                "what prompted it, the intended outcome. Rendered as the '任务目标 / Goal' block."
+            ),
         },
         "assumptions": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Explicit assumptions made while researching.",
+            "description": "Optional. Explicit assumptions made while researching. Omit if none.",
         },
         "research_notes": {
             "type": "string",
-            "description": "Markdown: key files read, existing patterns found, constraints uncovered during exploration.",
+            "description": "Optional. Markdown: key files read, existing patterns found, constraints uncovered during exploration.",
         },
         "steps": {
             "type": "array",
-            "minItems": 1,
-            "description": "Ordered implementation steps.",
+            "description": "Optional/internal. Compatibility field for ordered implementation notes. User-facing plans render todos as Tasks.",
             "items": {
                 "type": "object",
                 "properties": {
@@ -148,6 +154,7 @@ _WRITE_DRAFT_SCHEMA: Dict[str, Any] = {
         "todos": {
             "type": "array",
             "minItems": 1,
+            "description": "Required. The only user-visible execution plan, rendered as Tasks. Prefer <= ~15 substantive todos over dozens of micro-todos.",
             "items": {
                 "type": "object",
                 "properties": {
@@ -163,19 +170,38 @@ _WRITE_DRAFT_SCHEMA: Dict[str, Any] = {
         "risks": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Risks with suggested mitigations.",
+            "description": "Optional. Risks with suggested mitigations. Omit if none.",
         },
         "verification": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "End-to-end verification steps to confirm the plan works.",
+            "description": "Optional. End-to-end verification steps to confirm the plan works.",
+        },
+        "critical_files": {
+            "type": "array",
+            "description": (
+                "Optional but recommended. Files to be created/modified with a short change "
+                "description each. Rendered as the '关键文件清单 / Critical Files' block."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root."},
+                    "change": {"type": "string", "description": "Short description of the change."},
+                },
+                "required": ["path"],
+            },
         },
         "markdown_body": {
             "type": "string",
-            "description": "Full plan in markdown for human review. Include all sections.",
+            "description": (
+                "Optional. Full plan in markdown for human review. "
+                "If omitted, the system auto-generates a readable version from the structured fields — "
+                "do NOT duplicate the whole plan here for large plans."
+            ),
         },
     },
-    "required": ["goal", "assumptions", "research_notes", "steps", "todos", "risks", "verification", "markdown_body"],
+    "required": ["goal", "todos"],
 }
 
 
@@ -184,44 +210,97 @@ class PlanWriteDraftTool(BaseTool):
     description = (
         "Submit a complete, actionable plan for user review. "
         "Only call after you have explored the codebase with read-only tools. "
-        "Every step/todo must reference concrete file paths and line numbers. "
-        "After submission, wait — the user will approve, reject, or request changes."
+        "Every todo must reference concrete file paths and line numbers when possible. "
+        "After submission, wait — the user will approve, reject, or request changes. "
+        "Required fields: 'goal', 'todos'. Optional 'steps' is kept only for compatibility/internal notes. Everything else is optional "
+        "('markdown_body' is auto-generated if omitted). "
+        "Recommended for a high-quality plan: 'context' (why this change — the 任务目标 block), "
+        "'critical_files' (files to change — the 关键文件清单 block), and 'verification' (how to test — the 验证 block). "
+        "Each todo becomes a numbered PART in the 任务方案 block, so order todos as the implementation approach. "
+        "NEVER call this tool with empty arguments. "
+        "For large plans, merge work into coarse-grained todos rather than dozens of micro-todos."
     )
     parameters = _WRITE_DRAFT_SCHEMA
 
+    _SKELETON = (
+        '{"goal": "<one sentence>", '
+        '"todos": [{"id": "t1", "title": "<task>", "acceptance_criteria": "<how to verify>"}]}'
+    )
+
     async def execute(self, **kwargs) -> ToolResult:
-        # Basic validation
+        # Empty-args guard: the most common failure mode is the model emitting {}.
+        if not kwargs:
+            return ToolResult(error=(
+                "[ERROR] plan_write_draft was called with EMPTY arguments. "
+                "This tool MUST receive a full JSON object. Do not call it with {}. "
+                "Required: 'goal' (string), 'todos' (non-empty array). "
+                "Optional (omit if large/unneeded): assumptions, research_notes, risks, verification, markdown_body. "
+                f"Re-call now with at minimum: {self._SKELETON}"
+            ))
+
+        # Aggregate ALL problems into one actionable message instead of failing
+        # on the first field — the model needs the full contract to recover.
+        errors: List[str] = []
+
         goal = kwargs.get("goal", "")
         if not goal or not isinstance(goal, str):
-            return ToolResult(error="'goal' is required (non-empty string).")
-
-        assumptions = kwargs.get("assumptions", [])
-        if not isinstance(assumptions, list):
-            return ToolResult(error="'assumptions' must be an array of strings.")
-
-        research_notes = kwargs.get("research_notes", "")
-        if not isinstance(research_notes, str):
-            return ToolResult(error="'research_notes' must be a string.")
+            errors.append("'goal' is required (non-empty string).")
 
         steps = kwargs.get("steps", [])
-        if not isinstance(steps, list) or len(steps) == 0:
-            return ToolResult(error="'steps' must be a non-empty array.")
+        if not isinstance(steps, list):
+            steps = []
 
         todos = kwargs.get("todos", [])
         if not isinstance(todos, list) or len(todos) == 0:
-            return ToolResult(error="'todos' must be a non-empty array.")
+            errors.append("'todos' must be a non-empty array of todo objects.")
+
+        # Optional fields: coerce bad/missing values to safe defaults instead of erroring.
+        assumptions = kwargs.get("assumptions", [])
+        if not isinstance(assumptions, list):
+            assumptions = []
+
+        research_notes = kwargs.get("research_notes", "")
+        if not isinstance(research_notes, str):
+            research_notes = ""
 
         risks = kwargs.get("risks", [])
         if not isinstance(risks, list):
-            return ToolResult(error="'risks' must be an array of strings.")
+            risks = []
 
         verification = kwargs.get("verification", [])
         if not isinstance(verification, list):
-            return ToolResult(error="'verification' must be an array of strings.")
+            verification = []
 
         markdown_body = kwargs.get("markdown_body", "")
-        if not isinstance(markdown_body, str) or not markdown_body.strip():
-            return ToolResult(error="'markdown_body' is required (non-empty markdown string).")
+        if not isinstance(markdown_body, str):
+            markdown_body = ""
+
+        context = kwargs.get("context", "")
+        if not isinstance(context, str):
+            context = ""
+
+        critical_files_raw = kwargs.get("critical_files", [])
+        critical_files: List[Dict[str, str]] = []
+        if isinstance(critical_files_raw, list):
+            for cf in critical_files_raw:
+                if isinstance(cf, dict) and cf.get("path"):
+                    critical_files.append({
+                        "path": str(cf.get("path", "")),
+                        "change": str(cf.get("change", "")),
+                    })
+                elif isinstance(cf, str) and cf.strip():
+                    critical_files.append({"path": cf.strip(), "change": ""})
+
+        if errors:
+            return ToolResult(error=(
+                "[ERROR] plan_write_draft validation failed:\n- "
+                + "\n- ".join(errors)
+                + "\n\nRequired shape: 'goal' (string), "
+                "'todos' (non-empty array). Re-call with ONE complete JSON object — "
+                "do NOT send empty arguments. If the plan is large, omit 'markdown_body' "
+                "(the system auto-generates a readable version) and use coarse-grained todos. "
+                f"Minimal example: {self._SKELETON}"
+            ))
 
         return ToolResult(
             output="Plan draft submitted for review.",
@@ -229,13 +308,113 @@ class PlanWriteDraftTool(BaseTool):
                 "plan_action": "draft_submitted",
                 "payload": {
                     "goal": goal,
+                    "context": context,
                     "assumptions": assumptions,
                     "research_notes": research_notes,
                     "steps": steps,
                     "todos": todos,
                     "risks": risks,
                     "verification": verification,
+                    "critical_files": critical_files,
                     "markdown_body": markdown_body,
                 },
+            },
+        )
+
+
+# ── plan_update_todos ───────────────────────────────────────────────
+
+_UPDATE_TODOS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "updates": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Todo status changes to apply during BUILD execution.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The todo id from the approved plan."},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "blocked", "cancelled"],
+                        "description": "New status for this todo.",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short note, e.g. the blocker reason.",
+                    },
+                },
+                "required": ["id", "status"],
+            },
+        }
+    },
+    "required": ["updates"],
+}
+
+
+class PlanUpdateTodosTool(BaseTool):
+    name = "plan_update_todos"
+    description = (
+        "Update plan todo statuses during BUILD execution (after the user clicked Build). "
+        "Call this RIGHT BEFORE starting a todo (set it 'in_progress') and IMMEDIATELY AFTER "
+        "finishing it (set it 'completed') — one todo at a time. Do NOT batch many completions "
+        "at the end; the user watches progress tick item-by-item in the plan card. Mark a todo "
+        "'blocked' with a note if you hit a real blocker. You may update several todos in one "
+        "call (e.g. mark the finished one 'completed' and the next one 'in_progress' together). "
+        "NEVER call this tool with empty arguments."
+    )
+    parameters = _UPDATE_TODOS_SCHEMA
+
+    _SKELETON = '{"updates": [{"id": "t1", "status": "completed"}]}'
+    _VALID_STATUS = {"pending", "in_progress", "completed", "blocked", "cancelled"}
+
+    async def execute(self, **kwargs) -> ToolResult:
+        if not kwargs:
+            return ToolResult(error=(
+                "[ERROR] plan_update_todos was called with EMPTY arguments. "
+                "Pass a non-empty 'updates' array of {id, status} objects. "
+                f"Re-call now with at minimum: {self._SKELETON}"
+            ))
+
+        updates = kwargs.get("updates", [])
+        if not isinstance(updates, list) or len(updates) == 0:
+            return ToolResult(error=(
+                "[ERROR] plan_update_todos requires a non-empty 'updates' array of "
+                "{id, status} objects. status must be one of "
+                "pending|in_progress|completed|blocked|cancelled. "
+                f"Minimal example: {self._SKELETON}"
+            ))
+
+        clean: List[Dict[str, str]] = []
+        for u in updates:
+            if not isinstance(u, dict):
+                continue
+            tid = u.get("id")
+            status = u.get("status")
+            if not tid or not isinstance(tid, str):
+                continue
+            if status not in self._VALID_STATUS:
+                # Degrade gracefully: skip an unknown status rather than failing the whole call.
+                continue
+            entry: Dict[str, str] = {"id": tid, "status": status}
+            note = u.get("note")
+            if isinstance(note, str) and note.strip():
+                entry["note"] = note.strip()
+            clean.append(entry)
+
+        if not clean:
+            return ToolResult(error=(
+                "[ERROR] plan_update_todos: no valid updates after validation. Each update "
+                "needs a string 'id' and a 'status' of "
+                "pending|in_progress|completed|blocked|cancelled. "
+                f"Minimal example: {self._SKELETON}"
+            ))
+
+        return ToolResult(
+            output=f"Applied {len(clean)} todo update(s).",
+            metadata={
+                "plan_action": "todos_updated",
+                "payload": {"updates": clean},
             },
         )

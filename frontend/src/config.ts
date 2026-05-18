@@ -4,9 +4,15 @@ export const AUTH_HEADER = 'X-Desktop-Agent-Token';
 
 let authToken = '';
 let fetchPatched = false;
+let authUnavailableReason = '';
+let authInitPromise: Promise<void> | null = null;
 
 export function getAuthToken(): string {
   return authToken;
+}
+
+export function getAuthUnavailableReason(): string {
+  return authUnavailableReason;
 }
 
 export function withAuthQuery(url: string): string {
@@ -17,6 +23,30 @@ export function withAuthQuery(url: string): string {
 }
 
 export async function initApiAuth(): Promise<void> {
+  if (authInitPromise) {
+    await authInitPromise;
+    return;
+  }
+  authInitPromise = loadApiAuth();
+  try {
+    await authInitPromise;
+  } finally {
+    authInitPromise = null;
+  }
+}
+
+export async function ensureApiAuth(): Promise<void> {
+  if (authToken || authUnavailableReason || authInitPromise) {
+    await authInitPromise;
+    return;
+  }
+  if (typeof window !== 'undefined' && window.electronAPI?.getAuthToken) {
+    await initApiAuth();
+  }
+}
+
+async function loadApiAuth(): Promise<void> {
+  authUnavailableReason = '';
   try {
     const token = await window.electronAPI?.getAuthToken?.();
     authToken = token || '';
@@ -24,11 +54,35 @@ export async function initApiAuth(): Promise<void> {
     console.warn('Failed to load Desktop Agent auth token:', error);
     authToken = '';
   }
+
+  if (!authToken) {
+    await refreshAuthRequirement();
+  }
   patchFetch();
 }
 
 export function __setAuthTokenForTests(token: string): void {
   authToken = token;
+  authUnavailableReason = '';
+  authInitPromise = null;
+}
+
+export async function refreshAuthRequirement(): Promise<void> {
+  authUnavailableReason = '';
+  try {
+    const res = await fetch(`${API_BASE}/api/health`, { cache: 'no-store' });
+    if (res.status === 401 || res.status === 403) {
+      const hasElectronAuthBridge = !!window.electronAPI?.getAuthToken;
+      authUnavailableReason = hasElectronAuthBridge
+        ? (authToken
+          ? 'Desktop Agent local auth rejected the renderer token.'
+          : 'Electron did not provide a Desktop Agent auth token.')
+        : 'Desktop Agent local auth is enabled, but this page is not running inside Electron.';
+    }
+  } catch {
+    // Backend may still be starting; keep the app bootable and let normal
+    // reconnect behavior handle it.
+  }
 }
 
 function patchFetch(): void {

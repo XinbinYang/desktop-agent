@@ -85,25 +85,12 @@ BUILTIN_COMMANDS: List[CommandInfo] = [
 
 def get_commands() -> List[Dict[str, Any]]:
     """Return all registered commands as JSON-serializable dicts."""
-    result = []
-    for cmd in BUILTIN_COMMANDS:
-        result.append({
+    return [
+        {
             "name": cmd.name,
             "description": cmd.description,
             "args": cmd.args,
             "category": cmd.category,
-        })
-    # Also register skills as commands
-    try:
-        from app.skills import SkillManager
-        skills = SkillManager.list_skills()
-        for skill in skills:
-            result.append({
-                "name": skill["id"] if isinstance(skill, dict) else skill.name,
-                "description": skill.get("description", "") if isinstance(skill, dict) else skill.description,
-                "args": "",
-                "category": "skills",
-            })
-    except Exception:
-        pass
-    return result
+        }
+        for cmd in BUILTIN_COMMANDS
+    ]

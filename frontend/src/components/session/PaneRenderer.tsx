@@ -4,7 +4,7 @@ import { X, Plus, GripVertical, Users, UserPlus } from 'lucide-react';
 import { SessionView, type SessionViewHandle } from './SessionView';
 import type { PaneNode, SessionPane, SplitNode } from './PaneTypes';
 import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSessionContext';
-import type { AgentType, ModelInfo, ProjectInfo } from '../../types';
+import type { AgentType, FileEdit, ModelInfo, ProjectInfo } from '../../types';
 import type { Team } from '../../lib/teamStore';
 import { getTeamForPane } from '../../lib/teamStore';
 import { agentForRole, roleForAgent } from '../../lib/agentProfiles';
@@ -67,6 +67,8 @@ interface PaneRendererProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onOpenPlanInWorkspace?: () => void;
+  onProjectFileEdit?: (edit: FileEdit) => void;
 }
 
 function splitLayout(node: SplitNode): Record<string, number> {
@@ -102,6 +104,8 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   openRunWorktree,
   handleOpenFileFromPanel,
   handleOpenFileFromPanelWithLine,
+  onOpenPlanInWorkspace,
+  onProjectFileEdit,
 }) {
   if (node.type === 'leaf') {
     return (
@@ -132,6 +136,8 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         openRunWorktree={openRunWorktree}
         handleOpenFileFromPanel={handleOpenFileFromPanel}
         handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+        onOpenPlanInWorkspace={onOpenPlanInWorkspace}
+        onProjectFileEdit={onProjectFileEdit}
       />
     );
   }
@@ -185,6 +191,8 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               openRunWorktree={openRunWorktree}
               handleOpenFileFromPanel={handleOpenFileFromPanel}
               handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+              onOpenPlanInWorkspace={onOpenPlanInWorkspace}
+              onProjectFileEdit={onProjectFileEdit}
             />
           </Panel>
         </React.Fragment>
@@ -220,6 +228,8 @@ interface LeafPaneProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onOpenPlanInWorkspace?: () => void;
+  onProjectFileEdit?: (edit: FileEdit) => void;
 }
 
 const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
@@ -249,6 +259,8 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   openRunWorktree,
   handleOpenFileFromPanel,
   handleOpenFileFromPanelWithLine,
+  onOpenPlanInWorkspace,
+  onProjectFileEdit,
 }) {
   const [indicator, setIndicator] = useState<DropIndicator | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -573,6 +585,8 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           openRunWorktree={openRunWorktree}
           handleOpenFileFromPanel={handleOpenFileFromPanel}
           handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+          onOpenPlanInWorkspace={onOpenPlanInWorkspace}
+          onProjectFileEdit={onProjectFileEdit}
         />
       </div>
     </div>

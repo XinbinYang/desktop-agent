@@ -35,12 +35,14 @@ interface SidebarProps {
   currentProject?: ProjectInfo | null;
   fileTree?: FileNode[];
   expandedPaths?: Set<string>;
+  loadingPaths?: Set<string>;
   onTogglePath?: (path: string) => void;
   onSelectFile?: (path: string, type: 'file' | 'dir') => void;
   onOpenFolder?: () => void;
   onOpenProjectModal?: () => void;
   onCloseProject?: () => void;
-  onRefreshTree?: () => void;
+  onRefreshTree?: () => void | Promise<void>;
+  isRefreshingProject?: boolean;
 }
 
 type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number; is_primary?: boolean};
@@ -79,12 +81,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   currentProject,
   fileTree = [],
   expandedPaths = new Set(),
+  loadingPaths = new Set(),
   onTogglePath,
   onSelectFile,
   onOpenFolder,
   onOpenProjectModal,
   onCloseProject,
   onRefreshTree,
+  isRefreshingProject = false,
 }) => {
   const { theme, setTheme } = useTheme();
   const { t, i18n } = useTranslation();
@@ -180,12 +184,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   currentProject={currentProject}
                   fileTree={fileTree}
                   expandedPaths={expandedPaths}
+                  loadingPaths={loadingPaths}
                   onTogglePath={onTogglePath || (() => {})}
                   onSelectFile={onSelectFile || (() => {})}
                   onOpenFolder={onOpenFolder || (() => {})}
                   onOpenModal={onOpenProjectModal || (() => {})}
                   onCloseProject={onCloseProject || (() => {})}
                   onRefreshTree={onRefreshTree || (() => {})}
+                  isRefreshing={isRefreshingProject}
                 />
               </div>
             ) : (
@@ -214,12 +220,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
               currentProject={currentProject || null}
               fileTree={fileTree}
               expandedPaths={expandedPaths}
+              loadingPaths={loadingPaths}
               onTogglePath={onTogglePath || (() => {})}
               onSelectFile={onSelectFile || (() => {})}
               onOpenFolder={onOpenFolder || (() => {})}
               onOpenModal={onOpenProjectModal || (() => {})}
               onCloseProject={onCloseProject || (() => {})}
               onRefreshTree={onRefreshTree || (() => {})}
+              isRefreshing={isRefreshingProject}
             />
           </div>
         )}

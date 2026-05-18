@@ -6,7 +6,7 @@ from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, List, Optional
 
 from app.tools.base import BaseTool, ToolResult
-from app.worker import WorkerSession, WORKER_PROFILES
+from app.worker import WorkerSession, WORKER_PROFILES, format_worker_exception
 
 _worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
     "worker_event_callback",
@@ -27,6 +27,12 @@ def _emit_worker_event(event: Dict[str, Any]) -> None:
     cb = _worker_event_callback_var.get()
     if cb:
         cb(event)
+
+
+def _worker_completed_successfully(status: str, result: str) -> bool:
+    if status != "completed":
+        return False
+    return "ACCEPTANCE: FAIL" not in result
 
 
 def _register_worker(session_id: str, worker: WorkerSession) -> None:
@@ -81,6 +87,12 @@ class DispatchWorkerTool(BaseTool):
                 "items": {"type": "string"},
                 "description": "List of file paths to inject as context into the worker's system prompt.",
             },
+            "agent_type": {
+                "type": "string",
+                "enum": ["coding", "personal"],
+                "description": "Logical agent type used for skill matching. Defaults to coding.",
+                "default": "coding",
+            },
             "prior_context": {
                 "type": "string",
                 "description": "Output from previous workers (e.g. architect plan, prior summaries). Prepended to task so worker has full context.",
@@ -95,6 +107,7 @@ class DispatchWorkerTool(BaseTool):
         profile: str = "code",
         model_id: str = "",
         context_files: Optional[List[str]] = None,
+        agent_type: str = "coding",
         prior_context: str = "",
         session_id: str = "",
         run_id: str = "",
@@ -117,11 +130,14 @@ class DispatchWorkerTool(BaseTool):
             context_files=context_files,
             run_id=run_id,
             parent_tool_call_id=tool_call_id,
+            agent_type=agent_type,
         )
 
         started_at = time.time()
         events: List[Dict[str, Any]] = []
         final_result = ""
+        final_status = "failed"
+        final_iterations = 0
 
         _register_worker(session_id, worker)
         try:
@@ -129,7 +145,10 @@ class DispatchWorkerTool(BaseTool):
                 events.append(event)
                 _emit_worker_event(event)
                 if event["type"] == "worker_done":
-                    final_result = event["data"].get("result", "")
+                    data = event.get("data") or {}
+                    final_result = data.get("result", "")
+                    final_status = data.get("status", final_status)
+                    final_iterations = data.get("iterations", worker.iteration)
         finally:
             _unregister_worker(session_id, worker.worker_id)
 
@@ -142,10 +161,12 @@ class DispatchWorkerTool(BaseTool):
                 tool_call_summaries += f"\n  [{d['name']}] {d.get('result', '')[:200]}"
 
         output = (
-            f"Worker {worker_id} ({profile}) completed in {duration_ms}ms, {worker.iteration} iterations.\n"
+            f"Worker {worker_id} ({profile}) {final_status} in {duration_ms}ms, {final_iterations} iterations.\n"
             f"Result: {final_result}\n"
             f"Tool calls:{tool_call_summaries or ' none'}"
         )
+        if not _worker_completed_successfully(final_status, final_result):
+            return ToolResult(output=output, error=output)
         return ToolResult(output=output)
 
 
@@ -226,16 +247,34 @@ class DispatchParallelTool(BaseTool):
                 context_files=task_spec.get("context_files"),
                 run_id=run_id,
                 parent_tool_call_id=tool_call_id,
+                agent_type=agent_type,
             )
             events: List[Dict[str, Any]] = []
             final = ""
+            final_status = "failed"
+            final_iterations = 0
             _register_worker(session_id, worker)
             try:
                 async for event in worker.run():
                     events.append(event)
                     _emit_worker_event(event)
                     if event["type"] == "worker_done":
-                        final = event["data"].get("result", "")
+                        data = event.get("data") or {}
+                        final = data.get("result", "")
+                        final_status = data.get("status", final_status)
+                        final_iterations = data.get("iterations", worker.iteration)
+            except Exception as e:
+                final_status = "failed"
+                final = f"[Worker dispatch error: {format_worker_exception(e)}]"
+                final_iterations = worker.iteration
+                failed_event = worker._worker_event("worker_done", {
+                    "status": final_status,
+                    "result": final,
+                    "iterations": final_iterations,
+                    "duration_ms": round((time.time() - started_at) * 1000),
+                })
+                events.append(failed_event)
+                _emit_worker_event(failed_event)
             finally:
                 _unregister_worker(session_id, worker.worker_id)
             return {
@@ -245,7 +284,8 @@ class DispatchParallelTool(BaseTool):
                 "agent_type": agent_type,
                 "task": task_spec["task"],
                 "result": final,
-                "iterations": worker.iteration,
+                "status": final_status,
+                "iterations": final_iterations,
                 "events": events,
             }
 
@@ -266,11 +306,19 @@ class DispatchParallelTool(BaseTool):
                 output_parts.append(f"  Worker {i}: FAILED - {result_raw}")
             else:
                 result: Dict[str, Any] = result_raw  # type: ignore[assignment]
-                success_count += 1
+                status = result.get("status", "failed")
+                worker_success = _worker_completed_successfully(status, str(result.get("result", "")))
+                if worker_success:
+                    success_count += 1
+                else:
+                    fail_count += 1
                 output_parts.append(
-                    f"  {result['worker_id']} ({result['profile']}, {result['model_id']}): "
+                    f"  {result['worker_id']} ({result['profile']}, {result['model_id']}, {status}): "
                     f"{result['iterations']} iterations - {result['result'][:300]}"
                 )
 
         output_parts.append(f"\n{success_count} succeeded, {fail_count} failed")
-        return ToolResult(output="\n".join(output_parts))
+        output = "\n".join(output_parts)
+        if fail_count:
+            return ToolResult(output=output, error=output)
+        return ToolResult(output=output)

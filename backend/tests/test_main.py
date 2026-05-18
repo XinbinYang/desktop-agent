@@ -244,9 +244,10 @@ class TestLocalAuth:
     def test_websocket_requires_token_when_enabled(self, client, monkeypatch):
         monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
 
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws/auth_missing"):
-                pass
+        with client.websocket_connect("/ws/auth_missing") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 1008
 
     def test_websocket_accepts_valid_query_token(self, client, monkeypatch):
         monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
@@ -334,6 +335,153 @@ class TestWebSocket:
                 assert "plan_status" in types
                 assert "done" in types
 
+    def test_websocket_chat_without_mode_uses_session_plan_mode(self, client):
+        """If the UI already switched to Plan, a chat without chat_mode still runs as Plan."""
+        from unittest.mock import patch
+        from .conftest import _make_stream_mock
+
+        mock_response = {
+            "choices": [{
+                "message": {
+                    "content": "我需要先确认开放范围。",
+                    "role": "assistant",
+                }
+            }]
+        }
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
+            with client.websocket_connect(f"/ws/test_plan_default_ws_{uuid.uuid4().hex}") as ws:
+                ws.send_json({"type": "set_chat_mode", "chat_mode": "plan"})
+                receive_until(ws, "plan_status")
+
+                ws.send_json({
+                    "type": "chat",
+                    "text": "plan this without explicit mode",
+                    "model_id": "gpt-4o",
+                    "thinking_intensity": "medium",
+                })
+                plan_phases = []
+                for _ in range(30):
+                    msg = ws.receive_json()
+                    if msg.get("type") == "plan_status":
+                        plan_phases.append(msg.get("data", {}).get("phase"))
+                    if msg.get("type") == "done":
+                        break
+
+                assert "clarifying" in plan_phases
+
+    def test_session_connections_endpoint_counts_active_websocket(self, client):
+        sid = f"test_active_ws_{uuid.uuid4().hex}"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            snapshot = client.get("/api/sessions/connections").json()
+            assert snapshot["total"] >= 1
+            assert any(item["session_id"] == sid and item["connections"] == 1 for item in snapshot["connections"])
+            ws.close()
+
+    def test_delete_session_closes_active_websocket(self, client):
+        sid = f"test_delete_ws_{uuid.uuid4().hex}"
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            response = client.delete(f"/api/sessions/{sid}")
+            assert response.status_code == 200
+            assert response.json()["closed_connections"] == 1
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 4004
+
+    def test_websocket_submit_plan_decisions_continues_to_draft(self, client):
+        from unittest.mock import patch
+        from .conftest import _make_stream_mock
+
+        ask_response = {
+            "choices": [{
+                "message": {
+                    "content": "I need one decision.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_q",
+                        "function": {
+                            "name": "plan_ask_questions",
+                            "arguments": json.dumps({
+                                "questions": [{
+                                    "id": "scope",
+                                    "prompt": "What scope?",
+                                    "allow_multiple": False,
+                                    "options": [
+                                        {"id": "small", "label": "Small"},
+                                        {"id": "large", "label": "Large"},
+                                    ],
+                                }],
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }
+        draft_response = {
+            "choices": [{
+                "message": {
+                    "content": "Creating the plan.",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_d",
+                        "function": {
+                            "name": "plan_write_draft",
+                            "arguments": json.dumps({
+                                "goal": "Test decision plan",
+                                "assumptions": ["User chose small plus Other note"],
+                                "research_notes": "none",
+                                "steps": [{"id": "s1", "title": "Step 1", "details": "", "depends_on": []}],
+                                "todos": [{"id": "t1", "title": "Todo 1", "acceptance_criteria": "works", "depends_on": []}],
+                                "risks": [],
+                                "verification": [],
+                                "markdown_body": "# Test decision plan\n\nTest content.",
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }
+        streams = [_make_stream_mock(ask_response), _make_stream_mock(draft_response)]
+
+        async def stream_sequence(*args, **kwargs):
+            stream = streams.pop(0)
+            async for event in stream(*args, **kwargs):
+                yield event
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence):
+            with client.websocket_connect(f"/ws/test_plan_submit_ws_{uuid.uuid4().hex}") as ws:
+                ws.send_json({
+                    "type": "chat",
+                    "text": "plan this with a question",
+                    "model_id": "gpt-4o",
+                    "chat_mode": "plan",
+                })
+                first_types = []
+                for _ in range(30):
+                    msg = ws.receive_json()
+                    first_types.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "plan_questions" in first_types
+
+                ws.send_json({
+                    "type": "submit_plan_decisions",
+                    "answers": [{
+                        "question_id": "scope",
+                        "selected": ["small"],
+                        "other_text": "Keep an escape hatch",
+                        "skipped": False,
+                    }],
+                })
+                second_types = []
+                for _ in range(40):
+                    msg = ws.receive_json()
+                    second_types.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "plan_status" in second_types
+                assert "plan_draft" in second_types
+
     def test_websocket_plan_approve_then_build(self, client):
         from unittest.mock import patch
         from app.agent import PLAN_CONTINUE_MARKER
@@ -410,6 +558,47 @@ class TestWebSocket:
                         break
                 assert "build_started" in build_types
                 assert "done" in build_types
+
+    def test_websocket_build_recovers_from_plan_snapshot(self, client):
+        from unittest.mock import patch
+        from .conftest import _make_stream_mock
+
+        build_response = {
+            "choices": [{
+                "message": {
+                    "content": "Task completed.",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        plan_state = {
+            "mode": "plan",
+            "phase": "awaiting_approval",
+            "goal": "Snapshot plan",
+            "draft": "# Snapshot plan",
+            "structured_plan": None,
+            "questions": [],
+            "todos": [{"id": "t1", "title": "First todo", "status": "pending"}],
+            "decisions": {},
+            "decision_notes": {},
+            "approved": False,
+            "pending_clarification": False,
+            "plan_file_path": None,
+            "research_notes": "",
+        }
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(build_response)):
+            with client.websocket_connect(f"/ws/test_plan_snapshot_build_ws_{uuid.uuid4().hex}") as ws:
+                ws.send_json({"type": "build_plan", "plan_state": plan_state})
+                build_types = []
+                for _ in range(20):
+                    msg = ws.receive_json()
+                    build_types.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "build_started" in build_types
+                assert "error" not in build_types
 
     def test_websocket_clear(self, client):
         """WebSocket clear message type"""
@@ -515,6 +704,33 @@ class TestWebSocket:
             assert msg["type"] == "error"
             assert "invalid" in msg["data"]["message"].lower()
 
+    def test_delete_session_cancels_running_runtime(self, client, monkeypatch):
+        """Deleting a historical session permanently terminates its live run."""
+        import asyncio
+        from app.agent import AgentSession
+
+        markers = {"cancelled": False}
+
+        async def slow_run(self, *args, **kwargs):
+            yield {"type": "status", "data": {"status": "thinking"}}
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                markers["cancelled"] = True
+                raise
+
+        monkeypatch.setattr(AgentSession, "run", slow_run)
+        sid = f"test_delete_cancels_runtime_{uuid.uuid4().hex}"
+
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "chat", "text": "slow", "model_id": "gpt-4o"})
+            receive_until(ws, "status")
+            response = client.delete(f"/api/sessions/{sid}")
+
+        assert response.status_code == 200
+        assert response.json()["runtime_terminated"] is True
+        assert markers["cancelled"] is True
+
 
 class TestProjectAPI:
     def test_get_projects_empty(self, client):
@@ -587,6 +803,60 @@ class TestProjectAPI:
         names = [n["name"] for n in data["nodes"]]
         assert "README.md" in names
         assert "src" in names
+
+    def test_refresh_project_returns_latest_tree(self, client, temp_dir):
+        """POST /api/projects/refresh returns refreshed project metadata and tree."""
+        proj_dir = temp_dir / "refreshproj"
+        proj_dir.mkdir()
+        (proj_dir / "README.md").write_text("x", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        (proj_dir / "new_file.py").write_text("print('new')\n", encoding="utf-8")
+        response = client.post("/api/projects/refresh")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project"]["name"] == "refreshproj"
+        names = [n["name"] for n in data["nodes"]]
+        assert "README.md" in names
+        assert "new_file.py" in names
+
+    def test_refresh_project_without_current_project(self, client):
+        """POST /api/projects/refresh is safe when no project is open."""
+        client.post("/api/projects/close")
+
+        response = client.post("/api/projects/refresh")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "project": None,
+            "nodes": [],
+            "error": "No current project",
+        }
+
+    def test_get_project_tree_loads_deep_path_on_demand(self, client, temp_dir):
+        """GET /api/projects/tree?path=... returns children beyond initial tree depth."""
+        proj_dir = temp_dir / "outer"
+        deep_dir = proj_dir / "OPEN AGENT" / "src" / "open_agent"
+        (deep_dir / "cli").mkdir(parents=True)
+        (deep_dir / "__init__.py").write_text("", encoding="utf-8")
+        (deep_dir / "cli" / "__init__.py").write_text("", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        root_response = client.get("/api/projects/tree")
+        root_nodes = root_response.json()["nodes"]
+        outer_node = next(n for n in root_nodes if n["name"] == "OPEN AGENT")
+        src_node = next(n for n in outer_node["children"] if n["name"] == "src")
+        package_node = next(n for n in src_node["children"] if n["name"] == "open_agent")
+        assert package_node["has_children"] is True
+        assert "children" not in package_node
+
+        response = client.get("/api/projects/tree", params={"path": "OPEN AGENT/src/open_agent"})
+
+        assert response.status_code == 200
+        names = [n["name"] for n in response.json()["nodes"]]
+        assert "cli" in names
+        assert "__init__.py" in names
 
     def test_get_project_tree_blocks_path_escape(self, client, temp_dir):
         """GET /api/projects/tree rejects sibling prefix/path traversal escapes."""

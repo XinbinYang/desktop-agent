@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
 from app.project_manager import ProjectManager
+from app.runtime_paths import workspace_root
 from app.security import resolve_under_base
 
 # File operations are sandboxed under the project root or current project directory
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_PROJECT_ROOT = workspace_root()
 DIFF_TEXT_LIMIT = 1_000_000
 
 
@@ -93,12 +94,14 @@ def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Opt
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
             candidate = Path(path)
-            if project_relative and not candidate.is_absolute():
+            if candidate.is_absolute():
+                return candidate.resolve(), None
+            if project_relative:
                 base, base_err = _get_base_path(project_relative=True)
                 if base_err:
                     return base, base_err
                 return (base / candidate).resolve(), None
-            return Path(path).resolve(), None
+            return (_PROJECT_ROOT / candidate).resolve(), None
         except (OSError, ValueError) as e:
             return Path(path), f"Invalid path: {path} ({e})"
     base, base_err = _get_base_path(project_relative)

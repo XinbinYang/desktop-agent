@@ -19,7 +19,9 @@ def _run_git(args: List[str], cwd: Optional[str] = None, env: Optional[Dict[str,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=env
+            env=env,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.returncode, redact_sensitive_text(result.stdout), redact_sensitive_text(result.stderr)
     except subprocess.TimeoutExpired:

@@ -13,6 +13,15 @@
 
 ---
 
+> ⚠️ **工作区约定（不可修改）**
+> - 工作区根 = 项目仓库根目录（即 `desktop-agent` 所在的目录）。
+> - 你的身份与记忆文件统一位于 `AGENTS/personal/`。
+> - 使用 `file_write` 写入身份文档时，**保持默认 `project_relative=false`**。
+>   相对路径如 `AGENTS/personal/USER.md` 会相对工作区根解析。
+> - 不要在任何其他位置（如 `backend/AGENTS/`）创建身份文件。
+
+---
+
 ## 第一阶段：了解彼此
 
 从类似这样的话开始：

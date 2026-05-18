@@ -70,6 +70,13 @@ interface ResolvedSession {
   is_primary?: boolean;
 }
 
+interface PendingProjectFileOpen {
+  sessionId: string;
+  path: string;
+  content: string;
+  language: string;
+}
+
 type SplitPlacement = 'before' | 'after';
 
 interface SplitPaneOptions {
@@ -173,6 +180,25 @@ function sessionModelForPane(pane: SessionPane | null | undefined, meta?: Sessio
   return pane?.model || meta?.model_id || '';
 }
 
+function findFileNode(nodes: FileNode[], path: string): FileNode | undefined {
+  for (const node of nodes) {
+    if (node.path === path) return node;
+    if (node.children) {
+      const found = findFileNode(node.children, path);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function withDirectoryChildren(nodes: FileNode[], path: string, children: FileNode[]): FileNode[] {
+  return nodes.map((node) => {
+    if (node.path === path) return { ...node, children };
+    if (!node.children) return node;
+    return { ...node, children: withDirectoryChildren(node.children, path, children) };
+  });
+}
+
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
   clearSession: () => {},
@@ -182,12 +208,16 @@ const NOOP_ACTIONS: SessionActions = {
   stopRunning: () => {},
   retryLast: () => {},
   switchModel: () => {},
+  switchRole: () => {},
   executeToolDirect: () => {},
   addTerminalLog: (_msg: string) => {},
   approvePlan: () => {},
   buildPlan: () => {},
+  pauseBuild: () => {},
+  endBuild: () => {},
   rejectPlan: () => {},
   updatePlanDecision: () => {},
+  submitPlanDecisions: () => {},
   onSelectFileInEditor: () => {},
   onCloseFileInEditor: () => {},
   onFileContentChange: () => {},
@@ -220,7 +250,9 @@ export default function App() {
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [showProjectModal, setShowProjectModal] = useState(false);
+  const [isRefreshingProject, setIsRefreshingProject] = useState(false);
 
   const layout = useLayoutState();
   const agentModel = agentModels[layout.activeAgent] || '';
@@ -264,6 +296,8 @@ export default function App() {
   const centerGroupRef = useRef<GroupImperativeHandle>(null);
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
+  const projectRefreshTimerRef = useRef<number | null>(null);
+  const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
 
   useEffect(() => {
     const panel = rightPanelRef.current;
@@ -344,9 +378,11 @@ export default function App() {
   }, []);
 
   // Slash command handler — delegates to focused session actions
-  const handleSlashCommand = useCallback((command: string, _args: string) => {
+  const handleSlashCommand = useCallback(async (command: string, args: string) => {
     const a = focusedActions;
-    switch (command) {
+    const arg = (args || '').trim().replace(/^(['"])(.*)\1$/, '$2');
+
+    switch (command.toLowerCase()) {
       case 'new':
         if (focusedAgentType === 'personal') {
           a.clearSession();
@@ -361,7 +397,7 @@ export default function App() {
         addTerminalLog('[命令] 已清除会话');
         break;
       case 'help':
-        addTerminalLog('[Help] Commands: /new /clear /compact /rewind /context /help /model /role /project /config /screenshot /skills');
+        addTerminalLog('[Help] Commands: /new /clear /compact /rewind /context /help /model <model_id> /role <role_id> /project <path> /config /screenshot /skills');
         addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
         break;
       case 'compact':
@@ -386,7 +422,111 @@ export default function App() {
       }
       case 'config':
         setShowSettings(true);
+        addTerminalLog('[Command] Opened settings');
         break;
+      case 'skills':
+        layout.setSidebarCollapsed(false);
+        layout.setActiveSection('skills');
+        addTerminalLog('[Command] Opened Skills panel');
+        break;
+      case 'model': {
+        if (!arg) {
+          const available = models.map((m) => `${m.id}${m.name && m.name !== m.id ? ` (${m.name})` : ''}`).join(', ');
+          addTerminalLog(available ? `[Model] Available models: ${available}` : '[Model] Models are still loading');
+          break;
+        }
+        const target = models.find((m) => m.id === arg);
+        if (!target) {
+          const available = models.map((m) => m.id).join(', ');
+          addTerminalLog(`[Model] Unknown model: ${arg}${available ? `. Available: ${available}` : ''}`);
+          break;
+        }
+        setPaneRoot((prev) => mapPaneTree(prev, (pane) => (
+          pane.sessionId === focusedSessionId ? { ...pane, model: arg } : pane
+        )));
+        setSessions((prev) => prev.map((session) => (
+          session.id === focusedSessionId ? { ...session, model_id: arg } : session
+        )));
+        a.switchModel(arg);
+        addTerminalLog(`[Model] Switching focused session to ${arg}`);
+        break;
+      }
+      case 'role': {
+        if (!arg) {
+          try {
+            const res = await fetch(`${API_BASE}/api/roles`);
+            const data = await res.json();
+            const roles = (data.roles || []).map((r: { id: string; name?: string }) =>
+              `${r.id}${r.name && r.name !== r.id ? ` (${r.name})` : ''}`
+            );
+            addTerminalLog(roles.length > 0 ? `[Role] Available roles: ${roles.join(', ')}` : '[Role] No roles found');
+          } catch (err) {
+            addTerminalLog(`[Role] Failed to load roles: ${err}`);
+          }
+          break;
+        }
+        const targetAgent = agentForRole(arg);
+        layout.setActiveAgent(targetAgent);
+        layout.setActiveSection(targetAgent === 'personal' ? 'personal' : 'project');
+        setPaneRoot((prev) => {
+          const leaf = findLeafById(prev, focusedLeafId);
+          if (!leaf) return prev;
+          return replaceNode(prev, focusedLeafId, {
+            ...leaf,
+            pane: {
+              ...leaf.pane,
+              agentType: targetAgent,
+              role: arg,
+              isPrimary: targetAgent === 'personal',
+            },
+          });
+        });
+        setSessions((prev) => prev.map((session) => (
+          session.id === focusedSessionId
+            ? { ...session, role_id: arg, agent_type: targetAgent, is_primary: targetAgent === 'personal' }
+            : session
+        )));
+        a.switchRole(arg);
+        addTerminalLog(`[Role] Switching focused session to ${arg}`);
+        break;
+      }
+      case 'project': {
+        layout.setSidebarCollapsed(false);
+        layout.setActiveSection('project');
+        if (!arg) {
+          setShowProjectModal(true);
+          addTerminalLog('[Project] Choose a folder or create a project');
+          break;
+        }
+        try {
+          const res = await fetch(`${API_BASE}/api/projects/open`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: arg }),
+          });
+          const project = await res.json();
+          if (project.error) {
+            addTerminalLog(`[Project] Open failed: ${project.error}`);
+            break;
+          }
+          setCurrentProject(project);
+
+          const [treeRes, sessionsRes] = await Promise.all([
+            fetch(`${API_BASE}/api/projects/tree`),
+            fetch(`${API_BASE}/api/sessions?project_path=${encodeURIComponent(project.path)}`),
+          ]);
+          const tree = await treeRes.json().catch(() => ({}));
+          const sessionData = await sessionsRes.json().catch(() => ({}));
+          setFileTree(tree.nodes || []);
+          setExpandedPaths(new Set());
+          setLoadingPaths(new Set());
+          setSessions(sessionData.sessions || []);
+          addTerminalLog(`[Project] Opened ${project.name || project.path}`);
+        } catch (err) {
+          addTerminalLog(`[Project] Open error: ${err}`);
+        }
+        break;
+      }
       case 'screenshot':
         if (a) a.executeToolDirect('screenshot', {});
         addTerminalLog('[命令] 正在截图...');
@@ -394,7 +534,17 @@ export default function App() {
       default:
         addTerminalLog(`[命令] 未知命令: /${command}`);
     }
-  }, [focusedActions, focusedAgentType, focusedSnapshot?.contextUsage, openFocusedRewind, addTerminalLog]);
+  }, [
+    addTerminalLog,
+    focusedActions,
+    focusedAgentType,
+    focusedLeafId,
+    focusedSessionId,
+    focusedSnapshot?.contextUsage,
+    layout,
+    models,
+    openFocusedRewind,
+  ]);
 
   // Load models, roles, sessions
   useEffect(() => {
@@ -572,28 +722,105 @@ export default function App() {
     }
   }, []);
 
+  const fetchProjectTreePath = useCallback(async (path = ''): Promise<FileNode[]> => {
+    const url = path
+      ? `${API_BASE}/api/projects/tree?path=${encodeURIComponent(path)}`
+      : `${API_BASE}/api/projects/tree`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.nodes || [];
+  }, []);
+
+  const refreshProject = useCallback(async (options: { silent?: boolean } = {}) => {
+    const silent = options.silent ?? false;
+    setIsRefreshingProject(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/refresh`, { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        if (!silent) addTerminalLog(`[Project] Refresh failed: ${data.error}`);
+        if (!data.project && data.error === 'No current project') {
+          setCurrentProject(null);
+          setFileTree([]);
+        }
+        return;
+      }
+      if (data.project) {
+        setCurrentProject(data.project);
+      }
+      let nextNodes: FileNode[] = data.nodes || [];
+      for (const path of Array.from(expandedPaths)) {
+        const node = findFileNode(nextNodes, path);
+        if (
+          node?.type === 'dir' &&
+          node.has_children !== false &&
+          !Object.prototype.hasOwnProperty.call(node, 'children')
+        ) {
+          const children = await fetchProjectTreePath(path);
+          nextNodes = withDirectoryChildren(nextNodes, path, children);
+        }
+      }
+      setFileTree(nextNodes);
+      if (!silent) addTerminalLog('[Project] Refreshed project files');
+    } catch (err) {
+      console.error('[App] Failed to refresh project:', err);
+      if (!silent) addTerminalLog(`[Project] Refresh error: ${err}`);
+    } finally {
+      setIsRefreshingProject(false);
+    }
+  }, [addTerminalLog, expandedPaths, fetchProjectTreePath]);
+
+  const loadProjectTree = useCallback(async () => {
+    await refreshProject({ silent: true });
+  }, [refreshProject]);
+
+  const loadDirectoryChildren = useCallback(async (path: string) => {
+    setLoadingPaths((prev) => new Set(prev).add(path));
+    try {
+      const children = await fetchProjectTreePath(path);
+      setFileTree((prev) => withDirectoryChildren(prev, path, children));
+    } catch (err) {
+      console.error('[App] Failed to load directory children:', err);
+    } finally {
+      setLoadingPaths((prev) => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+    }
+  }, [fetchProjectTreePath]);
+
+  const scheduleProjectRefresh = useCallback(() => {
+    if (!currentProject) return;
+    if (projectRefreshTimerRef.current !== null) {
+      window.clearTimeout(projectRefreshTimerRef.current);
+    }
+    projectRefreshTimerRef.current = window.setTimeout(() => {
+      projectRefreshTimerRef.current = null;
+      void refreshProject({ silent: true });
+    }, 400);
+  }, [currentProject, refreshProject]);
+
+  useEffect(() => {
+    return () => {
+      if (projectRefreshTimerRef.current !== null) {
+        window.clearTimeout(projectRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
   const loadCurrentProject = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/projects/current`);
       const data = await res.json();
-      if (data.path && !data.error) {
+      if (data && data.path && !data.error) {
         setCurrentProject(data);
-        loadProjectTree();
+        await loadProjectTree();
       }
     } catch (err) {
       console.error('[App] Failed to load current project:', err);
     }
-  }, []);
-
-  const loadProjectTree = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/projects/tree`);
-      const data = await res.json();
-      setFileTree(data.nodes || []);
-    } catch (err) {
-      console.error('[App] Failed to load project tree:', err);
-    }
-  }, []);
+  }, [loadProjectTree]);
 
   const handleOpenFolder = useCallback(async () => {
     const result = await window.electronAPI.selectFolder();
@@ -610,14 +837,16 @@ export default function App() {
           return;
         }
         setCurrentProject(project);
-        loadProjectTree();
+        setExpandedPaths(new Set());
+        setLoadingPaths(new Set());
+        setFileTree(await fetchProjectTreePath());
         loadSessions(project.path);
         addTerminalLog(`[系统] 已打开项目: ${project.name}`);
       } catch (err) {
         console.error('[App] Open project error:', err);
       }
     }
-  }, [loadProjectTree, addTerminalLog]);
+  }, [fetchProjectTreePath, loadSessions, addTerminalLog]);
 
   const handleCloseProject = useCallback(() => {
     fetch(`${API_BASE}/api/projects/close`, { method: 'POST' })
@@ -625,41 +854,122 @@ export default function App() {
         setCurrentProject(null);
         setFileTree([]);
         setExpandedPaths(new Set());
+        setLoadingPaths(new Set());
         loadSessions();
       })
       .catch(console.error);
   }, []);
 
   const handleTogglePath = useCallback((path: string) => {
+    const willExpand = !expandedPaths.has(path);
+    const node = findFileNode(fileTree, path);
     setExpandedPaths((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
-  }, []);
+    if (
+      willExpand &&
+      node?.type === 'dir' &&
+      node.has_children !== false &&
+      !Object.prototype.hasOwnProperty.call(node, 'children')
+    ) {
+      void loadDirectoryChildren(path);
+    }
+  }, [expandedPaths, fileTree, loadDirectoryChildren]);
 
   // handleSelectFile → opens file in focused session's editor
+  const revealWorkspaceEditor = useCallback(() => {
+    layout.setRightPanelVisible(true);
+    layout.setRightZone('workspace');
+    setWorkspaceView('editor');
+    requestAnimationFrame(() => {
+      rightPanelRef.current?.expand?.();
+    });
+  }, [layout]);
+
+  const openProjectFileInSession = useCallback((sessionId: string, file: PendingProjectFileOpen) => {
+    const handle = sessionViewRefs.current.get(sessionId);
+    if (!handle) return false;
+    handle.openFile(file.path, file.content, file.language);
+    revealWorkspaceEditor();
+    return true;
+  }, [revealWorkspaceEditor]);
+
+  useEffect(() => {
+    const pending = pendingProjectFileOpenRef.current;
+    if (!pending) return;
+    if (openProjectFileInSession(pending.sessionId, pending)) {
+      pendingProjectFileOpenRef.current = null;
+    }
+  }, [focusedSessionId, focusedAgentType, paneRoot, openProjectFileInSession]);
+
+  const ensureCodingSessionForProject = useCallback(async (): Promise<string> => {
+    if (focusedAgentType === 'coding') {
+      return focusedSessionId;
+    }
+
+    const leaves = collectLeafNodes(paneRoot);
+    const rememberedLeafId = lastFocusedLeafByAgent.current.coding;
+    const rememberedLeaf = rememberedLeafId ? findLeafById(paneRoot, rememberedLeafId) : null;
+    const codingLeaf = rememberedLeaf?.pane.agentType === 'coding'
+      ? rememberedLeaf
+      : leaves.find((entry) => entry.pane.agentType === 'coding')?.node || null;
+
+    layout.setActiveAgent('coding');
+    layout.setActiveSection('project');
+    if (codingLeaf) {
+      setFocusedLeafId(codingLeaf.id);
+      lastFocusedLeafByAgent.current.coding = codingLeaf.id;
+      return codingLeaf.pane.sessionId;
+    }
+
+    const resolved = await resolveAgentSessionClient('coding', 'last_or_create');
+    applyResolvedSessionToFocusedPane(resolved);
+    loadSessions(currentProject?.path ?? null);
+    addTerminalLog(`[ç³»ç»Ÿ] å·²åˆ‡æ¢åˆ° ${AGENT_LABEL.coding}`);
+    return resolved.session_id;
+  }, [
+    addTerminalLog,
+    applyResolvedSessionToFocusedPane,
+    currentProject?.path,
+    focusedAgentType,
+    focusedSessionId,
+    layout,
+    loadSessions,
+    paneRoot,
+    resolveAgentSessionClient,
+  ]);
+
   const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir') => {
     if (type !== 'file' || !currentProject) return;
     try {
       const filePath = currentProject.path.replace(/\\/g, '/') + '/' + path;
       const res = await fetch(`${API_BASE}/api/file/read?path=${encodeURIComponent(filePath)}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        addTerminalLog(`[Project] Failed to read file: ${path}`);
+        return;
+      }
       const data = await res.json();
+      if (data.error) {
+        addTerminalLog(`[Project] Read failed: ${data.error}`);
+        return;
+      }
       const content = data.content ?? '';
       const name = path.split('/').pop() || path;
       const language = getLangFromFilename(name);
-      const h = sessionViewRefs.current.get(focusedSessionId);
-      if (h) {
-        h.openFile(path, content, language);
-        layout.setRightZone('workspace');
-        setWorkspaceView('editor');
+      const sessionId = await ensureCodingSessionForProject();
+      const pending: PendingProjectFileOpen = { sessionId, path, content, language };
+      if (!openProjectFileInSession(sessionId, pending)) {
+        pendingProjectFileOpenRef.current = pending;
+        revealWorkspaceEditor();
       }
     } catch (err) {
       console.error('[App] Read file error:', err);
+      addTerminalLog(`[Project] Read file error: ${err}`);
     }
-  }, [currentProject, focusedSessionId, layout]);
+  }, [addTerminalLog, currentProject, ensureCodingSessionForProject, openProjectFileInSession, revealWorkspaceEditor]);
 
   const handleOpenFileFromPanel = useCallback((path: string) => {
     if (!currentProject) return;
@@ -674,6 +984,10 @@ export default function App() {
   const handleOpenFileFromPanelWithLine = useCallback((path: string, _line?: number) => {
     handleOpenFileFromPanel(path);
   }, [handleOpenFileFromPanel]);
+
+  const handleOpenPlanInWorkspace = useCallback(() => {
+    revealWorkspaceEditor();
+  }, [revealWorkspaceEditor]);
 
   const runAction = useCallback(async (runId: string, action: 'apply' | 'merge' | 'discard') => {
     try {
@@ -714,12 +1028,14 @@ export default function App() {
         return;
       }
       setCurrentProject(project);
-      loadProjectTree();
+      setExpandedPaths(new Set());
+      setLoadingPaths(new Set());
+      setFileTree(await fetchProjectTreePath());
       addTerminalLog(`[Run] opened worktree: ${worktreePath}`);
     } catch (err) {
       addTerminalLog(`[Run] open worktree error: ${err}`);
     }
-  }, [addTerminalLog, loadProjectTree]);
+  }, [addTerminalLog, fetchProjectTreePath]);
 
   // ---- Session pane management (tree-based) ----
 
@@ -795,22 +1111,36 @@ export default function App() {
     // If the deleted session is the focused one, create a new one in that leaf
     if (focusedSessionId === id) {
       const agentType: AgentType = layout.activeAgent === 'personal' ? 'personal' : 'coding';
-      const newId = createDefaultSessionId(agentType);
-      setPaneRoot((prev) => {
-        const leaf = findLeafById(prev, focusedLeafId);
-        if (!leaf) return prev;
-        const newPane: SessionPane = {
-          ...leaf.pane,
-          sessionId: newId,
-          model: agentModels[agentType] || agentModel,
-          agentType,
-          role: roleForAgent(agentType),
-          isPrimary: agentType === 'personal',
-        };
-        return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
-      });
+      try {
+        const resolved = await resolveAgentSessionClient(agentType, agentType === 'personal' ? 'canonical' : 'new');
+        applyResolvedSessionToFocusedPane(resolved);
+      } catch {
+        const newId = createDefaultSessionId(agentType);
+        setPaneRoot((prev) => {
+          const leaf = findLeafById(prev, focusedLeafId);
+          if (!leaf) return prev;
+          const newPane: SessionPane = {
+            ...leaf.pane,
+            sessionId: newId,
+            model: agentModels[agentType] || agentModel,
+            agentType,
+            role: roleForAgent(agentType),
+            isPrimary: agentType === 'personal',
+          };
+          return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+        });
+      }
     }
-  }, [focusedSessionId, focusedLeafId, agentModel, agentModels, layout.activeAgent, loadSessions]);
+  }, [
+    focusedSessionId,
+    focusedLeafId,
+    agentModel,
+    agentModels,
+    layout.activeAgent,
+    loadSessions,
+    resolveAgentSessionClient,
+    applyResolvedSessionToFocusedPane,
+  ]);
 
   // Split a leaf into two panes (drag to edge)
   const handleSplitPane = useCallback((
@@ -1137,19 +1467,23 @@ export default function App() {
               currentProject={currentProject}
               fileTree={fileTree}
               expandedPaths={expandedPaths}
+              loadingPaths={loadingPaths}
               onTogglePath={handleTogglePath}
               onSelectFile={handleSelectFile}
               onOpenFolder={handleOpenFolder}
               onOpenProjectModal={() => setShowProjectModal(true)}
               onCloseProject={handleCloseProject}
-              onRefreshTree={loadProjectTree}
+              onRefreshTree={refreshProject}
+              isRefreshingProject={isRefreshingProject}
             />
             <ProjectModal
               isOpen={showProjectModal}
               onClose={() => setShowProjectModal(false)}
-              onProjectCreated={(project) => {
+              onProjectCreated={async (project) => {
                 setCurrentProject(project);
-                loadProjectTree();
+                setExpandedPaths(new Set());
+                setLoadingPaths(new Set());
+                setFileTree(await fetchProjectTreePath());
                 setShowProjectModal(false);
                 addTerminalLog(`[系统] 已创建项目: ${project.name}`);
               }}
@@ -1255,6 +1589,8 @@ export default function App() {
                     openRunWorktree={openRunWorktree}
                     handleOpenFileFromPanel={handleOpenFileFromPanel}
                     handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+                    onOpenPlanInWorkspace={handleOpenPlanInWorkspace}
+                    onProjectFileEdit={scheduleProjectRefresh}
                   />
                 </Panel>
 

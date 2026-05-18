@@ -36,6 +36,66 @@ class TestWorkerSession:
         assert "src/a.py" in worker.messages[1]["content"]
         assert "tests/test_a.py" in worker.messages[1]["content"]
 
+    def test_worker_injects_matched_enabled_skills(self, monkeypatch):
+        from app.skills import SkillManager
+
+        monkeypatch.setattr(
+            SkillManager,
+            "match_skills",
+            classmethod(lambda cls, *args, **kwargs: ["using-superpowers", "systematic-debugging"]),
+        )
+        monkeypatch.setattr(
+            SkillManager,
+            "build_skill_prompt",
+            classmethod(lambda cls, skill_ids: "\n".join(f"## Skill: {skill_id}" for skill_id in skill_ids)),
+        )
+
+        worker = WorkerSession(
+            worker_id="w1",
+            task="Fix a crashy bug and add a regression test",
+            profile_name="code",
+            model_id="gpt-4o",
+            agent_type="coding",
+        )
+
+        system_prompt = worker.messages[0]["content"]
+        assert worker.matched_skills == ["systematic-debugging"]
+        assert "## Worker Active Skills" in system_prompt
+        assert "systematic-debugging" in system_prompt
+        assert "using-superpowers" not in system_prompt
+
+    @pytest.mark.asyncio
+    async def test_worker_start_event_reports_matched_skills(self, mock_litellm, monkeypatch):
+        from app.skills import SkillManager
+
+        monkeypatch.setattr(
+            SkillManager,
+            "match_skills",
+            classmethod(lambda cls, *args, **kwargs: ["verification-before-completion"]),
+        )
+        monkeypatch.setattr(
+            SkillManager,
+            "build_skill_prompt",
+            classmethod(lambda cls, skill_ids: "\n".join(f"## Skill: {skill_id}" for skill_id in skill_ids)),
+        )
+        mock_litellm.return_value.model_dump.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "Task completed successfully.",
+                    "role": "assistant",
+                }
+            }]
+        }
+
+        worker = WorkerSession("w1", "Verify the change", "code", "gpt-4o", agent_type="coding")
+        events = []
+        async for event in worker.run():
+            events.append(event)
+
+        assert events[0]["type"] == "worker_start"
+        assert events[0]["data"]["agent_type"] == "coding"
+        assert events[0]["data"]["skills"] == ["verification-before-completion"]
+
     @pytest.mark.asyncio
     async def test_worker_completes_with_content(self, mock_litellm):
         mock_litellm.return_value.model_dump.return_value = {

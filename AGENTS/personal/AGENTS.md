@@ -5,6 +5,17 @@
 
 ---
 
+> ⚠️ **工作区约定（不可修改）**
+> - 工作区根 = 项目仓库根目录（即 `desktop-agent` 所在的目录）。
+> - 你的身份与记忆文件统一位于 `AGENTS/personal/`。
+> - 共享跨 Agent 文件位于 `AGENTS/_shared/`。
+> - 使用 `file_write` / `file_read` 等文件工具时，**务必保持默认 `project_relative=false`**。
+>   相对路径（如 `AGENTS/personal/USER.md`）会相对工作区根解析，**不是** `backend/` 目录。
+> - **绝对不要**在任何其他位置（如 `backend/AGENTS/`）新建 AGENTS/ 目录或身份文件。
+>   所有身份文档的读写都必须指向 AGENTS/ 下的正确位置。
+
+---
+
 ## 首次运行检测 / First Run Detection
 
 在开始任何其他操作之前，先检查：

@@ -300,7 +300,12 @@ settings:
         ]
 
     @pytest.mark.asyncio
-    async def test_kimi_stream_uses_openai_compatible_when_base_url_has_v1(self, monkeypatch, tmp_path):
+    async def test_kimi_stream_uses_non_stream_call(self, monkeypatch, tmp_path):
+        """Kimi's coding endpoint does not deliver usable incremental SSE on
+        either protocol, so chat_completion_stream must use a single non-stream
+        call replayed as events — no streaming attempt (which would only add a
+        wasted upstream request before the same fallback).
+        """
         config_yaml = tmp_path / "models.yaml"
         config_yaml.write_text("""
 providers:
@@ -321,16 +326,25 @@ settings:
         config._config = None
         router = ModelRouter("kimi-for-coding")
 
-        async def openai_stream(*args, **kwargs):
-            yield {"type": "done", "response": {"choices": [{"message": {"content": "ok"}}]}}
+        async def openai_call(*args, **kwargs):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        anthropic_stream_mock = MagicMock()
+        openai_stream_mock = MagicMock()
 
         with (
-            patch.object(router, "_call_kimi_openai_stream", openai_stream),
-            patch.object(router, "_call_kimi_anthropic_stream", new_callable=AsyncMock) as anthropic_mock,
+            patch.object(router, "_call_kimi_openai", openai_call),
+            patch.object(router, "_call_kimi_anthropic", new_callable=AsyncMock),
+            patch.object(router, "_call_kimi_anthropic_stream", anthropic_stream_mock),
+            patch.object(router, "_call_kimi_openai_stream", openai_stream_mock),
         ):
             events = []
             async for event in router.chat_completion_stream(messages=[{"role": "user", "content": "hi"}]):
                 events.append(event)
 
+        # The non-stream call is replayed as events; neither streaming helper
+        # is invoked (no wasted upstream request / 429 amplification).
         assert events[-1]["response"]["choices"][0]["message"]["content"] == "ok"
-        anthropic_mock.assert_not_called()
+        assert any(event["type"] == "text_delta" and event["text"] == "ok" for event in events)
+        anthropic_stream_mock.assert_not_called()
+        openai_stream_mock.assert_not_called()

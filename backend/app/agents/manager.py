@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.runtime_paths import agents_dir
+from app.runtime_paths import agents_dir, workspace_root
 
 logger = logging.getLogger(__name__)
 
@@ -71,15 +71,35 @@ class AgentManager:
         """Personal Agent: full OpenClaw cognitive system with bootstrap detection."""
         parts: List[str] = []
 
+        ws_root = str(workspace_root()).replace("\\", "/")
         parts.append(
             "## Runtime Context\n"
+            "- Workspace root: " + ws_root + ". "
+            "你的身份与记忆文件统一位于 " + ws_root + "/AGENTS/personal/ "
+            "（共享文件在 " + ws_root + "/AGENTS/_shared/）。\n"
             "- The host has already loaded the Personal Agent workspace files into this system prompt. "
             "Do not call file or shell tools merely to locate or re-read AGENTS/personal/SOUL.md, "
             "USER.md, MEMORY.md, BOOTSTRAP.md, or related identity files.\n"
+            "- 读写身份文件时使用 `file_write` / `file_read` 且 `project_relative=false`。"
+            "形如 \"AGENTS/personal/USER.md\" 的相对路径会相对工作区根（即 " + ws_root + "）解析，"
+            "不会写入 backend 目录。任何情况下都不要在别处新建 AGENTS/ 目录。\n"
             "- For greetings, identity questions, model questions, and ordinary conversation, answer directly.\n"
             "- Use tools only when the user's task requires observation, file changes, external lookup, "
             "or desktop/browser control. This is a Windows desktop app; if shell commands are needed, "
             "prefer PowerShell-compatible commands."
+        )
+
+        parts.append(
+            "## Coding Agent Collaboration\n"
+            "- Personal Agent is the default owner of the user relationship, intent clarification, memory, "
+            "and final user-facing summary.\n"
+            "- Coding Agent is an engineering specialist. Use `consult_coding_agent` for read-only diagnosis "
+            "and `delegate_to_coding_agent` for implementation, verification, or code review tasks.\n"
+            "- If the user explicitly writes `@coding agent`, prioritize delegation for that turn. "
+            "Do not reinterpret it as a normal mention or a page switch.\n"
+            "- For ordinary code-intent messages, suggest or use Coding Agent according to collaboration settings. "
+            "Keep non-code personal preference, product intent, and private memory handling in Personal.\n"
+            "- Summarize Coding results in plain language and call out verification evidence, blockers, and next decisions."
         )
 
         # 0. Bootstrap detection — highest priority
@@ -153,6 +173,10 @@ class AgentManager:
         if shared_prefs:
             parts.append(shared_prefs)
 
+        cross_agent_memory = cls._load_workspace_file("_shared", "cross_agent_memory.md")
+        if cross_agent_memory:
+            parts.append("## Cross-Agent Memory\n" + _truncate(cross_agent_memory, 3000))
+
         # 10. Shared base rules
         base_rules = cls._load_workspace_file("_shared", "base_rules.md")
         if base_rules:
@@ -183,6 +207,18 @@ class AgentManager:
         if agents_md:
             parts.append(agents_md)
 
+        parts.append(
+            "## Collaboration Boundary\n"
+            "- You are the Coding Agent specialist. Handle technical diagnosis, implementation, verification, "
+            "and review. Do not take over private preferences, emotional support, scheduling, or non-code product decisions.\n"
+            "- When the task packet lacks product intent or user preference context, call `request_personal_context` "
+            "for a scoped summary instead of reading Personal Agent private memory directly.\n"
+            "- Respect the task packet: mode, constraints, allowed tools, acceptance criteria, and owner. "
+            "For consult mode, stay read-only. For execute mode, implement only the requested scope.\n"
+            "- Return evidence: changed files, verification commands, review findings, blockers, and "
+            "ACCEPTANCE: PASS or ACCEPTANCE: FAIL."
+        )
+
         # 2. Code expert persona
         soul = cls._load_workspace_file("coding", "SOUL.md")
         if soul:
@@ -197,6 +233,10 @@ class AgentManager:
         shared_prefs = cls._load_workspace_file("_shared", "user_preferences.md")
         if shared_prefs:
             parts.append(shared_prefs)
+
+        cross_agent_memory = cls._load_workspace_file("_shared", "cross_agent_memory.md")
+        if cross_agent_memory:
+            parts.append("## Cross-Agent Memory\n" + _truncate(cross_agent_memory, 3000))
 
         # 5. Shared base rules
         base_rules = cls._load_workspace_file("_shared", "base_rules.md")
@@ -517,30 +557,13 @@ class AgentManager:
 
     @classmethod
     def _load_active_skills(cls) -> str:
-        """Load skill files with success rate > 50%."""
-        skills_dir = cls._personal_dir() / "skills"
-        if not skills_dir.exists():
-            return ""
+        """Skill injection is handled by SkillManager per turn.
 
-        parts: List[str] = []
-        try:
-            from app.skills import SkillManager
-        except Exception:
-            SkillManager = None  # type: ignore[assignment]
-
-        for skill_file in sorted(skills_dir.glob("*.md")):
-            skill_id = f"personal:{skill_file.stem}"
-            if SkillManager and not SkillManager.is_skill_enabled(skill_id, agent_type="personal"):
-                continue
-            try:
-                content = skill_file.read_text(encoding="utf-8")
-                parts.append(content[:1500])
-            except (OSError, UnicodeDecodeError):
-                continue
-
-        if not parts:
-            return ""
-        return "## Active Skills\n\n" + "\n\n---\n\n".join(parts)
+        Older builds loaded every personal skill into the Personal Agent base
+        prompt. User-authored Agent Skills now use progressive disclosure, so
+        only matched skills should enter context.
+        """
+        return ""
 
     # ──────────────────────────────────────────────
     # Project context (Coding Agent)

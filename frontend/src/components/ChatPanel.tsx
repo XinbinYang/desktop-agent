@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check } from 'lucide-react';
+import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X } from 'lucide-react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+import { useTranslation } from 'react-i18next';
 import {
   ChatMessage,
   ToolCall,
@@ -8,7 +9,9 @@ import {
   ToolSummary,
   ClientChatMode,
   ThinkingIntensity,
+  AgentType,
   PlanQuestion,
+  PlanDecisionAnswer,
   PlanState,
   PlanTodo,
   ContextUsage,
@@ -50,8 +53,12 @@ interface ChatPanelProps {
   planState: PlanState;
   onApprovePlan: () => void;
   onBuildPlan: () => void;
+  onPauseBuild: () => void;
+  onEndBuild: () => void;
   onRejectPlan: () => void;
   onUpdatePlanDecision: (questionId: string, selected: string[]) => void;
+  onSubmitPlanDecisions: (answers: PlanDecisionAnswer[]) => void;
+  onViewPlan?: () => void;
   onCommand?: (command: string, args: string) => void;
   contextUsage?: ContextUsage | null;
   checkpoints?: ConversationCheckpoint[];
@@ -63,9 +70,25 @@ interface ChatPanelProps {
   onRewindOpenChange?: (open: boolean) => void;
   projectOpen?: boolean;
   fileTree?: any[];
+  agentType?: AgentType;
+  projectName?: string;
 }
 
 type OutputMode = 'concise' | 'balanced' | 'verbose';
+
+const COMMAND_KEYS = new Set(['ArrowDown', 'ArrowUp', 'Enter', 'Escape']);
+const DIRECT_COMMANDS = new Set([
+  'clear',
+  'new',
+  'help',
+  'compact',
+  'rewind',
+  'context',
+  'config',
+  'screenshot',
+  'skills',
+]);
+const ARG_COMMANDS = new Set(['model', 'role', 'project']);
 
 const THINKING_LEVELS: ThinkingIntensity[] = ['low', 'medium', 'high'];
 const THINKING_LABELS: Record<ThinkingIntensity, string> = {
@@ -73,6 +96,17 @@ const THINKING_LABELS: Record<ThinkingIntensity, string> = {
   medium: 'MEDIUM',
   high: 'HIGH',
 };
+
+function parseSlashInput(value: string): { command: string; args: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed === '/') return null;
+  const match = trimmed.match(/^\/([A-Za-z][\w-]*)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return {
+    command: match[1].toLowerCase(),
+    args: (match[2] || '').trim(),
+  };
+}
 
 function getInitialOutputMode(): OutputMode {
   try {
@@ -140,6 +174,402 @@ function formatThinkDuration(ms: number): string {
   const s = totalSec % 60;
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
+
+const EmptyStatusChip: React.FC<{
+  children: React.ReactNode;
+  tone?: 'accent' | 'success' | 'neutral';
+  title?: string;
+}> = ({ children, tone = 'neutral', title }) => {
+  const toneClass =
+    tone === 'success'
+      ? 'border-success/25 bg-success/10 text-success'
+      : tone === 'accent'
+        ? 'border-accent/25 bg-accent/10 text-accent'
+        : 'border-border-subtle bg-surface text-fg-secondary';
+
+  return (
+    <div
+      className={`max-w-full rounded-md border px-2.5 py-1 chat-text-xs font-medium ${toneClass}`}
+      title={title}
+    >
+      <span className="block truncate">{children}</span>
+    </div>
+  );
+};
+
+const EmptyChatWelcome: React.FC<{
+  agentType: AgentType;
+  chatMode: ClientChatMode;
+  projectName?: string;
+}> = ({ agentType, chatMode, projectName }) => {
+  const { t } = useTranslation();
+  const isCoding = agentType === 'coding';
+  const AgentIcon = isCoding ? Code2 : Bot;
+  const agentLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
+  const modeLabel = chatMode === 'plan' ? t('chat.empty.planMode') : t('chat.empty.agentMode');
+  const title = projectName
+    ? t('chat.empty.projectReady', { projectName })
+    : t('chat.empty.ready');
+
+  return (
+    <div
+      data-testid="empty-chat-welcome"
+      className="flex h-full min-h-[220px] items-center justify-center px-[var(--chat-space-xl)] py-8 text-fg"
+    >
+      <div className="w-full max-w-md text-center">
+        <div
+          className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl border ${
+            isCoding
+              ? 'border-success/30 bg-success/10 text-success'
+              : 'border-accent/30 bg-accent/10 text-accent'
+          }`}
+          aria-hidden
+        >
+          <AgentIcon className="h-6 w-6" />
+        </div>
+        <h2 className="chat-text-lg font-semibold text-fg">{title}</h2>
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+          <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
+          <EmptyStatusChip tone={chatMode === 'plan' ? 'accent' : 'neutral'}>{modeLabel}</EmptyStatusChip>
+          {projectName && (
+            <EmptyStatusChip title={projectName}>
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <FolderOpen className="h-3 w-3 shrink-0" />
+                <span className="truncate">{projectName}</span>
+              </span>
+            </EmptyStatusChip>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const OPTION_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+
+function planAnswerLabel(question: PlanQuestion | undefined, answer: PlanDecisionAnswer): string {
+  if (answer.skipped) return 'Skipped; use best default';
+  const labels = (answer.selected || []).map((id) => question?.options.find((o) => o.id === id)?.label || id);
+  if (answer.other_text?.trim()) labels.push(`Other: ${answer.other_text.trim()}`);
+  return labels.length > 0 ? labels.join(', ') : 'No answer recorded';
+}
+
+const PlanAnswersBlock: React.FC<{
+  questions: PlanQuestion[];
+  answers: PlanDecisionAnswer[];
+}> = ({ questions, answers }) => (
+  <div className="my-2 rounded-lg border border-border bg-surface/80 px-4 py-3">
+    <div className="chat-text-sm text-fg-muted mb-3">Answers</div>
+    <div className="space-y-3">
+      {answers.map((answer) => {
+        const question = questions.find((q) => q.id === answer.question_id);
+        return (
+          <div key={answer.question_id} className="chat-text-sm">
+            <div className="font-medium text-fg-secondary">{question?.prompt || answer.question_id}</div>
+            <div className="mt-1 text-fg">{planAnswerLabel(question, answer)}</div>
+          </div>
+        );
+      })}
+    </div>
+  </div>
+);
+
+const CreatingPlanStatus: React.FC = () => (
+  <div className="rounded-md border border-[color:var(--plan-pill-border)] bg-surface/90 px-3 py-2 chat-text-sm text-fg-secondary flex items-center gap-2">
+    <Loader2 className="w-3.5 h-3.5 animate-spin text-[color:var(--plan-pill-bg)]" />
+    <span>Creating plan</span>
+  </div>
+);
+
+const PlanTodoStatusIcon: React.FC<{ status: PlanTodo['status'] }> = ({ status }) => {
+  if (status === 'completed') return <CheckCircle2 className="w-4 h-4 text-success" />;
+  if (status === 'blocked' || status === 'cancelled') return <AlertCircle className="w-4 h-4 text-danger" />;
+  if (status === 'in_progress') return <Loader2 className="w-4 h-4 animate-spin text-accent" />;
+  return <Circle className="w-4 h-4 text-fg-muted" />;
+};
+
+const PlanExecutionCard: React.FC<{
+  goal: string;
+  todos: PlanTodo[];
+  phase?: PlanState['phase'];
+  compact?: boolean;
+  onPause?: () => void;
+  onEnd?: () => void;
+  onContinue?: () => void;
+}> = ({ goal, todos, phase = 'executing', compact = false, onPause, onEnd, onContinue }) => {
+  const [expanded, setExpanded] = useState(false);
+  const inProgressIndex = todos.findIndex((t) => t.status === 'in_progress');
+  const pendingIndex = todos.findIndex((t) => t.status === 'pending');
+  const currentIndex = inProgressIndex >= 0 ? inProgressIndex : pendingIndex >= 0 ? pendingIndex : 0;
+  const active = todos[currentIndex] || todos[0];
+  const completed = todos.filter((t) => t.status === 'completed').length;
+  const isPaused = phase === 'approved_waiting_build';
+  const isRunning = phase === 'executing' && inProgressIndex >= 0;
+  const progressIndex = isRunning ? currentIndex + 1 : completed;
+  const allDone = todos.length > 0 && completed === todos.length;
+  const hasControls = (phase === 'executing' || isPaused) && !!(onPause || onEnd || onContinue);
+
+  return (
+    <div className={`rounded-lg border border-border bg-surface-alt/90 overflow-hidden ${compact ? 'my-2' : ''}`}>
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border bg-surface-hover/60">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="min-w-0 flex-1 flex items-center gap-2 hover:text-fg transition-colors text-left"
+          title={expanded ? 'Collapse todos' : 'Expand todos'}
+        >
+          {expanded
+            ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+            : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />}
+          <span className="chat-text-sm font-semibold text-fg-secondary shrink-0">Build</span>
+          {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent shrink-0" />}
+          {isPaused && <Pause className="w-3.5 h-3.5 text-warning shrink-0" />}
+          <span className="chat-text-sm text-fg truncate">{goal || 'Plan execution'}</span>
+        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {todos.length > 0 && (
+            <span className="chat-text-xs text-fg-muted tabular-nums px-1">
+              {Math.min(progressIndex, todos.length)}/{todos.length}
+            </span>
+          )}
+          {hasControls && isPaused && onContinue && (
+            <button
+              type="button"
+              onClick={onContinue}
+              className="inline-flex items-center gap-1 rounded-md border border-border-subtle bg-surface px-2 py-1 chat-text-xs text-fg-secondary hover:text-fg hover:bg-surface-hover"
+              title="Continue Build"
+              aria-label="Continue Build"
+            >
+              <Play className="w-3.5 h-3.5" />
+              Continue
+            </button>
+          )}
+          {hasControls && phase === 'executing' && onPause && (
+            <button
+              type="button"
+              onClick={onPause}
+              className="inline-flex items-center gap-1 rounded-md border border-border-subtle bg-surface px-2 py-1 chat-text-xs text-fg-secondary hover:text-fg hover:bg-surface-hover"
+              title="Pause Build"
+              aria-label="Pause Build"
+            >
+              <Pause className="w-3.5 h-3.5" />
+              Pause
+            </button>
+          )}
+          {hasControls && onEnd && (
+            <button
+              type="button"
+              onClick={onEnd}
+              className="inline-flex items-center gap-1 rounded-md border border-danger/35 bg-danger/10 px-2 py-1 chat-text-xs text-danger hover:bg-danger/15"
+              title="End Build"
+              aria-label="End Build"
+            >
+              <X className="w-3.5 h-3.5" />
+              End
+            </button>
+          )}
+        </div>
+      </div>
+      {!expanded && active && !allDone && (
+        <div className="flex items-center gap-2 px-3 py-2 chat-text-sm">
+          <PlanTodoStatusIcon status={active.status} />
+          <span className="text-fg truncate">{active.title}</span>
+        </div>
+      )}
+      {expanded && (
+        <div className="px-3 py-2 space-y-2 max-h-60 overflow-y-auto">
+          {todos.map((todo) => (
+            <div key={todo.id} className="flex items-start gap-2 chat-text-sm">
+              <PlanTodoStatusIcon status={todo.status} />
+              <span className={
+                todo.status === 'completed'
+                  ? 'text-fg-muted line-through'
+                  : todo.status === 'in_progress'
+                    ? 'text-fg'
+                    : todo.status === 'blocked' || todo.status === 'cancelled'
+                      ? 'text-danger'
+                      : 'text-fg-secondary'
+              }>
+                {todo.title}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const PlanQuestionsDock: React.FC<{
+  questions: PlanQuestion[];
+  onSubmit: (answers: PlanDecisionAnswer[]) => void;
+}> = ({ questions, onSubmit }) => {
+  const [index, setIndex] = useState(0);
+  const [answers, setAnswers] = useState<Record<string, {
+    selected: string[];
+    other: boolean;
+    otherText: string;
+    skipped: boolean;
+  }>>({});
+
+  useEffect(() => {
+    const init: Record<string, { selected: string[]; other: boolean; otherText: string; skipped: boolean }> = {};
+    questions.forEach((q) => {
+      init[q.id] = answers[q.id] || { selected: [], other: false, otherText: '', skipped: false };
+    });
+    setAnswers(init);
+    setIndex((prev) => Math.min(prev, Math.max(questions.length - 1, 0)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [questions.map((q) => q.id).join('|')]);
+
+  if (questions.length === 0) return null;
+  const question = questions[Math.min(index, questions.length - 1)];
+  const answer = answers[question.id] || { selected: [], other: false, otherText: '', skipped: false };
+  const otherNeedsText = answer.other && !answer.otherText.trim();
+  const canContinue = answer.skipped || answer.selected.length > 0 || (answer.other && answer.otherText.trim().length > 0);
+  const isLast = index === questions.length - 1;
+
+  const updateAnswer = (next: Partial<typeof answer>) => {
+    setAnswers((prev) => ({
+      ...prev,
+      [question.id]: { ...answer, ...next },
+    }));
+  };
+
+  const selectOption = (id: string) => {
+    if (question.allow_multiple) {
+      const selected = answer.selected.includes(id)
+        ? answer.selected.filter((x) => x !== id)
+        : [...answer.selected, id];
+      updateAnswer({ selected, skipped: false });
+      return;
+    }
+    updateAnswer({ selected: [id], other: false, otherText: '', skipped: false });
+  };
+
+  const toggleOther = () => {
+    if (question.allow_multiple) {
+      updateAnswer({ other: !answer.other, skipped: false });
+      return;
+    }
+    updateAnswer({ selected: [], other: true, skipped: false });
+  };
+
+  const toPayload = (source: typeof answers): PlanDecisionAnswer[] => questions.map((q) => {
+    const a = source[q.id] || { selected: [], other: false, otherText: '', skipped: false };
+    return {
+      question_id: q.id,
+      selected: a.skipped ? [] : a.selected,
+      other_text: a.skipped || !a.other ? '' : a.otherText.trim(),
+      skipped: a.skipped,
+    };
+  });
+
+  const continueOrSubmit = () => {
+    if (!canContinue || otherNeedsText) return;
+    if (!isLast) {
+      setIndex((prev) => Math.min(prev + 1, questions.length - 1));
+      return;
+    }
+    onSubmit(toPayload(answers));
+  };
+
+  const skipQuestion = () => {
+    const nextAnswers = {
+      ...answers,
+      [question.id]: { selected: [], other: false, otherText: '', skipped: true },
+    };
+    setAnswers(nextAnswers);
+    if (!isLast) {
+      setIndex((prev) => Math.min(prev + 1, questions.length - 1));
+      return;
+    }
+    onSubmit(toPayload(nextAnswers));
+  };
+
+  return (
+    <div className="mb-3 rounded-lg border border-[color:var(--plan-pill-border)] bg-surface/95 shadow-2xl overflow-hidden" role="dialog" aria-label="Plan questions">
+      <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-border-subtle">
+        <div className="flex items-center gap-2">
+          <PlanModeIcon className="text-[color:var(--plan-pill-bg)]" />
+          <span className="chat-text-sm font-semibold text-fg">Questions</span>
+        </div>
+        <div className="flex items-center gap-2 chat-text-xs text-fg-muted">
+          <span>{index + 1} of {questions.length}</span>
+          {questions.length > 1 && (
+            <div className="flex items-center gap-1">
+              <button type="button" onClick={() => setIndex((v) => Math.max(0, v - 1))} disabled={index === 0} className="disabled:opacity-35 hover:text-fg" aria-label="Previous question">
+                <ChevronDown className="w-3 h-3 rotate-180" />
+              </button>
+              <button type="button" onClick={() => setIndex((v) => Math.min(questions.length - 1, v + 1))} disabled={index === questions.length - 1} className="disabled:opacity-35 hover:text-fg" aria-label="Next question">
+                <ChevronDown className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="px-4 py-3">
+        <div className="chat-text-sm font-semibold text-fg mb-3">
+          {index + 1}. {question.prompt}
+        </div>
+        <div className="space-y-2">
+          {question.options.map((option, optionIndex) => {
+            const selected = answer.selected.includes(option.id);
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => selectOption(option.id)}
+                className={`w-full flex items-start gap-2 text-left rounded-md px-2 py-1.5 chat-text-sm transition-colors ${
+                  selected ? 'bg-accent/15 text-fg border border-accent/35' : 'text-fg-secondary hover:bg-surface-hover border border-transparent'
+                }`}
+              >
+                <span className="mt-0.5 w-5 h-5 rounded border border-border bg-surface-alt text-[11px] font-semibold text-fg-secondary flex items-center justify-center shrink-0">
+                  {OPTION_LETTERS[optionIndex]}
+                </span>
+                <span>{option.label}</span>
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={toggleOther}
+            className={`w-full flex items-start gap-2 text-left rounded-md px-2 py-1.5 chat-text-sm transition-colors ${
+              answer.other ? 'bg-accent/15 text-fg border border-accent/35' : 'text-fg-muted hover:bg-surface-hover border border-transparent'
+            }`}
+          >
+            <span className="mt-0.5 w-5 h-5 rounded border border-border bg-surface-alt text-[11px] font-semibold text-fg-secondary flex items-center justify-center shrink-0">
+              {OPTION_LETTERS[question.options.length]}
+            </span>
+            <span>Other...</span>
+          </button>
+          {answer.other && (
+            <input
+              value={answer.otherText}
+              onChange={(e) => updateAnswer({ otherText: e.target.value, skipped: false })}
+              placeholder="Describe your preference"
+              className="w-full mt-1 bg-surface-input border border-border rounded-md px-3 py-2 chat-text-sm text-fg outline-none focus:border-accent"
+              autoFocus
+            />
+          )}
+        </div>
+      </div>
+      <div className="flex items-center justify-end gap-2 px-3 py-2 border-t border-border-subtle">
+        <button type="button" onClick={skipQuestion} className="chat-text-xs text-fg-muted hover:text-fg-secondary">
+          Skip Esc
+        </button>
+        <button
+          type="button"
+          onClick={continueOrSubmit}
+          disabled={!canContinue || otherNeedsText}
+          className="chat-text-xs font-semibold rounded-md bg-[color:var(--plan-pill-bg)] text-[color:var(--plan-pill-fg)] px-3 py-1.5 disabled:opacity-45 disabled:cursor-not-allowed hover:brightness-110"
+        >
+          Continue
+        </button>
+      </div>
+    </div>
+  );
+};
 
 /**
  * Live, auto-collapsing thinking/reasoning block (VSCode Claude-Code style).
@@ -417,21 +847,88 @@ const PlanQuestionsInlineCard: React.FC<{
  * In-stream plan draft review card — rendered inside the chat timeline.
  * Shows structured plan with collapsible sections and a prominent Build button.
  */
+function buildPlanReviewMarkdown(
+  block: Extract<AssistantBlock, { type: 'plan_draft' }>,
+  planState: PlanState,
+): string {
+  const explicit = (block.draft || planState.draft || '').trim();
+  if (explicit) return explicit;
+
+  const sp = block.structured_plan || planState.structured_plan;
+  const todos = planTasksForCard(block, planState);
+  const lines: string[] = ['# Plan'];
+  const goal = block.goal || planState.goal || sp?.goal || '';
+  if (goal) lines.push('', '## Goal', goal);
+
+  if (sp?.assumptions?.length) {
+    lines.push('', '## Assumptions', ...sp.assumptions.map((item) => `- ${item}`));
+  }
+
+  if (todos.length > 0) {
+    lines.push('', '## Tasks');
+    todos.forEach((todo) => {
+      lines.push(`- [ ] ${todo.title}`);
+      if (todo.acceptance_criteria) lines.push(`  - Acceptance: ${todo.acceptance_criteria}`);
+    });
+  }
+
+  if (sp?.risks?.length) {
+    lines.push('', '## Risks', ...sp.risks.map((risk) => `- ${risk}`));
+  }
+
+  if (sp?.acceptance_criteria?.length) {
+    lines.push('', '## Verification', ...sp.acceptance_criteria.map((item) => `- ${item}`));
+  }
+
+  return lines.join('\n').trim() || '# Plan\n\nPlan details are not available yet.';
+}
+
+function planTasksForCard(
+  block: Extract<AssistantBlock, { type: 'plan_draft' }>,
+  planState: PlanState,
+): PlanTodo[] {
+  const sp = block.structured_plan || planState.structured_plan || null;
+  const primary =
+    planState.todos.length > 0
+      ? planState.todos
+      : block.todos.length > 0
+        ? block.todos
+        : (sp?.todos || []);
+  if (primary.length > 0) return primary;
+  return (sp?.steps || []).map((step, index) => ({
+    id: step.id || `step_${index + 1}`,
+    title: step.title,
+    status: 'pending' as const,
+    depends_on: step.depends_on || [],
+    parallel_group: step.parallel_group,
+    acceptance_criteria: step.details || '',
+  }));
+}
+
 const PlanDraftInlineCard: React.FC<{
   block: Extract<AssistantBlock, { type: 'plan_draft' }>;
   planState: PlanState;
   onBuild: () => void;
-}> = ({ block, planState, onBuild }) => {
-  const isExecuting = ['executing', 'completed', 'approved_waiting_build'].includes(planState.phase);
+  onViewPlan?: () => void;
+}> = ({ block, planState, onBuild, onViewPlan }) => {
+  const isExecuting = planState.phase === 'executing';
   const canBuild = planState.phase === 'awaiting_approval' && !planState.approved;
-  const [open, setOpen] = useState<Record<string, boolean>>({ todos: true, risks: false, steps: false });
+  const sp = block.structured_plan || planState.structured_plan || null;
+  const [open, setOpen] = useState<Record<string, boolean>>({ goal: false, tasks: true, files: false, risks: false, verification: false });
   const toggle = (k: string) => setOpen((prev) => ({ ...prev, [k]: !prev[k] }));
 
   // Use live todos from planState when executing for real-time status
-  const todos: PlanTodo[] = isExecuting && planState.todos.length > 0
+  const tasks: PlanTodo[] = isExecuting && planState.todos.length > 0
     ? planState.todos
-    : block.todos;
-  const sp = block.structured_plan;
+    : planTasksForCard(block, planState);
+  const verification = sp?.acceptance_criteria || [];
+  const context = sp?.context?.trim() || '';
+  const criticalFiles = sp?.critical_files || [];
+  // Defensive: only show the live "Building" pulse while a todo is actually
+  // in progress. If the backend's terminal transition is delayed, this stops
+  // the indicator from spinning forever once every todo is resolved.
+  const allTasksResolved = tasks.length > 0 && tasks.every((t) => t.status === 'completed' || t.status === 'cancelled');
+  const showBuilding = isExecuting && !allTasksResolved;
 
   return (
     <div className="my-2 rounded-xl border border-[color:var(--plan-pill-border)] overflow-hidden">
@@ -442,7 +939,7 @@ const PlanDraftInlineCard: React.FC<{
           <span className="chat-text-xs font-semibold text-[color:var(--plan-pill-fg)] uppercase tracking-wide">
             Implementation Plan
           </span>
-          {isExecuting && (
+          {showBuilding && (
             <span className="ml-auto flex items-center gap-1.5 chat-text-xs text-accent">
               <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse inline-block" />
               Building
@@ -455,24 +952,47 @@ const PlanDraftInlineCard: React.FC<{
         <div className="chat-text-sm font-semibold text-fg leading-snug">{block.goal}</div>
       </div>
 
-      {/* Tasks section */}
-      {todos.length > 0 && (
+      {/* 任务目标 / Goal section */}
+      {context && (
         <div className="border-b border-border-subtle">
           <button
             type="button"
-            onClick={() => toggle('todos')}
+            onClick={() => toggle('goal')}
             className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
           >
             <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
-              Tasks ({todos.length})
+              任务目标 / Goal
             </span>
-            {open.todos
+            {open.goal
               ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
               : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
           </button>
-          {open.todos && (
+          {open.goal && (
+            <div className="px-4 pb-3 chat-text-xs text-fg-secondary whitespace-pre-wrap leading-relaxed">
+              {context}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 任务方案 / Approach (PART 1..N) */}
+      {tasks.length > 0 && (
+        <div className="border-b border-border-subtle">
+          <button
+            type="button"
+            onClick={() => toggle('tasks')}
+            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
+          >
+            <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
+              任务方案 / Approach ({tasks.length})
+            </span>
+            {open.tasks
+              ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
+              : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
+          </button>
+          {open.tasks && (
             <div className="px-4 pb-3 space-y-2">
-              {todos.map((t, i) => {
+              {tasks.map((t, i) => {
                 const s = t.status || 'pending';
                 return (
                   <div key={t.id} className="flex items-start gap-2.5 chat-text-xs">
@@ -485,6 +1005,7 @@ const PlanDraftInlineCard: React.FC<{
                       {s === 'completed' ? '✓' : s === 'blocked' ? '!' : i + 1}
                     </span>
                     <div className="flex-1 min-w-0">
+                      <span className="text-fg-muted font-medium chat-text-xs uppercase tracking-wide mr-1">PART {i + 1}</span>
                       <span className={s === 'completed' ? 'line-through text-fg-muted' : 'text-fg'}>
                         {t.title}
                       </span>
@@ -500,27 +1021,27 @@ const PlanDraftInlineCard: React.FC<{
         </div>
       )}
 
-      {/* Steps section */}
-      {sp && sp.steps && sp.steps.length > 0 && (
+      {/* 关键文件清单 / Critical Files section */}
+      {criticalFiles.length > 0 && (
         <div className="border-b border-border-subtle">
           <button
             type="button"
-            onClick={() => toggle('steps')}
+            onClick={() => toggle('files')}
             className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
           >
             <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
-              Steps ({sp.steps.length})
+              关键文件清单 / Critical Files ({criticalFiles.length})
             </span>
-            {open.steps
+            {open.files
               ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
               : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
           </button>
-          {open.steps && (
-            <div className="px-4 pb-3 space-y-1.5">
-              {sp.steps.map((s, i) => (
-                <div key={s.id} className="chat-text-xs text-fg-secondary">
-                  <span className="font-medium text-fg">{i + 1}.</span> {s.title}
-                  {s.details && <div className="mt-0.5 text-fg-muted text-[10px] pl-3">{s.details.slice(0, 120)}</div>}
+          {open.files && (
+            <div className="px-4 pb-3 space-y-1">
+              {criticalFiles.map((cf, i) => (
+                <div key={`${cf.path}-${i}`} className="chat-text-xs flex gap-1.5">
+                  <code className="shrink-0 text-accent">{cf.path}</code>
+                  {cf.change && <span className="text-fg-muted">— {cf.change}</span>}
                 </div>
               ))}
             </div>
@@ -556,19 +1077,51 @@ const PlanDraftInlineCard: React.FC<{
         </div>
       )}
 
-      {/* CTA footer */}
+      {/* Verification section */}
+      {verification.length > 0 && (
+        <div className="border-b border-border-subtle">
+          <button
+            type="button"
+            onClick={() => toggle('verification')}
+            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-hover transition-colors text-left"
+          >
+            <span className="chat-text-xs font-medium text-fg-secondary uppercase tracking-wide">
+              验证 / Verification ({verification.length})
+            </span>
+            {open.verification
+              ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted" />
+              : <ChevronRight className="w-3.5 h-3.5 text-fg-muted" />}
+          </button>
+          {open.verification && (
+            <div className="px-4 pb-3 space-y-1">
+              {verification.map((item, i) => (
+                <div key={i} className="chat-text-xs text-fg-secondary flex gap-1.5">
+                  <Check className="mt-0.5 w-3 h-3 shrink-0 text-success" />
+                  <span>{item}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {canBuild && (
-        <div className="px-4 py-3 bg-[color-mix(in_srgb,var(--plan-pill-bg)_8%,var(--bg-surface))] space-y-2">
+        <div className="px-4 py-2.5 bg-[color-mix(in_srgb,var(--plan-pill-bg)_8%,var(--bg-surface))] flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={onViewPlan}
+            className="chat-text-sm text-fg-secondary hover:text-fg"
+          >
+            View Plan
+          </button>
           <button
             type="button"
             onClick={onBuild}
-            className="w-full py-2.5 px-4 rounded-lg bg-accent text-fg-on-accent font-semibold chat-text-sm hover:brightness-110 active:scale-[0.99] transition flex items-center justify-center gap-2"
+            className="py-1.5 px-3 rounded-md bg-[color:var(--plan-pill-bg)] text-[color:var(--plan-pill-fg)] font-semibold chat-text-sm hover:brightness-110 active:scale-[0.99] transition inline-flex items-center justify-center gap-1"
+            title="Build plan (Ctrl+Enter)"
           >
             ▶ Build
           </button>
-          <p className="text-center chat-text-xs text-fg-muted">
-            Not right? Describe changes in the chat below and I&apos;ll revise.
-          </p>
         </div>
       )}
 
@@ -644,8 +1197,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   planState,
   onApprovePlan,
   onBuildPlan,
+  onPauseBuild,
+  onEndBuild,
   onRejectPlan,
   onUpdatePlanDecision,
+  onSubmitPlanDecisions,
+  onViewPlan,
   onCommand,
   contextUsage,
   checkpoints = [],
@@ -657,8 +1214,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onRewindOpenChange,
   projectOpen = false,
   fileTree = [],
+  agentType = 'personal',
+  projectName,
 }) => {
-  const planBlocksChatSend = chatMode === 'plan' && planState.phase === 'awaiting_decision';
+  const planBlocksChatSend = (chatMode === 'plan' || planState.mode === 'plan') && planState.phase === 'awaiting_decision';
   const isPlanModeActive = chatMode === 'plan';
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
@@ -769,7 +1328,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const handleSend = () => {
     if (planBlocksChatSend) return;
     if (!input.trim() && !attachedImage) return;
-    onSend(input.trim(), attachedImage || undefined, { chatMode, thinkingIntensity });
+    const slashCommand = parseSlashInput(input);
+    if (slashCommand && !attachedImage) {
+      onCommand?.(slashCommand.command, slashCommand.args);
+      setInput('');
+      setSlashQuery('');
+      onDraftClear?.();
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      return;
+    }
+    onSend(input.trim(), attachedImage || undefined);
     setInput('');
     setAttachedImage(null);
     onDraftClear?.();
@@ -794,41 +1364,25 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   const handleCommand = useCallback((cmd: { name: string; args: string }) => {
     setSlashQuery('');
-    if (cmd.name === 'clear') {
-      onCommand?.('clear', '');
+    if (DIRECT_COMMANDS.has(cmd.name)) {
+      onCommand?.(cmd.name, '');
       setInput('');
-    } else if (cmd.name === 'new') {
-      onCommand?.('new', '');
-      setInput('');
-    } else if (cmd.name === 'help') {
-      onCommand?.('help', '');
-      setInput('');
-    } else if (cmd.name === 'compact') {
-      onCommand?.('compact', cmd.args || '');
-      setInput('');
-    } else if (cmd.name === 'rewind') {
-      onCommand?.('rewind', '');
-      setInput('');
-    } else if (cmd.name === 'context') {
-      onCommand?.('context', '');
-      setInput('');
-    } else if (cmd.name === 'config') {
-      onCommand?.('config', '');
-      setInput('');
-    } else if (cmd.name === 'screenshot') {
-      onCommand?.('screenshot', '');
-      setInput('');
-    } else {
+    } else if (ARG_COMMANDS.has(cmd.name) || cmd.args) {
       // For commands with args, fill the command prefix and let user type args
       setInput(`/${cmd.name} `);
-      if (cmd.args) {
-        // Focus back on textarea for arg input
-        setTimeout(() => textareaRef.current?.focus(), 0);
-      }
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    } else {
+      setInput(`/${cmd.name} `);
+      setTimeout(() => textareaRef.current?.focus(), 0);
     }
   }, [onCommand]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    if (showSlashMenu && COMMAND_KEYS.has(e.key)) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       if (planBlocksChatSend) return;
       e.preventDefault();
@@ -973,7 +1527,15 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const renderBlock = useCallback((block: AssistantBlock, _bi: number) => {
     switch (block.type) {
       case 'thinking':
-        return <ReasoningBlock key={`t-${block.timestamp}`} text={block.text} />;
+        return (
+          <ReasoningBlock
+            key={`t-${block.timestamp}`}
+            text={block.text}
+            complete={block.complete}
+            startedAt={block.startedAt}
+            endedAt={block.endedAt}
+          />
+        );
       case 'text':
         return (
           <div key={`md-${block.timestamp}`} className="prose prose-sm chat-prose max-w-none">
@@ -1010,12 +1572,20 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           />
         );
       case 'plan_questions':
+        return null;
+      case 'plan_answers':
+        return null;
+      case 'plan_execution':
         return (
-          <PlanQuestionsInlineCard
-            key={`pq-${block.timestamp}`}
-            questions={block.questions}
-            planState={planState}
-            onUpdate={onUpdatePlanDecision}
+          <PlanExecutionCard
+            key={`pe-${block.timestamp}`}
+            goal={block.goal || planState.goal}
+            todos={block.todos}
+            phase={planState.phase}
+            compact
+            onPause={onPauseBuild}
+            onEnd={onEndBuild}
+            onContinue={onBuildPlan}
           />
         );
       case 'plan_draft':
@@ -1025,12 +1595,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             block={block}
             planState={planState}
             onBuild={onBuildPlan}
+            onViewPlan={onViewPlan}
           />
         );
       default:
         return null;
     }
-  }, [planState, onUpdatePlanDecision, onBuildPlan, markdownComponents]);
+  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents]);
 
   const itemContent = useCallback((index: number) => {
     const msg = filteredMessages[index];
@@ -1073,8 +1644,27 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     );
   }, [filteredMessages, messages, onRetry, isRunning, expandedToolDetails, showAllToolDetails, hideToolNoise, planState, onUpdatePlanDecision, onBuildPlan, markdownComponents, renderBlock]);
 
+  const planTaskRequirement =
+    chatMode === 'plan'
+      ? (planState.goal || planState.draft.split('\n')[0]?.replace(/^Goal:\s*/, '') || '')
+      : '';
+
   const virtuosoComponents: any = useMemo(() => ({
-    Header: () => <div className="h-[var(--chat-space-md)]" />,
+    Header: () => (
+      <>
+        <div className="h-[var(--chat-space-md)]" />
+        {planTaskRequirement && (
+          <div className="px-[var(--chat-space-lg)] pb-[var(--chat-space-sm)]">
+            <div className="rounded-md border border-accent/30 bg-surface/95 backdrop-blur px-3 py-2">
+              <div className="chat-text-xs text-fg-secondary">
+                <span className="text-fg font-medium">Task requirement:</span>{' '}
+                {planTaskRequirement}
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    ),
     Footer: isRunning
       ? () => (
           <div className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
@@ -1091,26 +1681,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       : undefined,
     EmptyPlaceholder: messages.length === 0
       ? () => (
-          <div className="flex flex-col items-center justify-center h-full text-fg-muted p-[var(--chat-space-lg)]">
-            <div className="text-4xl mb-4">&#x1f5a5;&#xfe0f;</div>
-            <div className="text-lg font-medium mb-2 text-fg">Desktop Agent Ready</div>
-            <div className="text-sm text-center max-w-md text-fg-secondary">
-              I can help you control your computer: manage files, run commands,<br />
-              control the browser, operate desktop keyboard &amp; mouse, and interact with other applications.
-            </div>
-            <div className="mt-6 grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Read / Write Files</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Browser Automation</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Keyboard &amp; Mouse</div>
-              <div className="bg-surface px-3 py-2 rounded border border-border text-fg-secondary shadow-sm">Window Management</div>
-            </div>
-          </div>
+          <EmptyChatWelcome
+            agentType={agentType}
+            chatMode={chatMode}
+            projectName={projectName}
+          />
         )
       : null,
-  }), [isRunning, messages.length]);
+  }), [agentType, chatMode, isRunning, messages.length, planTaskRequirement, projectName]);
 
   return (
-    <div className="h-full flex flex-col bg-app" data-density={density}>
+    <div className="relative h-full min-h-0 flex flex-col overflow-hidden bg-app" data-density={density}>
       {/* 搜索栏 */}
       {showSearch && (
         <div className="px-4 pt-3 pb-1 border-b border-border flex items-center gap-2">
@@ -1166,15 +1747,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       </div>
 
       {/* 消息列表 */}
-      <div className="flex-1 relative">
-        {chatMode === 'plan' && (planState.goal || planState.draft) && (
-          <div className="sticky top-0 z-20 mx-[var(--chat-space-lg)] mt-[var(--chat-space-md)] rounded-md border border-accent/30 bg-surface/95 backdrop-blur px-3 py-2">
-            <div className="chat-text-xs text-fg-secondary">
-              <span className="text-fg font-medium">Task requirement:</span>{' '}
-              {planState.goal || planState.draft.split('\n')[0]?.replace(/^Goal:\s*/, '') || ''}
-            </div>
-          </div>
-        )}
+      <div className="min-h-0 flex-1 relative overflow-hidden">
         <Virtuoso
           ref={virtuosoRef}
           className="h-full"
@@ -1200,7 +1773,30 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       )}
 
       {/* Input area */}
-      <div className="border-t border-border p-[var(--chat-space-lg)] bg-surface">
+      <div className="relative z-30 shrink-0 border-t border-border p-[var(--chat-space-lg)] bg-surface">
+        {planState.phase === 'awaiting_decision' && planState.questions.length > 0 && (
+          <PlanQuestionsDock
+            questions={planState.questions}
+            onSubmit={onSubmitPlanDecisions}
+          />
+        )}
+        {planState.phase === 'planning' && (
+          <div className="mb-3">
+            <CreatingPlanStatus />
+          </div>
+        )}
+        {(planState.phase === 'executing' || planState.phase === 'approved_waiting_build') && planState.todos.length > 0 && (
+          <div className="mb-2">
+            <PlanExecutionCard
+              goal={planState.goal}
+              todos={planState.todos}
+              phase={planState.phase}
+              onPause={onPauseBuild}
+              onEnd={onEndBuild}
+              onContinue={onBuildPlan}
+            />
+          </div>
+        )}
         {/* ── Plan mode status bar ── */}
         {chatMode === 'plan' && (
           <div
@@ -1228,7 +1824,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                   type="button"
                   className="ml-auto chat-text-xs text-fg-muted hover:text-fg-secondary underline underline-offset-2 shrink-0"
                   onClick={() => {
-                    if (typeof window !== 'undefined' && (window as any).electronAPI?.openPath) {
+                    if (onViewPlan) {
+                      onViewPlan();
+                    } else if (typeof window !== 'undefined' && (window as any).electronAPI?.openPath) {
                       (window as any).electronAPI.openPath(planState.plan_file_path);
                     }
                   }}
@@ -1268,15 +1866,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             )}
           </div>
         )}
-        {planBlocksChatSend && (
-          <div
-            className="mb-2 rounded-lg border border-warning/35 bg-warning/10 px-3 py-1.5 chat-text-xs text-warning"
-            role="alert"
-          >
-            Please complete the questions above before sending a new message.
-          </div>
-        )}
-
         {attachedImage && (
           <div className="mb-2 flex items-center gap-2">
             <div className="relative inline-block">

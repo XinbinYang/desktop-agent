@@ -32,6 +32,7 @@ const isDev = process.argv.includes('--dev');
 const isPackaged = app.isPackaged;
 const shouldOpenDevTools = process.env.DESKTOP_AGENT_OPEN_DEVTOOLS === '1';
 let authToken = null;
+let lastRendererCrashReloadAt = 0;
 
 const WINDOW_THEMES = {
   dark: {
@@ -344,6 +345,38 @@ function createWindow() {
   if (state.maximized) {
     mainWindow.maximize();
   }
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[Electron] Renderer process gone:', details);
+    const now = Date.now();
+    if (now - lastRendererCrashReloadAt > 10000 && mainWindow && !mainWindow.isDestroyed()) {
+      lastRendererCrashReloadAt = now;
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          console.error('[Electron] Reloading renderer after crash');
+          mainWindow.reload();
+        }
+      }, 500);
+    }
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error('[Electron] Renderer failed to load:', { errorCode, errorDescription, validatedURL });
+  });
+
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      console.error(`[Renderer:${level}] ${message} (${sourceId}:${line})`);
+    }
+  });
+
+  mainWindow.on('unresponsive', () => {
+    console.error('[Electron] Window became unresponsive');
+  });
+
+  mainWindow.on('responsive', () => {
+    console.error('[Electron] Window became responsive again');
+  });
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');

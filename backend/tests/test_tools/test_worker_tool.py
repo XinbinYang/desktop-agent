@@ -75,6 +75,51 @@ class TestDispatchWorkerTool:
         # Should fall back to 'general' profile
         assert "Worker" in result.output
 
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_passes_agent_type_to_session(self):
+        seen = []
+
+        async def replacement_run(self):
+            seen.append(self.agent_type)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Task completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchWorkerTool()
+            result = await tool.execute(
+                task="Summarize notes",
+                profile="general",
+                agent_type="personal",
+                model_id="gpt-4o",
+            )
+
+        assert "Worker" in result.output
+        assert seen == ["personal"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_failed_done_returns_tool_error(self):
+        async def replacement_run(self):
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "failed",
+                "result": "[Worker model error: TimeoutError]",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchWorkerTool()
+            result = await tool.execute(task="Fail task", profile="code", model_id="gpt-4o")
+
+        assert result.error
+        assert "failed" in result.output
+        assert "Worker model error" in result.error
+
 
 class TestDispatchParallelTool:
     @pytest.mark.asyncio
@@ -136,6 +181,65 @@ class TestDispatchParallelTool:
 
         assert "1 succeeded" in result.output
         assert "1 failed" in result.output
+        assert result.error
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_worker_done_failed_counts_as_failure(self):
+        """A worker can report failure without throwing; that must not be
+        counted as a successful dispatch."""
+
+        call_count = [0]
+
+        async def replacement_run(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                yield {"type": "worker_done", "data": {
+                    "worker_id": self.worker_id,
+                    "status": "failed",
+                    "result": "[Worker model error: TimeoutError]",
+                    "iterations": 1,
+                    "duration_ms": 10,
+                }}
+            else:
+                yield {"type": "worker_done", "data": {
+                    "worker_id": self.worker_id,
+                    "status": "completed",
+                    "result": "Task completed successfully.",
+                    "iterations": 1,
+                    "duration_ms": 10,
+                }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(tasks=[
+                {"task": "Task A", "profile": "code"},
+                {"task": "Task B", "profile": "code"},
+            ])
+
+        assert "1 succeeded" in result.output
+        assert "1 failed" in result.output
+        assert "(code," in result.output
+        assert "failed): 1 iterations" in result.output
+        assert result.error
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_acceptance_fail_counts_as_failure(self):
+        async def replacement_run(self):
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Could not verify.\nACCEPTANCE: FAIL",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(tasks=[{"task": "Task A", "profile": "code"}])
+
+        assert "0 succeeded" in result.output
+        assert "1 failed" in result.output
+        assert result.error
 
     @pytest.mark.asyncio
     async def test_dispatch_parallel_per_task_model_context_and_acceptance(self):
@@ -151,6 +255,7 @@ class TestDispatchParallelTool:
                 "profile": self.profile.name,
                 "task": self.task,
                 "context_files": self._context_files,
+                "agent_type": self.agent_type,
             })
             yield {"type": "worker_done", "data": {
                 "worker_id": self.worker_id,
@@ -188,8 +293,10 @@ class TestDispatchParallelTool:
         assert "Manager notes" in seen[0]["task"]
         assert "Return key routes" in seen[0]["task"]
         assert seen[0]["context_files"] == ["backend/app/main.py"]
+        assert seen[0]["agent_type"] == "coding"
         assert seen[1]["model_id"] == second_model
         assert seen[1]["profile"] == "reviewer"
+        assert seen[1]["agent_type"] == "coding"
 
     @pytest.mark.asyncio
     async def test_dispatch_parallel_empty_tasks(self, mock_litellm):

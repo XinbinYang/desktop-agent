@@ -44,6 +44,22 @@ class ProjectManager:
     _lock = threading.Lock()
 
     @classmethod
+    def _build_project_info(cls, project_path: Path, last_opened: Optional[str] = None) -> Dict[str, Any]:
+        git_info = cls._get_git_info(project_path)
+        return {
+            "path": str(project_path),
+            "name": project_path.name,
+            "git_branch": git_info.get("branch"),
+            "git_remote": git_info.get("remote_url"),
+            "git_ahead": git_info.get("ahead", 0),
+            "git_behind": git_info.get("behind", 0),
+            "git_modified": git_info.get("modified", 0),
+            "git_untracked": git_info.get("untracked", 0),
+            "git_staged": git_info.get("staged", 0),
+            "last_opened": last_opened or datetime.now(timezone.utc).isoformat(),
+        }
+
+    @classmethod
     def _load_recent(cls) -> List[Dict[str, Any]]:
         if RECENT_FILE.exists():
             try:
@@ -82,7 +98,8 @@ class ProjectManager:
             # 当前分支
             result = subprocess.run(
                 ["git", "-C", str(path), "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 info["branch"] = result.stdout.strip() or None
@@ -90,7 +107,8 @@ class ProjectManager:
             # Remote URL
             result = subprocess.run(
                 ["git", "-C", str(path), "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 info["remote_url"] = redact_sensitive_text(result.stdout.strip()) or None
@@ -100,7 +118,8 @@ class ProjectManager:
                 result = subprocess.run(
                     ["git", "-C", str(path), "rev-list", "--left-right",
                      f"--count", f"origin/{info['branch']}...{info['branch']}"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
                 )
                 if result.returncode == 0:
                     parts = result.stdout.strip().split("\t")
@@ -111,7 +130,8 @@ class ProjectManager:
             # Status counts
             result = subprocess.run(
                 ["git", "-C", str(path), "status", "--short"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 for line in result.stdout.strip().split("\n"):
@@ -139,20 +159,7 @@ class ProjectManager:
         if not project_path.is_dir():
             raise ValueError(f"路径不是目录: {path}")
 
-        git_info = cls._get_git_info(project_path)
-
-        project = {
-            "path": str(project_path),
-            "name": project_path.name,
-            "git_branch": git_info.get("branch"),
-            "git_remote": git_info.get("remote_url"),
-            "git_ahead": git_info.get("ahead", 0),
-            "git_behind": git_info.get("behind", 0),
-            "git_modified": git_info.get("modified", 0),
-            "git_untracked": git_info.get("untracked", 0),
-            "git_staged": git_info.get("staged", 0),
-            "last_opened": datetime.now(timezone.utc).isoformat(),
-        }
+        project = cls._build_project_info(project_path)
 
         cls._lock.acquire()
         try:
@@ -181,6 +188,25 @@ class ProjectManager:
         """返回当前项目信息"""
         with cls._lock:
             return dict(cls._current_project) if cls._current_project else None
+
+    @classmethod
+    def refresh_current(cls) -> Optional[Dict[str, Any]]:
+        """Refresh current project metadata without changing recent project ordering."""
+        with cls._lock:
+            current = dict(cls._current_project) if cls._current_project else None
+        if not current:
+            return None
+
+        project_path = Path(current["path"]).resolve()
+        if not project_path.exists():
+            raise ValueError(f"Path does not exist: {project_path}")
+        if not project_path.is_dir():
+            raise ValueError(f"Path is not a directory: {project_path}")
+
+        refreshed = cls._build_project_info(project_path, current.get("last_opened"))
+        with cls._lock:
+            cls._current_project = refreshed
+        return dict(refreshed)
 
     @classmethod
     def list_recent(cls) -> List[Dict[str, Any]]:
@@ -272,6 +298,12 @@ class ProjectManager:
         if not target.exists():
             return []
 
+        def has_visible_children(path: Path) -> bool:
+            try:
+                return any(not _should_exclude(child.name) for child in path.iterdir())
+            except PermissionError:
+                return False
+
         def build_tree(path: Path) -> List[Dict[str, Any]]:
             nodes = []
             try:
@@ -287,6 +319,7 @@ class ProjectManager:
                     if item.is_file():
                         node["extension"] = item.suffix.lstrip(".")
                     if item.is_dir():
+                        node["has_children"] = has_visible_children(item)
                         # 限制递归深度：仅当目录不太深时递归
                         depth = len(Path(rel).parts)
                         if depth < 3:

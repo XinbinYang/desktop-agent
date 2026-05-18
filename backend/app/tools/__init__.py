@@ -39,11 +39,24 @@ from app.tools.coding_tool import (
     RepoMapTool, CodeSearchTool, FileOutlineTool, FilePatchTool,
     VerifyProjectTool, RunReviewTool, WorktreeStatusTool,
 )
-from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool
+from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool, PlanUpdateTodosTool
 from app.tools.test_tool import RunTestsTool
 from app.tools.diagnostics_tool import ListDiagnosticsTool
 from app.tools.ocr_tool import OCRClickTool, OCRFindTool, OCRReadTool
 from app.tools.memory_tool import MemorySearchTool, MemoryHandoffTool, MemoryListTool
+from app.tools.collaboration_tool import (
+    ConsultCodingAgentTool,
+    DelegateToCodingAgentTool,
+    RequestPersonalContextTool,
+)
+from app.tools.skill_tool import (
+    SkillArchiveTool,
+    SkillDraftSaveTool,
+    SkillListTool,
+    SkillPublishTool,
+    SkillReadTool,
+    SkillValidateTool,
+)
 
 # 全局工具注册表
 ALL_TOOLS: list[BaseTool] = [
@@ -121,6 +134,7 @@ ALL_TOOLS: list[BaseTool] = [
     # Plan mode 工具
     PlanAskQuestionsTool(),
     PlanWriteDraftTool(),
+    PlanUpdateTodosTool(),
     RunTestsTool(),
     ListDiagnosticsTool(),
     OCRClickTool(),
@@ -130,6 +144,15 @@ ALL_TOOLS: list[BaseTool] = [
     MemorySearchTool(),
     MemoryHandoffTool(),
     MemoryListTool(),
+    ConsultCodingAgentTool(),
+    DelegateToCodingAgentTool(),
+    RequestPersonalContextTool(),
+    SkillDraftSaveTool(),
+    SkillValidateTool(),
+    SkillPublishTool(),
+    SkillListTool(),
+    SkillReadTool(),
+    SkillArchiveTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
@@ -150,10 +173,15 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     "verify_project", "run_review", "worktree_status",
     # Worker dispatch
     "dispatch_worker", "dispatch_parallel",
+    # Collaboration
+    "request_personal_context",
+    # Skill authoring
+    "skill_draft_save", "skill_validate", "skill_publish",
+    "skill_list", "skill_read", "skill_archive",
     # Knowledge base
     "knowledge_search", "knowledge_list",
     # Plan mode
-    "plan_ask_questions", "plan_write_draft",
+    "plan_ask_questions", "plan_write_draft", "plan_update_todos",
     # Testing & diagnostics
     "run_tests", "list_diagnostics",
     # Screenshot / browser (for debugging UI)
@@ -214,7 +242,12 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "verify_project", "run_review", "worktree_status",
     ],
     "Worker 派发": ["dispatch_worker", "dispatch_parallel"],
-    "Plan Mode": ["plan_ask_questions", "plan_write_draft"],
+    "Agent Collaboration": ["consult_coding_agent", "delegate_to_coding_agent", "request_personal_context"],
+    "Plan Mode": ["plan_ask_questions", "plan_write_draft", "plan_update_todos"],
+    "Skill Authoring": [
+        "skill_draft_save", "skill_validate", "skill_publish",
+        "skill_list", "skill_read", "skill_archive",
+    ],
     "记忆管理": ["memory_search", "memory_list", "memory_handoff_write"],
 }
 

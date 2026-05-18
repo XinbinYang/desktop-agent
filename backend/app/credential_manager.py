@@ -81,21 +81,24 @@ class CredentialManager:
                 # Git for Windows 自带 GCM
                 result = subprocess.run(
                     ["git", "config", "--system", "credential.helper"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
                 )
                 if "manager" in result.stdout.lower():
                     return True
                 # 或者直接检查 git-credential-manager-core.exe
                 result = subprocess.run(
                     ["where", "git-credential-manager.exe"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
                 )
                 if result.returncode == 0:
                     return True
             else:
                 result = subprocess.run(
                     ["git", "config", "--system", "credential.helper"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
                 )
                 if result.stdout.strip():
                     return True
@@ -239,7 +242,8 @@ class CredentialManager:
 
             result = subprocess.run(
                 ["git", "credential", "fill"],
-                input=input_data, capture_output=True, text=True, timeout=10
+                input=input_data, capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace",
             )
             if result.returncode != 0:
                 return None
@@ -269,7 +273,8 @@ class CredentialManager:
 
             result = subprocess.run(
                 ["git", "credential", "approve"],
-                input=input_data, capture_output=True, text=True, timeout=10
+                input=input_data, capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace",
             )
             return result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):

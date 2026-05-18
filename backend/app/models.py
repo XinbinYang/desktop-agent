@@ -1346,16 +1346,29 @@ class ModelRouter:
         """Unified streaming completion. Yields delta events then a 'done' event with full response."""
         provider_name = self._get_provider()[0]
         if provider_name == "kimi":
-            if self._kimi_prefers_openai_compatible():
-                async for event in self._call_kimi_openai_stream(
-                    messages=messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
-                ):
-                    yield event
-            else:
-                async for event in self._call_kimi_anthropic_stream(
-                    messages=messages, tools=tools, max_tokens=max_tokens, thinking_intensity=thinking_intensity,
-                ):
-                    yield event
+            # Kimi's coding endpoint does not deliver usable incremental SSE.
+            # Confirmed empirically on BOTH protocols it exposes:
+            #   - OpenAI-compatible  .../coding/v1  (/v1/chat/completions)
+            #   - Anthropic-compatible  .../coding  (/v1/messages)
+            # In both cases the stream connects and ends cleanly but the parsed
+            # message is empty ("completed with an empty message; falling back
+            # to non-stream"), matching the documented provider behaviour
+            # ("buffers until completion or returns an empty SSE body").
+            # Forcing a stream therefore only adds a wasted request before the
+            # non-stream fallback (2x upstream calls -> 429 in agent loops) with
+            # zero streaming gain. So Kimi uses a single non-stream call,
+            # replayed through the same event shape. (Revisit only if/when a
+            # Kimi endpoint that emits real token deltas exists — gate streaming
+            # on that specifically, never blanket-enable.)
+            response = await self.chat_completion_non_stream(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_intensity=thinking_intensity,
+            )
+            async for event in self._response_as_stream_events(response):
+                yield event
         elif self._is_deepseek():
             async for event in self._call_deepseek_stream(
                 messages=messages, tools=tools, temperature=temperature,

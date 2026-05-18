@@ -238,3 +238,76 @@ class TestFileSandbox:
         # 尝试用 ../ 跳出项目目录
         result = await read_tool.execute(path="../../outside.txt")
         assert "out of bounds" in result.error
+
+    @pytest.mark.asyncio
+    async def test_relative_path_writes_to_repo_root_not_cwd(self, write_tool):
+        """Regression: relative 'AGENTS/personal/__probe__.md' with
+        project_relative=False must land under repo_root (not backend/)
+        even though the test runner's cwd is backend/."""
+        from app.runtime_paths import repo_root
+
+        probe_rel = "AGENTS/personal/__test_probe__.md"
+        expected = repo_root() / probe_rel
+        # Clean up any leftover from previous runs
+        if expected.exists():
+            expected.unlink()
+
+        result = await write_tool.execute(path=probe_rel, content="probe ok")
+        assert result.error == "", f"unexpected error: {result.error}"
+
+        # Verify the file was created at the repo-root anchored path
+        assert expected.exists(), f"File not found at expected path: {expected}"
+        assert expected.read_text(encoding="utf-8") == "probe ok"
+
+        # Double-check: it should NOT exist under backend/
+        wrong = Path("backend") / probe_rel
+        assert not wrong.exists(), f"File incorrectly landed at {wrong}"
+
+        # Cleanup
+        expected.unlink(missing_ok=True)
+
+
+class TestFileSandboxUnrestricted:
+    """End-to-end path anchor tests with sandbox_mode=unrestricted.
+
+    Same assertions as TestFileSandbox but in unrestricted mode, since
+    the unrestricted code path in file_tool.py had the same cwd bug.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_unrestricted_mode(self, monkeypatch):
+        import app.config as config_mod
+
+        orig = config_mod.load_config
+
+        def wrapped():
+            c = orig()
+            c.settings.sandbox_mode = "unrestricted"
+            return c
+
+        monkeypatch.setattr(config_mod, "load_config", wrapped)
+
+    @pytest.fixture
+    def write_tool(self):
+        return FileWriteTool()
+
+    @pytest.mark.asyncio
+    async def test_relative_path_writes_to_repo_root_not_cwd(self, write_tool):
+        """Same regression test but exercising the unrestricted code path."""
+        from app.runtime_paths import repo_root
+
+        probe_rel = "AGENTS/personal/__test_probe_unrestricted__.md"
+        expected = repo_root() / probe_rel
+        if expected.exists():
+            expected.unlink()
+
+        result = await write_tool.execute(path=probe_rel, content="unrestricted ok")
+        assert result.error == "", f"unexpected error: {result.error}"
+
+        assert expected.exists(), f"File not found at expected path: {expected}"
+        assert expected.read_text(encoding="utf-8") == "unrestricted ok"
+
+        wrong = Path("backend") / probe_rel
+        assert not wrong.exists(), f"File incorrectly landed at {wrong}"
+
+        expected.unlink(missing_ok=True)

@@ -65,6 +65,9 @@ class Settings(BaseModel):
     thinking_policy_by_provider: Dict[str, Dict[str, Any]] = {}
     collaboration_mode: str = "serial"
     max_parallel_agents: int = 3
+    collaboration_enabled: bool = True
+    default_collaboration_mode: str = "hybrid"
+    auto_delegate_coding: str = "suggest"
     review_gate_enabled: bool = True
     auto_approve_rules: List[AutoApproveRule] = []
 

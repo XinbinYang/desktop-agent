@@ -29,6 +29,10 @@ describe('ChangesPanel', () => {
     expect(screen.getByTestId('diff-editor')).toBeInTheDocument()
     expect(screen.getByText('old')).toBeInTheDocument()
     expect(screen.getByText('new')).toBeInTheDocument()
+    expect(screen.getByText('1 accepted')).toBeInTheDocument()
+    expect(screen.getByText('accepted')).toBeInTheDocument()
+    expect(screen.queryByText('Accept All')).not.toBeInTheDocument()
+    expect(screen.queryByText('pending')).not.toBeInTheDocument()
   })
 
   it('opens selected edit path', () => {

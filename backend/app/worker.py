@@ -9,6 +9,14 @@ from app.message_utils import trim_messages, parse_tool_args, execute_tool
 WORKER_PROFILES: Dict[str, "WorkerProfile"] = {}
 
 
+def format_worker_exception(exc: Exception) -> str:
+    """Return a useful worker-facing exception string even for blank exceptions."""
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
+
+
 @dataclass
 class WorkerProfile:
     name: str
@@ -433,11 +441,14 @@ class WorkerSession:
         context_files: Optional[List[str]] = None,
         run_id: str = "",
         parent_tool_call_id: str = "",
+        agent_type: str = "coding",
+        active_skill_ids: Optional[List[str]] = None,
     ):
         self.worker_id = worker_id
         self.task = task
         self.profile = WORKER_PROFILES.get(profile_name, WORKER_PROFILES["general"])
         self.model_id = model_id
+        self.agent_type = agent_type if agent_type in ("coding", "personal") else "coding"
         self.run_id = run_id
         self.parent_tool_call_id = parent_tool_call_id
         self.router = ModelRouter(model_id)
@@ -448,9 +459,57 @@ class WorkerSession:
         self._context_files = context_files or []
         self._stale_count = 0
         self._started_at = time.time()
+        self.matched_skills = self._resolve_matched_skills(active_skill_ids)
         self._tool_schemas_cache = self._build_tool_schemas()
         self._build_system_prompt()
         self._add_task_message()
+
+    def _resolve_matched_skills(self, active_skill_ids: Optional[List[str]] = None) -> List[str]:
+        """Resolve enabled skills for this worker's subtask.
+
+        Workers are subagents, so skip the meta "using-superpowers" skill and
+        inject the concrete workflow skills that should shape execution.
+        """
+        try:
+            from app.project_manager import ProjectManager
+            from app.skills import SkillManager
+
+            role_id = "code-expert" if self.agent_type == "coding" else "desktop-agent"
+            if active_skill_ids is None:
+                project = ProjectManager.get_current()
+                skill_ids = SkillManager.match_skills(
+                    self.task,
+                    role_id,
+                    project is not None,
+                    agent_type=self.agent_type,
+                )
+            else:
+                skill_ids = [
+                    skill_id
+                    for skill_id in active_skill_ids
+                    if SkillManager.is_skill_enabled(skill_id, self.agent_type, role_id)
+                ]
+            return [skill_id for skill_id in skill_ids if skill_id != "using-superpowers"]
+        except Exception:
+            return []
+
+    def _build_skill_prompt(self) -> str:
+        if not self.matched_skills:
+            return ""
+        try:
+            from app.skills import SkillManager
+
+            skill_prompt = SkillManager.build_skill_prompt(self.matched_skills)
+        except Exception:
+            return ""
+        if not skill_prompt:
+            return ""
+        return (
+            "\n## Worker Active Skills\n"
+            "These skills matched this worker's subtask and are enabled for the agent. "
+            "Follow them where they apply, while keeping the assigned worker scope narrow.\n"
+            f"{skill_prompt}\n"
+        )
 
     def _build_system_prompt(self):
         from app.tools import get_static_tool, list_static_tool_names
@@ -475,6 +534,9 @@ class WorkerSession:
 """
         if self.profile.system_prompt_extra:
             prompt += f"\n{self.profile.system_prompt_extra}\n"
+        skill_prompt = self._build_skill_prompt()
+        if skill_prompt:
+            prompt += skill_prompt
         self.messages.append({"role": "system", "content": prompt})
 
     def _add_task_message(self):
@@ -521,6 +583,8 @@ class WorkerSession:
             "task": self.task,
             "profile": self.profile.name,
             "model_id": self.model_id,
+            "agent_type": self.agent_type,
+            "skills": self.matched_skills,
             "status": "running",
         })
 
@@ -543,7 +607,7 @@ class WorkerSession:
             except Exception as e:
                 yield self._worker_event("worker_done", {
                     "status": "failed",
-                    "result": f"[Worker model error: {e}]",
+                    "result": f"[Worker model error: {format_worker_exception(e)}]",
                     "iterations": self.iteration,
                     "duration_ms": round((time.time() - self._started_at) * 1000),
                 })

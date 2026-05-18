@@ -172,15 +172,87 @@ export interface RunEvent {
     | 'run_created'
     | 'context_pack'
     | 'skills_matched'
+    | 'skill_draft_ready'
     | 'guardrail_decision'
     | 'approval_required'
     | 'verification_start'
     | 'verification_result'
     | 'review_finding'
+    | 'collaboration_run_created'
+    | 'collaboration_task_update'
+    | 'agent_message'
+    | 'artifact_ready'
+    | 'decision_required'
+    | 'collaboration_run_completed'
     | 'run_completed';
   runId?: string;
   timestamp: number;
   data: Record<string, any>;
+}
+
+export interface ArtifactRef {
+  id: string;
+  type: string;
+  title: string;
+  url?: string;
+  path?: string;
+  content?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface ResultPacket {
+  status: 'pass' | 'fail' | 'blocked';
+  summary: string;
+  details?: string;
+  changed_files?: string[];
+  tests_run?: string[];
+  verification_passed?: boolean | null;
+  review_passed?: boolean | null;
+  assumptions?: string[];
+  blockers?: string[];
+  artifacts?: ArtifactRef[];
+}
+
+export interface CollaborationTask {
+  task_id: string;
+  run_id: string;
+  owner: 'personal' | 'coding' | 'worker';
+  mode: 'consult' | 'execute' | 'handoff';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'cancelled';
+  packet: Record<string, any>;
+  result?: ResultPacket | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CollaborationRun {
+  run_id: string;
+  session_id: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  source_agent: 'personal' | 'coding' | 'worker';
+  target_agent: 'personal' | 'coding' | 'worker';
+  mode: 'consult' | 'execute' | 'handoff';
+  goal: string;
+  project_path?: string;
+  task_ids: string[];
+  artifacts: ArtifactRef[];
+  summary?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentMention {
+  id: string;
+  label: string;
+  agent_type: AgentType;
+}
+
+export interface AgentMessage {
+  agent_type: AgentType;
+  text: string;
+  status?: string;
+  run_id?: string;
+  task_id?: string;
 }
 
 export type ClientChatMode = "agent" | "plan";
@@ -197,6 +269,13 @@ export interface PlanQuestion {
   allow_multiple?: boolean;
   options: PlanQuestionOption[];
   selected?: string[];
+}
+
+export interface PlanDecisionAnswer {
+  question_id: string;
+  selected: string[];
+  other_text?: string;
+  skipped?: boolean;
 }
 
 export type PlanTodoStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
@@ -219,13 +298,20 @@ export interface StructuredPlanStep {
   parallel_group?: string;
 }
 
+export interface CriticalFile {
+  path: string;
+  change?: string;
+}
+
 export interface StructuredPlanDraft {
   goal: string;
+  context?: string;
   assumptions: string[];
   steps: StructuredPlanStep[];
   todos: PlanTodo[];
   risks: string[];
   acceptance_criteria: string[];
+  critical_files?: CriticalFile[];
 }
 
 export interface PlanState {
@@ -237,6 +323,7 @@ export interface PlanState {
   questions: PlanQuestion[];
   todos: PlanTodo[];
   decisions: Record<string, string[]>;
+  decision_notes?: Record<string, string>;
   approved: boolean;
   /** Server: full todos withheld until user answers clarification questions */
   pending_clarification?: boolean;
@@ -274,6 +361,8 @@ export type AssistantBlock =
     }
   | { type: 'image'; base64: string; timestamp: number }
   | { type: 'plan_questions'; questions: PlanQuestion[]; timestamp: number }
+  | { type: 'plan_answers'; questions: PlanQuestion[]; answers: PlanDecisionAnswer[]; timestamp: number }
+  | { type: 'plan_execution'; goal: string; todos: PlanTodo[]; timestamp: number }
   | {
       type: 'plan_draft';
       goal: string;
@@ -319,6 +408,7 @@ export interface FileNode {
   type: 'file' | 'dir';
   path: string;
   extension?: string;
+  has_children?: boolean;
   children?: FileNode[];
 }
 
@@ -331,6 +421,8 @@ export interface OpenFile {
   isModified?: boolean;
   hasConflict?: boolean;
   isPinned?: boolean;
+  readOnly?: boolean;
+  source?: 'project' | 'plan' | 'artifact';
 }
 
 export interface EditorGroup {
@@ -356,6 +448,41 @@ export interface SkillCatalogItem {
   recommendedFor: AgentType[];
   category: string;
   trustLevel: 'local' | 'trusted' | 'external' | string;
+  status?: 'draft' | 'published' | 'archived' | string;
+  scopes?: AgentType[];
+  version?: string;
+  validation?: SkillValidationSummary;
+}
+
+export interface SkillValidationIssue {
+  level: 'error' | 'warning' | 'risk' | string;
+  code: string;
+  message: string;
+}
+
+export interface SkillValidationSummary {
+  passed?: boolean;
+  issues?: SkillValidationIssue[];
+  warnings?: SkillValidationIssue[];
+  risks?: SkillValidationIssue[];
+  name?: string;
+  description?: string;
+}
+
+export interface SkillDraftItem {
+  id: string;
+  draft_id: string;
+  skill_id: string;
+  name: string;
+  description: string;
+  status: 'draft' | string;
+  source: string;
+  scopes: AgentType[];
+  enabledByAgent: Record<AgentType, boolean>;
+  path: string;
+  created_at?: string;
+  updated_at?: string;
+  validation?: SkillValidationSummary;
 }
 
 export interface SkillPreset {
@@ -418,7 +545,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'skills_matched' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 

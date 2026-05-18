@@ -101,6 +101,56 @@ describe('Sidebar', () => {
     expect(screen.queryByText('Open Browser')).not.toBeInTheDocument()
   })
 
+  it('shows skill drafts awaiting review', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/api/skills/drafts')) {
+        return {
+          ok: true,
+          json: async () => ({
+            drafts: [{
+              id: 'daily-report-1',
+              draft_id: 'daily-report-1',
+              skill_id: 'user:daily-report',
+              name: 'daily-report',
+              description: 'Use when writing daily reports.',
+              status: 'draft',
+              source: 'user',
+              scopes: ['personal'],
+              enabledByAgent: { personal: true, coding: false },
+              path: 'AGENTS/skills/.drafts/daily-report-1',
+              validation: { passed: true, issues: [], warnings: [], risks: [] },
+            }],
+          }),
+        }
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          skills: [{
+            id: 'using-superpowers',
+            name: 'using-superpowers',
+            description: 'Load relevant skills only when needed.',
+            source: 'superpowers',
+            enabledByAgent: { personal: true, coding: true },
+            recommendedFor: ['personal', 'coding'],
+            category: 'core',
+            trustLevel: 'local',
+          }],
+          preferences: { personal: { 'using-superpowers': true }, coding: { 'using-superpowers': true } },
+          defaults: { personal: {}, coding: {} },
+          presets: [],
+        }),
+      }
+    }))
+
+    render(<Sidebar {...defaultProps} />)
+
+    expect(await screen.findByText('Drafts awaiting review')).toBeInTheDocument()
+    expect(screen.getByText('daily-report')).toBeInTheDocument()
+    expect(screen.getByText('Validated')).toBeInTheDocument()
+    expect(screen.getByText('Publish')).toBeInTheDocument()
+  })
+
   it('shows settings content when activeSection is settings', () => {
     render(<Sidebar {...defaultProps} activeSection="settings" />)
     expect(screen.getByText('Active Agent')).toBeInTheDocument()

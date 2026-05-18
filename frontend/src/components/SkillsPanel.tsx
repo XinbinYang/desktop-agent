@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ChevronDown, ChevronRight, Loader2, Sparkles } from 'lucide-react';
+import { AlertCircle, Archive, CheckCircle2, ChevronDown, ChevronRight, Loader2, RefreshCw, Sparkles } from 'lucide-react';
 import { API_BASE } from '../config';
-import type { AgentType, SkillCatalogItem, SkillCatalogResponse, SkillPreferences, SkillPreset } from '../types';
+import type { AgentType, SkillCatalogItem, SkillCatalogResponse, SkillDraftItem, SkillPreferences, SkillPreset } from '../types';
 import { AGENT_LABEL } from '../lib/agentProfiles';
 import { cn } from './ui/cn';
 
@@ -23,6 +23,7 @@ const CATEGORY_ORDER = [
   'multi-agent',
   'workspace-release',
   'writing',
+  'user',
   'personal',
   'other',
 ];
@@ -35,6 +36,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   'multi-agent': 'Multi-Agent',
   'workspace-release': 'Workspace & Release',
   writing: 'Writing',
+  user: 'User Skills',
   personal: 'Personal',
   other: 'Other',
 };
@@ -72,6 +74,7 @@ function isEnabled(skill: SkillCatalogItem, preferences: SkillPreferences, agent
 }
 
 function getCategoryId(skill: SkillCatalogItem): string {
+  if (skill.source === 'user') return 'user';
   if (skill.source === 'personal') return 'personal';
   return SKILL_CATEGORY_BY_ID[skill.id] || skill.category || 'other';
 }
@@ -151,6 +154,7 @@ function CategoryCheckbox({
 
 export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
   const [skills, setSkills] = useState<SkillCatalogItem[]>([]);
+  const [drafts, setDrafts] = useState<SkillDraftItem[]>([]);
   const [presets, setPresets] = useState<SkillPreset[]>([]);
   const [preferences, setPreferences] = useState<SkillPreferences>(emptyPreferences);
   const [loading, setLoading] = useState(true);
@@ -162,12 +166,19 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${API_BASE}/api/skills`, { signal });
+      const [response, draftsResponse] = await Promise.all([
+        fetch(`${API_BASE}/api/skills`, { signal }),
+        fetch(`${API_BASE}/api/skills/drafts`, { signal }),
+      ]);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = (await response.json()) as SkillCatalogResponse;
       setSkills(data.skills || []);
       setPresets(data.presets || []);
       setPreferences(normalizePreferences(data.preferences));
+      if (draftsResponse.ok) {
+        const draftsData = (await draftsResponse.json()) as { drafts?: SkillDraftItem[] };
+        setDrafts(draftsData.drafts || []);
+      }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         setError('Failed to load skills');
@@ -240,6 +251,61 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     }
   };
 
+  const validateDraft = async (draft: SkillDraftItem) => {
+    setPendingKey(`draft:${draft.draft_id}:validate`);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/skills/drafts/${encodeURIComponent(draft.draft_id)}/validate`, {
+        method: 'POST',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadCatalog();
+    } catch {
+      setError('Skill draft validation failed');
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
+  const publishDraft = async (draft: SkillDraftItem) => {
+    setPendingKey(`draft:${draft.draft_id}:publish`);
+    setError(null);
+    try {
+      const enableFor = (draft.scopes || []).includes(activeAgent) ? [activeAgent] : ['personal'];
+      const response = await fetch(`${API_BASE}/api/skills/drafts/${encodeURIComponent(draft.draft_id)}/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enable_for: enableFor, allow_risky: false }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as SkillCatalogResponse;
+      setSkills(data.skills || []);
+      setPresets(data.presets || []);
+      setPreferences(normalizePreferences(data.preferences));
+      await loadCatalog();
+    } catch {
+      setError('Skill draft was not published');
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
+  const archiveUserSkill = async (skill: SkillCatalogItem) => {
+    setPendingKey(`archive:${skill.id}`);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/skills/${encodeURIComponent(skill.id)}/archive`, {
+        method: 'POST',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadCatalog();
+    } catch {
+      setError('Skill was not archived');
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
   const updatePreference = (skill: SkillCatalogItem, nextEnabled: boolean) => {
     const previous = preferences;
     const next = normalizePreferences(previous);
@@ -285,37 +351,59 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
   const renderSkill = (skill: SkillCatalogItem, categoryPending: boolean) => {
     const enabled = isEnabled(skill, preferences, activeAgent);
     const pending = pendingKey === skill.id || categoryPending;
-    const sourceLabel = skill.source === 'personal' ? 'Personal' : skill.source === 'superpowers' ? 'Local' : skill.source;
+    const archivePending = pendingKey === `archive:${skill.id}`;
+    const sourceLabel = skill.source === 'personal'
+      ? 'Personal'
+      : skill.source === 'superpowers'
+        ? 'Local'
+        : skill.source === 'user'
+          ? 'User'
+          : skill.source;
 
     return (
-      <label
+      <div
         key={skill.id}
         className={cn(
-          'flex items-center gap-2 rounded border border-border bg-surface px-2 py-1.5 transition-colors',
+          'flex items-center gap-1.5 rounded border border-border bg-surface px-2 py-1.5 transition-colors',
           enabled ? 'border-accent/25 bg-accent/5' : 'hover:bg-surface-hover'
         )}
         title={skill.description || skill.name}
       >
-        <span className="relative flex h-4 w-4 items-center justify-center">
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={pending}
-            onChange={(event) => updatePreference(skill, event.target.checked)}
-            className="h-3.5 w-3.5 rounded border-border bg-surface accent-accent"
-            aria-label={`${enabled ? 'Disable' : 'Enable'} ${skill.name} for ${AGENT_LABEL[activeAgent]}`}
-          />
-          {pending && <Loader2 className="absolute h-3 w-3 animate-spin text-accent" />}
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-xs font-medium text-fg">{skill.name}</span>
-          <span className="mt-1 flex flex-wrap gap-1">
-            <Badge tone={enabled ? 'success' : 'neutral'}>{enabled ? 'Auto' : 'Off'}</Badge>
-            {skill.recommendedFor.includes(activeAgent) && <Badge tone="accent">Rec</Badge>}
-            <Badge>{sourceLabel}</Badge>
+        <label className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="relative flex h-4 w-4 items-center justify-center">
+            <input
+              type="checkbox"
+              checked={enabled}
+              disabled={pending || archivePending}
+              onChange={(event) => updatePreference(skill, event.target.checked)}
+              className="h-3.5 w-3.5 rounded border-border bg-surface accent-accent"
+              aria-label={`${enabled ? 'Disable' : 'Enable'} ${skill.name} for ${AGENT_LABEL[activeAgent]}`}
+            />
+            {pending && <Loader2 className="absolute h-3 w-3 animate-spin text-accent" />}
           </span>
-        </span>
-      </label>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-medium text-fg">{skill.name}</span>
+            <span className="mt-1 flex flex-wrap gap-1">
+              <Badge tone={enabled ? 'success' : 'neutral'}>{enabled ? 'Auto' : 'Off'}</Badge>
+              {skill.recommendedFor.includes(activeAgent) && <Badge tone="accent">Rec</Badge>}
+              <Badge>{sourceLabel}</Badge>
+              {skill.version && <Badge>{skill.version}</Badge>}
+            </span>
+          </span>
+        </label>
+        {skill.source === 'user' && (
+          <button
+            type="button"
+            disabled={archivePending}
+            onClick={() => archiveUserSkill(skill)}
+            className="shrink-0 rounded p-1 text-fg-muted hover:bg-surface-hover hover:text-danger disabled:opacity-60"
+            title="Archive skill"
+            aria-label={`Archive ${skill.name}`}
+          >
+            {archivePending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Archive className="h-3 w-3" />}
+          </button>
+        )}
+      </div>
     );
   };
 
@@ -364,6 +452,58 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     );
   };
 
+  const renderDraft = (draft: SkillDraftItem) => {
+    const validation = draft.validation || {};
+    const issueCount = (validation.issues || []).length;
+    const riskCount = (validation.risks || []).length;
+    const warningCount = (validation.warnings || []).length;
+    const validating = pendingKey === `draft:${draft.draft_id}:validate`;
+    const publishing = pendingKey === `draft:${draft.draft_id}:publish`;
+    const canPublish = validation.passed === true;
+
+    return (
+      <div key={draft.draft_id} className="rounded border border-border bg-surface px-2 py-1.5">
+        <div className="flex items-start gap-2">
+          <span className="mt-0.5 shrink-0 text-accent">
+            {canPublish ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-medium text-fg">{draft.name}</span>
+            <span className="mt-0.5 block line-clamp-2 text-[10px] leading-snug text-fg-muted">
+              {draft.description}
+            </span>
+            <span className="mt-1 flex flex-wrap gap-1">
+              <Badge tone={canPublish ? 'success' : 'neutral'}>{canPublish ? 'Validated' : 'Draft'}</Badge>
+              {issueCount > 0 && <Badge>{issueCount} errors</Badge>}
+              {riskCount > 0 && <Badge>{riskCount} risks</Badge>}
+              {warningCount > 0 && <Badge>{warningCount} warnings</Badge>}
+            </span>
+          </span>
+        </div>
+        <div className="mt-2 flex items-center gap-1">
+          <button
+            type="button"
+            disabled={!!pendingKey}
+            onClick={() => validateDraft(draft)}
+            className="inline-flex items-center gap-1 rounded border border-border bg-surface-alt px-2 py-1 text-[10px] text-fg-secondary hover:bg-surface-hover disabled:opacity-60"
+          >
+            {validating ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            Validate
+          </button>
+          <button
+            type="button"
+            disabled={!!pendingKey || !canPublish}
+            onClick={() => publishDraft(draft)}
+            className="inline-flex items-center gap-1 rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/15 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {publishing ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle2 className="h-3 w-3" />}
+            Publish
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-3">
       <div>
@@ -388,12 +528,20 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           Loading skills
         </div>
-      ) : skills.length === 0 ? (
+      ) : skills.length === 0 && drafts.length === 0 ? (
         <div className="rounded border border-border bg-surface-alt px-2 py-3 text-center text-xs text-fg-muted">
           No local skills found.
         </div>
       ) : (
         <>
+          {drafts.length > 0 && (
+            <div className="space-y-1 rounded border border-border bg-surface-alt p-1.5">
+              <div className="px-1 text-[10px] font-medium text-fg-muted">Drafts awaiting review</div>
+              <div className="space-y-1">
+                {drafts.map(renderDraft)}
+              </div>
+            </div>
+          )}
           {activePresets.length > 0 && (
             <div className="space-y-1 rounded border border-border bg-surface-alt p-1.5">
               <div className="px-1 text-[10px] font-medium text-fg-muted">Task presets</div>

@@ -8,6 +8,7 @@ interface CodeEditorProps {
   content: string;
   filename: string;
   isModified?: boolean;
+  readOnly?: boolean;
   onChange?: (value: string) => void;
   onSave?: (value: string) => void;
 }
@@ -20,6 +21,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   content,
   filename,
   isModified,
+  readOnly = false,
   onChange,
   onSave,
 }) => {
@@ -52,27 +54,34 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     ensureMonacoThemes(monaco);
 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      if (readOnly) return;
       if (onSave && currentValueRef.current !== undefined) {
         onSave(currentValueRef.current);
         setHasChanged(false);
       }
     });
-  }, [onSave, resolved]);
+  }, [onSave, readOnly]);
 
   const handleChange = useCallback((value: string | undefined) => {
+    if (readOnly) return;
     if (value === undefined) return;
     currentValueRef.current = value;
     setHasChanged(true);
     onChange?.(value);
-  }, [onChange]);
+  }, [onChange, readOnly]);
 
-  const showModified = isModified || hasChanged;
+  const showModified = !readOnly && (isModified || hasChanged);
 
   return (
     <div className="h-full flex flex-col bg-app">
       <div className="flex items-center justify-between bg-surface px-3 py-1 text-[10px] text-fg-secondary border-b border-border z-10 shrink-0">
         <div className="flex items-center gap-2">
           <span>{filename}</span>
+          {readOnly && (
+            <span className="rounded border border-border-subtle px-1.5 py-0.5 text-[10px] text-fg-muted">
+              Read-only
+            </span>
+          )}
           {showModified && (
             <span className="w-1.5 h-1.5 rounded-full bg-accent" title="已修改" />
           )}
@@ -81,6 +90,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           {showModified && (
             <button
               onClick={() => {
+                if (readOnly) return;
                 if (onSave && currentValueRef.current !== undefined) {
                   onSave(currentValueRef.current);
                   setHasChanged(false);
@@ -116,7 +126,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             renderWhitespace: 'selection',
             folding: true,
             bracketPairColorization: { enabled: true },
-            readOnly: false,
+            readOnly,
           }}
           loading={
             <div className="h-full flex items-center justify-center text-fg-muted text-xs">

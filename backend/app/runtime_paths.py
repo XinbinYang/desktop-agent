@@ -15,9 +15,18 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def workspace_root() -> Path:
+    """Canonical agent workspace root (contains AGENTS/). Single source of truth
+    for file tool sandbox, prompt rendering, and all identity-file paths.
+
+    Currently equals the repo root so AGENTS/ stays version-controlled.
+    """
+    return repo_root()
+
+
 def agents_dir() -> Path:
-    """Agent workspace directory at the project root (AGENTS/)."""
-    return repo_root() / "AGENTS"
+    """Agent workspace directory (AGENTS/ under workspace_root)."""
+    return workspace_root() / "AGENTS"
 
 
 def bundled_root() -> Path:

@@ -181,18 +181,54 @@ class EvolutionEngine:
     def _crystallize_skills(cls) -> List[str]:
         """Analyze recent successful tasks and generate skill templates.
 
-        This is a simplified version that creates placeholder skill files.
-        In a full implementation, this would call an LLM to analyze task patterns.
+        Creates inert skill drafts. Publishing requires user review.
         """
-        skills_dir = AgentManager._personal_dir() / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-
         new_skills: List[str] = []
 
         # Check for common task patterns in recent diaries
         diary_text = cls._load_recent_summary()
         if not diary_text:
             return new_skills
+
+        draft_patterns = {
+            "file-organization": ["整理", "文件", "organize", "file"],
+            "web-search": ["搜索", "查找", "search", "find"],
+            "data-analysis": ["分析", "数据", "analysis", "data"],
+            "code-review": ["审查", "review", "检查代码"],
+        }
+
+        try:
+            from app.skill_authoring import list_drafts, list_published_entries, save_draft
+
+            existing_names = {
+                str(d.get("name", ""))
+                for d in list_drafts()
+            } | {
+                str(e.get("name", ""))
+                for e in list_published_entries(include_archived=False).values()
+            }
+        except Exception as exc:
+            logger.warning("Skill draft creation unavailable: %s", exc)
+            return new_skills
+
+        diary_lower = diary_text.lower()
+        for skill_name, keywords in draft_patterns.items():
+            if skill_name in existing_names:
+                continue
+            if any(kw.lower() in diary_lower for kw in keywords):
+                try:
+                    save_draft(
+                        name=skill_name,
+                        description=f"Use when handling recurring tasks related to {', '.join(keywords)}.",
+                        body=cls._generate_skill_template(skill_name, keywords),
+                        scopes=["personal"],
+                        created_from="evolution",
+                    )
+                    new_skills.append(skill_name)
+                except Exception as exc:
+                    logger.warning("Failed to create skill draft %s: %s", skill_name, exc)
+
+        return new_skills
 
         # Simple pattern detection
         patterns = {

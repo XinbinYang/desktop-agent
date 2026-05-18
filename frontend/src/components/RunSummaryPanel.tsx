@@ -23,6 +23,13 @@ function lastEvent(items: RunEvent[]): RunEvent | undefined {
   return items.length ? items[items.length - 1] : undefined;
 }
 
+function isCollaborationEvent(event: RunEvent): boolean {
+  return event.type.startsWith('collaboration_') ||
+    event.type === 'agent_message' ||
+    event.type === 'artifact_ready' ||
+    event.type === 'decision_required';
+}
+
 function statusClass(status?: string): string {
   if (status === 'completed' || status === 'applied' || status === 'merged') return 'text-emerald-400';
   if (status === 'failed' || status === 'cancelled' || status === 'max_iterations_reached') return 'text-red-400';
@@ -87,12 +94,14 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
 
   const selected = grouped.find((g) => g.runId === selectedRunId) || grouped[0];
   const items = selected?.items || [];
-  const created = items.find((e) => e.type === 'run_created');
+  const created = items.find((e) => e.type === 'run_created' || e.type === 'collaboration_run_created');
   const context = [...items].reverse().find((e) => e.type === 'context_pack');
-  const completed = [...items].reverse().find((e) => e.type === 'run_completed');
+  const completed = [...items].reverse().find((e) => e.type === 'run_completed' || e.type === 'collaboration_run_completed');
   const guardrails = items.filter((e) => e.type === 'guardrail_decision' || e.type === 'approval_required');
   const verifications = items.filter((e) => e.type === 'verification_result');
   const findings = items.filter((e) => e.type === 'review_finding');
+  const collaborationEvents = items.filter(isCollaborationEvent);
+  const selectedIsCollaboration = collaborationEvents.length > 0;
   const status = completed?.data?.status || created?.data?.status || 'running';
   const quality = qualitySummary(completed);
 
@@ -108,9 +117,10 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
     <div className="h-full flex min-w-0 bg-surface">
       <div className="w-56 shrink-0 border-r border-border overflow-y-auto">
         {grouped.map((run) => {
-          const runCreated = run.items.find((e) => e.type === 'run_created');
-          const runDone = [...run.items].reverse().find((e) => e.type === 'run_completed');
+          const runCreated = run.items.find((e) => e.type === 'run_created' || e.type === 'collaboration_run_created');
+          const runDone = [...run.items].reverse().find((e) => e.type === 'run_completed' || e.type === 'collaboration_run_completed');
           const runStatus = runDone?.data?.status || 'running';
+          const isCollab = run.items.some(isCollaborationEvent);
           return (
             <button
               key={run.runId}
@@ -123,7 +133,7 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
                 <span className={`text-[10px] uppercase ${statusClass(runStatus)}`}>{runStatus}</span>
               </div>
               <div className="mt-1 text-[11px] text-fg-muted truncate">
-                {runCreated?.data?.mode || 'current'} {formatTime(lastEvent(run.items)?.timestamp)}
+                {isCollab ? 'collab' : runCreated?.data?.mode || 'current'} {formatTime(lastEvent(run.items)?.timestamp)}
               </div>
             </button>
           );
@@ -137,6 +147,7 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
             <div className="mt-1 text-sm font-semibold text-fg font-mono truncate">{selected?.runId}</div>
             <div className={`mt-1 text-xs ${statusClass(status)}`}>{status}</div>
           </div>
+          {!selectedIsCollaboration && (
           <div className="flex gap-2">
             <button
               type="button"
@@ -171,6 +182,7 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
               <Trash2 className="w-3 h-3" /> Discard
             </button>
           </div>
+          )}
         </div>
 
         {created && (
@@ -181,14 +193,49 @@ export function RunSummaryPanel({ events, onOpenWorktree, onApplyRun, onMergeRun
             <dl className="grid grid-cols-[110px_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
               <dt className="text-fg-muted">Mode</dt>
               <dd className="text-fg">{created.data.mode || '-'}</dd>
+              {created.data.goal && (
+                <>
+                  <dt className="text-fg-muted">Goal</dt>
+                  <dd className="text-fg truncate" title={created.data.goal}>{created.data.goal}</dd>
+                </>
+              )}
               <dt className="text-fg-muted">Project</dt>
               <dd className="text-fg truncate" title={created.data.project_path}>{created.data.project_path || '-'}</dd>
-              <dt className="text-fg-muted">Worktree</dt>
-              <dd className="text-fg truncate" title={created.data.worktree_path}>{created.data.worktree_path || '-'}</dd>
-              <dt className="text-fg-muted">Base</dt>
-              <dd className="text-fg font-mono truncate">{created.data.base_branch || '-'} {created.data.base_commit || ''}</dd>
+              {!selectedIsCollaboration && (
+                <>
+                  <dt className="text-fg-muted">Worktree</dt>
+                  <dd className="text-fg truncate" title={created.data.worktree_path}>{created.data.worktree_path || '-'}</dd>
+                  <dt className="text-fg-muted">Base</dt>
+                  <dd className="text-fg font-mono truncate">{created.data.base_branch || '-'} {created.data.base_commit || ''}</dd>
+                </>
+              )}
             </dl>
           </div>
+        )}
+
+        {collaborationEvents.length > 0 && (
+          <section className="border border-border bg-surface-alt rounded p-3">
+            <div className="text-xs font-semibold text-fg mb-2">Collaboration Timeline</div>
+            <div className="space-y-2">
+              {collaborationEvents.map((event) => {
+                const taskStatus = event.data?.status || event.data?.result?.status || '';
+                const message = event.data?.text || event.data?.summary || event.data?.goal || event.data?.artifact?.title || '';
+                return (
+                  <div key={event.id} className="border-t border-border/60 first:border-t-0 pt-2 first:pt-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-fg">{event.type.replace(/_/g, ' ')}</span>
+                      <span className={`text-[10px] uppercase ${statusClass(taskStatus)}`}>{taskStatus || formatTime(event.timestamp)}</span>
+                    </div>
+                    {message && (
+                      <div className="mt-1 text-[11px] text-fg-muted whitespace-pre-wrap line-clamp-4">
+                        {message}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
         )}
 
         <div className={`border rounded p-3 ${quality.tone}`}>

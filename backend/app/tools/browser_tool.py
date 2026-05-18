@@ -29,6 +29,19 @@ def set_browser_session(session_id: str):
     """设置当前浏览器会话 ID（由 AgentSession 调用）"""
     _BROWSER_SESSION_CTX.set(session_id)
 
+async def close_browser_session(session_id: str) -> None:
+    """Close and forget the Playwright resources owned by one agent session."""
+    sess = _SESSIONS.pop(session_id, None)
+    if not sess:
+        return
+    if sess.get("page"):
+        await sess["page"].close()
+    if sess.get("browser"):
+        await sess["browser"].close()
+    if sess.get("playwright"):
+        await sess["playwright"].stop()
+
+
 class BrowserNavigateTool(BaseTool):
     name = "browser_navigate"
     description = "在浏览器中打开指定网址。如果没有打开浏览器会自动启动。"

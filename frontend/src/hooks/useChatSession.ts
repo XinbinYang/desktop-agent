@@ -12,6 +12,7 @@ import {
   isRetryableError,
   ThinkingIntensity,
   PlanQuestion,
+  PlanDecisionAnswer,
   PlanState,
   PlanTodo,
   StructuredPlanDraft,
@@ -62,9 +63,13 @@ function appendBlock(
         (lastBlock.type === 'thinking' || lastBlock.type === 'text') &&
         !sealedThinking
       ) {
+        // The first real token replaces the "Waiting for model response..."
+        // placeholder instead of being appended after it.
+        const prevText = (lastBlock as { text: string }).text;
+        const base = prevText === THINKING_PLACEHOLDER_TEXT ? '' : prevText;
         blocks[blocks.length - 1] = {
           ...lastBlock,
-          text: (lastBlock as { text: string }).text + (block as { text: string }).text,
+          text: base + (block as { text: string }).text,
         } as AssistantBlock;
         updated[updated.length - 1] = { ...last, blocks };
         return updated;
@@ -133,6 +138,23 @@ function refreshLatestAssistantSummary(messages: ChatMessage[]): ChatMessage[] {
   return messages;
 }
 
+function hasOnlyPlanQuestionNoise(blocks: AssistantBlock[] = []): boolean {
+  return blocks.every((block) =>
+    block.type === 'thinking' ||
+    block.type === 'text' ||
+    (block.type === 'tool_call' && block.name === 'plan_ask_questions')
+  );
+}
+
+function dropOpenPlanQuestionNoise(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const updated = [...messages];
+  const last = updated[updated.length - 1];
+  if (!last || last.role !== 'assistant' || last.turnComplete || !last.blocks) return messages;
+  if (!hasOnlyPlanQuestionNoise(last.blocks)) return messages;
+  return updated.slice(0, -1);
+}
+
 function markTurnComplete(messages: ChatMessage[]): ChatMessage[] {
   const updated = [...messages];
   const last = updated[updated.length - 1];
@@ -164,6 +186,35 @@ function mergeBlock(
   return null;
 }
 
+const THINKING_PLACEHOLDER_TEXT = 'Waiting for model response...';
+
+function stripThinkingPlaceholder(text: string): string {
+  return text.startsWith(THINKING_PLACEHOLDER_TEXT)
+    ? text.slice(THINKING_PLACEHOLDER_TEXT.length).replace(/^\s+/, '')
+    : text;
+}
+
+function sanitizeThinkingPlaceholders(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false;
+  const sanitized = messages.map((message) => {
+    if (message.role !== 'assistant' || !message.blocks) return message;
+
+    const blocks = message.blocks
+      .map((block) => {
+        if (block.type !== 'thinking') return block;
+        const nextText = stripThinkingPlaceholder(block.text || '');
+        if (nextText === block.text) return block;
+        changed = true;
+        return { ...block, text: nextText };
+      })
+      .filter((block) => block.type !== 'thinking' || (block.text || '').trim().length > 0);
+
+    if (blocks.length !== message.blocks.length) changed = true;
+    return changed ? { ...message, blocks } : message;
+  });
+  return changed ? sanitized : messages;
+}
+
 /**
  * Seal the most recent still-open thinking block (frontend-derived
  * completion). Called before appending any non-thinking block and on every
@@ -177,22 +228,6 @@ function completeOpenThinking(messages: ChatMessage[]): ChatMessage[] {
     (b) => ({ ...b, complete: true, endedAt: Date.now() } as AssistantBlock),
   );
   return result ?? messages;
-}
-
-function ensureThinkingPlaceholder(messages: ChatMessage[]): ChatMessage[] {
-  const last = messages[messages.length - 1];
-  if (
-    last?.role === 'assistant' &&
-    !last.turnComplete &&
-    last.blocks?.some((block) => block.type === 'thinking' || block.type === 'text' || block.type === 'tool_call')
-  ) {
-    return messages;
-  }
-  return appendBlock(
-    messages,
-    { type: 'thinking', text: 'Waiting for model response...', timestamp: Date.now(), startedAt: Date.now() },
-    false,
-  );
 }
 
 function isDispatchTool(name?: string): boolean {
@@ -310,6 +345,9 @@ function sessionSnapshotToState(snapshot: any): {
       }
       for (const tc of msg.tool_calls || []) {
         const func = tc.function || {};
+        if (func.name === 'plan_ask_questions') {
+          continue;
+        }
         const args = parseToolArgs(func.arguments);
         const block: AssistantBlock = {
           type: 'tool_call',
@@ -392,7 +430,7 @@ function sessionSnapshotToState(snapshot: any): {
       : undefined;
 
   return {
-    messages: restoredMessages,
+    messages: sanitizeThinkingPlaceholders(restoredMessages),
     toolCalls: restoredToolCalls,
     chatMode,
     thinkingIntensity,
@@ -450,15 +488,19 @@ export function useChatSession(
     questions: [],
     todos: [],
     decisions: {},
+    decision_notes: {},
     approved: false,
     pending_clarification: false,
     plan_file_path: null,
     research_notes: '',
   });
+  const planStateRef = useRef<PlanState>(planState);
 
   const onToolCallRef = useRef<((tc: ToolCall) => void) | null>(null);
   const onFileEditRef = useRef<((edit: FileEdit) => void) | null>(null);
   const pendingWorkerEventsRef = useRef<Record<string, WorkerEvent[]>>({});
+  const planBufferedContentRef = useRef('');
+  const buildRequestInFlightRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const userTouchedRef = useRef(false);
   const [hydratedSessionId, setHydratedSessionId] = useState('');
@@ -468,6 +510,30 @@ export function useChatSession(
       ...prev.slice(-200),
       `[${new Date().toLocaleTimeString()}] ${log}`,
     ]);
+  }, []);
+
+  const shouldBufferPlanContent = useCallback(() => {
+    const plan = planStateRef.current;
+    return (
+      chatModeRef.current === 'plan' &&
+      !plan.approved &&
+      (plan.phase === 'clarifying' || plan.phase === 'planning' || plan.phase === 'awaiting_decision')
+    );
+  }, []);
+
+  const flushPlanBufferedContent = useCallback(() => {
+    const text = planBufferedContentRef.current;
+    if (!text) return;
+    planBufferedContentRef.current = '';
+    setMessages((prev) => appendBlock(
+      completeOpenThinking(prev),
+      { type: 'text', text, timestamp: Date.now() },
+      true,
+    ));
+  }, []);
+
+  const discardPlanBufferedContent = useCallback(() => {
+    planBufferedContentRef.current = '';
   }, []);
 
   const recordRunEvent = useCallback((event: WS_EVENT) => {
@@ -497,6 +563,10 @@ export function useChatSession(
       localStorage.setItem('desktop-agent-thinking-intensity', thinkingIntensity);
     } catch { /* ignore */ }
   }, [thinkingIntensity]);
+
+  useEffect(() => {
+    planStateRef.current = planState;
+  }, [planState]);
 
   const takePendingWorkerEvents = useCallback((toolCallId?: string): WorkerEvent[] => {
     const pending = pendingWorkerEventsRef.current;
@@ -604,6 +674,7 @@ export function useChatSession(
         case 'chat_mode': {
           const m = event.data?.chat_mode;
           if (m === 'plan' || m === 'agent') {
+            chatModeRef.current = m;
             setChatModeState(m);
           }
           break;
@@ -619,6 +690,10 @@ export function useChatSession(
 
         case 'content':
           userTouchedRef.current = true;
+          if (shouldBufferPlanContent()) {
+            planBufferedContentRef.current += event.data.text || '';
+            break;
+          }
           setMessages((prev) => {
             // Answer text starting seals any open thinking block.
             const updated = appendBlock(
@@ -692,6 +767,11 @@ export function useChatSession(
           setToolCalls((prev) => [...prev, tc]);
           addTerminalLog(`[工具] ${event.data.name}: ${event.data.result}`);
           onToolCallRef.current?.(tc);
+
+          if (event.data.name === 'plan_ask_questions') {
+            setMessages((prev) => dropOpenPlanQuestionNoise(completeOpenThinking(prev)));
+            break;
+          }
 
           setMessages((prev0) => {
             // A tool landing seals any open thinking block (covers the case
@@ -814,6 +894,11 @@ export function useChatSession(
           addTerminalLog(`[Skills] ${(event.data.skills || []).length} matched, ${(event.data.disabled_matches || []).length} disabled`);
           break;
 
+        case 'skill_draft_ready':
+          recordRunEvent(event);
+          addTerminalLog(`[Skills] Draft ready: ${event.data.name || event.data.draft_id || ''}`.trim());
+          break;
+
         case 'guardrail_decision':
         case 'approval_required':
           recordRunEvent(event);
@@ -835,6 +920,30 @@ export function useChatSession(
           addTerminalLog(`[Review] ${event.data.severity || 'info'}: ${event.data.message || ''}`);
           break;
 
+        case 'collaboration_run_created':
+        case 'collaboration_task_update':
+        case 'agent_message':
+        case 'artifact_ready':
+        case 'decision_required':
+        case 'collaboration_run_completed': {
+          recordRunEvent(event);
+          const collabId = event.data?.collaboration_run_id || event.data?.run_id || '';
+          if (event.type === 'collaboration_run_created') {
+            addTerminalLog(`[Collab] Coding Agent run created ${collabId}`.trim());
+          } else if (event.type === 'collaboration_task_update') {
+            addTerminalLog(`[Collab] Task ${event.data?.task_id || ''} ${event.data?.status || ''}`.trim());
+          } else if (event.type === 'agent_message') {
+            addTerminalLog(`[Collab] ${event.data?.agent_type || 'agent'}: ${(event.data?.text || '').slice(0, 160)}`);
+          } else if (event.type === 'artifact_ready') {
+            addTerminalLog(`[Collab] Artifact ready ${event.data?.artifact?.title || collabId}`.trim());
+          } else if (event.type === 'decision_required') {
+            addTerminalLog(`[Collab] Decision required ${event.data?.reason || collabId}`.trim());
+          } else {
+            addTerminalLog(`[Collab] Run ${event.data?.status || 'completed'} ${collabId}`.trim());
+          }
+          break;
+        }
+
         case 'run_completed':
           recordRunEvent(event);
           addTerminalLog(`[Run] ${event.data.status || 'completed'}: ${event.data.summary || ''}`);
@@ -842,7 +951,13 @@ export function useChatSession(
 
         case 'status': {
           const status = event.data.status;
+          if (status === 'thinking' || status === 'executing' || status === 'running') {
+            setIsRunning(true);
+          }
           if (status === 'executing') {
+            if (event.data.tool === 'plan_ask_questions') {
+              break;
+            }
             // Tool execution starting seals the preceding thinking block.
             // Push a running placeholder — the matching tool_call event will fill in details
             setMessages((prev) =>
@@ -861,9 +976,8 @@ export function useChatSession(
             );
           } else if (status === 'completed' || status === 'max_iterations_reached') {
             setIsRunning(false);
+            flushPlanBufferedContent();
             setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
-          } else if (status === 'thinking') {
-            setMessages((prev) => ensureThinkingPlaceholder(prev));
           }
           addTerminalLog(
             `[状态] ${event.data.status} (迭代: ${event.data.iteration})`
@@ -872,13 +986,36 @@ export function useChatSession(
         }
 
         case 'plan_status':
+          if (event.data.mode === 'agent') {
+            chatModeRef.current = event.data.mode;
+            setChatModeState(event.data.mode);
+          } else if (
+            event.data.mode === 'plan' &&
+            event.data.phase !== 'executing' &&
+            event.data.phase !== 'completed'
+          ) {
+            chatModeRef.current = 'plan';
+            setChatModeState('plan');
+          }
           setPlanState((prev) => ({
             ...prev,
             mode: (event.data.mode || prev.mode) as ClientChatMode,
             phase: event.data.phase || prev.phase,
             approved: typeof event.data.approved === 'boolean' ? event.data.approved : prev.approved,
-            goal: event.data.goal || prev.goal,
-            structured_plan: event.data.structured_plan ?? prev.structured_plan,
+            goal: typeof event.data.goal === 'string' ? event.data.goal : prev.goal,
+            draft: typeof event.data.draft === 'string' ? event.data.draft : prev.draft,
+            structured_plan:
+              event.data.structured_plan !== undefined ? event.data.structured_plan : prev.structured_plan,
+            questions: Array.isArray(event.data.questions) ? event.data.questions as PlanQuestion[] : prev.questions,
+            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+            decisions:
+              event.data.decisions && typeof event.data.decisions === 'object'
+                ? event.data.decisions as Record<string, string[]>
+                : prev.decisions,
+            decision_notes:
+              event.data.decision_notes && typeof event.data.decision_notes === 'object'
+                ? event.data.decision_notes as Record<string, string>
+                : prev.decision_notes,
             pending_clarification:
               typeof event.data.pending_clarification === 'boolean'
                 ? event.data.pending_clarification
@@ -888,11 +1025,17 @@ export function useChatSession(
             research_notes:
               typeof event.data.research_notes === 'string' ? event.data.research_notes : prev.research_notes,
           }));
+          if (event.data.phase === 'planning') {
+            setIsRunning(true);
+          }
           break;
 
         case 'plan_draft': {
+          discardPlanBufferedContent();
           const draftTodos = Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : [];
           const draftStructured = (event.data.structured_plan ?? null) as StructuredPlanDraft | null;
+          chatModeRef.current = 'plan';
+          setChatModeState('plan');
           setPlanState((prev) => ({
             ...prev,
             mode: 'plan',
@@ -919,23 +1062,23 @@ export function useChatSession(
         }
 
         case 'plan_questions': {
+          discardPlanBufferedContent();
           const questions = Array.isArray(event.data.questions) ? event.data.questions as PlanQuestion[] : [];
+          chatModeRef.current = 'plan';
+          setChatModeState('plan');
           setPlanState((prev) => ({
             ...prev,
             mode: 'plan',
             questions,
+            decisions: {},
+            decision_notes: {},
             phase: event.data.phase || 'awaiting_decision',
             pending_clarification:
               typeof event.data.pending_clarification === 'boolean'
                 ? event.data.pending_clarification
                 : prev.pending_clarification,
           }));
-          // Inject interactive question card into the chat stream
-          setMessages((prev) => appendBlock(prev, {
-            type: 'plan_questions',
-            questions,
-            timestamp: Date.now(),
-          }, false));
+          setMessages((prev) => dropOpenPlanQuestionNoise(prev));
           break;
         }
 
@@ -950,11 +1093,50 @@ export function useChatSession(
           break;
 
         case 'build_started':
+          buildRequestInFlightRef.current = false;
+          setPlanState((prevPlan) => {
+            setMessages((prevMessages) => appendBlock(
+              completeOpenThinking(prevMessages),
+              {
+                type: 'plan_execution',
+                goal: prevPlan.goal,
+                todos: prevPlan.todos,
+                timestamp: Date.now(),
+              },
+              false,
+            ));
+            return {
+              ...prevPlan,
+              phase: 'executing',
+            };
+          });
+          addTerminalLog('[计划] Build 已启动，进入执行阶段');
+          break;
+
+        case 'build_paused':
+          buildRequestInFlightRef.current = false;
+          setIsRunning(false);
           setPlanState((prev) => ({
             ...prev,
-            phase: 'executing',
+            ...event.data,
+            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+            phase: 'approved_waiting_build',
+            approved: true,
           }));
-          addTerminalLog('[计划] Build 已启动，进入执行阶段');
+          addTerminalLog('[Plan] Build paused');
+          break;
+
+        case 'build_ended':
+          buildRequestInFlightRef.current = false;
+          setIsRunning(false);
+          setPlanState((prev) => ({
+            ...prev,
+            ...event.data,
+            todos: Array.isArray(event.data.todos) ? event.data.todos as PlanTodo[] : prev.todos,
+            phase: event.data.phase || 'awaiting_approval',
+            approved: false,
+          }));
+          addTerminalLog('[Plan] Build ended');
           break;
 
         case 'plan_rejected':
@@ -984,6 +1166,7 @@ export function useChatSession(
           break;
 
         case 'error': {
+          buildRequestInFlightRef.current = false;
           const msg = errorMessage(event.data);
           const retryable = isRetryableError(event.data);
           setMessages((prev) => {
@@ -1050,6 +1233,8 @@ export function useChatSession(
           break;
 
         case 'cleared':
+          buildRequestInFlightRef.current = false;
+          discardPlanBufferedContent();
           setMessages([]);
           setToolCalls([]);
           setFileEdits([]);
@@ -1066,13 +1251,17 @@ export function useChatSession(
             questions: [],
             todos: [],
             decisions: {},
+            decision_notes: {},
             approved: false,
             pending_clarification: false,
+            plan_file_path: null,
+            research_notes: '',
           });
           addTerminalLog('[系统] 会话已清空');
           break;
 
         case 'interrupted':
+          buildRequestInFlightRef.current = false;
           setIsRunning(false);
           setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
           addTerminalLog('[系统] 用户中断');
@@ -1087,7 +1276,17 @@ export function useChatSession(
           break;
       }
     },
-    [addTerminalLog, attachWorkerEvent, recordFileEdit, recordRunEvent, sessionId, takePendingWorkerEvents]
+    [
+      addTerminalLog,
+      attachWorkerEvent,
+      discardPlanBufferedContent,
+      flushPlanBufferedContent,
+      recordFileEdit,
+      recordRunEvent,
+      sessionId,
+      shouldBufferPlanContent,
+      takePendingWorkerEvents,
+    ]
   );
 
   const { isConnected, send, disconnect } = useWebSocket(sessionId, handleMessage);
@@ -1097,6 +1296,7 @@ export function useChatSession(
   }, [send]);
 
   const setChatMode = useCallback((mode: ClientChatMode) => {
+    chatModeRef.current = mode;
     setChatModeState(mode);
     sendRef.current({ type: 'set_chat_mode', chat_mode: mode });
   }, []);
@@ -1123,7 +1323,7 @@ export function useChatSession(
       const data = await loadSession(sessionId);
       if (!mounted || userTouchedRef.current) return;
       if (data && ((data.messages || []).length > 0 || (data.toolCalls || []).length > 0)) {
-        setMessages(data.messages || []);
+        setMessages(sanitizeThinkingPlaceholders(data.messages || []));
         setToolCalls(data.toolCalls || []);
         setFileEdits(data.fileEdits || []);
         if (data.chatMode === 'plan' || data.chatMode === 'agent') {
@@ -1247,15 +1447,15 @@ export function useChatSession(
         agent_type: agentType,
         role_id: roleId,
         image_base64: imageBase64,
-        chat_mode: overrides?.chatMode || chatMode,
-        thinking_intensity: overrides?.thinkingIntensity || thinkingIntensity,
+        chat_mode: overrides?.chatMode || chatModeRef.current,
+        thinking_intensity: overrides?.thinkingIntensity || thinkingIntensityRef.current,
       });
       if (sent === false) {
         setIsRunning(false);
         addTerminalLog('[错误] WebSocket 未连接，消息未发送');
       }
     },
-    [send, sessionId, currentModel, agentType, roleId, addTerminalLog, chatMode, thinkingIntensity]
+    [send, sessionId, currentModel, agentType, roleId, addTerminalLog, thinkingIntensity]
   );
 
   const clearSession = useCallback(() => {
@@ -1292,11 +1492,11 @@ export function useChatSession(
       model_id: currentModel,
       agent_type: agentType,
       role_id: roleId,
-      chat_mode: chatMode,
+      chat_mode: chatModeRef.current,
       thinking_intensity: thinkingIntensity,
     });
     if (sent === false) setIsRunning(false);
-  }, [send, currentModel, agentType, roleId, chatMode, thinkingIntensity]);
+  }, [send, currentModel, agentType, roleId, thinkingIntensity]);
 
   const stopRunning = useCallback(() => {
     send({ type: 'stop' });
@@ -1308,15 +1508,20 @@ export function useChatSession(
       model_id: currentModel,
       agent_type: agentType,
       role_id: roleId,
-      chat_mode: chatMode,
+      chat_mode: chatModeRef.current,
       thinking_intensity: thinkingIntensity,
     });
     setIsRunning(true);
-  }, [send, currentModel, agentType, roleId, chatMode, thinkingIntensity]);
+  }, [send, currentModel, agentType, roleId, thinkingIntensity]);
 
   const switchModel = useCallback((modelId: string) => {
     if (!modelId) return;
     send({ type: 'switch_model', model_id: modelId });
+  }, [send]);
+
+  const switchRole = useCallback((roleId: string) => {
+    if (!roleId) return;
+    send({ type: 'switch_role', role_id: roleId });
   }, [send]);
 
   const approvePlan = useCallback(() => {
@@ -1325,8 +1530,57 @@ export function useChatSession(
   }, [send]);
 
   const buildPlan = useCallback(() => {
+    if (buildRequestInFlightRef.current) {
+      addTerminalLog('[Plan] Build already requested');
+      return;
+    }
+    const snapshot = planStateRef.current;
+    const hasPlan = !!(snapshot.draft || snapshot.structured_plan || snapshot.todos.length > 0);
+    const buildable = snapshot.phase === 'awaiting_approval' || snapshot.phase === 'approved_waiting_build';
+    if (!hasPlan || !buildable) {
+      addTerminalLog('[Plan] Build ignored: no approved plan draft is ready');
+      return;
+    }
+    buildRequestInFlightRef.current = true;
+    const sent = send({ type: 'build_plan', plan_state: snapshot });
+    if (!sent) {
+      buildRequestInFlightRef.current = false;
+      return;
+    }
     setIsRunning(true);
-    send({ type: 'build_plan' });
+    setPlanState((prev) => ({
+      ...prev,
+      approved: true,
+      phase: 'approved_waiting_build',
+    }));
+  }, [addTerminalLog, send]);
+
+  const pauseBuild = useCallback(() => {
+    setIsRunning(false);
+    setPlanState((prev) => ({
+      ...prev,
+      approved: true,
+      phase: 'approved_waiting_build',
+      todos: prev.todos.map((todo) => (
+        todo.status === 'in_progress' ? { ...todo, status: 'pending' as const } : todo
+      )),
+    }));
+    send({ type: 'pause_build' });
+  }, [send]);
+
+  const endBuild = useCallback(() => {
+    setIsRunning(false);
+    setPlanState((prev) => ({
+      ...prev,
+      approved: false,
+      phase: prev.draft || prev.structured_plan ? 'awaiting_approval' : 'idle',
+      todos: prev.todos.map((todo) => (
+        todo.status === 'pending' || todo.status === 'in_progress'
+          ? { ...todo, status: 'cancelled' as const }
+          : todo
+      )),
+    }));
+    send({ type: 'end_build' });
   }, [send]);
 
   const rejectPlan = useCallback(() => {
@@ -1342,6 +1596,39 @@ export function useChatSession(
     }));
   }, [send]);
 
+  const submitPlanDecisions = useCallback((answers: PlanDecisionAnswer[]) => {
+    const normalized = answers.map((answer) => ({
+      question_id: answer.question_id,
+      selected: Array.isArray(answer.selected) ? answer.selected : [],
+      other_text: answer.other_text || '',
+      skipped: !!answer.skipped,
+    }));
+    setPlanState((prev) => {
+      const decisions = { ...prev.decisions };
+      const decisionNotes = { ...(prev.decision_notes || {}) };
+      for (const answer of normalized) {
+        decisions[answer.question_id] = answer.selected;
+        const notes: string[] = [];
+        if (answer.other_text.trim()) notes.push(`Other: ${answer.other_text.trim()}`);
+        if (answer.skipped) notes.push('Skipped');
+        if (notes.length > 0) decisionNotes[answer.question_id] = notes.join('; ');
+      }
+      return {
+        ...prev,
+        phase: 'planning',
+        pending_clarification: false,
+        decisions,
+        decision_notes: decisionNotes,
+      };
+    });
+    setIsRunning(true);
+    const sent = send({ type: 'submit_plan_decisions', answers: normalized });
+    if (sent === false) {
+      setIsRunning(false);
+      addTerminalLog('[错误] WebSocket 未连接，计划选择未发送');
+    }
+  }, [addTerminalLog, send]);
+
   const executeToolDirect = useCallback(
     (toolName: string, args: any) => {
       send({ type: 'tool_direct', tool_name: toolName, args });
@@ -1352,6 +1639,8 @@ export function useChatSession(
   const resetSession = useCallback(() => {
     disconnect();
     userTouchedRef.current = false;
+    buildRequestInFlightRef.current = false;
+    discardPlanBufferedContent();
     setHydratedSessionId('');
     setMessages([]);
     setToolCalls([]);
@@ -1371,10 +1660,13 @@ export function useChatSession(
       questions: [],
       todos: [],
       decisions: {},
+      decision_notes: {},
       approved: false,
       pending_clarification: false,
+      plan_file_path: null,
+      research_notes: '',
     });
-  }, [disconnect]);
+  }, [discardPlanBufferedContent, disconnect]);
 
   const saveInputDraft = useCallback(async (text: string) => {
     await saveDraft(sessionId, text);
@@ -1408,6 +1700,7 @@ export function useChatSession(
     stopRunning,
     retryLast,
     switchModel,
+    switchRole,
     executeToolDirect,
     resetSession,
     addTerminalLog,
@@ -1425,8 +1718,11 @@ export function useChatSession(
     planState,
     approvePlan,
     buildPlan,
+    pauseBuild,
+    endBuild,
     rejectPlan,
     updatePlanDecision,
+    submitPlanDecisions,
     suggestAgentSwitch,
     clearSuggestAgentSwitch,
   };

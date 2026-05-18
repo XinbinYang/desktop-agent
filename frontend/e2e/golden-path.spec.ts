@@ -16,6 +16,29 @@ test.describe('Desktop Agent Golden Path', () => {
   });
 
   test('full user journey: models load, chat, slash commands, @mentions, panels', async ({ page }) => {
+    const closeSettingsIfOpen = async () => {
+      const modal = page.locator('.fixed.inset-0').first();
+      if (await modal.isVisible({ timeout: 500 }).catch(() => false)) {
+        await modal.locator('button').first().click();
+        await expect(modal).toBeHidden({ timeout: 2000 });
+      }
+    };
+
+    await page.route('**/api/commands**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          commands: [
+            { name: 'help', description: 'Show help', args: '', category: 'general' },
+            { name: 'clear', description: 'Clear session', args: '', category: 'session' },
+            { name: 'config', description: 'Open settings', args: '', category: 'general' },
+            { name: 'skills', description: 'Open skills', args: '', category: 'general' },
+          ],
+        }),
+      });
+    });
+
     // ── 1. App loads and fetches models ──────────────────────────────────
     await page.goto(FRONTEND_URL, { waitUntil: 'networkidle' });
     await page.waitForTimeout(1000);
@@ -33,14 +56,13 @@ test.describe('Desktop Agent Golden Path', () => {
       // Should see provider cards or general settings
       const modal = page.locator('[role="dialog"], .fixed.inset-0').first();
       if (await modal.isVisible()) {
-        // Close with Escape
-        await page.keyboard.press('Escape');
-        await page.waitForTimeout(300);
+        await closeSettingsIfOpen();
       }
     }
 
     // ── 3. Chat input is visible and functional ──────────────────────────
     const textarea = page.locator('textarea[placeholder*="Type a message"], textarea[placeholder*="Shift+Enter"]').first();
+    await closeSettingsIfOpen();
     await expect(textarea).toBeVisible({ timeout: 5000 });
 
     // ── 4. Slash command menu appears when typing / ──────────────────────
@@ -48,10 +70,17 @@ test.describe('Desktop Agent Golden Path', () => {
     await textarea.fill('/');
     await page.waitForTimeout(500);
 
-    // Slash menu should appear with command options
-    const slashMenu = page.locator('text=/help').first();
-    const hasSlashMenu = await slashMenu.isVisible({ timeout: 2000 }).catch(() => false);
-    console.log(`Slash menu visible: ${hasSlashMenu}`);
+    // Slash menu should appear with command options, and arrow navigation should
+    // follow the rendered order: /help -> /config -> /skills.
+    await expect(page.locator('text=/help').first()).toBeVisible({ timeout: 2000 });
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('[role="dialog"], .fixed.inset-0').first()).toBeVisible({ timeout: 2000 });
+    await closeSettingsIfOpen();
+
+    await textarea.fill('/skills');
+    await page.keyboard.press('Enter');
+    await expect(page.getByText('Skills').first()).toBeVisible({ timeout: 2000 });
 
     // Clear input
     await textarea.fill('');

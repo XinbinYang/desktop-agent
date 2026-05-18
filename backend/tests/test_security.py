@@ -1,4 +1,7 @@
-from app.security import redact_sensitive_text, redact_mapping
+from pathlib import Path
+
+import pytest
+from app.security import redact_sensitive_text, redact_mapping, resolve_under_base
 
 
 class TestRedactSensitiveText:
@@ -66,3 +69,59 @@ class TestRedactMapping:
         """An empty token isn't a secret; passing through avoids ambiguity in logs."""
         out = redact_mapping({"token": ""})
         assert out["token"] == ""
+
+
+class TestResolveUnderBase:
+    """Path anchoring tests for resolve_under_base.
+
+    The backend process runs with cwd=backend/, so any cwd-relative resolution
+    would silently map AGENTS/personal/USER.md -> backend/AGENTS/personal/USER.md.
+    These tests verify relative paths are always anchored to *base*, not cwd.
+    """
+
+    @pytest.fixture
+    def repo_root(self) -> Path:
+        """Repository root = backend/app security.py is at backend/app/security.py
+        so parents[2] from that file = repo root."""
+        from app.runtime_paths import repo_root as rr
+        return rr()
+
+    def test_relative_path_anchored_to_base_not_cwd(self, repo_root):
+        """Relative path 'AGENTS/personal/USER.md' must resolve under repo_root
+        even when cwd is backend/."""
+        result, err = resolve_under_base(
+            "AGENTS/personal/USER.md",
+            repo_root,
+            allow_relative=False,
+        )
+        assert err is None, f"unexpected error: {err}"
+        assert result == (repo_root / "AGENTS/personal/USER.md").resolve(), (
+            f"Expected {repo_root / 'AGENTS/personal/USER.md'}, got {result}"
+        )
+
+    def test_absolute_path_still_works(self, repo_root):
+        """Absolute paths should still resolve normally."""
+        target = repo_root / "AGENTS" / "personal" / "USER.md"
+        result, err = resolve_under_base(str(target), repo_root, allow_relative=False)
+        assert err is None
+        assert result == target.resolve()
+
+    def test_out_of_bounds_still_blocked(self, repo_root):
+        """Path traversal escaping base must still be blocked."""
+        result, err = resolve_under_base(
+            "../../../outside.txt", repo_root, allow_relative=False
+        )
+        assert err is not None
+        assert "escapes" in err
+
+    def test_relative_with_allow_relative_true_also_anchored(self, repo_root):
+        """Even with allow_relative=True, path resolves under base, not cwd."""
+        result, err = resolve_under_base(
+            "AGENTS/personal/USER.md",
+            repo_root,
+            allow_relative=True,
+        )
+        assert err is None
+        assert result == (repo_root / "AGENTS/personal/USER.md").resolve(), (
+            f"Expected {repo_root / 'AGENTS/personal/USER.md'}, got {result}"
+        )

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 vi.mock('react-virtuoso', () => {
   const Virtuoso = ({ data, itemContent, components, totalCount }: any) => {
@@ -35,8 +35,11 @@ vi.mock('../components/session/SessionView', async () => {
     addTerminalLog: vi.fn(),
     approvePlan: vi.fn(),
     buildPlan: vi.fn(),
+    pauseBuild: vi.fn(),
+    endBuild: vi.fn(),
     rejectPlan: vi.fn(),
     updatePlanDecision: vi.fn(),
+    submitPlanDecisions: vi.fn(),
     onSelectFileInEditor: vi.fn(),
     onCloseFileInEditor: vi.fn(),
     onFileContentChange: vi.fn(),
@@ -51,7 +54,10 @@ vi.mock('../components/session/SessionView', async () => {
   };
   return {
     SessionView: React.forwardRef((props: any, ref: any) => {
-      React.useImperativeHandle(ref, () => ({ openFile: vi.fn(), switchModel: vi.fn(), openRewind: vi.fn() }));
+      ;(globalThis as any).__desktopAgentLastSessionViewProps = props;
+      const openFile = React.useMemo(() => vi.fn(), [props.sessionId]);
+      ;((globalThis as any).__desktopAgentOpenFiles ||= {})[props.sessionId] = openFile;
+      React.useImperativeHandle(ref, () => ({ openFile, switchModel: vi.fn(), openRewind: vi.fn() }), [openFile]);
       React.useEffect(() => {
         props.onSnapshot({
           sessionId: props.sessionId,
@@ -83,6 +89,8 @@ describe('App', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    delete (globalThis as any).__desktopAgentLastSessionViewProps
+    delete (globalThis as any).__desktopAgentOpenFiles
     // Reset fetch mock
     global.fetch = vi.fn(() =>
       Promise.resolve({
@@ -95,6 +103,83 @@ describe('App', () => {
       })
     ) as any
   })
+
+  const collapsedProjectLayout = () => ({
+    activeSection: 'project',
+    activeAgent: 'personal',
+    showTerminal: true,
+    rightZone: 'activity',
+    rightPanelVisible: false,
+    sidebarCollapsed: false,
+    mainLayout: { center: 99, right: 1 },
+    terminalLayout: { conversation: 76, terminal: 24 },
+  })
+
+  const mockProjectFileFetch = (sessionId = 'session_coding_file') => {
+    const project = {
+      path: 'C:/repo',
+      name: 'repo',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const nodes = [
+      { name: 'src', path: 'src', type: 'dir', has_children: false },
+      { name: 'README.md', path: 'README.md', type: 'file', extension: 'md' },
+    ]
+    return vi.fn((url: string, _init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project, nodes }) }) as any
+      }
+      if (url.includes('/api/file/read')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ content: '# Hello\n', path: 'C:/repo/README.md' }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: sessionId,
+            agent_type: 'coding',
+            role_id: 'code-expert',
+            model_id: 'gpt-4o',
+            title: 'Project',
+            project_path: project.path,
+            created: false,
+            is_primary: false,
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      return Promise.resolve({ json: () => Promise.resolve({}) }) as any
+    })
+  }
 
   it('renders without crashing', async () => {
     render(<App />)
@@ -229,5 +314,244 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByText('Providers')).toBeInTheDocument()
+  })
+
+  it('debounces project refresh after file edits', async () => {
+    const project = {
+      path: 'C:/repo',
+      name: 'repo',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: {
+              openai: { api_key_configured: true, models: [] },
+            },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            project,
+            nodes: [{ name: 'new.ts', path: 'new.ts', type: 'file', extension: 'ts' }],
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      return Promise.resolve({ json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/refresh'))).toBe(true)
+    })
+    const initialRefreshCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/api/projects/refresh')).length
+
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        ;(globalThis as any).__desktopAgentLastSessionViewProps.onProjectFileEdit({
+          path: 'C:/repo/new.ts',
+          operation: 'create',
+          unified_diff: 'diff',
+          stats: { added: 1, removed: 0 },
+          truncated: false,
+        })
+        vi.advanceTimersByTime(399)
+      })
+
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/api/projects/refresh')).length).toBe(initialRefreshCalls)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1)
+      })
+
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/api/projects/refresh')).length).toBe(initialRefreshCalls + 1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('loads deep directory children one level at a time', async () => {
+    const project = {
+      path: 'C:/outer',
+      name: 'outer',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const rootNodes = [{
+      name: 'OPEN AGENT',
+      path: 'OPEN AGENT',
+      type: 'dir',
+      has_children: true,
+      children: [{
+        name: 'src',
+        path: 'OPEN AGENT/src',
+        type: 'dir',
+        has_children: true,
+        children: [{
+          name: 'open_agent',
+          path: 'OPEN AGENT/src/open_agent',
+          type: 'dir',
+          has_children: true,
+        }],
+      }],
+    }]
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project, nodes: rootNodes }) }) as any
+      }
+      if (url.includes('/api/projects/tree?path=OPEN%20AGENT%2Fsrc%2Fopen_agent')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            nodes: [
+              { name: 'cli', path: 'OPEN AGENT/src/open_agent/cli', type: 'dir', has_children: false },
+              { name: '__init__.py', path: 'OPEN AGENT/src/open_agent/__init__.py', type: 'file', extension: 'py' },
+            ],
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: 'session_coding_tree',
+            agent_type: 'coding',
+            role_id: 'code-expert',
+            model_id: 'gpt-4o',
+            title: 'Tree',
+            project_path: project.path,
+            created: false,
+            is_primary: false,
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      return Promise.resolve({ json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+
+    fireEvent.click(await screen.findByText('OPEN AGENT'))
+    fireEvent.click(await screen.findByText('src'))
+    fireEvent.click(await screen.findByText('open_agent'))
+
+    expect(await screen.findByText('cli')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/projects/tree?path=OPEN%20AGENT%2Fsrc%2Fopen_agent'))).toBe(true)
+  })
+
+  it('opens a project file in the coding editor and reveals the right panel', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
+    const fetchMock = mockProjectFileFetch('session_coding_file')
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+    fireEvent.click(await screen.findByText('README.md'))
+
+    await waitFor(() => {
+      expect((globalThis as any).__desktopAgentOpenFiles.session_coding_file).toHaveBeenCalledWith(
+        'README.md',
+        '# Hello\n',
+        'markdown',
+      )
+    })
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.rightPanelVisible).toBe(true)
+      expect(layout.rightZone).toBe('workspace')
+    })
+  })
+
+  it('switches from Personal to Coding before opening a project file', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
+    const fetchMock = mockProjectFileFetch('session_coding_from_personal')
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(await screen.findByText('README.md'))
+
+    await waitFor(() => {
+      const resolveCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/sessions/resolve'))
+      expect(resolveCall).toBeTruthy()
+      expect(JSON.parse(String(resolveCall?.[1]?.body))).toMatchObject({
+        agent_type: 'coding',
+        policy: 'last_or_create',
+      })
+    })
+    await waitFor(() => {
+      expect((globalThis as any).__desktopAgentOpenFiles.session_coding_from_personal).toHaveBeenCalledWith(
+        'README.md',
+        '# Hello\n',
+        'markdown',
+      )
+    })
+  })
+
+  it('does not open the editor when clicking a directory in the project tree', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
+    const fetchMock = mockProjectFileFetch('session_coding_file')
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(await screen.findByText('src'))
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/file/read'))).toBe(false)
+    expect((globalThis as any).__desktopAgentOpenFiles?.session_coding_file).toBeUndefined()
   })
 })

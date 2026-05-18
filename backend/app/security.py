@@ -23,11 +23,17 @@ def is_relative_to(path: Path, base: Path) -> bool:
 
 
 def resolve_under_base(path: str, base: Path, *, allow_relative: bool = True) -> Tuple[Path, Optional[str]]:
-    """Resolve a user supplied path and ensure it stays under base."""
+    """Resolve a user supplied path and ensure it stays under base.
+
+    Relative paths are always anchored to ``base``, never to the process
+    current working directory. (The backend process runs with cwd=backend/,
+    so cwd-relative resolution silently wrote agent files to backend/AGENTS/.)
+    ``allow_relative`` is retained for signature stability only.
+    """
     resolved_base = base.resolve()
     try:
         raw_path = Path(path)
-        resolved = (resolved_base / raw_path).resolve() if allow_relative and not raw_path.is_absolute() else raw_path.resolve()
+        resolved = raw_path.resolve() if raw_path.is_absolute() else (resolved_base / raw_path).resolve()
     except (OSError, ValueError) as e:
         return Path(path), f"Invalid path: {path} ({e})"
 
