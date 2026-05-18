@@ -227,6 +227,14 @@ def _extract_model_ids(payload: dict[str, Any]) -> list[str]:
     return ids
 
 
+def _clamp_parallel_agent_count(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 3
+    return max(1, min(16, parsed))
+
+
 async def _fetch_provider_models(provider_name: str | None, base_url: str, api_key: str) -> tuple[int, dict[str, Any]]:
     lowered = (provider_name or "").lower() + " " + base_url.lower()
     if "kimi" in lowered and "/coding" in base_url.lower():
@@ -306,9 +314,13 @@ def update_settings(req: SettingsUpdateRequest):
     coding_update = update.pop("coding_agent", None)
     personal_update = update.pop("personal_agent", None)
     current = cfg.settings.model_dump()
+    if "max_parallel_agents" in update:
+        update["max_parallel_agents"] = _clamp_parallel_agent_count(update["max_parallel_agents"])
     current.update(update)
     cfg.settings = Settings(**current)
     if isinstance(coding_update, dict):
+        if "max_parallel_workers" in coding_update:
+            coding_update["max_parallel_workers"] = _clamp_parallel_agent_count(coding_update["max_parallel_workers"])
         coding_current = cfg.coding_agent.model_dump()
         coding_current.update(coding_update)
         cfg.coding_agent = CodingAgentConfig(**coding_current)

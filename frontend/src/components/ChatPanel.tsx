@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X } from 'lucide-react';
-import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+import { Virtuoso, VirtuosoHandle, type IndexLocationWithAlign, type ListRange, type StateSnapshot } from 'react-virtuoso';
 import { useTranslation } from 'react-i18next';
 import {
   ChatMessage,
@@ -14,6 +14,8 @@ import {
   PlanDecisionAnswer,
   PlanState,
   PlanTodo,
+  FileEdit,
+  RunEvent,
   ContextUsage,
   ConversationCheckpoint,
   TaskGuidanceItem,
@@ -28,14 +30,22 @@ import { ToolCallView } from './ToolCallView';
 import { FileEditView } from './FileEditView';
 import { SlashCommandMenu } from './SlashCommandMenu';
 import { AtMentionMenu } from './AtMentionMenu';
-import { ChatMessageItem } from './ChatMessageItem';
 import { ContextMeter } from './ContextMeter';
 import { RewindModal } from './RewindModal';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
+import {
+  buildTimelineEvents,
+  type TimelineEvent,
+  type TimelineRenderMode,
+  type TimelineToolEvent,
+} from '../lib/timelineEvents';
 
 interface ChatPanelProps {
+  sessionId?: string;
   messages: ChatMessage[];
   toolCalls: ToolCall[];
+  fileEdits?: FileEdit[];
+  runEvents?: RunEvent[];
   onSend: (
     text: string,
     imageBase64?: string,
@@ -81,6 +91,16 @@ interface ChatPanelProps {
 }
 
 type OutputMode = 'concise' | 'balanced' | 'verbose';
+
+interface ChatScrollMemory {
+  atBottom?: boolean;
+  messageCount: number;
+  range?: ListRange;
+  snapshot?: StateSnapshot;
+  updatedAt: number;
+}
+
+const chatScrollMemoryBySession = new Map<string, ChatScrollMemory>();
 
 const COMMAND_KEYS = new Set(['ArrowDown', 'ArrowUp', 'Enter', 'Escape']);
 const DIRECT_COMMANDS = new Set([
@@ -727,7 +747,7 @@ const ReasoningBlock: React.FC<{
         <div
           ref={scrollRef}
           aria-live="polite"
-          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary whitespace-pre-wrap overflow-y-auto border-t border-border-subtle"
+          className="px-[var(--chat-bubble-px)] py-[var(--chat-space-md)] chat-text-sm text-fg-secondary whitespace-pre-wrap overflow-y-auto border-t border-border-subtle"
           style={{
             maxHeight: inProgress ? '140px' : '360px',
             lineHeight: 'var(--chat-line-height)',
@@ -1261,9 +1281,170 @@ const CodeBlock: React.FC<{ language: string; value: string; theme: 'dark' | 'li
   );
 };
 
+function trimCodePreview(value: string, maxLines = 20): string {
+  const lines = value.split(/\r?\n/);
+  if (lines.length <= maxLines) return value;
+  return `${lines.slice(0, maxLines).join('\n')}\n...`;
+}
+
+const PlainCodeBlock: React.FC<{ language?: string; value: string }> = ({ language, value }) => (
+  <div className="my-[var(--chat-space-sm)] overflow-hidden rounded-md border border-border-subtle bg-surface-alt">
+    <div className="border-b border-border-subtle px-3 py-1 chat-text-xs font-medium uppercase text-fg-muted">
+      {language || 'text'}
+    </div>
+    <pre className="max-h-72 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono chat-text-xs text-fg-secondary">
+      {trimCodePreview(value)}
+    </pre>
+  </div>
+);
+
+const timelineDotClass: Record<TimelineEvent['kind'], string> = {
+  user: 'bg-accent',
+  thinking: 'bg-info',
+  text_summary: 'bg-fg-muted',
+  tool: 'bg-success',
+  file_edit: 'bg-success',
+  todo: 'bg-accent',
+  knowledge: 'bg-accent',
+  image: 'bg-info',
+  error: 'bg-danger',
+  run_status: 'bg-fg-muted',
+};
+
+const TimelineEventShell = React.memo<{
+  event: TimelineEvent;
+  index: number;
+  totalCount: number;
+  children: React.ReactNode;
+}>(({ event, index, totalCount, children }) => (
+  <div className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
+    <div className="relative pl-[var(--chat-timeline-indent)]">
+      {index < totalCount - 1 && (
+        <div className="absolute left-[5px] top-2.5 bottom-0 w-px bg-border-subtle" />
+      )}
+      <div className={`absolute left-[2px] top-2 w-1.5 h-1.5 rounded-full ${timelineDotClass[event.kind]}`} />
+      {children}
+    </div>
+  </div>
+));
+
+TimelineEventShell.displayName = 'TimelineEventShell';
+
+const TimelineThinkingRow = React.memo<{ event: Extract<TimelineEvent, { kind: 'thinking' }> }>(({ event }) => {
+  const [expanded, setExpanded] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const inProgress = !event.complete;
+
+  useEffect(() => {
+    if (!inProgress) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [inProgress]);
+
+  const hasTimer = typeof event.startedAt === 'number';
+  const elapsedMs = hasTimer
+    ? (event.complete ? (event.endedAt ?? now) : now) - (event.startedAt as number)
+    : 0;
+  const label = inProgress ? 'Thinking' : hasTimer ? `Thought for ${formatThinkDuration(elapsedMs)}` : 'Thought';
+
+  return (
+    <div className="rounded-md border border-border-subtle bg-surface/50 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-fg-secondary hover:bg-surface-hover"
+      >
+        {inProgress ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-info shrink-0" />
+        ) : expanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        )}
+        <span className="font-medium">{label}</span>
+        {inProgress && hasTimer && (
+          <span className="text-fg-muted tabular-nums">{formatThinkDuration(elapsedMs)}</span>
+        )}
+      </button>
+      {expanded && (
+        <div className="max-h-72 overflow-auto whitespace-pre-wrap border-t border-border-subtle px-[var(--chat-bubble-px)] py-[var(--chat-space-sm)] chat-text-sm text-fg-secondary">
+          {event.text}
+        </div>
+      )}
+    </div>
+  );
+});
+
+TimelineThinkingRow.displayName = 'TimelineThinkingRow';
+
+const TimelineToolGroupRow = React.memo<{
+  event: TimelineToolEvent;
+  mode: TimelineRenderMode;
+}>(({ event, mode }) => {
+  const [expanded, setExpanded] = useState(false);
+  const isPersonal = mode === 'personal';
+  const Icon = event.status === 'running' ? Loader2 : event.status === 'error' ? AlertCircle : CheckCircle2;
+
+  if (event.tools.length === 1 && !event.grouped && !event.disclosure) {
+    const tool = event.tools[0];
+    return (
+      <ToolCallView
+        name={tool.name}
+        args={tool.args}
+        result={tool.result}
+        status={tool.status}
+        durationMs={tool.durationMs}
+        workerEvents={tool.workerEvents}
+        variant={isPersonal ? 'disclosure' : 'event-row'}
+      />
+    );
+  }
+
+  return (
+    <div
+      className="my-[var(--chat-space-xs)] rounded-md border border-border-subtle bg-surface/45 overflow-hidden"
+      data-testid={isPersonal ? 'personal-tool-disclosure' : 'coding-tool-group'}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex min-w-0 items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-left hover:bg-surface-hover"
+      >
+        <Icon className={`w-3.5 h-3.5 shrink-0 ${event.status === 'running' ? 'animate-spin text-info' : event.status === 'error' ? 'text-danger' : 'text-success'}`} />
+        {expanded ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />}
+        <span className="font-medium text-fg-secondary truncate">{event.label}</span>
+        <span className="ml-auto text-fg-muted shrink-0">
+          {isPersonal ? 'details' : `${event.tools.length} calls`}
+        </span>
+      </button>
+      {expanded && (
+        <div className="border-t border-border-subtle px-2 py-1.5">
+          {event.tools.map((tool) => (
+            <ToolCallView
+              key={tool.id}
+              name={tool.name}
+              args={tool.args}
+              result={tool.result}
+              status={tool.status}
+              durationMs={tool.durationMs}
+              workerEvents={tool.workerEvents}
+              variant={isPersonal ? 'disclosure' : 'event-row'}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+});
+
+TimelineToolGroupRow.displayName = 'TimelineToolGroupRow';
+
 export const ChatPanel: React.FC<ChatPanelProps> = ({
+  sessionId,
   messages,
   toolCalls,
+  fileEdits = [],
+  runEvents = [],
   onSend,
   onStop,
   onRetry,
@@ -1371,11 +1552,66 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const messagesLengthRef = useRef(messages.length);
+  const activeScrollSessionRef = useRef(sessionId);
+  const initialScrollMemoryRef = useRef<ChatScrollMemory | undefined>(
+    sessionId ? chatScrollMemoryBySession.get(sessionId) : undefined,
+  );
+  const scrollRestoreAppliedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  if (activeScrollSessionRef.current !== sessionId) {
+    activeScrollSessionRef.current = sessionId;
+    initialScrollMemoryRef.current = sessionId
+      ? chatScrollMemoryBySession.get(sessionId)
+      : undefined;
+    scrollRestoreAppliedRef.current = false;
+  }
+
+  useEffect(() => {
+    messagesLengthRef.current = messages.length;
+  }, [messages.length]);
+
+  const rememberScrollMemory = useCallback(
+    (patch: Partial<ChatScrollMemory>) => {
+      if (!sessionId) return;
+      const existing = chatScrollMemoryBySession.get(sessionId);
+      chatScrollMemoryBySession.set(sessionId, {
+        ...existing,
+        ...patch,
+        messageCount: messagesLengthRef.current,
+        updatedAt: Date.now(),
+      });
+      if (chatScrollMemoryBySession.size > 80) {
+        const oldest = [...chatScrollMemoryBySession.entries()]
+          .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+          .slice(0, chatScrollMemoryBySession.size - 80);
+        for (const [key] of oldest) chatScrollMemoryBySession.delete(key);
+      }
+    },
+    [sessionId],
+  );
+
+  const saveVirtuosoSnapshot = useCallback(() => {
+    if (!sessionId) return;
+    virtuosoRef.current?.getState((snapshot) => {
+      rememberScrollMemory({ snapshot });
+    });
+  }, [rememberScrollMemory, sessionId]);
+
+  useEffect(() => {
+    initialScrollMemoryRef.current = sessionId
+      ? chatScrollMemoryBySession.get(sessionId)
+      : undefined;
+    scrollRestoreAppliedRef.current = false;
+    return () => {
+      saveVirtuosoSnapshot();
+    };
+  }, [saveVirtuosoSnapshot, sessionId]);
 
   // 加载草稿
   useEffect(() => {
@@ -1409,7 +1645,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       align: 'end',
     });
     setIsNearBottom(true);
-  }, []);
+    rememberScrollMemory({ atBottom: true });
+  }, [rememberScrollMemory]);
+
+  const handleRangeChanged = useCallback((range: ListRange) => {
+    rememberScrollMemory({ range });
+  }, [rememberScrollMemory]);
+
+  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
+    setIsNearBottom(atBottom);
+    rememberScrollMemory({ atBottom });
+  }, [rememberScrollMemory]);
 
   const handleSend = () => {
     if (planBlocksChatSend) return;
@@ -1603,8 +1849,44 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     return messages.filter((m) => m.content.toLowerCase().includes(q));
   }, [messages, searchQuery]);
 
+  const timelineMode: TimelineRenderMode = agentType === 'coding' ? 'coding' : 'personal';
+  const timelineEvents = useMemo(() => buildTimelineEvents({
+    messages: filteredMessages,
+    toolCalls,
+    fileEdits,
+    runEvents,
+    planState,
+    mode: timelineMode,
+  }), [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode]);
+
   // Markdown 自定义渲染
   // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
+  const timelineItemCount = timelineEvents.length;
+  const initialTopMostItemIndex = useMemo<IndexLocationWithAlign | number | undefined>(() => {
+    const memory = initialScrollMemoryRef.current;
+    if (!memory || timelineItemCount === 0) return undefined;
+    if (memory.atBottom) return { index: 'LAST', align: 'end' };
+    const index = Math.min(Math.max(memory.range?.startIndex ?? 0, 0), Math.max(timelineItemCount - 1, 0));
+    return index > 0 ? { index, align: 'start' } : undefined;
+  }, [timelineItemCount, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || timelineItemCount === 0 || scrollRestoreAppliedRef.current) return;
+    const memory = initialScrollMemoryRef.current || chatScrollMemoryBySession.get(sessionId);
+    if (!memory) return;
+    scrollRestoreAppliedRef.current = true;
+    requestAnimationFrame(() => {
+      if (memory.atBottom) {
+        virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+        return;
+      }
+      const index = Math.min(Math.max(memory.range?.startIndex ?? 0, 0), Math.max(timelineItemCount - 1, 0));
+      if (index > 0) {
+        virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
+      }
+    });
+  }, [timelineItemCount, sessionId]);
+
   const markdownComponents = useMemo(() => ({
     pre({ node, children, ...props }: any) {
       const codeNode = node?.children?.[0];
@@ -1624,6 +1906,26 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       );
     },
   }), [resolved]);
+
+  const lightweightMarkdownComponents = useMemo(() => ({
+    pre({ node, children, ...props }: any) {
+      const codeNode = node?.children?.[0];
+      if (codeNode?.tagName === 'code') {
+        const className = codeNode.properties?.className?.[0] || '';
+        const match = /language-(\w+)/.exec(className);
+        const value = codeNode.children?.map((c: any) => c.value).join('') || '';
+        return <PlainCodeBlock language={match ? match[1] : ''} value={value} />;
+      }
+      return <pre {...props}>{children}</pre>;
+    },
+    code({ children, ...props }: any) {
+      return (
+        <code className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary" {...props}>
+          {children}
+        </code>
+      );
+    },
+  }), []);
 
   const renderBlock = useCallback((block: AssistantBlock, _bi: number) => {
     switch (block.type) {
@@ -1704,46 +2006,163 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     }
   }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents]);
 
-  const itemContent = useCallback((index: number) => {
-    const msg = filteredMessages[index];
-    if (!msg) return null;
+  const lastAssistantMsgId = useMemo(() => {
     const lastMsg = messages[messages.length - 1];
-    const lastAssistantMsgId = lastMsg?.role === 'assistant' && !lastMsg?.isTool ? lastMsg.id : null;
-    // Stable per-message key: streamed token updates change the `msg`/`data`
-    // identity (appendBlock returns a fresh array + message object), which is
-    // what drives Virtuoso to re-render. Keying by content hash instead would
-    // remount the row on every token, destroying ReasoningBlock local state
-    // (expand/collapse, timer, auto-scroll) and causing the "blinking" bug.
+    return lastMsg?.role === 'assistant' && !lastMsg?.isTool ? lastMsg.id : null;
+  }, [messages]);
+
+  const renderTimelineEvent = useCallback((event: TimelineEvent, index: number) => {
+    const markdownForMode = timelineMode === 'coding' ? lightweightMarkdownComponents : markdownComponents;
+    const retryable =
+      event.kind === 'text_summary' &&
+      event.messageId === lastAssistantMsgId &&
+      onRetry &&
+      !isRunning;
+
+    let content: React.ReactNode = null;
+
+    switch (event.kind) {
+      case 'user':
+        content = (
+          <div className={`relative group ${
+            timelineMode === 'coding'
+              ? 'rounded-md border border-accent/20 bg-accent/10 px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] chat-text-sm text-fg'
+              : 'bg-accent/15 text-fg rounded-lg px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] ml-auto max-w-[85%] border border-accent/20 chat-text-sm'
+          }`}>
+            {event.imageBase64 && (
+              <img
+                src={`data:image/png;base64,${event.imageBase64}`}
+                alt="attached"
+                loading="lazy"
+                decoding="async"
+                className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+              />
+            )}
+            <div className="prose prose-sm chat-prose chat-prose-plain max-w-none">
+              <p className="whitespace-pre-wrap">{event.text}</p>
+            </div>
+          </div>
+        );
+        break;
+      case 'thinking':
+        content = <TimelineThinkingRow event={event} />;
+        break;
+      case 'text_summary':
+        content = (
+          <div className="relative group py-[var(--chat-space-xs)] text-fg">
+            {retryable && (
+              <button
+                type="button"
+                onClick={onRetry}
+                title="Regenerate"
+                className="absolute -top-2 -right-2 w-5 h-5 bg-surface-alt hover:bg-surface-hover border border-border rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                aria-label="Regenerate"
+              >
+                <RotateCcw className="w-2.5 h-2.5 text-fg-secondary" />
+              </button>
+            )}
+            <div className="prose prose-sm chat-prose max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownForMode}>
+                {event.text}
+              </ReactMarkdown>
+            </div>
+          </div>
+        );
+        break;
+      case 'tool':
+        content = <TimelineToolGroupRow event={event} mode={timelineMode} />;
+        break;
+      case 'file_edit':
+        content = <FileEditView edit={event.edit} compact variant="event-row" />;
+        break;
+      case 'knowledge':
+        content = <KnowledgeContextBlock sources={event.sources} />;
+        break;
+      case 'image':
+        content = (
+          <img
+            src={`data:image/png;base64,${event.base64}`}
+            alt="tool screenshot"
+            loading="lazy"
+            decoding="async"
+            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+          />
+        );
+        break;
+      case 'todo':
+        content = event.source === 'draft' && event.planDraft ? (
+          <PlanDraftInlineCard
+            block={event.planDraft}
+            planState={planState}
+            onBuild={onBuildPlan}
+            onViewPlan={onViewPlan}
+          />
+        ) : (
+          <PlanExecutionCard
+            goal={event.goal || planState.goal}
+            todos={event.todos}
+            phase={event.phase || planState.phase}
+            compact
+            onPause={onPauseBuild}
+            onEnd={onEndBuild}
+            onContinue={onBuildPlan}
+          />
+        );
+        break;
+      case 'error':
+        content = (
+          <div className="rounded-md border border-danger/20 bg-danger/10 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-danger">
+            {event.text}
+          </div>
+        );
+        break;
+      case 'run_status':
+        content = (
+          <div className="rounded-md border border-border-subtle bg-surface/35 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-fg-secondary">
+            <span className="font-medium text-fg">{event.label}</span>
+            {event.detail && <span className="text-fg-muted"> - {event.detail}</span>}
+          </div>
+        );
+        break;
+      default:
+        content = null;
+    }
+
     return (
-      <div key={msg.id} className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
-        <ChatMessageItem
-          msg={msg}
-          index={index}
-          totalCount={filteredMessages.length}
-          lastAssistantMsgId={lastAssistantMsgId}
-          onRetry={onRetry}
-          isRunning={isRunning}
-          expandedToolDetails={expandedToolDetails}
-          showAllToolDetails={showAllToolDetails}
-          onToggleToolDetails={(msgId) =>
-            setExpandedToolDetails((prev) => ({ ...prev, [msgId]: !prev[msgId] }))
-          }
-          onToggleShowAll={(msgId) =>
-            setShowAllToolDetails((prev) => ({ ...prev, [msgId]: true }))
-          }
-          hideToolNoise={hideToolNoise}
-          planState={planState}
-          onUpdatePlanDecision={onUpdatePlanDecision}
-          onBuildPlan={onBuildPlan}
-          markdownComponents={markdownComponents}
-          renderBlock={renderBlock}
-          isNoisyToolBlock={isNoisyToolBlock}
-          ToolSummaryRow={ToolSummaryRow}
-          ReasoningBlock={ReasoningBlock}
-        />
-      </div>
+      <TimelineEventShell
+        key={event.id}
+        event={event}
+        index={index}
+        totalCount={timelineEvents.length}
+      >
+        {content}
+      </TimelineEventShell>
     );
-  }, [filteredMessages, messages, onRetry, isRunning, expandedToolDetails, showAllToolDetails, hideToolNoise, planState, onUpdatePlanDecision, onBuildPlan, markdownComponents, renderBlock]);
+  }, [
+    timelineMode,
+    lightweightMarkdownComponents,
+    markdownComponents,
+    lastAssistantMsgId,
+    onRetry,
+    isRunning,
+    timelineEvents.length,
+    planState,
+    onBuildPlan,
+    onViewPlan,
+    onPauseBuild,
+    onEndBuild,
+  ]);
+
+  const itemContent = useCallback((index: number) => {
+    const event = timelineEvents[index];
+    if (!event) return null;
+    return renderTimelineEvent(event, index);
+  }, [timelineEvents, renderTimelineEvent]);
+
+  const virtuosoInitialProps = useMemo(
+    () => initialTopMostItemIndex === undefined ? {} : { initialTopMostItemIndex },
+    [initialTopMostItemIndex],
+  );
 
   const planTaskRequirement =
     chatMode === 'plan'
@@ -1848,13 +2267,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       </div>
 
       {/* 消息列表 */}
-      <div className="min-h-0 flex-1 relative overflow-hidden">
+      <div
+        className="min-h-0 flex-1 relative overflow-hidden"
+        data-testid={timelineMode === 'coding' ? 'coding-event-timeline' : 'personal-conversation-timeline'}
+      >
         <Virtuoso
           ref={virtuosoRef}
           className="h-full"
-          data={filteredMessages}
+          data={timelineEvents}
+          {...virtuosoInitialProps}
           followOutput={isNearBottom ? 'smooth' : false}
-          atBottomStateChange={(atBottom) => setIsNearBottom(atBottom)}
+          atBottomStateChange={handleAtBottomStateChange}
+          rangeChanged={handleRangeChanged}
           overscan={200}
           itemContent={itemContent}
           components={virtuosoComponents}

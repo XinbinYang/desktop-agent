@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import os
+import re
 import shlex
 import subprocess
 from typing import Any, Literal, Optional
@@ -12,7 +14,8 @@ from pathlib import Path
 from app.project_manager import ProjectManager
 from app.credential_manager import CredentialManager
 from app.coding_context import build_repo_map
-from app.security import is_relative_to, resolve_under_base
+from app.runtime_paths import runtime_dir
+from app.security import is_relative_to, redact_sensitive_text, resolve_under_base
 from app.project_rules import (
     PROJECT_RULES_FILE,
     USER_RULES_DIR,
@@ -46,6 +49,18 @@ class CloneProjectRequest(BaseModel):
 class ProjectPathRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     path: str
+
+
+class ProjectPinRequest(ProjectPathRequest):
+    pinned: bool
+
+
+class ProjectDisplayNameRequest(ProjectPathRequest):
+    name: str
+
+
+class PersistentWorktreeRequest(ProjectPathRequest):
+    name: Optional[str] = None
 
 
 class RenameProjectPathRequest(ProjectPathRequest):
@@ -113,6 +128,46 @@ def _command_display(command: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(command)
     return " ".join(shlex.quote(part) for part in command)
+
+
+def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return (
+            result.returncode,
+            redact_sensitive_text(result.stdout or ""),
+            redact_sensitive_text(result.stderr or ""),
+        )
+    except subprocess.TimeoutExpired:
+        return 1, "", f"git command timed out after {timeout}s"
+    except OSError as exc:
+        return 1, "", str(exc)
+
+
+def _project_id(path: str) -> str:
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
+
+
+def _slugify_worktree_name(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip()).strip(".-")
+    return slug[:64] or "worktree"
+
+
+def _unique_worktree_target(parent: Path, slug: str) -> Path:
+    target = parent / slug
+    index = 2
+    while target.exists():
+        target = parent / f"{slug}-{index}"
+        index += 1
+    return target
 
 
 def _build_run_command(root: Path, target: Path, action: str) -> tuple[Optional[list[str]], int, Optional[str]]:
@@ -249,6 +304,86 @@ def close_project():
     """关闭当前项目"""
     ProjectManager.close_project()
     return {"status": "closed"}
+
+
+@router.post("/api/projects/history/pin")
+def pin_project(req: ProjectPinRequest):
+    try:
+        metadata = ProjectManager.set_project_pinned(req.path, req.pinned)
+        return {"status": "ok", "project": metadata}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@router.post("/api/projects/history/rename")
+def rename_project_display(req: ProjectDisplayNameRequest):
+    try:
+        metadata = ProjectManager.rename_project_display(req.path, req.name)
+        return {"status": "ok", "project": metadata}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@router.post("/api/projects/history/archive-sessions")
+def archive_project_sessions(req: ProjectPathRequest):
+    from app.agent import archive_session_records_for_project
+
+    archived_count = archive_session_records_for_project(req.path, agent_type="coding")
+    metadata = ProjectManager.get_project_history(req.path)
+    return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
+
+
+@router.post("/api/projects/history/remove")
+def remove_project_from_history(req: ProjectPathRequest):
+    from app.agent import archive_session_records_for_project
+
+    try:
+        archived_count = archive_session_records_for_project(req.path, agent_type="coding")
+        metadata = ProjectManager.remove_project_from_history(req.path)
+        return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@router.post("/api/projects/worktrees/persistent")
+def create_persistent_worktree(req: PersistentWorktreeRequest):
+    source_path = Path(req.path).expanduser().resolve()
+    if not source_path.exists() or not source_path.is_dir():
+        return {"error": f"Project path is not a directory: {req.path}"}
+
+    code, root_text, stderr = _run_git(["rev-parse", "--show-toplevel"], source_path)
+    if code != 0:
+        return {"error": f"Project is not a Git repository: {stderr or req.path}"}
+    root = Path(root_text.strip()).resolve()
+
+    code, commit_text, stderr = _run_git(["rev-parse", "HEAD"], root)
+    if code != 0 or not commit_text.strip():
+        return {"error": f"Unable to read HEAD commit: {stderr or req.path}"}
+    commit = commit_text.strip()
+
+    default_name = f"{source_path.name}-worktree"
+    slug = _slugify_worktree_name(req.name or default_name)
+    parent = runtime_dir("worktrees") / "persistent" / _project_id(str(root))
+    parent.mkdir(parents=True, exist_ok=True)
+    target = _unique_worktree_target(parent, slug)
+
+    code, _, stderr = _run_git(["worktree", "add", "--detach", str(target), commit], root, timeout=60)
+    if code != 0:
+        return {"error": f"Failed to create worktree: {stderr}"}
+
+    try:
+        project = ProjectManager.open_project(str(target.resolve()))
+        CredentialManager.configure_gcm(str(target))
+    except ValueError as e:
+        return {"error": str(e)}
+
+    return {
+        "status": "ok",
+        "path": str(target.resolve()),
+        "base_project_path": str(root),
+        "base_commit": commit,
+        "project": project,
+    }
 
 
 @router.post("/api/projects/refresh")

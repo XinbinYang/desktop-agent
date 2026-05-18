@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>玄枢 XuanShu Logo Preview</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #0d1117;
+        --panel: #161b22;
+        --line: #30363d;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #58a6ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--ink);
+        color: var(--text);
+        font-family: Inter, "HarmonyOS Sans SC", "Microsoft YaHei", Arial, sans-serif;
+      }
+      main {
+        width: min(1120px, calc(100vw - 40px));
+        margin: 0 auto;
+        padding: 48px 0 64px;
+      }
+      header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 28px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 34px;
+        letter-spacing: 0;
+      }
+      p {
+        margin: 8px 0 0;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 22px;
+      }
+      .card.light {
+        background: #f4f7fa;
+        color: #0b0f14;
+      }
+      .card.light p { color: #5f7384; }
+      .label {
+        margin-bottom: 14px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+      .light .label { color: #5f7384; }
+      img {
+        display: block;
+        max-width: 100%;
+        height: auto;
+      }
+      .icon-row {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+      }
+      .icon-row img {
+        width: 148px;
+      }
+      .swatches {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .swatch {
+        min-height: 88px;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.12);
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        justify-content: end;
+        font-size: 11px;
+        color: white;
+      }
+      .swatch.light-text { color: #0b0f14; border-color: #d7e0e7; }
+      @media (max-width: 780px) {
+        .grid { grid-template-columns: 1fr; }
+        header { display: block; }
+        .swatches { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>玄枢 XuanShu</h1>
+          <p>Local Agent OS · see, think, act</p>
+        </div>
+        <p>Logo system preview</p>
+      </header>
+
+      <section class="grid">
+        <div class="card" style="grid-column: 1 / -1;">
+          <div class="label">Primary dark lockup</div>
+          <img src="./xuanshu-wordmark-dark.svg" alt="玄枢 XuanShu dark wordmark" />
+        </div>
+
+        <div class="card light" style="grid-column: 1 / -1;">
+          <div class="label">Light lockup</div>
+          <img src="./xuanshu-wordmark-light.svg" alt="玄枢 XuanShu light wordmark" />
+        </div>
+
+        <div class="card">
+          <div class="label">Dark app icon</div>
+          <div class="icon-row">
+            <img src="./xuanshu-icon.svg" alt="XuanShu icon" />
+            <div>
+              <h2 style="margin: 0 0 8px; font-size: 22px;">X-shaped central axis</h2>
+              <p>Uses the product dark tokens: app background, default border, primary text, blue accent, and success green.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card light">
+          <div class="label">Light app icon</div>
+          <div class="icon-row">
+            <img src="./xuanshu-icon-light.svg" alt="XuanShu light icon" />
+            <div>
+              <h2 style="margin: 0 0 8px; font-size: 22px;">Light theme match</h2>
+              <p>Uses the product light tokens: white app background, light surface, default border, and Windows-style blue accent.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+          <div class="label">Mono icon</div>
+          <div class="icon-row">
+            <img src="./xuanshu-icon-mono.svg" alt="XuanShu mono icon" />
+            <div>
+              <h2 style="margin: 0 0 8px; font-size: 22px;">One-color usage</h2>
+              <p>For masks, tray fallbacks, small UI marks, engraving, and constrained surfaces.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+          <div class="label">Palette</div>
+          <div class="swatches">
+            <div class="swatch" style="background:#0D1117;">Dark App<br />#0D1117</div>
+            <div class="swatch" style="background:#161B22;">Dark Surface<br />#161B22</div>
+            <div class="swatch light-text" style="background:#58A6FF;">Dark Accent<br />#58A6FF</div>
+            <div class="swatch light-text" style="background:#FFFFFF;">Light App<br />#FFFFFF</div>
+            <div class="swatch light-text" style="background:#F3F3F3;">Light Surface<br />#F3F3F3</div>
+            <div class="swatch" style="background:#0067B8;">Light Accent<br />#0067B8</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

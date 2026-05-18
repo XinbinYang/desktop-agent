@@ -60,6 +60,7 @@ settings:
   collaboration_enabled: true
   default_collaboration_mode: hybrid
   auto_delegate_coding: suggest
+  max_parallel_agents: 3
 
 coding_agent:
   enabled: true

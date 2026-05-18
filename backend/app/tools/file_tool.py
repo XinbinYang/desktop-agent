@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
 from app.project_manager import ProjectManager
-from app.runtime_paths import workspace_root
-from app.security import resolve_under_base
+from app.runtime_paths import agents_dir, workspace_root
+from app.security import is_relative_to, resolve_under_base
 
 # File operations are sandboxed under the project root or current project directory
 _PROJECT_ROOT = workspace_root()
@@ -88,9 +88,38 @@ def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]
     return _PROJECT_ROOT, None
 
 
+def _resolve_agent_workspace_path(path: str) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve AGENTS/* paths to the mutable runtime Agent workspace."""
+    try:
+        raw = Path(path)
+        root = agents_dir().resolve()
+        if raw.is_absolute():
+            resolved = raw.resolve()
+            if is_relative_to(resolved, root):
+                return resolved, None
+            return None, None
+
+        parts = raw.parts
+        if not parts or parts[0].lower() != "agents":
+            return None, None
+        rel = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+        resolved, err = resolve_under_base(str(rel), root, allow_relative=True)
+        if err:
+            return resolved, err
+        return resolved, None
+    except (OSError, ValueError) as e:
+        return Path(path), f"Invalid path: {path} ({e})"
+
+
 def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Optional[str]]:
     """Validate that a path is within the sandbox. Returns (resolved_path, error_message)."""
     from app.config import load_config
+
+    if not project_relative:
+        agent_path, agent_err = _resolve_agent_workspace_path(path)
+        if agent_path is not None or agent_err:
+            return agent_path or Path(path), agent_err
+
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
             candidate = Path(path)

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChevronDown, ChevronRight, CheckCircle2, XCircle, Wrench, Loader2, Bot } from 'lucide-react';
 import { WorkerEvent } from '../types';
 
@@ -9,6 +9,7 @@ interface ToolCallViewProps {
   status: 'running' | 'success' | 'error';
   durationMs?: number;
   workerEvents?: WorkerEvent[];
+  variant?: 'full' | 'event-row' | 'disclosure';
 }
 
 /** Shell/bash-style tools get a compact IN/OUT terminal view. */
@@ -24,6 +25,50 @@ function shellCommand(args: Record<string, any>): string {
     args.command ?? args.cmd ?? args.script ?? args.shell ?? args.input ?? '';
   if (Array.isArray(raw)) return raw.join(' ');
   return typeof raw === 'string' ? raw : '';
+}
+
+function truncateText(value: string, maxChars = 1200, maxLines = 8): string {
+  const lines = value.split(/\r?\n/);
+  const clippedLines = lines.length > maxLines;
+  let next = lines.slice(0, maxLines).join('\n');
+  const clippedChars = next.length > maxChars;
+  if (clippedChars) next = next.slice(0, maxChars);
+  return clippedLines || clippedChars ? `${next}\n...` : next;
+}
+
+function firstStringArg(args: Record<string, any>, keys: string[]): string {
+  for (const key of keys) {
+    const value = args?.[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return '';
+}
+
+function toolDisplayName(name: string, args: Record<string, any>): string {
+  const n = (name || '').toLowerCase();
+  if (n.includes('dispatch') || n.includes('worker') || n.includes('agent')) return 'Agent';
+  if (isShellTool(name)) return 'Bash';
+  if (n.includes('read')) return 'Read';
+  if (n.includes('search') || n.includes('grep')) return 'Search';
+  if (n.includes('list') || n.includes('ls')) return 'List';
+  if (n.includes('write') || n.includes('edit') || n.includes('patch')) return 'Edit';
+  if (n.includes('browser')) return 'Browser';
+  if (n.includes('web')) return 'Web';
+  return name || firstStringArg(args, ['tool', 'name']) || 'Tool';
+}
+
+function toolTarget(name: string, args: Record<string, any>): string {
+  const n = (name || '').toLowerCase();
+  if (n.includes('dispatch') || n.includes('worker') || n.includes('agent')) {
+    const tasks = Array.isArray(args?.tasks) ? args.tasks.length : 0;
+    if (tasks > 0) return `${tasks} agent${tasks > 1 ? 's' : ''}`;
+    return firstStringArg(args, ['task', 'goal', 'prompt']);
+  }
+  if (isShellTool(name)) return shellCommand(args);
+  const direct = firstStringArg(args, ['path', 'file', 'file_path', 'query', 'url', 'command']);
+  if (direct) return direct;
+  const first = Object.values(args || {}).find((value) => typeof value === 'string' && value.trim());
+  return typeof first === 'string' ? first : '';
 }
 
 function groupWorkerEvents(events: WorkerEvent[] = []): Record<string, WorkerEvent[]> {
@@ -97,6 +142,114 @@ const WorkerCard: React.FC<{ workerId: string; events: WorkerEvent[] }> = ({ wor
   );
 };
 
+function workerStatus(events: WorkerEvent[]): WorkerEvent['status'] {
+  const start = events.find((event) => event.type === 'worker_start');
+  const done = events.find((event) => event.type === 'worker_done');
+  return done?.status || start?.status || 'running';
+}
+
+function workerTitle(workerId: string, events: WorkerEvent[]): string {
+  const start = events.find((event) => event.type === 'worker_start');
+  const done = events.find((event) => event.type === 'worker_done');
+  return start?.task || done?.task || workerId;
+}
+
+function workerInput(events: WorkerEvent[]): string {
+  const start = events.find((event) => event.type === 'worker_start');
+  return start?.task || '';
+}
+
+function workerOutput(events: WorkerEvent[]): string {
+  const done = [...events].reverse().find((event) => event.type === 'worker_done');
+  if (done?.result) return done.result;
+  const content = [...events].reverse().find((event) => event.type === 'worker_content' && event.text);
+  return content?.text || '';
+}
+
+const InlineWorkerTrace: React.FC<{ workerId: string; events: WorkerEvent[] }> = ({ workerId, events }) => {
+  const status = workerStatus(events);
+  const title = workerTitle(workerId, events);
+  const input = workerInput(events);
+  const output = workerOutput(events);
+  const done = events.find((event) => event.type === 'worker_done');
+  const failed = status === 'failed' || status === 'cancelled';
+
+  return (
+    <div className="space-y-[var(--chat-space-xs)]">
+      <div className="flex items-center gap-2 chat-text-sm">
+        {status === 'running' ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-info shrink-0" />
+        ) : failed ? (
+          <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
+        ) : (
+          <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
+        )}
+        <span className="font-semibold text-fg">Agent:</span>
+        <span className="min-w-0 truncate text-fg-secondary" title={title}>{title}</span>
+        {done?.durationMs != null && <span className="ml-auto shrink-0 chat-text-xs text-fg-muted tabular-nums">{done.durationMs}ms</span>}
+      </div>
+      {(input || output) && (
+        <div className="ml-5 rounded-md border border-border-subtle bg-surface-alt/55 px-3 py-2 chat-text-sm text-fg-secondary">
+          {input && (
+            <div className="flex gap-3">
+              <span className="shrink-0 chat-text-xs font-medium uppercase text-fg-muted">IN</span>
+              <div className="min-w-0 whitespace-pre-wrap">{truncateText(input, 900, 6)}</div>
+            </div>
+          )}
+          {output && (
+            <div className={`${input ? 'mt-2 border-t border-border-subtle pt-2' : ''} flex gap-3`}>
+              <span className="shrink-0 chat-text-xs font-medium uppercase text-fg-muted">OUT</span>
+              <div className={`min-w-0 whitespace-pre-wrap ${failed ? 'text-danger' : 'text-fg-secondary'}`}>
+                {truncateText(output, 1200, 8)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const CompactToolDetails: React.FC<{
+  name: string;
+  args: Record<string, any>;
+  result?: string;
+  status: 'running' | 'success' | 'error';
+  workerGroups: Record<string, WorkerEvent[]>;
+}> = ({ name, args, result, status, workerGroups }) => {
+  const isShell = isShellTool(name);
+  const command = isShell ? shellCommand(args) : '';
+  const hasArgs = Object.keys(args || {}).length > 0;
+  const workerEntries = Object.entries(workerGroups);
+
+  return (
+    <div className="border-t border-border-subtle px-[var(--chat-bubble-px)] py-[var(--chat-space-sm)] space-y-[var(--chat-space-sm)] chat-text-xs">
+      {workerEntries.length > 0 ? (
+        <div className="space-y-[var(--chat-space-md)]">
+          {workerEntries.map(([workerId, events]) => (
+            <InlineWorkerTrace key={workerId} workerId={workerId} events={events} />
+          ))}
+        </div>
+      ) : isShell ? (
+        command && (
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-surface-alt px-3 py-2 font-mono text-fg-secondary">
+            {truncateText(command)}
+          </pre>
+        )
+      ) : hasArgs ? (
+        <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-surface-alt px-3 py-2 font-mono text-fg-secondary">
+          {truncateText(JSON.stringify(args, null, 2))}
+        </pre>
+      ) : null}
+      {workerEntries.length === 0 && result != null && (
+        <pre className={`max-h-40 overflow-auto whitespace-pre-wrap rounded bg-surface-alt px-3 py-2 font-mono ${status === 'error' ? 'text-danger' : 'text-fg-secondary'}`}>
+          {truncateText(result)}
+        </pre>
+      )}
+    </div>
+  );
+};
+
 export const ToolCallView: React.FC<ToolCallViewProps> = ({
   name,
   args,
@@ -104,12 +257,88 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
   status,
   durationMs,
   workerEvents,
+  variant = 'full',
 }) => {
-  const [expanded, setExpanded] = useState(false);
   const workerGroups = groupWorkerEvents(workerEvents);
   const workerCount = Object.keys(workerGroups).length;
+  const [expanded, setExpanded] = useState(workerCount > 0 && variant !== 'full');
   const isShell = isShellTool(name);
   const command = isShell ? shellCommand(args) : '';
+  const canExpand = status !== 'running' || workerCount > 0 || result != null;
+
+  useEffect(() => {
+    if (variant !== 'full' && workerCount > 0) {
+      setExpanded(true);
+    }
+  }, [variant, workerCount]);
+
+  if (variant === 'event-row' || variant === 'disclosure') {
+    const label = toolDisplayName(name, args);
+    const target = toolTarget(name, args);
+    const disclosure = variant === 'disclosure';
+
+    return (
+      <div
+        className={`my-[var(--chat-space-xs)] rounded-md border overflow-hidden ${
+          disclosure
+            ? 'border-border-subtle bg-surface/40'
+            : status === 'error'
+              ? 'border-danger/30 bg-danger/5'
+              : 'border-border-subtle bg-surface/45'
+        }`}
+        data-testid={disclosure ? 'tool-disclosure' : 'tool-event-row'}
+      >
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
+          onClick={() => canExpand && setExpanded((v) => !v)}
+          className="w-full flex min-w-0 items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-left hover:bg-surface-hover transition-colors"
+        >
+          {status === 'running' ? (
+            <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
+          ) : status === 'error' ? (
+            <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
+          )}
+          {workerCount > 0 ? (
+            <Bot className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          ) : (
+            <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          )}
+          <span className="font-medium text-fg-secondary shrink-0">
+            {disclosure ? `Used ${label}` : label}
+          </span>
+          {target && (
+            <span
+              className={`min-w-0 flex-1 truncate text-fg-muted ${workerCount > 0 ? '' : 'font-mono'}`}
+              title={target}
+            >
+              {target}
+            </span>
+          )}
+          {typeof durationMs === 'number' && (
+            <span className="text-fg-muted tabular-nums shrink-0">{durationMs}ms</span>
+          )}
+          {canExpand ? (
+            expanded ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          ) : (
+            <span className="text-info/80 shrink-0 font-medium">Running</span>
+          )}
+        </button>
+        {expanded && canExpand && (
+          <CompactToolDetails
+            name={name}
+            args={args}
+            result={result}
+            status={status}
+            workerGroups={workerGroups}
+          />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/40 overflow-hidden">

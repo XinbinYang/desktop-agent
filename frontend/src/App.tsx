@@ -5,6 +5,7 @@ import type { GroupImperativeHandle, PanelImperativeHandle } from 'react-resizab
 import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import { Sidebar } from './components/Sidebar';
+import type { ProjectHistoryAction } from './components/SessionHistoryPanel';
 import { SessionView, type SessionViewHandle } from './components/session/SessionView';
 import { PaneRenderer } from './components/session/PaneRenderer';
 import type { LeafNode, PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
@@ -29,7 +30,7 @@ import { PersonalWorkspacePanel } from './components/PersonalWorkspace/PersonalW
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
-import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType } from './types';
+import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
 import { API_BASE } from './config';
 import {
   DEFAULT_MAIN_LAYOUT,
@@ -48,17 +49,7 @@ import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
 import type { FileTreeAction } from './components/FileTree';
 
-interface SessionListItem {
-  id: string;
-  title?: string;
-  project_path?: string;
-  model_id: string;
-  role_id?: string;
-  agent_type?: AgentType;
-  message_count: number;
-  updated_at?: number;
-  is_primary?: boolean;
-}
+type SessionListItem = SessionHistoryItem;
 
 interface ResolvedSession {
   session_id: string;
@@ -88,6 +79,8 @@ interface SplitPaneOptions {
   role?: string;
   agentType?: AgentType;
 }
+
+const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
 
 function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
   if (!settings?.settings || !settings.providers) return false;
@@ -180,6 +173,24 @@ function sessionTitleForDisplay(pane: SessionPane | null | undefined, meta?: Ses
 
 function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
   return pane?.model || meta?.model_id || '';
+}
+
+function flattenSessionHistory(history: SessionHistoryResponse | null): SessionListItem[] {
+  if (!history) return [];
+  const byId = new Map<string, SessionListItem>();
+  for (const session of history.standalone_sessions || []) {
+    byId.set(session.id, session);
+  }
+  for (const project of history.projects || []) {
+    for (const session of project.sessions || []) {
+      byId.set(session.id, session);
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    if (a.is_primary && !b.is_primary) return -1;
+    if (!a.is_primary && b.is_primary) return 1;
+    return (b.updated_at || 0) - (a.updated_at || 0);
+  });
 }
 
 function findFileNode(nodes: FileNode[], path: string): FileNode | undefined {
@@ -284,7 +295,8 @@ export default function App() {
     const leaf = findLeafById(paneRoot, focusedLeafId);
     return leaf?.pane.sessionId ?? collectLeaves(paneRoot)[0]?.sessionId ?? '';
   }, [paneRoot, focusedLeafId]);
-  const [sessions, setSessions] = useState<SessionListItem[]>([]);
+  const [sessionHistory, setSessionHistory] = useState<SessionHistoryResponse | null>(null);
+  const sessions = React.useMemo(() => flattenSessionHistory(sessionHistory), [sessionHistory]);
   const [showSettings, setShowSettings] = useState(false);
 
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
@@ -408,14 +420,30 @@ export default function App() {
   }, [focusedSessionId]);
 
   const loadSessions = useCallback((projectPath?: string | null) => {
-    const url = projectPath
-      ? `${API_BASE}/api/sessions?project_path=${encodeURIComponent(projectPath)}`
-      : `${API_BASE}/api/sessions`;
-    fetch(url)
+    void projectPath;
+    fetch(`${API_BASE}/api/session-history`)
       .then((r) => r.json())
-      .then((data) => setSessions(data.sessions || []))
+      .then((data) => setSessionHistory(data || null))
       .catch(console.error);
   }, []);
+
+  const sessionHistoryHasRunning = React.useMemo(() => {
+    if (!sessionHistory) return false;
+    const standalone = Array.isArray(sessionHistory.standalone_sessions) ? sessionHistory.standalone_sessions : [];
+    const projects = Array.isArray(sessionHistory.projects) ? sessionHistory.projects : [];
+    return (
+      standalone.some((session) => session.is_running) ||
+      projects.some((project) => project.has_running || (project.sessions || []).some((session) => session.is_running))
+    );
+  }, [sessionHistory]);
+
+  useEffect(() => {
+    if (layout.activeSection !== 'sessions' && !sessionHistoryHasRunning) return;
+    const timer = window.setInterval(() => {
+      loadSessions(currentProject?.path ?? null);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [currentProject?.path, layout.activeSection, loadSessions, sessionHistoryHasRunning]);
 
   // Slash command handler — delegates to focused session actions
   const handleSlashCommand = useCallback(async (command: string, args: string) => {
@@ -424,13 +452,8 @@ export default function App() {
 
     switch (command.toLowerCase()) {
       case 'new':
-        if (focusedAgentType === 'personal') {
-          a.clearSession();
-          addTerminalLog('[Command] Started a fresh Personal Agent session');
-        } else {
-          newSessionRef.current();
-          addTerminalLog('[Command] Creating a new Coding Agent session');
-        }
+        newSessionRef.current();
+        addTerminalLog('[Command] Creating a new Coding Agent session');
         break;
       case 'clear':
         a.clearSession();
@@ -484,10 +507,8 @@ export default function App() {
         setPaneRoot((prev) => mapPaneTree(prev, (pane) => (
           pane.sessionId === focusedSessionId ? { ...pane, model: arg } : pane
         )));
-        setSessions((prev) => prev.map((session) => (
-          session.id === focusedSessionId ? { ...session, model_id: arg } : session
-        )));
         a.switchModel(arg);
+        loadSessions(currentProject?.path ?? null);
         addTerminalLog(`[Model] Switching focused session to ${arg}`);
         break;
       }
@@ -521,12 +542,8 @@ export default function App() {
             },
           });
         });
-        setSessions((prev) => prev.map((session) => (
-          session.id === focusedSessionId
-            ? { ...session, role_id: arg, agent_type: targetAgent, is_primary: targetAgent === 'personal' }
-            : session
-        )));
         a.switchRole(arg);
+        loadSessions(currentProject?.path ?? null);
         addTerminalLog(`[Role] Switching focused session to ${arg}`);
         break;
       }
@@ -551,16 +568,12 @@ export default function App() {
           }
           setCurrentProject(project);
 
-          const [treeRes, sessionsRes] = await Promise.all([
-            fetch(`${API_BASE}/api/projects/tree`),
-            fetch(`${API_BASE}/api/sessions?project_path=${encodeURIComponent(project.path)}`),
-          ]);
+          const treeRes = await fetch(`${API_BASE}/api/projects/tree`);
           const tree = await treeRes.json().catch(() => ({}));
-          const sessionData = await sessionsRes.json().catch(() => ({}));
           setFileTree(tree.nodes || []);
           setExpandedPaths(new Set());
           setLoadingPaths(new Set());
-          setSessions(sessionData.sessions || []);
+          loadSessions(project.path);
           addTerminalLog(`[Project] Opened ${project.name || project.path}`);
         } catch (err) {
           addTerminalLog(`[Project] Open error: ${err}`);
@@ -581,7 +594,9 @@ export default function App() {
     focusedLeafId,
     focusedSessionId,
     focusedSnapshot?.contextUsage,
+    currentProject?.path,
     layout,
+    loadSessions,
     models,
     openFocusedRewind,
   ]);
@@ -888,6 +903,146 @@ export default function App() {
     }
   }, [fetchProjectTreePath, loadSessions, addTerminalLog]);
 
+  const handleOpenProjectPath = useCallback(async (path: string): Promise<ProjectInfo | null> => {
+    if (!path) return null;
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      const project = await res.json();
+      if (project.error) {
+        addTerminalLog(`[Project] Open failed: ${project.error}`);
+        return null;
+      }
+      setCurrentProject(project);
+      setExpandedPaths(new Set());
+      setLoadingPaths(new Set());
+      setFileTree(await fetchProjectTreePath());
+      loadSessions(project.path);
+      addTerminalLog(`[Project] Opened ${project.name || project.path}`);
+      return project as ProjectInfo;
+    } catch (err) {
+      addTerminalLog(`[Project] Open error: ${err}`);
+      return null;
+    }
+  }, [addTerminalLog, fetchProjectTreePath, loadSessions]);
+
+  const handleProjectHistoryAction = useCallback(async (
+    action: ProjectHistoryAction,
+    project: SessionHistoryProject,
+  ) => {
+    const projectPath = project.path;
+    const refreshHistory = () => loadSessions(currentProject?.path ?? null);
+
+    const postJson = async (url: string, body: unknown) => {
+      const res = await fetch(`${API_BASE}${url}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return res.json();
+    };
+
+    try {
+      switch (action) {
+        case 'pin':
+        case 'unpin': {
+          const data = await postJson('/api/projects/history/pin', {
+            path: projectPath,
+            pinned: action === 'pin',
+          });
+          if (data.error) {
+            addTerminalLog(`[Project] Pin failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          refreshHistory();
+          addTerminalLog(`[Project] ${action === 'pin' ? 'Pinned' : 'Unpinned'} ${project.name}`);
+          return;
+        }
+        case 'reveal': {
+          const reveal = window.electronAPI?.revealPath;
+          const open = window.electronAPI?.openPath;
+          if (!reveal && !open) {
+            addTerminalLog('[Project] Electron path actions unavailable');
+            return;
+          }
+          const revealError = reveal ? await reveal(projectPath) : 'Reveal path unavailable';
+          if (revealError && open) {
+            const openError = await open(projectPath);
+            if (openError) addTerminalLog(`[Project] Open project path failed: ${openError}`);
+          } else if (revealError) {
+            addTerminalLog(`[Project] Reveal project path failed: ${revealError}`);
+          }
+          return;
+        }
+        case 'worktree': {
+          const defaultName = `${project.folder_name || project.name || 'project'}-worktree`;
+          const name = window.prompt('创建永久工作树', defaultName);
+          if (name === null) return;
+          const data = await postJson('/api/projects/worktrees/persistent', {
+            path: projectPath,
+            name: name.trim() || defaultName,
+          });
+          if (data.error) {
+            addTerminalLog(`[Project] Worktree failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          if (data.project?.path) {
+            setCurrentProject(data.project);
+            setExpandedPaths(new Set());
+            setLoadingPaths(new Set());
+            setFileTree(await fetchProjectTreePath());
+            loadSessions(data.project.path);
+          } else {
+            refreshHistory();
+          }
+          addTerminalLog(`[Project] Created persistent worktree: ${data.path || data.project?.path || project.name}`);
+          return;
+        }
+        case 'rename': {
+          const nextName = window.prompt('重命名项目', project.display_name || project.name)?.trim();
+          if (!nextName || nextName === (project.display_name || project.name)) return;
+          const data = await postJson('/api/projects/history/rename', { path: projectPath, name: nextName });
+          if (data.error) {
+            addTerminalLog(`[Project] Rename failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          refreshHistory();
+          addTerminalLog(`[Project] Renamed project to ${nextName}`);
+          return;
+        }
+        case 'archive': {
+          if (!window.confirm(`归档 ${project.name} 的对话？`)) return;
+          const data = await postJson('/api/projects/history/archive-sessions', { path: projectPath });
+          if (data.error) {
+            addTerminalLog(`[Project] Archive failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          refreshHistory();
+          addTerminalLog(`[Project] Archived ${data.archived_sessions ?? 0} sessions for ${project.name}`);
+          return;
+        }
+        case 'remove': {
+          if (!window.confirm(`从历史中移除 ${project.name}？对话会被归档，项目文件不会删除。`)) return;
+          const data = await postJson('/api/projects/history/remove', { path: projectPath });
+          if (data.error) {
+            addTerminalLog(`[Project] Remove failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          refreshHistory();
+          addTerminalLog(`[Project] Removed ${project.name} from history`);
+          return;
+        }
+        default:
+          return;
+      }
+    } catch (err) {
+      addTerminalLog(`[Project] Action failed: ${err}`);
+    }
+  }, [addTerminalLog, currentProject?.path, fetchProjectTreePath, loadSessions]);
+
   const handleCloseProject = useCallback(() => {
     fetch(`${API_BASE}/api/projects/close`, { method: 'POST' })
       .then(() => {
@@ -898,7 +1053,7 @@ export default function App() {
         loadSessions();
       })
       .catch(console.error);
-  }, []);
+  }, [loadSessions]);
 
   const handleTogglePath = useCallback((path: string) => {
     const willExpand = !expandedPaths.has(path);
@@ -1260,17 +1415,26 @@ export default function App() {
       setExpandedPaths(new Set());
       setLoadingPaths(new Set());
       setFileTree(await fetchProjectTreePath());
+      loadSessions(project.path);
       addTerminalLog(`[Run] opened worktree: ${worktreePath}`);
     } catch (err) {
       addTerminalLog(`[Run] open worktree error: ${err}`);
     }
-  }, [addTerminalLog, fetchProjectTreePath]);
+  }, [addTerminalLog, fetchProjectTreePath, loadSessions]);
 
   // ---- Session pane management (tree-based) ----
 
-  const switchSession = useCallback((newSessionId: string) => {
+  const switchSession = useCallback(async (newSessionId: string, projectPath?: string | null) => {
     const target = sessions.find((s) => s.id === newSessionId);
     const targetAgent = target ? normalizeAgentType(target.agent_type, target.role_id) : layout.activeAgent;
+    const targetProjectPath = projectPath || target?.project_path || '';
+    const currentProjectKey = currentProject?.path ? normalizeProjectPath(currentProject.path).toLowerCase() : '';
+    const targetProjectKey = targetProjectPath ? normalizeProjectPath(targetProjectPath).toLowerCase() : '';
+
+    if (targetAgent === 'coding' && targetProjectPath && targetProjectKey !== currentProjectKey) {
+      await handleOpenProjectPath(targetProjectPath);
+    }
+
     layout.setActiveAgent(targetAgent);
     if (targetAgent === 'personal') {
       const existingPersonal = collectLeafNodes(paneRoot).find((entry) => entry.pane.agentType === 'personal');
@@ -1294,7 +1458,15 @@ export default function App() {
       };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-  }, [focusedLeafId, sessions, agentModel, agentModels, layout, paneRoot]);
+  }, [agentModel, agentModels, currentProject?.path, focusedLeafId, handleOpenProjectPath, layout, paneRoot, sessions]);
+
+  const stopSessionById = useCallback((sessionId: string) => {
+    if (!sessionId) return;
+    void fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: 'POST' })
+      .catch((err) => {
+        console.error('[App] Failed to stop pane session:', err);
+      });
+  }, []);
 
   const newSession = useCallback(async () => {
     try {
@@ -1321,18 +1493,66 @@ export default function App() {
     }
   }, [addTerminalLog, agentModel, agentModels.coding, applyResolvedSessionToFocusedPane, currentProject?.path, focusedLeafId, loadSessions, resolveAgentSessionClient]);
 
+  const openNewSessionPane = useCallback(async () => {
+    const agentType: AgentType = 'coding';
+    let sessionId = createDefaultSessionId(agentType);
+    let model = agentModels.coding || agentModel;
+    let role = roleForAgent(agentType);
+    let title: string | undefined;
+
+    try {
+      const resolved = await resolveAgentSessionClient(agentType, 'new');
+      sessionId = resolved.session_id;
+      model = resolved.model_id || model;
+      role = resolved.role_id || role;
+      title = resolved.title || undefined;
+      loadSessions(currentProject?.path ?? null);
+      addTerminalLog('[System] Created Coding Agent session');
+    } catch (err) {
+      console.error('[App] Failed to create coding session:', err);
+    }
+
+    const newLeaf = createLeaf(agentType, model, sessionId);
+    newLeaf.pane.role = role;
+    newLeaf.pane.title = title;
+    newLeaf.pane.isPrimary = false;
+
+    setPaneRoot((prev) => {
+      const targetLeafId = findLeafById(prev, focusedLeafId)?.id ?? findFirstLeafId(prev);
+      if (!targetLeafId) return newLeaf;
+      const existing = findLeafById(prev, targetLeafId);
+      if (!existing) return prev;
+      const split: SplitNode = {
+        type: 'split',
+        id: nextNodeId(),
+        direction: 'horizontal',
+        children: [existing, newLeaf],
+        sizes: [50, 50],
+      };
+      return replaceNode(prev, targetLeafId, split);
+    });
+    setFocusedLeafId(newLeaf.id);
+    lastFocusedLeafByAgent.current.coding = newLeaf.id;
+    layout.setActiveAgent(agentType);
+    layout.setActiveSection('project');
+  }, [
+    addTerminalLog,
+    agentModel,
+    agentModels.coding,
+    currentProject?.path,
+    focusedLeafId,
+    layout,
+    loadSessions,
+    resolveAgentSessionClient,
+  ]);
+
   useEffect(() => {
-    newSessionRef.current = newSession;
-  }, [newSession]);
+    newSessionRef.current = openNewSessionPane;
+  }, [openNewSessionPane]);
 
   const startFocusedSession = useCallback(() => {
-    if (focusedAgentType === 'personal') {
-      focusedActions.clearSession();
-      addTerminalLog('[Command] Started a fresh Personal Agent session');
-      return;
-    }
-    newSession();
-  }, [focusedActions, focusedAgentType, newSession, addTerminalLog]);
+    openNewSessionPane();
+  }, [openNewSessionPane]);
 
   const deleteSession = useCallback(async (id: string) => {
     await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
@@ -1472,9 +1692,6 @@ export default function App() {
     setPaneRoot((prev) => mapPaneTree(prev, (pane) => (
       pane.sessionId === targetSessionId ? { ...pane, model: modelId } : pane
     )));
-    setSessions((prev) => prev.map((session) => (
-      session.id === targetSessionId ? { ...session, model_id: modelId } : session
-    )));
 
     const targetView = sessionViewRefs.current.get(targetSessionId);
     if (targetView?.switchModel) {
@@ -1482,10 +1699,16 @@ export default function App() {
     } else if (leafId === focusedLeafId) {
       focusedActions.switchModel(modelId);
     }
-  }, [focusedActions, focusedLeafId, layout, paneRoot]);
+    loadSessions(currentProject?.path ?? null);
+  }, [currentProject?.path, focusedActions, focusedLeafId, layout, loadSessions, paneRoot]);
 
   // Close a leaf pane
   const handleClosePane = useCallback((leafId: string) => {
+    const closingLeaf = findLeafById(paneRoot, leafId);
+    if (closingLeaf) {
+      stopSessionById(closingLeaf.pane.sessionId);
+    }
+
     setPaneRoot((prev) => {
       if (prev.type === 'leaf' && prev.id === leafId) {
         const removedPane = prev.pane;
@@ -1513,7 +1736,7 @@ export default function App() {
       }
       return result.root;
     });
-  }, [agentModel, layout.activeAgent]);
+  }, [agentModel, layout.activeAgent, paneRoot, stopSessionById]);
 
   const handleSplitResize = useCallback((splitId: string, sizes: number[]) => {
     setPaneRoot((prev) => updateSplitSizes(prev, splitId, sizes));
@@ -1577,11 +1800,11 @@ export default function App() {
   // Electron menu events
   useEffect(() => {
     if (window.electronAPI?.onNewSession) {
-      const handler = () => newSession();
+      const handler = () => openNewSessionPane();
       const unsubscribe = window.electronAPI.onNewSession(handler);
       return () => { unsubscribe?.(); };
     }
-  }, [newSession]);
+  }, [openNewSessionPane]);
 
   // ---- Hotkeys ----
   useHotkeys('ctrl+\\, cmd+\\', (e) => {
@@ -1703,6 +1926,7 @@ export default function App() {
               onClear={focusedActions.clearSession}
               onExecuteTool={focusedActions.executeToolDirect}
               isConnected={isConnected}
+              sessionHistory={sessionHistory}
               sessions={sessions}
               currentSession={focusedSessionId}
               onNewSession={startFocusedSession}
@@ -1710,6 +1934,8 @@ export default function App() {
               onRewindSession={openFocusedRewind}
               onSwitchSession={switchSession}
               onDeleteSession={deleteSession}
+              onOpenProject={handleOpenProjectPath}
+              onProjectAction={handleProjectHistoryAction}
               currentProjectPath={currentProject?.path ?? null}
               currentProject={currentProject}
               fileTree={fileTree}
@@ -1732,6 +1958,7 @@ export default function App() {
                 setExpandedPaths(new Set());
                 setLoadingPaths(new Set());
                 setFileTree(await fetchProjectTreePath());
+                loadSessions(project.path);
                 setShowProjectModal(false);
                 addTerminalLog(`[系统] 已创建项目: ${project.name}`);
               }}
@@ -1795,7 +2022,7 @@ export default function App() {
           defaultLayout={layout.mainLayout}
           onLayoutChanged={handleMainLayoutChanged}
           className="flex-1 min-w-0"
-          resizeTargetMinimumSize={{ fine: 22, coarse: 34 }}
+          resizeTargetMinimumSize={RESIZE_TARGET_MINIMUM_SIZE}
         >
           {/* Center area */}
           <Panel id="center" minSize="360px">
@@ -1808,7 +2035,7 @@ export default function App() {
                 defaultLayout={layout.terminalLayout}
                 onLayoutChanged={handleTerminalLayoutChanged}
                 className="flex-1 min-h-0"
-                resizeTargetMinimumSize={{ fine: 22, coarse: 34 }}
+                resizeTargetMinimumSize={RESIZE_TARGET_MINIMUM_SIZE}
               >
                 <Panel id="conversation" minSize="280px">
                   <PaneRenderer

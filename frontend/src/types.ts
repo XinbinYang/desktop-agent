@@ -473,6 +473,42 @@ export interface EditorGroup {
 export type AgentType = 'personal' | 'coding';
 export type SidebarSection = 'personal' | 'coding' | 'skills' | 'project' | 'sessions' | 'settings';
 
+export interface SessionHistoryItem {
+  id: string;
+  title?: string;
+  project_path?: string | null;
+  model_id: string;
+  role_id?: string;
+  agent_type?: AgentType;
+  message_count: number;
+  updated_at?: number;
+  is_primary?: boolean;
+  is_running: boolean;
+  active_connections: number;
+  activity_state: 'idle' | 'running' | 'needs_input';
+}
+
+export interface SessionHistoryProject {
+  path: string;
+  name: string;
+  display_name?: string | null;
+  folder_name?: string;
+  last_opened?: string | null;
+  is_current: boolean;
+  has_running: boolean;
+  is_pinned?: boolean;
+  is_archived?: boolean;
+  archived_sessions_count?: number;
+  source?: 'recent' | 'session' | 'current' | 'metadata';
+  sessions: SessionHistoryItem[];
+}
+
+export interface SessionHistoryResponse {
+  current_project_path: string | null;
+  projects: SessionHistoryProject[];
+  standalone_sessions: SessionHistoryItem[];
+}
+
 export interface SkillPreferences {
   personal: Record<string, boolean>;
   coding: Record<string, boolean>;

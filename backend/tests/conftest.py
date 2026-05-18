@@ -1,6 +1,8 @@
 import pytest
 import pytest_asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 BACKEND_ROOT = Path(__file__).parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
+
+TEST_USER_DATA_DIR = Path(tempfile.gettempdir()) / "desktop-agent-pytest-user-data"
+os.environ.setdefault("DESKTOP_AGENT_USER_DATA_DIR", str(TEST_USER_DATA_DIR))
 
 from fastapi.testclient import TestClient
 from httpx import AsyncClient, ASGITransport
@@ -102,7 +107,7 @@ def reset_config_cache(monkeypatch, tmp_path):
 def reset_local_auth(monkeypatch):
     """Local API auth is opt-in per test."""
     monkeypatch.delenv("DESKTOP_AGENT_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("DESKTOP_AGENT_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("DESKTOP_AGENT_USER_DATA_DIR", str(TEST_USER_DATA_DIR))
 
 
 @pytest.fixture(autouse=True)

@@ -44,6 +44,109 @@ class ProjectManager:
     _lock = threading.Lock()
 
     @classmethod
+    def _history_file(cls) -> Path:
+        return PROJECTS_DIR / "project_history.json"
+
+    @classmethod
+    def history_key(cls, path: str | Path | None) -> str:
+        return str(path or "").replace("\\", "/").rstrip("/").lower()
+
+    @classmethod
+    def _now_iso(cls) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @classmethod
+    def _normalized_path(cls, path: str | Path) -> str:
+        try:
+            return str(Path(path).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            return str(path)
+
+    @classmethod
+    def _load_history(cls) -> Dict[str, Dict[str, Any]]:
+        path = cls._history_file()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            return {}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for key, entry in projects.items():
+            if not isinstance(entry, dict):
+                continue
+            entry_path = str(entry.get("path") or "")
+            item_key = cls.history_key(entry_path) or str(key)
+            if not item_key:
+                continue
+            normalized[item_key] = dict(entry, path=entry_path or str(key))
+        return normalized
+
+    @classmethod
+    def _save_history(cls, projects: Dict[str, Dict[str, Any]]) -> None:
+        path = cls._history_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"projects": projects}, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"[ProjectManager] Failed to save project history: {e}")
+
+    @classmethod
+    def _update_history_entry(cls, path: str | Path, updates: Dict[str, Any]) -> Dict[str, Any]:
+        normalized_path = cls._normalized_path(path)
+        key = cls.history_key(normalized_path)
+        if not key:
+            raise ValueError("Project path is required")
+        projects = cls._load_history()
+        entry = dict(projects.get(key) or {})
+        entry["path"] = normalized_path
+        for field, value in updates.items():
+            if value is None:
+                entry.pop(field, None)
+            else:
+                entry[field] = value
+        entry["updated_at"] = cls._now_iso()
+        projects[key] = entry
+        cls._save_history(projects)
+        return dict(entry)
+
+    @classmethod
+    def list_project_history(cls) -> List[Dict[str, Any]]:
+        return list(cls._load_history().values())
+
+    @classmethod
+    def get_project_history(cls, path: str | Path) -> Dict[str, Any]:
+        key = cls.history_key(cls._normalized_path(path))
+        return dict(cls._load_history().get(key) or {})
+
+    @classmethod
+    def set_project_pinned(cls, path: str | Path, pinned: bool) -> Dict[str, Any]:
+        return cls._update_history_entry(path, {"pinned_at": cls._now_iso() if pinned else None})
+
+    @classmethod
+    def rename_project_display(cls, path: str | Path, name: str) -> Dict[str, Any]:
+        display_name = (name or "").strip()
+        if not display_name:
+            raise ValueError("Project name is required")
+        if len(display_name) > 80:
+            raise ValueError("Project name is too long")
+        return cls._update_history_entry(path, {"display_name": display_name})
+
+    @classmethod
+    def remove_project_from_history(cls, path: str | Path) -> Dict[str, Any]:
+        now = cls._now_iso()
+        return cls._update_history_entry(path, {"removed_at": now, "archived_at": now})
+
+    @classmethod
+    def restore_project_to_history(cls, path: str | Path) -> Dict[str, Any]:
+        return cls._update_history_entry(path, {"removed_at": None, "archived_at": None})
+
+    @classmethod
     def _build_project_info(cls, project_path: Path, last_opened: Optional[str] = None) -> Dict[str, Any]:
         git_info = cls._get_git_info(project_path)
         return {
@@ -174,6 +277,7 @@ class ProjectManager:
         recent.insert(0, project)
         recent = recent[:20]  # 最多保留 20 个
         cls._save_recent(recent)
+        cls.restore_project_to_history(project_path)
 
         return project
 

@@ -7,6 +7,7 @@ import time
 import uuid
 import copy
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from app.config import load_config, get_provider_for_model, get_model_for_agent, get_thinking_intensity_for_agent
@@ -316,6 +317,7 @@ def list_session_records(project_path: str = "", agent_type: str = "") -> List[D
                 "message_count": len(data.get("messages", [])),
                 "updated_at": path.stat().st_mtime,
                 "is_primary": is_primary,
+                "archived_at": data.get("archived_at"),
             })
         except Exception:
             pass
@@ -323,6 +325,34 @@ def list_session_records(project_path: str = "", agent_type: str = "") -> List[D
         sessions,
         key=lambda s: (0 if s.get("is_primary") else 1, -float(s.get("updated_at", 0))),
     )
+
+
+def archive_session_records_for_project(project_path: str, agent_type: str = "coding") -> int:
+    project_key = _normalize_project_key(project_path)
+    if not project_key:
+        return 0
+
+    archived_at = datetime.now(timezone.utc).isoformat()
+    changed = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = _load_session_data(path.stem)
+            if not isinstance(data, dict):
+                continue
+            if _resolve_stored_agent_type(data) != agent_type:
+                continue
+            if _normalize_project_key(data.get("project_path")) != project_key:
+                continue
+            if data.get("archived_at"):
+                continue
+            data["archived_at"] = archived_at
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+            changed += 1
+        except Exception:
+            pass
+    return changed
 
 
 def _shell_command_looks_like_verification(command: str) -> bool:
@@ -502,7 +532,9 @@ class AgentSession:
             # Coding Agent: inject repo map and operating rules
             if self._agent_type == "coding":
                 try:
-                    coding_cfg = load_config().coding_agent
+                    cfg = load_config()
+                    coding_cfg = cfg.coding_agent
+                    max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
                     if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
                         if self._repo_map_cache is None:
                             self._repo_map_cache = build_repo_map(project["path"])
@@ -515,10 +547,10 @@ class AgentSession:
                             "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
                             "or destructive/security-sensitive choices.\n"
                             "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
-                            "use `dispatch_parallel` to launch multiple `explorer` workers simultaneously — one per "
+                            f"use `dispatch_parallel` to launch at most {max_parallel_agents} `explorer` workers simultaneously — one per "
                             "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
                             "and reports back. Synthesize their reports before dispatching an architect. "
-                            "Never read files one-by-one inline when you could parallelize exploration.\n"
+                            f"Never request more than {max_parallel_agents} workers in a single `dispatch_parallel` call.\n"
                             "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
                             "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
                             "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "

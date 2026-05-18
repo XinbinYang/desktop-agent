@@ -4,7 +4,9 @@ import { ChatPanel } from '../../components/ChatPanel'
 import type { ChatMessage, PlanState } from '../../types'
 
 vi.mock('react-virtuoso', () => {
-  const Virtuoso = ({ data, itemContent, components, totalCount }: any) => {
+  const Virtuoso = (props: any) => {
+    ;(globalThis as any).__chatPanelVirtuosoProps = props;
+    const { data, itemContent, components, totalCount } = props;
     const count = totalCount ?? data?.length ?? 0;
     return (
       <div>
@@ -64,6 +66,7 @@ describe('ChatPanel', () => {
     expect(screen.queryByText('Desktop Agent Ready')).not.toBeInTheDocument()
     expect(screen.queryByText('Read / Write Files')).not.toBeInTheDocument()
     expect(screen.queryByText('Browser Automation')).not.toBeInTheDocument()
+    expect(Object.prototype.hasOwnProperty.call((globalThis as any).__chatPanelVirtuosoProps || {}, 'initialTopMostItemIndex')).toBe(false)
   })
 
   it('renders coding project state in the empty welcome', () => {
@@ -71,6 +74,110 @@ describe('ChatPanel', () => {
     const welcome = screen.getByTestId('empty-chat-welcome')
     expect(within(welcome).getByText('Coding Agent')).toBeInTheDocument()
     expect(within(welcome).getAllByText(/desktop-agent/).length).toBeGreaterThan(0)
+  })
+
+  it('uses the coding event timeline for Coding Agent sessions', () => {
+    const messages: ChatMessage[] = [
+      { id: '1', role: 'user', content: 'Inspect the app', isTool: false },
+      {
+        id: '2',
+        role: 'assistant',
+        content: '',
+        isTool: false,
+        blocks: [
+          { type: 'tool_call', name: 'file_read', args: { path: 'a.ts' }, result: 'a', status: 'success', toolCallId: 'r1', timestamp: 1 },
+          { type: 'tool_call', name: 'file_read', args: { path: 'b.ts' }, result: 'b', status: 'success', toolCallId: 'r2', timestamp: 2 },
+          { type: 'text', text: 'I checked the files.', timestamp: 3 },
+        ],
+      },
+    ]
+
+    render(<ChatPanel {...defaultProps} agentType="coding" messages={messages} />)
+
+    expect(screen.getByTestId('coding-event-timeline')).toBeInTheDocument()
+    expect(screen.getByText('Read 2 files')).toBeInTheDocument()
+    expect(screen.getByText('I checked the files.')).toBeInTheDocument()
+    expect(screen.queryByText('Summary')).not.toBeInTheDocument()
+  })
+
+  it('uses the personal conversation timeline and folds adjacent tools', () => {
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [
+        { type: 'tool_call', name: 'knowledge_search', args: { query: 'memory' }, result: 'one', status: 'success', toolCallId: 'k1', timestamp: 1 },
+        { type: 'tool_call', name: 'file_read', args: { path: 'notes.md' }, result: 'two', status: 'success', toolCallId: 'k2', timestamp: 2 },
+        { type: 'text', text: 'I found the note.', timestamp: 3 },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    expect(screen.getByTestId('personal-conversation-timeline')).toBeInTheDocument()
+    expect(screen.getByText('Used 2 tools')).toBeInTheDocument()
+    expect(screen.queryByText('knowledge_search')).not.toBeInTheDocument()
+    expect(screen.getByText('I found the note.')).toBeInTheDocument()
+  })
+
+  it('renders coding file edits as lightweight event rows', () => {
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [{
+        type: 'file_edit',
+        timestamp: 1,
+        edit: {
+          path: 'src/example.ts',
+          operation: 'modify',
+          old_text: 'old content',
+          new_text: 'new content',
+          unified_diff: '--- a/example.ts\n+++ b/example.ts\n-old content\n+new content\n',
+          stats: { added: 1, removed: 1 },
+          truncated: false,
+          tool_call_id: 'edit-1',
+        },
+      }],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="coding" messages={messages} />)
+
+    expect(screen.getByTestId('file-edit-event-row')).toBeInTheDocument()
+    expect(screen.queryByText(/old content/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('View diff'))
+    expect(screen.getByText(/-old content/)).toBeInTheDocument()
+  })
+
+  it('keeps run lifecycle events out of the main chat stream', () => {
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '需要我做什么？直接说任务就行。',
+      isTool: false,
+    }]
+
+    render(
+      <ChatPanel
+        {...defaultProps}
+        agentType="coding"
+        messages={messages}
+        runEvents={[
+          { id: 'r1', type: 'run_created', timestamp: 1, data: {} },
+          { id: 'r2', type: 'context_pack', timestamp: 2, data: {} },
+          { id: 'r3', type: 'skills_matched', timestamp: 3, data: { skills: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] } },
+          { id: 'r4', type: 'run_completed', timestamp: 4, data: { summary: 'Run completed after 1 iteration(s).' } },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('需要我做什么？直接说任务就行。')).toBeInTheDocument()
+    expect(screen.queryByText(/run created/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/context pack/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Checked skills/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Run completed/i)).not.toBeInTheDocument()
   })
 
   it('renders plan mode in the empty welcome', () => {
@@ -554,7 +661,7 @@ describe('ChatPanel', () => {
     expect(onCompact).toHaveBeenCalledWith(false)
   })
 
-  it('shows an in-progress thinking block as a live expanded window', () => {
+  it('folds an in-progress thinking block until opened', () => {
     const messages: ChatMessage[] = [
       {
         id: 'a1',
@@ -567,13 +674,15 @@ describe('ChatPanel', () => {
       },
     ]
     render(<ChatPanel {...defaultProps} messages={messages} />)
-    // In progress → auto-expanded, streaming text is visible without a click.
-    const live = screen.getByText('partial reasoning so far')
-    expect(live).toBeInTheDocument()
-    // The same block carries the live "Thinking" header.
-    const block = live.closest('.border-l-info\\/70') as HTMLElement
-    expect(block).not.toBeNull()
-    expect(within(block).getByText('Thinking')).toBeInTheDocument()
+    // In-progress thinking stays out of the main reading path until opened.
+    const timeline = screen.getByTestId('personal-conversation-timeline')
+    expect(within(timeline).getByText('Thinking')).toBeInTheDocument()
+    expect(screen.queryByText('partial reasoning so far')).not.toBeInTheDocument()
+    fireEvent.click(within(timeline).getByText('Thinking'))
+    const body = screen.getByText('partial reasoning so far')
+    expect(body).toBeInTheDocument()
+    expect(body).not.toHaveClass('font-mono')
+    expect(body).toHaveClass('chat-text-sm')
   })
 
   it('auto-collapses a completed thinking block to "Thought for Ns" and expands on click', () => {
@@ -628,5 +737,49 @@ describe('ChatPanel', () => {
     expect(onLoadCheckpoints).toHaveBeenCalled()
     expect(onRewindToCheckpoint).toHaveBeenCalledWith('chk_1')
     expect(onRewindOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it('restores the visible message range when a session panel remounts', () => {
+    const messages: ChatMessage[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `m-${index}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `message ${index}`,
+      isTool: false,
+    }))
+
+    const first = render(<ChatPanel {...defaultProps} sessionId="session-scroll" messages={messages} />)
+    ;(globalThis as any).__chatPanelVirtuosoProps.rangeChanged({ startIndex: 5, endIndex: 9 })
+    first.unmount()
+
+    render(<ChatPanel {...defaultProps} sessionId="session-scroll" messages={messages} />)
+
+    expect((globalThis as any).__chatPanelVirtuosoProps.initialTopMostItemIndex).toEqual({
+      index: 5,
+      align: 'start',
+    })
+    expect((globalThis as any).__chatPanelVirtuosoProps.restoreStateFrom).toBeUndefined()
+  })
+
+  it('clamps restored scroll index to projected timeline length', () => {
+    const manyMessages: ChatMessage[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `long-${index}`,
+      role: 'assistant',
+      content: `message ${index}`,
+      isTool: false,
+    }))
+    const first = render(<ChatPanel {...defaultProps} sessionId="session-clamp" messages={manyMessages} />)
+    ;(globalThis as any).__chatPanelVirtuosoProps.rangeChanged({ startIndex: 9, endIndex: 11 })
+    first.unmount()
+
+    render(
+      <ChatPanel
+        {...defaultProps}
+        sessionId="session-clamp"
+        messages={[{ id: 'short', role: 'assistant', content: 'only one event', isTool: false }]}
+      />,
+    )
+
+    expect(Object.prototype.hasOwnProperty.call((globalThis as any).__chatPanelVirtuosoProps || {}, 'initialTopMostItemIndex')).toBe(false)
+    expect((globalThis as any).__chatPanelVirtuosoProps.restoreStateFrom).toBeUndefined()
   })
 })

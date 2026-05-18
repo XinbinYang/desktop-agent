@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,14 +34,18 @@ _AGENT_DEFAULT_ROLE: Dict[str, str] = {
 class AgentManager:
     """Manage dual-agent configuration, workspace, memory, and prompt rendering.
 
-    Workspace files live under AGENTS/ at the repo root:
+    Workspace files live under the runtime AGENTS directory:
     - AGENTS/personal/  -> Personal Agent full cognitive system
     - AGENTS/coding/    -> Coding Agent lean workspace
     - AGENTS/_shared/   -> Cross-agent shared preferences
     """
 
-    AGENTS_DIR: Path = agents_dir()
+    AGENTS_DIR: Optional[Path] = None
     BUILTIN_AGENTS: frozenset[str] = frozenset({"personal", "coding"})
+
+    @classmethod
+    def _agents_root(cls) -> Path:
+        return cls.AGENTS_DIR if cls.AGENTS_DIR is not None else agents_dir()
 
     # ──────────────────────────────────────────────
     # Prompt rendering
@@ -72,17 +75,18 @@ class AgentManager:
         parts: List[str] = []
 
         ws_root = str(workspace_root()).replace("\\", "/")
+        agent_root = str(cls._agents_root()).replace("\\", "/")
         parts.append(
             "## Runtime Context\n"
-            "- Workspace root: " + ws_root + ". "
-            "你的身份与记忆文件统一位于 " + ws_root + "/AGENTS/personal/ "
-            "（共享文件在 " + ws_root + "/AGENTS/_shared/）。\n"
+            "- Workspace root: " + ws_root + ".\n"
+            "- Agent runtime workspace: " + agent_root + ". "
+            "你的身份与记忆文件统一位于这个 runtime AGENTS 目录的 personal/ 子目录，"
+            "共享文件在 _shared/。\n"
             "- The host has already loaded the Personal Agent workspace files into this system prompt. "
-            "Do not call file or shell tools merely to locate or re-read AGENTS/personal/SOUL.md, "
+            "Do not call file or shell tools merely to locate or re-read personal/SOUL.md, "
             "USER.md, MEMORY.md, BOOTSTRAP.md, or related identity files.\n"
-            "- 读写身份文件时使用 `file_write` / `file_read` 且 `project_relative=false`。"
-            "形如 \"AGENTS/personal/USER.md\" 的相对路径会相对工作区根（即 " + ws_root + "）解析，"
-            "不会写入 backend 目录。任何情况下都不要在别处新建 AGENTS/ 目录。\n"
+            "- 读写身份、记忆、日记、技能等 Agent 文件时，"
+            "使用上面的 Agent runtime workspace 绝对路径，不要写回仓库 AGENTS/ 模板目录。\n"
             "- For greetings, identity questions, model questions, and ordinary conversation, answer directly.\n"
             "- Use tools only when the user's task requires observation, file changes, external lookup, "
             "or desktop/browser control. This is a Windows desktop app; if shell commands are needed, "
@@ -281,7 +285,7 @@ class AgentManager:
 
         agent_type may be 'personal', 'coding', or '_shared'.
         """
-        return cls.AGENTS_DIR / agent_type / filename
+        return cls._agents_root() / agent_type / filename
 
     @classmethod
     def _load_workspace_file(cls, agent_type: str, filename: str) -> str:
@@ -324,7 +328,7 @@ class AgentManager:
     @classmethod
     def list_workspace_files(cls, agent_type: str) -> List[Dict[str, Any]]:
         """List all files in an agent's workspace directory."""
-        base = cls.AGENTS_DIR / agent_type
+        base = cls._agents_root() / agent_type
         if not base.exists():
             return []
         files: List[Dict[str, Any]] = []
@@ -344,7 +348,7 @@ class AgentManager:
 
     @classmethod
     def _personal_dir(cls) -> Path:
-        return cls.AGENTS_DIR / "personal"
+        return cls._agents_root() / "personal"
 
     @classmethod
     def _memory_dir(cls) -> Path:
@@ -607,7 +611,7 @@ class AgentManager:
         result = cls.write_diary_entry(entry)
 
         # Also update cross-agent memory
-        cross_path = cls.AGENTS_DIR / "_shared" / "cross_agent_memory.md"
+        cross_path = cls._agents_root() / "_shared" / "cross_agent_memory.md"
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         cross_entry = f"- [{now}] {entry}\n"
         try:
@@ -624,7 +628,7 @@ class AgentManager:
         cls, category: str, key: str, value: str
     ) -> bool:
         """Sync a preference discovered by Personal Agent to shared preferences."""
-        prefs_path = cls.AGENTS_DIR / "_shared" / "user_preferences.md"
+        prefs_path = cls._agents_root() / "_shared" / "user_preferences.md"
         try:
             existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
             new_line = f"- {key}: {value}"

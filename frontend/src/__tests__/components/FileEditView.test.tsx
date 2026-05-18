@@ -93,6 +93,15 @@ describe('FileEditView', () => {
       fireEvent.click(header)
       expect(screen.queryByTestId('monaco-diff')).not.toBeInTheDocument()
     })
+
+    it('event-row starts collapsed and expands to a lightweight unified diff', () => {
+      render(<FileEditView edit={baseEdit} compact variant="event-row" />)
+      expect(screen.getByTestId('file-edit-event-row')).toBeInTheDocument()
+      expect(screen.queryByTestId('monaco-diff')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByText('View diff'))
+      expect(screen.queryByTestId('monaco-diff')).not.toBeInTheDocument()
+      expect(screen.getByText(/-old content/)).toBeInTheDocument()
+    })
   })
 
   describe('truncated fallback', () => {

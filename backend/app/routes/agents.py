@@ -186,8 +186,6 @@ async def reset_bootstrap():
 async def bootstrap_status():
     """Check if bootstrap onboarding is complete."""
     return {"bootstrapped": AgentManager.is_bootstrapped()}
-    result = await EvolutionEngine.run_evolution_cycle()
-    return result
 
 
 @router.get("/personal/learnings")

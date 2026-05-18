@@ -16,17 +16,51 @@ def repo_root() -> Path:
 
 
 def workspace_root() -> Path:
-    """Canonical agent workspace root (contains AGENTS/). Single source of truth
-    for file tool sandbox, prompt rendering, and all identity-file paths.
-
-    Currently equals the repo root so AGENTS/ stays version-controlled.
-    """
+    """Canonical project workspace root for regular file-tool operations."""
     return repo_root()
 
 
+def _default_user_data_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return (Path(base) / "Desktop Agent").expanduser().resolve()
+
+
+def bundled_agents_dir() -> Path:
+    return bundled_root() / "AGENTS"
+
+
+def _copy_missing_tree(source: Path, target: Path) -> None:
+    if not source.exists():
+        target.mkdir(parents=True, exist_ok=True)
+        return
+
+    for src in source.rglob("*"):
+        rel = src.relative_to(source)
+        dst = target / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            continue
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
 def agents_dir() -> Path:
-    """Agent workspace directory (AGENTS/ under workspace_root)."""
-    return workspace_root() / "AGENTS"
+    """Mutable Agent workspace under the runtime data directory.
+
+    The repository keeps seed templates in ``AGENTS/``. Runtime persona,
+    memory, skills, and handoff files live in user data so normal app usage and
+    tests do not dirty the git worktree.
+    """
+    target = runtime_root() / "AGENTS"
+    _copy_missing_tree(bundled_agents_dir(), target)
+    return target
 
 
 def bundled_root() -> Path:
@@ -39,17 +73,15 @@ def bundled_config_path() -> Path:
     return bundled_root() / "config" / "models.yaml"
 
 
-def user_data_dir() -> Path | None:
+def user_data_dir() -> Path:
     raw = os.environ.get(USER_DATA_ENV, "").strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser().resolve()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return _default_user_data_dir()
 
 
 def runtime_root() -> Path:
     root = user_data_dir()
-    if root is None:
-        return backend_root()
     return root / "backend"
 
 
@@ -71,9 +103,6 @@ def runtime_file(*parts: str) -> Path:
 
 
 def default_config_path() -> Path:
-    if user_data_dir() is None:
-        return bundled_config_path()
-
     target = runtime_file("config", "models.yaml")
     if target.exists():
         return target

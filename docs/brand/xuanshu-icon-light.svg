@@ -1,0 +1,63 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">XuanShu light icon</title>
+  <desc id="desc">A light theme app icon with an abstract central axis, broken orbital rings, and a subtle X-shaped control core.</desc>
+  <defs>
+    <linearGradient id="xuanshu-axis" x1="132" y1="124" x2="386" y2="394" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0969DA"/>
+      <stop offset="0.45" stop-color="#0067B8"/>
+      <stop offset="1" stop-color="#005A9E"/>
+    </linearGradient>
+    <linearGradient id="xuanshu-ring" x1="94" y1="82" x2="424" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0969DA"/>
+      <stop offset="0.52" stop-color="#0067B8"/>
+      <stop offset="1" stop-color="#005A9E"/>
+    </linearGradient>
+    <radialGradient id="xuanshu-core" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(256 256) rotate(90) scale(58)">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.28" stop-color="#DCEBFA"/>
+      <stop offset="0.74" stop-color="#0067B8"/>
+      <stop offset="1" stop-color="#1F883D"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="#FFFFFF"/>
+  <rect x="24" y="24" width="464" height="464" rx="92" stroke="#D4D4D4" stroke-width="2"/>
+
+  <g opacity="0.86">
+    <path d="M131.5 143.2A174 174 0 0 1 263.9 82.2" stroke="#E5E5E5" stroke-width="18" stroke-linecap="round"/>
+    <path d="M362.7 111.1A174 174 0 0 1 429.7 254.8" stroke="#E5E5E5" stroke-width="18" stroke-linecap="round"/>
+    <path d="M403.4 354.9A174 174 0 0 1 262.3 430" stroke="#E5E5E5" stroke-width="18" stroke-linecap="round"/>
+    <path d="M153.8 393.9A174 174 0 0 1 82.4 252.6" stroke="#E5E5E5" stroke-width="18" stroke-linecap="round"/>
+  </g>
+
+  <g>
+    <path d="M136.8 138.4A174 174 0 0 1 264.9 82" stroke="url(#xuanshu-ring)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M365.2 113.2A174 174 0 0 1 429.7 251.7" stroke="url(#xuanshu-ring)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M399.1 359.5A174 174 0 0 1 264.9 430" stroke="url(#xuanshu-ring)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M150.6 391A174 174 0 0 1 82.4 260.2" stroke="url(#xuanshu-ring)" stroke-width="10" stroke-linecap="round"/>
+
+    <path d="M175.5 195.9A104 104 0 0 1 256 152" stroke="#0969DA" stroke-width="7" stroke-linecap="round" opacity="0.88"/>
+    <path d="M331.8 185.2A104 104 0 0 1 360 256" stroke="#0067B8" stroke-width="7" stroke-linecap="round" opacity="0.88"/>
+    <path d="M336.5 323.3A104 104 0 0 1 256 360" stroke="#005A9E" stroke-width="7" stroke-linecap="round" opacity="0.88"/>
+    <path d="M180.2 326.8A104 104 0 0 1 152 256" stroke="#0067B8" stroke-width="7" stroke-linecap="round" opacity="0.88"/>
+  </g>
+
+  <g>
+    <path d="M177 175L335 337" stroke="#FFFFFF" stroke-width="38" stroke-linecap="round"/>
+    <path d="M337 175L175 337" stroke="#FFFFFF" stroke-width="38" stroke-linecap="round"/>
+    <path d="M177 175L335 337" stroke="url(#xuanshu-axis)" stroke-width="22" stroke-linecap="round"/>
+    <path d="M337 175L175 337" stroke="url(#xuanshu-axis)" stroke-width="22" stroke-linecap="round"/>
+  </g>
+
+  <circle cx="256" cy="256" r="54" fill="#FFFFFF" stroke="#D4D4D4" stroke-width="10"/>
+  <circle cx="256" cy="256" r="34" fill="url(#xuanshu-core)"/>
+  <circle cx="256" cy="256" r="11" fill="#FFFFFF"/>
+
+  <circle cx="134" cy="137" r="8" fill="#0969DA"/>
+  <circle cx="366" cy="114" r="7" fill="#0067B8"/>
+  <circle cx="399" cy="359" r="7" fill="#005A9E"/>
+  <circle cx="151" cy="391" r="6" fill="#1F883D"/>
+
+  <path d="M256 86V121" stroke="#1E1E1E" stroke-width="5" stroke-linecap="round" opacity="0.34"/>
+  <path d="M256 391V426" stroke="#1E1E1E" stroke-width="5" stroke-linecap="round" opacity="0.2"/>
+</svg>

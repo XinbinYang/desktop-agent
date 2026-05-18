@@ -18,6 +18,7 @@ from app.agent import (
     AgentSession,
     SESSIONS_DIR,
     _sessions,
+    _load_session_data,
     clear_session,
     get_or_create_session,
     list_session_records,
@@ -58,7 +59,12 @@ from app.skill_authoring import (
     validate_skill as validate_user_skill,
 )
 from app.skills import SkillManager
-from app.session_runtime import get_session_runtime, terminate_session_runtime
+from app.session_runtime import (
+    cancel_session_runtime,
+    get_session_runtime,
+    session_runtime_status,
+    terminate_session_runtime,
+)
 from app.tools import ALL_TOOLS, SAFE_DIRECT_TOOLS, get_tool, list_tool_names
 from app.tools.browser_tool import close_browser_session
 from app.tools.file_tool import build_file_edit_metadata
@@ -218,6 +224,178 @@ def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> st
         return agent_type
     return AgentManager.get_agent_type_for_role(role_id or "desktop-agent")
 
+
+def _history_project_key(path: Optional[str]) -> str:
+    return str(path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _history_project_name(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/").rstrip("/")
+    if not normalized:
+        return "Untitled project"
+    return Path(normalized).name or normalized
+
+
+def _session_activity_state(session_id: str, is_running: bool) -> str:
+    if is_running:
+        return "running"
+
+    phase = ""
+    live = _sessions.get(session_id)
+    if live is not None:
+        phase = getattr(getattr(live, "plan_state", None), "phase", "") or ""
+    else:
+        data = _load_session_data(session_id)
+        plan_state = data.get("plan_state") if isinstance(data, dict) else None
+        if isinstance(plan_state, dict):
+            phase = str(plan_state.get("phase") or "")
+
+    if phase in {"awaiting_decision", "awaiting_approval", "approved_waiting_build"}:
+        return "needs_input"
+    return "idle"
+
+
+def _session_history_item(record: Dict[str, Any], connection_counts: Dict[str, int]) -> Dict[str, Any]:
+    session_id = str(record.get("id") or "")
+    runtime = session_runtime_status(session_id)
+    is_running = bool(runtime.get("is_running"))
+    item = dict(record)
+    item["is_running"] = is_running
+    item["active_connections"] = int(connection_counts.get(session_id, 0))
+    item["activity_state"] = _session_activity_state(session_id, is_running)
+    return item
+
+
+def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
+    current_project = ProjectManager.get_current()
+    current_project_path = current_project.get("path") if current_project else None
+    current_key = _history_project_key(current_project_path)
+    metadata_entries = ProjectManager.list_project_history()
+    metadata_by_key = {
+        _history_project_key(item.get("path")): item
+        for item in metadata_entries
+        if _history_project_key(item.get("path"))
+    }
+
+    connection_counts = {
+        str(item.get("session_id")): int(item.get("connections") or 0)
+        for item in session_websocket_snapshot()
+    }
+    session_items: List[Dict[str, Any]] = []
+    archived_counts: Dict[str, int] = {}
+    for record in list_session_records():
+        item = _session_history_item(record, connection_counts)
+        project_path = item.get("project_path")
+        if item.get("agent_type") == "coding" and project_path and item.get("archived_at"):
+            key = _history_project_key(str(project_path))
+            archived_counts[key] = archived_counts.get(key, 0) + 1
+            if not include_archived:
+                continue
+        session_items.append(item)
+
+    projects_by_key: Dict[str, Dict[str, Any]] = {}
+    project_order: List[str] = []
+
+    def ensure_project(
+        path: Optional[str],
+        source: Optional[Dict[str, Any]] = None,
+        source_type: str = "session",
+    ) -> Optional[Dict[str, Any]]:
+        if not path:
+            return None
+        key = _history_project_key(path)
+        if not key:
+            return None
+        metadata = metadata_by_key.get(key) or {}
+        is_archived = bool(metadata.get("archived_at"))
+        is_removed = bool(metadata.get("removed_at"))
+        if (is_archived or is_removed) and key != current_key and not include_archived:
+            return None
+        if key not in projects_by_key:
+            project_path = source.get("path") if source and source.get("path") else path
+            folder_name = _history_project_name(project_path)
+            display_name = str(metadata.get("display_name") or "").strip()
+            source_name = source.get("name") if source and source.get("name") else ""
+            projects_by_key[key] = {
+                "path": project_path,
+                "name": display_name or source_name or folder_name,
+                "display_name": display_name or None,
+                "folder_name": folder_name,
+                "last_opened": source.get("last_opened") if source else None,
+                "is_current": key == current_key,
+                "has_running": False,
+                "is_pinned": bool(metadata.get("pinned_at")),
+                "is_archived": is_archived,
+                "archived_sessions_count": archived_counts.get(key, 0),
+                "source": source_type,
+                "_order": len(project_order),
+                "_pinned_at": metadata.get("pinned_at") or "",
+                "sessions": [],
+            }
+            project_order.append(key)
+        elif source:
+            project = projects_by_key[key]
+            display_name = str(metadata.get("display_name") or "").strip()
+            project["name"] = display_name or source.get("name") or project["name"]
+            project["display_name"] = display_name or None
+            project["folder_name"] = project.get("folder_name") or _history_project_name(project.get("path") or path)
+            project["last_opened"] = source.get("last_opened") or project.get("last_opened")
+            project["is_current"] = project["is_current"] or key == current_key
+            project["is_pinned"] = bool(metadata.get("pinned_at"))
+            project["is_archived"] = is_archived
+            project["archived_sessions_count"] = archived_counts.get(key, 0)
+        return projects_by_key[key]
+
+    for project in ProjectManager.list_recent():
+        ensure_project(project.get("path"), project, "recent")
+    if current_project_path:
+        ensure_project(current_project_path, current_project, "current")
+    for metadata in metadata_entries:
+        if metadata.get("pinned_at"):
+            ensure_project(metadata.get("path"), metadata, "metadata")
+
+    standalone_sessions: List[Dict[str, Any]] = []
+    for item in session_items:
+        project_path = item.get("project_path")
+        if item.get("agent_type") == "coding" and project_path:
+            project = ensure_project(str(project_path), source_type="session")
+            if project is not None:
+                project["sessions"].append(item)
+                project["has_running"] = bool(project["has_running"] or item.get("is_running"))
+            continue
+        standalone_sessions.append(item)
+
+    def session_sort_key(session: Dict[str, Any]) -> float:
+        try:
+            return -float(session.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for project in projects_by_key.values():
+        project["sessions"] = sorted(project["sessions"], key=session_sort_key)
+        project["archived_sessions_count"] = archived_counts.get(_history_project_key(project.get("path")), 0)
+
+    pinned_projects = sorted(
+        (project for project in projects_by_key.values() if project.get("is_pinned")),
+        key=lambda project: str(project.get("_pinned_at") or ""),
+        reverse=True,
+    )
+    regular_projects = sorted(
+        (project for project in projects_by_key.values() if not project.get("is_pinned")),
+        key=lambda project: int(project.get("_order") or 0),
+    )
+    projects = pinned_projects + regular_projects
+    for project in projects:
+        project.pop("_order", None)
+        project.pop("_pinned_at", None)
+
+    return {
+        "current_project_path": current_project_path,
+        "projects": projects,
+        "standalone_sessions": standalone_sessions,
+    }
+
+
 class StoreCredentialRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     host: str
@@ -271,6 +449,13 @@ async def chat(req: ChatRequest):
 
     return {"events": results}
 
+
+@app.get("/api/session-history")
+def get_session_history(include_archived: bool = False):
+    """Return project-grouped session history with live per-session activity."""
+    return _build_session_history(include_archived=include_archived)
+
+
 @app.get("/api/sessions")
 def list_sessions(project_path: str = "", agent_type: str = ""):
     """èŽ·å–æ‰€æœ‰ä¿å­˜çš„ä¼šè¯åˆ—è¡¨ï¼Œå¯æŒ‰é¡¹ç›®è·¯å¾„è¿‡æ»¤"""
@@ -323,6 +508,30 @@ def get_session_context(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session.context_usage()
+
+
+@app.get("/api/sessions/{session_id}/runtime")
+def get_session_runtime_status(session_id: str):
+    """Return live runtime state for one session without touching other sessions."""
+    return session_runtime_status(session_id)
+
+
+@app.post("/api/sessions/{session_id}/stop")
+async def stop_session_runtime(session_id: str):
+    """Stop only the live run owned by this session."""
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    was_running = await cancel_session_runtime(session_id, session, broadcast=True)
+    cancel_workers_for_session(session_id)
+    paused_plan = False
+    if session is not None:
+        paused_plan = session.pause_plan_build()
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "was_running": was_running,
+        "paused_plan": paused_plan,
+        **session_runtime_status(session_id),
+    }
 
 
 @app.get("/api/sessions/{session_id}/checkpoints")

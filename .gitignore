@@ -8,6 +8,7 @@ frontend/dist/
 frontend/build/
 frontend/release/
 frontend/release-packaged/
+frontend/.vite/
 backend/build/
 backend/desktop-agent-backend.exe
 backend/__pycache__/
@@ -31,11 +32,20 @@ npm-debug.log*
 
 # Session data
 backend/sessions/
+backend/plans/
 backend/projects/
 backend/preview/
 backend/data/
 backend/models/
 backend/workflows/
+AGENTS/personal/memory/
+AGENTS/personal/.archive/
+AGENTS/personal/.learnings/
+backend/tests/tmp/
+backend/tests/e2e_screenshot*.png
+backend/agent_screenshot.png
+.agent-memory/
+.playwright-mcp/
 data/
 workflows/
 frontend/release-packaged/acceptance/

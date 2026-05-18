@@ -87,10 +87,12 @@ import App from '../App'
 
 describe('App', () => {
   beforeEach(() => {
+    vi.restoreAllMocks()
     vi.clearAllMocks()
     localStorage.clear()
     delete (globalThis as any).__desktopAgentLastSessionViewProps
     delete (globalThis as any).__desktopAgentOpenFiles
+    delete (window as any).electronAPI
     // Reset fetch mock
     global.fetch = vi.fn(() =>
       Promise.resolve({
@@ -264,6 +266,357 @@ describe('App', () => {
       })
     })
     expect(await screen.findByTitle('Coding Agent · Implement tabs')).toBeInTheDocument()
+  })
+
+  it('creates a new coding session in a split pane without replacing the current pane', async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: 'session_coding_new',
+            agent_type: 'coding',
+            role_id: 'code-expert',
+            model_id: 'gpt-4o',
+            title: 'New Task',
+            project_path: null,
+            created: true,
+            is_primary: false,
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          models: [
+            { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+          ],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByTestId('session-session_personal_main')
+    fireEvent.click(screen.getByLabelText('Sessions'))
+    fireEvent.click(screen.getByRole('button', { name: '/new' }))
+
+    expect(await screen.findByTestId('session-session_coding_new')).toBeInTheDocument()
+    expect(screen.getByTestId('session-session_personal_main')).toBeInTheDocument()
+    const resolveCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/sessions/resolve'))
+    expect(JSON.parse(String(resolveCall?.[1]?.body))).toMatchObject({
+      agent_type: 'coding',
+      policy: 'new',
+    })
+  })
+
+  it('opens a session project before switching to a session from that project', async () => {
+    const projectA = {
+      path: 'C:/repo-a',
+      name: 'repo-a',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const projectB = {
+      path: 'C:/repo-b',
+      name: 'repo-b',
+      git_branch: 'main',
+      last_opened: '2026-05-18T01:00:00Z',
+    }
+    const history = {
+      current_project_path: projectA.path,
+      projects: [
+        { ...projectA, is_current: true, has_running: false, sessions: [] },
+        {
+          ...projectB,
+          is_current: false,
+          has_running: false,
+          sessions: [{
+            id: 'session_b',
+            title: 'Fix bug',
+            project_path: projectB.path,
+            model_id: 'gpt-4o',
+            role_id: 'code-expert',
+            agent_type: 'coding',
+            message_count: 2,
+            updated_at: 1779116000,
+            is_primary: false,
+            is_running: false,
+            active_connections: 0,
+            activity_state: 'idle',
+          }],
+        },
+      ],
+      standalone_sessions: [],
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(projectA) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project: projectA, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/projects/open')) {
+        expect(JSON.parse(String(init?.body))).toEqual({ path: projectB.path })
+        return Promise.resolve({ json: () => Promise.resolve(projectB) }) as any
+      }
+      if (url.endsWith('/api/projects/tree')) {
+        return Promise.resolve({ json: () => Promise.resolve({ nodes: [] }) }) as any
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Sessions'))
+    fireEvent.click(await screen.findByLabelText('Expand project repo-b'))
+    fireEvent.click(await screen.findByLabelText('Open session Fix bug'))
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/open'))).toBe(true)
+    })
+    expect(await screen.findByTestId('session-session_b')).toBeInTheDocument()
+  })
+
+  it('handles project action menu through App handlers', async () => {
+    const project = {
+      path: 'C:/repo',
+      name: 'repo',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const worktreeProject = {
+      path: 'C:/runtime/worktrees/persistent/repo-worktree',
+      name: 'repo-worktree',
+      git_branch: 'HEAD',
+      last_opened: '2026-05-18T01:00:00Z',
+    }
+    const history = {
+      current_project_path: project.path,
+      projects: [{
+        ...project,
+        folder_name: 'repo',
+        is_current: true,
+        has_running: false,
+        is_pinned: false,
+        is_archived: false,
+        archived_sessions_count: 0,
+        source: 'recent',
+        sessions: [],
+      }],
+      standalone_sessions: [],
+    }
+    const revealPath = vi.fn(() => Promise.resolve('reveal failed'))
+    const openPath = vi.fn(() => Promise.resolve(null))
+    ;(window as any).electronAPI = { revealPath, openPath }
+    const promptSpy = vi.spyOn(window, 'prompt')
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/projects/tree')) {
+        return Promise.resolve({ json: () => Promise.resolve({ nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/projects/history/pin')) {
+        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', project: {} }) }) as any
+      }
+      if (url.endsWith('/api/projects/history/rename')) {
+        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', project: {} }) }) as any
+      }
+      if (url.endsWith('/api/projects/history/archive-sessions')) {
+        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', archived_sessions: 2 }) }) as any
+      }
+      if (url.endsWith('/api/projects/history/remove')) {
+        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', archived_sessions: 2 }) }) as any
+      }
+      if (url.endsWith('/api/projects/worktrees/persistent')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({ status: 'ok', path: worktreeProject.path, project: worktreeProject }),
+        }) as any
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Sessions'))
+    await screen.findByText('repo')
+
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('在资源管理器中打开'))
+    await waitFor(() => {
+      expect(revealPath).toHaveBeenCalledWith(project.path)
+      expect(openPath).toHaveBeenCalledWith(project.path)
+    })
+
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('置顶项目'))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/history/pin'))
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: project.path, pinned: true })
+    })
+
+    promptSpy.mockReturnValueOnce('Repo Alias')
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('重命名项目'))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/history/rename'))
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: project.path, name: 'Repo Alias' })
+    })
+
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('归档对话'))
+    await waitFor(() => {
+      expect(confirmSpy).toHaveBeenCalled()
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/history/archive-sessions'))).toBe(true)
+    })
+
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('移除'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/history/remove'))).toBe(true)
+    })
+
+    promptSpy.mockReturnValueOnce('repo-worktree')
+    fireEvent.click(screen.getByLabelText('Project actions for repo'))
+    fireEvent.click(await screen.findByText('创建永久工作树'))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/worktrees/persistent'))
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: project.path, name: 'repo-worktree' })
+    })
+  })
+
+  it('stops only the closed pane session and keeps sibling panes mounted', async () => {
+    localStorage.setItem('desktop-agent-pane-tree', JSON.stringify({
+      version: 2,
+      focusedLeafId: 'leaf_a',
+      paneRoot: {
+        type: 'split',
+        id: 'root',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'leaf_a',
+            pane: { id: 'pane_a', sessionId: 'session_a', model: 'gpt-4o', agentType: 'coding', role: 'code-expert' },
+          },
+          {
+            type: 'leaf',
+            id: 'leaf_b',
+            pane: { id: 'pane_b', sessionId: 'session_b', model: 'gpt-4o', agentType: 'coding', role: 'code-expert' },
+          },
+        ],
+      },
+    }))
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/api/sessions/session_b/stop')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'ok', was_running: true }) }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          models: [
+            { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+          ],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByTestId('session-session_a')
+    fireEvent.click(screen.getAllByLabelText('Close pane')[1])
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url, init]) =>
+        String(url).endsWith('/api/sessions/session_b/stop') &&
+        (init as RequestInit | undefined)?.method === 'POST',
+      )).toBe(true)
+    })
+    expect(screen.getByTestId('session-session_a')).toBeInTheDocument()
+    expect(screen.queryByTestId('session-session_b')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/sessions/session_a/stop'))).toBe(false)
   })
 
   it('opens settings when the default provider has no configured API key', async () => {

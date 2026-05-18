@@ -1,5 +1,6 @@
 """Worker dispatch tools - Manager dispatches subagents for parallel execution."""
 import asyncio
+from copy import deepcopy
 import time
 import uuid
 from contextvars import ContextVar, Token
@@ -33,6 +34,30 @@ def _worker_completed_successfully(status: str, result: str) -> bool:
     if status != "completed":
         return False
     return "ACCEPTANCE: FAIL" not in result
+
+
+def _coerce_worker_limit(value: Any, default: int = 3) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(16, limit))
+
+
+def get_parallel_worker_limit() -> int:
+    """Return the user-visible maximum for dispatch_parallel.
+
+    ``settings.max_parallel_agents`` is the setting shown in the UI. The older
+    ``coding_agent.max_parallel_workers`` field remains a config default for
+    coding behavior, but the dispatch tool must obey the visible global limit.
+    """
+    try:
+        from app.config import load_config
+
+        cfg = load_config()
+        return _coerce_worker_limit(getattr(cfg.settings, "max_parallel_agents", 3))
+    except Exception:
+        return 3
 
 
 def _register_worker(session_id: str, worker: WorkerSession) -> None:
@@ -172,7 +197,10 @@ class DispatchWorkerTool(BaseTool):
 
 class DispatchParallelTool(BaseTool):
     name = "dispatch_parallel"
-    description = "Dispatch MULTIPLE worker agents to execute subtasks IN PARALLEL. Workers run simultaneously. Use when tasks are independent. Each worker gets its own task and profile."
+    description = (
+        "Dispatch MULTIPLE worker agents to execute subtasks IN PARALLEL. Workers run simultaneously. "
+        "Use only when tasks are independent. Never exceed the configured max parallel sub-agent count."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -210,6 +238,34 @@ class DispatchParallelTool(BaseTool):
         "required": ["tasks"],
     }
 
+    def _parameters_with_limit(self) -> Dict[str, Any]:
+        params = deepcopy(self.parameters)
+        limit = get_parallel_worker_limit()
+        tasks_schema = params["properties"]["tasks"]
+        tasks_schema["maxItems"] = limit
+        tasks_schema["description"] = (
+            f"List of tasks, each dispatched to a separate worker. Hard maximum: {limit} tasks. "
+            "If more work exists, merge related scopes or dispatch in later batches."
+        )
+        return params
+
+    def get_openai_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self._parameters_with_limit(),
+            },
+        }
+
+    def get_anthropic_schema(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self._parameters_with_limit(),
+        }
+
     async def execute(
         self,
         tasks: List[Dict[str, Any]],
@@ -221,6 +277,27 @@ class DispatchParallelTool(BaseTool):
         from app.config import load_config
         if not model_id:
             model_id = load_config().settings.default_model
+
+        if not tasks:
+            msg = "[ERROR] dispatch_parallel requires at least one task."
+            return ToolResult(output=msg, error=msg)
+
+        worker_limit = get_parallel_worker_limit()
+        requested_workers = len(tasks)
+        if requested_workers > worker_limit:
+            msg = (
+                f"[ERROR] dispatch_parallel requested {requested_workers} workers, "
+                f"but the configured maximum is {worker_limit}. "
+                "Merge related scopes or dispatch the remaining work in a later batch."
+            )
+            return ToolResult(
+                output=msg,
+                error=msg,
+                metadata={
+                    "worker_limit": worker_limit,
+                    "requested_workers": requested_workers,
+                },
+            )
 
         started_at = time.time()
 

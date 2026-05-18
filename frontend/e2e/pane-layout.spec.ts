@@ -52,6 +52,10 @@ async function mockBackend(page: import('@playwright/test').Page) {
     contentType: 'application/json',
     body: JSON.stringify({ sessions: [] }),
   }));
+  await page.route('**/api/session-history', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ current_project_path: null, projects: [], standalone_sessions: [] }),
+  }));
   await page.route('**/api/settings', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({

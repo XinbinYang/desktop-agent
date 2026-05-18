@@ -66,8 +66,6 @@ def _read_auth_token_file() -> str:
     from app.runtime_paths import user_data_dir
 
     base = user_data_dir()
-    if base is None:
-        return ""
     auth_file = base / AUTH_FILE_NAME
     if not auth_file.exists():
         return ""

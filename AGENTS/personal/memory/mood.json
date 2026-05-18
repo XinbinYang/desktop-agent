@@ -1,207 +1,74 @@
 {
-  "current": "neutral",
-  "baseline": "positive",
-  "updated_at": "2026-05-18T20:54:23.616744",
+  "current": "negative",
+  "updated_at": "2026-05-18T22:32:40.533845",
   "history": [
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.054536"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.155163"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.213208"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.400833"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.541093"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.603415"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.664050"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.704827"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.742108"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.781538"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.819287"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.856741"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.903688"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:16.942241"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:17.002328"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:17.046678"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:25:17.087608"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:27:37.588370"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:19.539123"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:19.624943"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.153796"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.288938"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.415569"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.464624"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.607231"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.720292"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.777315"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.848474"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.905746"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:20.953260"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.005066"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.052966"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.101832"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.168884"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.233094"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.302496"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.360656"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:28:21.427339"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:08:55.478615"
     },
     {
       "mood": "negative",
-      "timestamp": "2026-05-18T20:32:33.402014"
+      "timestamp": "2026-05-18T22:09:23.669521"
     },
     {
       "mood": "neutral",
-      "timestamp": "2026-05-18T20:51:16.459780"
+      "timestamp": "2026-05-18T22:09:23.677913"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:20:01.265111"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:20:22.589310"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:23.335800"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:24.337630"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:30.323656"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:35.982812"
     },
     {
       "mood": "neutral",
-      "timestamp": "2026-05-18T20:51:32.516317"
+      "timestamp": "2026-05-18T22:22:35.991629"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:51:32.533188"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:23:37.618907"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:51:51.657008"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:31:51.612469"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:52:38.777010"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:37.566810"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:53:05.600458"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:38.518471"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:53:09.294457"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:39.319982"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:54:14.608320"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:39.995374"
     },
     {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:54:14.620276"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:54:23.594591"
-    },
-    {
-      "mood": "neutral",
-      "timestamp": "2026-05-18T20:54:23.616744"
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:40.533845"
     }
   ]
 }

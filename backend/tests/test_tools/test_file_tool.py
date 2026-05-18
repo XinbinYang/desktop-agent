@@ -240,24 +240,28 @@ class TestFileSandbox:
         assert "out of bounds" in result.error
 
     @pytest.mark.asyncio
-    async def test_relative_path_writes_to_repo_root_not_cwd(self, write_tool):
+    async def test_agents_relative_path_writes_to_runtime_not_repo(self, write_tool):
         """Regression: relative 'AGENTS/personal/__probe__.md' with
-        project_relative=False must land under repo_root (not backend/)
-        even though the test runner's cwd is backend/."""
-        from app.runtime_paths import repo_root
+        project_relative=False must land under the mutable runtime AGENTS
+        workspace, not the repo template directory or backend cwd."""
+        from app.runtime_paths import agents_dir, repo_root
 
         probe_rel = "AGENTS/personal/__test_probe__.md"
-        expected = repo_root() / probe_rel
+        expected = agents_dir() / "personal" / "__test_probe__.md"
+        repo_template = repo_root() / probe_rel
         # Clean up any leftover from previous runs
         if expected.exists():
             expected.unlink()
+        if repo_template.exists():
+            repo_template.unlink()
 
         result = await write_tool.execute(path=probe_rel, content="probe ok")
         assert result.error == "", f"unexpected error: {result.error}"
 
-        # Verify the file was created at the repo-root anchored path
+        # Verify the file was created at the runtime AGENTS path
         assert expected.exists(), f"File not found at expected path: {expected}"
         assert expected.read_text(encoding="utf-8") == "probe ok"
+        assert not repo_template.exists(), f"File incorrectly landed at repo template path: {repo_template}"
 
         # Double-check: it should NOT exist under backend/
         wrong = Path("backend") / probe_rel
@@ -292,20 +296,24 @@ class TestFileSandboxUnrestricted:
         return FileWriteTool()
 
     @pytest.mark.asyncio
-    async def test_relative_path_writes_to_repo_root_not_cwd(self, write_tool):
+    async def test_agents_relative_path_writes_to_runtime_not_cwd(self, write_tool):
         """Same regression test but exercising the unrestricted code path."""
-        from app.runtime_paths import repo_root
+        from app.runtime_paths import agents_dir, repo_root
 
         probe_rel = "AGENTS/personal/__test_probe_unrestricted__.md"
-        expected = repo_root() / probe_rel
+        expected = agents_dir() / "personal" / "__test_probe_unrestricted__.md"
+        repo_template = repo_root() / probe_rel
         if expected.exists():
             expected.unlink()
+        if repo_template.exists():
+            repo_template.unlink()
 
         result = await write_tool.execute(path=probe_rel, content="unrestricted ok")
         assert result.error == "", f"unexpected error: {result.error}"
 
         assert expected.exists(), f"File not found at expected path: {expected}"
         assert expected.read_text(encoding="utf-8") == "unrestricted ok"
+        assert not repo_template.exists(), f"File incorrectly landed at repo template path: {repo_template}"
 
         wrong = Path("backend") / probe_rel
         assert not wrong.exists(), f"File incorrectly landed at {wrong}"

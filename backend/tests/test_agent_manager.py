@@ -83,6 +83,27 @@ class TestAgentManagerBackwardCompat:
 class TestAgentManagerWorkspaceFiles:
     """Verify workspace file CRUD operations."""
 
+    def test_runtime_agents_seed_from_bundled_templates(self, tmp_path, monkeypatch):
+        from app import runtime_paths
+
+        bundle = tmp_path / "bundle"
+        template_file = bundle / "AGENTS" / "personal" / "USER.md"
+        template_file.parent.mkdir(parents=True)
+        template_file.write_text("seed user", encoding="utf-8")
+        user_data = tmp_path / "user-data"
+
+        monkeypatch.setenv(runtime_paths.USER_DATA_ENV, str(user_data))
+        monkeypatch.setattr(runtime_paths, "bundled_root", lambda: bundle)
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", None)
+
+        root = AgentManager._agents_root()
+        runtime_file = root / "personal" / "USER.md"
+        assert root == user_data / "backend" / "AGENTS"
+        assert runtime_file.read_text(encoding="utf-8") == "seed user"
+
+        runtime_file.write_text("custom user", encoding="utf-8")
+        assert AgentManager._agents_root().joinpath("personal", "USER.md").read_text(encoding="utf-8") == "custom user"
+
     def test_save_and_load_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
         ok = AgentManager.save_workspace_file("personal", "test.md", "hello world")
@@ -104,6 +125,18 @@ class TestAgentManagerWorkspaceFiles:
         assert len(agents) == 2
         types = {a["type"] for a in agents}
         assert types == {"personal", "coding"}
+
+    def test_agents_files_api_reads_runtime_workspace(self, client, tmp_path, monkeypatch):
+        runtime_agents = tmp_path / "AGENTS"
+        personal = runtime_agents / "personal"
+        personal.mkdir(parents=True)
+        (personal / "USER.md").write_text("runtime user profile", encoding="utf-8")
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", runtime_agents)
+
+        response = client.get("/api/agents/personal/files/USER.md")
+
+        assert response.status_code == 200
+        assert response.json()["content"] == "runtime user profile"
 
 
 class TestBootstrapManagement:

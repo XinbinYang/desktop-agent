@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import uuid
 
@@ -197,6 +198,234 @@ class TestAPIRoutes:
         assert first.json()["session_id"] == second.json()["session_id"]
         assert third.json()["session_id"] != first.json()["session_id"]
         assert third.json()["created"] is True
+
+    def _write_session_record(
+        self,
+        sessions_dir,
+        session_id: str,
+        *,
+        agent_type: str = "coding",
+        project_path: str | None = None,
+        updated_at: float = 1000.0,
+        phase: str = "idle",
+    ) -> None:
+        role_id = "code-expert" if agent_type == "coding" else "desktop-agent"
+        data = {
+            "session_id": session_id,
+            "model_id": "gpt-4o",
+            "role_id": role_id,
+            "agent_type": agent_type,
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": f"{session_id} title"},
+            ],
+            "plan_state": {
+                "mode": "plan" if phase != "idle" else "agent",
+                "phase": phase,
+                "draft": "",
+                "goal": "",
+                "questions": [],
+                "todos": [],
+                "decisions": {},
+                "decision_notes": {},
+                "approved": False,
+                "pending_clarification": False,
+                "structured_plan": None,
+                "plan_file_path": None,
+                "plan_file_versions": [],
+                "research_notes": "",
+            },
+            "project_path": project_path,
+        }
+        path = sessions_dir / f"{session_id}.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        os.utime(path, (updated_at, updated_at))
+
+    def test_session_history_groups_projects_and_standalone_sessions(self, client, monkeypatch, tmp_path, isolate_projects):
+        import app.agent as agent_module
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        from app.project_manager import ProjectManager
+
+        project_a = tmp_path / "project-a"
+        project_b = tmp_path / "project-b"
+        missing_project = tmp_path / "missing-project"
+        project_a.mkdir()
+        project_b.mkdir()
+        ProjectManager.open_project(str(project_a))
+        ProjectManager.open_project(str(project_b))
+
+        self._write_session_record(sessions_dir, "coding_a", project_path=str(project_a), updated_at=3000)
+        self._write_session_record(sessions_dir, "coding_missing", project_path=str(missing_project), updated_at=2000)
+        self._write_session_record(sessions_dir, "personal_project", agent_type="personal", project_path=str(project_a), updated_at=1500)
+        self._write_session_record(sessions_dir, "personal_free", agent_type="personal", project_path=None, updated_at=1000)
+
+        response = client.get("/api/session-history")
+
+        assert response.status_code == 200
+        data = response.json()
+        projects = {project["path"]: project for project in data["projects"]}
+        assert str(project_a) in projects
+        assert str(project_b) in projects
+        assert str(missing_project) in projects
+        assert projects[str(project_a)]["sessions"][0]["id"] == "coding_a"
+        assert projects[str(missing_project)]["name"] == "missing-project"
+        standalone_ids = {session["id"] for session in data["standalone_sessions"]}
+        assert {"personal_project", "personal_free"}.issubset(standalone_ids)
+
+    def test_session_history_marks_running_connection_and_needs_input(self, client, monkeypatch, tmp_path):
+        import asyncio
+        import app.agent as agent_module
+        from app.agent import AgentSession
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        project_path = str(tmp_path / "repo")
+        (tmp_path / "repo").mkdir()
+        sid_running = f"history_running_{uuid.uuid4().hex}"
+        sid_waiting = f"history_waiting_{uuid.uuid4().hex}"
+        self._write_session_record(sessions_dir, sid_running, project_path=project_path, updated_at=3000)
+        self._write_session_record(sessions_dir, sid_waiting, project_path=project_path, updated_at=2000, phase="awaiting_decision")
+
+        async def slow_run(self, *args, **kwargs):
+            yield {"type": "status", "data": {"status": "thinking"}}
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
+
+        monkeypatch.setattr(AgentSession, "run", slow_run)
+
+        with client.websocket_connect(f"/ws/{sid_running}") as ws:
+            ws.send_json({"type": "chat", "text": "slow", "model_id": "gpt-4o", "agent_type": "coding"})
+            receive_until(ws, "status")
+            data = client.get("/api/session-history").json()
+
+            project = next(project for project in data["projects"] if project["path"] == project_path)
+            sessions = {session["id"]: session for session in project["sessions"]}
+            assert project["has_running"] is True
+            assert sessions[sid_running]["is_running"] is True
+            assert sessions[sid_running]["active_connections"] == 1
+            assert sessions[sid_running]["activity_state"] == "running"
+            assert sessions[sid_waiting]["activity_state"] == "needs_input"
+
+        client.delete(f"/api/sessions/{sid_running}")
+
+    def test_session_history_applies_project_metadata_and_archives_sessions(self, client, monkeypatch, tmp_path, isolate_projects):
+        import app.agent as agent_module
+        from app.project_manager import ProjectManager
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        project_a = tmp_path / "project-a"
+        project_b = tmp_path / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        ProjectManager.open_project(str(project_b))
+        ProjectManager.open_project(str(project_a))
+        ProjectManager.set_project_pinned(str(project_b), True)
+        ProjectManager.rename_project_display(str(project_b), "Pinned Alias")
+
+        self._write_session_record(sessions_dir, "coding_a", project_path=str(project_a), updated_at=3000)
+        self._write_session_record(sessions_dir, "coding_b", project_path=str(project_b), updated_at=2000)
+
+        data = client.get("/api/session-history").json()
+        assert data["projects"][0]["path"] == str(project_b)
+        assert data["projects"][0]["name"] == "Pinned Alias"
+        assert data["projects"][0]["display_name"] == "Pinned Alias"
+        assert data["projects"][0]["folder_name"] == "project-b"
+        assert data["projects"][0]["is_pinned"] is True
+        assert data["projects"][0]["source"] in {"recent", "metadata"}
+
+        archive = client.post("/api/projects/history/archive-sessions", json={"path": str(project_b)})
+        assert archive.status_code == 200
+        assert archive.json()["archived_sessions"] == 1
+        archived_record = json.loads((sessions_dir / "coding_b.json").read_text(encoding="utf-8"))
+        assert archived_record["archived_at"]
+
+        data = client.get("/api/session-history").json()
+        project_b_item = next(project for project in data["projects"] if project["path"] == str(project_b))
+        assert project_b_item["sessions"] == []
+        assert project_b_item["archived_sessions_count"] == 1
+
+        data_with_archived = client.get("/api/session-history?include_archived=true").json()
+        project_b_archived = next(project for project in data_with_archived["projects"] if project["path"] == str(project_b))
+        assert project_b_archived["sessions"][0]["id"] == "coding_b"
+
+    def test_remove_project_hides_history_without_deleting_and_reopen_restores_project(self, client, monkeypatch, tmp_path, isolate_projects):
+        import app.agent as agent_module
+        from app.project_manager import ProjectManager
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        project = tmp_path / "repo"
+        project.mkdir()
+        ProjectManager.open_project(str(project))
+        self._write_session_record(sessions_dir, "coding_remove", project_path=str(project), updated_at=3000)
+
+        removed = client.post("/api/projects/history/remove", json={"path": str(project)})
+        assert removed.status_code == 200
+        assert removed.json()["archived_sessions"] == 1
+        assert project.exists()
+        assert (sessions_dir / "coding_remove.json").exists()
+
+        ProjectManager.close_project()
+        data = client.get("/api/session-history").json()
+        assert str(project) not in {item["path"] for item in data["projects"]}
+
+        reopened = client.post("/api/projects/open", json={"path": str(project)})
+        assert reopened.status_code == 200
+        data = client.get("/api/session-history").json()
+        assert str(project) in {item["path"] for item in data["projects"]}
+
+    def test_persistent_worktree_endpoint_creates_runtime_worktree(self, client, tmp_path, isolate_projects):
+        git = subprocess.run(["git", "--version"], capture_output=True, text=True)
+        if git.returncode != 0:
+            pytest.skip("git is not available")
+
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        not_git = client.post("/api/projects/worktrees/persistent", json={"path": str(plain)})
+        assert not_git.status_code == 200
+        assert "not a Git repository" in not_git.json()["error"]
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+        (repo / "README.md").write_text("# repo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True, text=True)
+
+        response = client.post(
+            "/api/projects/worktrees/persistent",
+            json={"path": str(repo), "name": f"review-{uuid.uuid4().hex[:8]}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["path"]
+        assert "worktrees" in data["path"].replace("\\", "/")
+        assert os.path.isdir(data["path"])
+        assert data["project"]["path"] == data["path"]
 
     def test_upload_image(self, client):
         """POST /api/upload-image accepts file upload"""
@@ -774,6 +1003,43 @@ class TestWebSocket:
         assert response.status_code == 200
         assert response.json()["runtime_terminated"] is True
         assert markers["cancelled"] is True
+
+    def test_stop_session_runtime_only_cancels_target_session(self, client, monkeypatch):
+        """Session-scoped stop leaves other live sessions running."""
+        import asyncio
+        from app.agent import AgentSession
+
+        markers = {}
+
+        async def slow_run(self, *args, **kwargs):
+            markers.setdefault(self.session_id, {"cancelled": False})
+            yield {"type": "status", "data": {"status": "thinking"}}
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                markers[self.session_id]["cancelled"] = True
+                raise
+
+        monkeypatch.setattr(AgentSession, "run", slow_run)
+        sid_a = f"test_stop_target_a_{uuid.uuid4().hex}"
+        sid_b = f"test_stop_target_b_{uuid.uuid4().hex}"
+
+        with client.websocket_connect(f"/ws/{sid_a}") as ws_a:
+            with client.websocket_connect(f"/ws/{sid_b}") as ws_b:
+                ws_a.send_json({"type": "chat", "text": "slow a", "model_id": "gpt-4o"})
+                ws_b.send_json({"type": "chat", "text": "slow b", "model_id": "gpt-4o"})
+                receive_until(ws_a, "status")
+                receive_until(ws_b, "status")
+
+                response = client.post(f"/api/sessions/{sid_a}/stop")
+
+                assert response.status_code == 200
+                assert response.json()["was_running"] is True
+                assert markers[sid_a]["cancelled"] is True
+                assert markers[sid_b]["cancelled"] is False
+                assert client.get(f"/api/sessions/{sid_b}/runtime").json()["is_running"] is True
+
+                client.delete(f"/api/sessions/{sid_b}")
 
 
 class TestProjectAPI:

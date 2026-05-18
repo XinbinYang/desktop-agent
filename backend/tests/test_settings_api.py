@@ -73,6 +73,19 @@ settings:
         # Restore
         client.put("/api/settings", json={"max_iterations": 50})
 
+    def test_put_settings_clamps_parallel_agent_limit(self, client):
+        response = client.put("/api/settings", json={"max_parallel_agents": 99})
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+        response = client.get("/api/settings")
+        assert response.json()["settings"]["max_parallel_agents"] == 16
+
+        response = client.put("/api/settings", json={"max_parallel_agents": 0})
+        assert response.status_code == 200
+        response = client.get("/api/settings")
+        assert response.json()["settings"]["max_parallel_agents"] == 1
+
     def test_put_provider_updates_config(self, client):
         """PUT /api/providers/{name} updates a provider."""
         # First get current state

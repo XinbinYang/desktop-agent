@@ -242,6 +242,30 @@ class TestDispatchParallelTool:
         assert result.error
 
     @pytest.mark.asyncio
+    async def test_dispatch_parallel_rejects_tasks_above_configured_limit(self):
+        tool = DispatchParallelTool()
+        tasks = [{"task": f"Task {idx}", "profile": "code"} for idx in range(4)]
+
+        with patch("app.tools.worker_tool.get_parallel_worker_limit", return_value=3):
+            result = await tool.execute(tasks=tasks, model_id="gpt-4o")
+
+        assert result.error
+        assert "requested 4 workers" in result.output
+        assert "configured maximum is 3" in result.output
+        assert result.metadata["requested_workers"] == 4
+        assert result.metadata["worker_limit"] == 3
+
+    def test_dispatch_parallel_schema_exposes_configured_limit(self):
+        tool = DispatchParallelTool()
+
+        with patch("app.tools.worker_tool.get_parallel_worker_limit", return_value=2):
+            schema = tool.get_openai_schema()
+
+        tasks_schema = schema["function"]["parameters"]["properties"]["tasks"]
+        assert tasks_schema["maxItems"] == 2
+        assert "Hard maximum: 2" in tasks_schema["description"]
+
+    @pytest.mark.asyncio
     async def test_dispatch_parallel_per_task_model_context_and_acceptance(self):
         from app.config import list_all_models
         model_ids = [m["id"] for m in list_all_models()]
@@ -302,5 +326,5 @@ class TestDispatchParallelTool:
     async def test_dispatch_parallel_empty_tasks(self, mock_litellm):
         tool = DispatchParallelTool()
         result = await tool.execute(tasks=[])
-        if result.output:
-            assert "0 succeeded" in result.output
+        assert result.error
+        assert "requires at least one task" in result.output

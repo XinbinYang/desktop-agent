@@ -80,6 +80,12 @@ interface GeneralFormState extends AppSettings {
 
 type WebSearchKeyField = 'brave_api_key' | 'tavily_api_key' | 'serpapi_api_key';
 
+function clampParallelAgentCount(value: string | number): number {
+  const parsed = typeof value === 'number' ? value : parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 3;
+  return Math.max(1, Math.min(16, parsed));
+}
+
 interface WebSearchFormState {
   provider: WebSearchProvider;
   brave_api_key: string;
@@ -865,7 +871,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) =>
                       setGeneralForm({
                         ...generalForm,
-                        max_parallel_agents: parseInt(e.target.value, 10) || 3,
+                        max_parallel_agents: clampParallelAgentCount(e.target.value),
                       })}
                     className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
                   />

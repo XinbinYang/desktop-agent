@@ -1,0 +1,20 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">XuanShu monochrome icon</title>
+  <desc id="desc">A one-color version of the XuanShu central-axis logo for engraving, masks, and small UI surfaces.</desc>
+  <rect width="512" height="512" rx="112" fill="#0D1117"/>
+  <g stroke="#F4F7FA" stroke-linecap="round">
+    <path d="M136.8 138.4A174 174 0 0 1 264.9 82" stroke-width="10"/>
+    <path d="M365.2 113.2A174 174 0 0 1 429.7 251.7" stroke-width="10"/>
+    <path d="M399.1 359.5A174 174 0 0 1 264.9 430" stroke-width="10"/>
+    <path d="M150.6 391A174 174 0 0 1 82.4 260.2" stroke-width="10"/>
+    <path d="M175.5 195.9A104 104 0 0 1 256 152" stroke-width="7" opacity="0.72"/>
+    <path d="M331.8 185.2A104 104 0 0 1 360 256" stroke-width="7" opacity="0.72"/>
+    <path d="M336.5 323.3A104 104 0 0 1 256 360" stroke-width="7" opacity="0.72"/>
+    <path d="M180.2 326.8A104 104 0 0 1 152 256" stroke-width="7" opacity="0.72"/>
+    <path d="M177 175L335 337" stroke-width="22"/>
+    <path d="M337 175L175 337" stroke-width="22"/>
+  </g>
+  <circle cx="256" cy="256" r="54" fill="#0D1117" stroke="#F4F7FA" stroke-width="10"/>
+  <circle cx="256" cy="256" r="32" fill="#F4F7FA"/>
+  <circle cx="256" cy="256" r="10" fill="#0B0F14"/>
+</svg>

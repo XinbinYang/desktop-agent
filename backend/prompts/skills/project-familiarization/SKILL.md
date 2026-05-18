@@ -22,15 +22,13 @@ Read these files first:
 
 ### Phase 2: Parallel Code Scanning
 
-Use `dispatch_parallel` to launch 3-4 explorer agents concurrently. Each agent gets a focused task:
+Use `dispatch_parallel` to launch up to the configured maximum explorer agents concurrently (normally 3; never exceed the max parallel sub-agent setting). Each agent gets a focused task:
 
 **Agent 1 — Backend / Core Logic**: "Scan the backend/core directory structure. List the top-level modules and read the key files. Report: module names, what each does, entry points, key classes/functions."
 
 **Agent 2 — Frontend / UI (if exists)**: "Scan the frontend directory structure. List pages, components, routing. Report: tech stack, page list, key components, state management approach."
 
-**Agent 3 — Config & Infrastructure**: "Read config files, CI configs, Dockerfiles, database schemas. Report: deployment approach, CI pipeline, data storage, environment configuration."
-
-**Agent 4 — Recent Changes**: "Run git log for last 10 commits and git status. Report: recent work, current branch state, active areas of development."
+**Agent 3 — Config, Infrastructure & Recent Changes**: "Read config files, CI configs, Dockerfiles, database schemas, and inspect git status / recent commits. Report: deployment approach, CI pipeline, data storage, environment configuration, current branch state, and active areas of development."
 
 ### Phase 3: Synthesize
 

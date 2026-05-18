@@ -6,12 +6,13 @@ import {
   UserCog, Settings, BookOpen, Sun, Moon, Laptop,
   Brain, Activity, Moon as MoonIcon, Sparkles, FolderOpen
 } from 'lucide-react';
-import { ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
+import { ProjectInfo, FileNode, SidebarSection, type AgentType, type SessionHistoryItem, type SessionHistoryResponse } from '../types';
 import { ProjectPanel } from './ProjectPanel';
 import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
 import { AGENT_LABEL } from '../lib/agentProfiles';
+import { SessionHistoryPanel, type ProjectHistoryAction } from './SessionHistoryPanel';
 
 interface SidebarProps {
   activeSection: SidebarSection;
@@ -24,13 +25,16 @@ interface SidebarProps {
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
-  sessions?: {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number; is_primary?: boolean}[];
+  sessionHistory?: SessionHistoryResponse | null;
+  sessions?: SessionHistoryItem[];
   currentSession?: string;
   onNewSession?: () => void;
   onCompactSession?: () => void;
   onRewindSession?: () => void;
-  onSwitchSession?: (id: string) => void;
+  onSwitchSession?: (id: string, projectPath?: string | null) => void;
   onDeleteSession?: (id: string) => void;
+  onOpenProject?: (path: string) => void;
+  onProjectAction?: (action: ProjectHistoryAction, project: SessionHistoryResponse['projects'][number]) => void;
   currentProjectPath?: string | null;
   // 项目相关
   currentProject?: ProjectInfo | null;
@@ -71,6 +75,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClear,
   onExecuteTool,
   isConnected,
+  sessionHistory = null,
   sessions = [],
   currentSession,
   onNewSession,
@@ -78,6 +83,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onRewindSession,
   onSwitchSession,
   onDeleteSession,
+  onOpenProject,
+  onProjectAction,
   currentProjectPath,
   // 项目
   currentProject,
@@ -274,10 +281,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </span>
               )}
             </div>
-            {sessions.length === 0 && (
+            <SessionHistoryPanel
+              history={sessionHistory}
+              fallbackSessions={sessions}
+              currentSession={currentSession}
+              currentProjectPath={currentProjectPath}
+              onSwitchSession={onSwitchSession}
+              onDeleteSession={onDeleteSession}
+              onOpenProject={onOpenProject}
+              onOpenProjectModal={onOpenProjectModal}
+              onProjectAction={onProjectAction}
+            />
+            {false && sessions.length === 0 && (
               <div className="text-xs text-fg-muted text-center py-4">No sessions yet</div>
             )}
-            {sessions.map(s => (
+            {false && sessions.map(s => (
               <div
                 key={s.id}
                 className={`flex items-center justify-between px-2 py-1.5 rounded text-xs cursor-pointer ${

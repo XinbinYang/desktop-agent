@@ -498,8 +498,11 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   return (
     <div className="h-full min-h-0 flex flex-col" onClick={onFocus}>
       <ChatPanel
+        sessionId={sessionId}
         messages={messages}
         toolCalls={toolCalls}
+        fileEdits={fileEdits}
+        runEvents={runEvents}
         onSend={sendMessage}
         contextUsage={contextUsage}
         checkpoints={checkpoints}

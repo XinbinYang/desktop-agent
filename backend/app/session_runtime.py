@@ -129,6 +129,29 @@ def get_session_runtime(session_id: str) -> SessionRuntime:
     return runtime
 
 
+def session_runtime_status(session_id: str) -> Dict[str, Any]:
+    runtime = _session_runtimes.get(session_id)
+    return {
+        "session_id": session_id,
+        "is_running": bool(runtime and runtime.is_running),
+        "is_deleted": bool(runtime and runtime.is_deleted),
+    }
+
+
+async def cancel_session_runtime(
+    session_id: str,
+    session: Optional[AgentSession] = None,
+    *,
+    broadcast: bool = True,
+) -> bool:
+    runtime = _session_runtimes.get(session_id)
+    if runtime is None:
+        return False
+    was_running = runtime.is_running
+    await runtime.cancel(session, broadcast=broadcast)
+    return was_running
+
+
 async def terminate_session_runtime(session_id: str, session: Optional[AgentSession] = None) -> bool:
     runtime = _session_runtimes.pop(session_id, None)
     if runtime is None:

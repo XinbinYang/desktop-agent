@@ -71,6 +71,8 @@ interface PaneRendererProps {
   onProjectFileEdit?: (edit: FileEdit) => void;
 }
 
+const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
+
 function splitLayout(node: SplitNode): Record<string, number> {
   return node.children.reduce<Record<string, number>>((layout, child, index) => {
     layout[child.id] = node.sizes[index] ?? 100 / node.children.length;
@@ -151,7 +153,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         onSplitResize(node.id, node.children.map((child, index) => layout[child.id] ?? node.sizes[index] ?? 100 / node.children.length));
       }}
       className="flex-1 min-h-0"
-      resizeTargetMinimumSize={{ fine: 22, coarse: 34 }}
+      resizeTargetMinimumSize={RESIZE_TARGET_MINIMUM_SIZE}
     >
       {node.children.map((child, index) => (
         <React.Fragment key={child.id}>
