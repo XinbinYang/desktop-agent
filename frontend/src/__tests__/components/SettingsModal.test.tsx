@@ -39,6 +39,16 @@ const mockSettingsResponse: SettingsResponse = {
     screenshot_on_step: true,
     sandbox_mode: 'sandbox',
   },
+  web_search: {
+    provider: 'auto',
+    fallback_enabled: true,
+    allow_private_network: false,
+    providers: {
+      brave: { api_key_masked: 'brv...1234', api_key_configured: true },
+      tavily: { api_key_masked: '', api_key_configured: false },
+      serpapi: { api_key_masked: '', api_key_configured: false },
+    },
+  },
 };
 
 function mockFetchResponse(data: any) {
@@ -316,5 +326,71 @@ describe('SettingsModal', () => {
     );
 
     expect(await screen.findByText(/当前模型: GPT-4o/)).toBeInTheDocument();
+  });
+  it('renders web search settings and preserves existing keys on save', async () => {
+    const onSettingsChanged = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse))
+      .mockResolvedValueOnce(mockFetchResponse({ status: 'ok', web_search: mockSettingsResponse.web_search }))
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={onSettingsChanged}
+      />
+    );
+
+    fireEvent.click(await screen.findByText('Web Search'));
+    expect(await screen.findByText('Brave Search API Key')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('brv...1234')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Save Web Search'));
+
+    await waitFor(() => expect(onSettingsChanged).toHaveBeenCalled());
+    const saveCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/web-search/settings') && init?.method === 'PUT'
+    );
+    expect(saveCall).toBeTruthy();
+    const body = JSON.parse(saveCall![1].body as string);
+    expect(body.provider).toBe('auto');
+    expect(body.brave_api_key).toBe('');
+    expect(body.fallback_enabled).toBe(true);
+  });
+
+  it('tests web search settings from the form', async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse))
+      .mockResolvedValueOnce(mockFetchResponse({
+        ok: true,
+        message: 'Search succeeded via duckduckgo',
+        provider: 'duckduckgo',
+        result_count: 2,
+      }));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByText('Web Search'));
+    fireEvent.click(await screen.findByText('Test search'));
+
+    expect(await screen.findByText('Search succeeded via duckduckgo')).toBeInTheDocument();
+    const testCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/web-search/test') && init?.method === 'POST'
+    );
+    expect(testCall).toBeTruthy();
+    const body = JSON.parse(testCall![1].body as string);
+    expect(body.query).toBe('OpenAI API documentation');
+    expect(body.brave_api_key).toBe('');
   });
 });

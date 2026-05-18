@@ -6,9 +6,10 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import load_config, mask_api_key, save_config, reload_config
-from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig, PersonalAgentConfig
+from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig, PersonalAgentConfig, WebSearchConfig
 from app.roles import RoleManager
 from app.skills import SkillManager
+from app.tools.web_tool import perform_web_search
 
 router = APIRouter()
 
@@ -66,6 +67,19 @@ class FetchModelsRequest(BaseModel):
     api_key: str = ""
 
 
+class WebSearchSettingsRequest(BaseModel):
+    provider: Optional[str] = None
+    brave_api_key: Optional[str] = None
+    tavily_api_key: Optional[str] = None
+    serpapi_api_key: Optional[str] = None
+    fallback_enabled: Optional[bool] = None
+    allow_private_network: Optional[bool] = None
+
+
+class WebSearchTestRequest(WebSearchSettingsRequest):
+    query: str = "OpenAI API documentation"
+
+
 class SuggestedModel(BaseModel):
     id: str
     suggested_name: str
@@ -89,6 +103,60 @@ def _is_local_provider(provider_name: str | None, base_url: str) -> bool:
         or "127.0.0.1" in lowered_url
         or lowered_url.startswith("http://[::1]")
     )
+
+
+def _web_search_settings_payload(cfg) -> dict[str, Any]:
+    web = cfg.web_search
+    return {
+        "provider": web.provider,
+        "fallback_enabled": web.fallback_enabled,
+        "allow_private_network": web.allow_private_network,
+        "providers": {
+            "brave": {
+                "api_key_masked": mask_api_key(web._raw_brave_api_key or web.brave_api_key),
+                "api_key_configured": bool(web.brave_api_key),
+            },
+            "tavily": {
+                "api_key_masked": mask_api_key(web._raw_tavily_api_key or web.tavily_api_key),
+                "api_key_configured": bool(web.tavily_api_key),
+            },
+            "serpapi": {
+                "api_key_masked": mask_api_key(web._raw_serpapi_api_key or web.serpapi_api_key),
+                "api_key_configured": bool(web.serpapi_api_key),
+            },
+        },
+    }
+
+
+def _apply_web_search_update(web: WebSearchConfig, req: WebSearchSettingsRequest) -> WebSearchConfig:
+    current = web.model_dump()
+    update = req.model_dump(exclude_none=True)
+    provider = update.get("provider")
+    if provider:
+        provider = str(provider).lower()
+        if provider not in {"auto", "brave", "tavily", "serpapi", "duckduckgo"}:
+            raise HTTPException(status_code=400, detail=f"Unknown web search provider: {provider}")
+        current["provider"] = provider
+    for field in ("fallback_enabled", "allow_private_network"):
+        if field in update:
+            current[field] = bool(update[field])
+
+    raw_values = {
+        "brave_api_key": web._raw_brave_api_key,
+        "tavily_api_key": web._raw_tavily_api_key,
+        "serpapi_api_key": web._raw_serpapi_api_key,
+    }
+    for field in raw_values:
+        value = update.get(field)
+        if isinstance(value, str) and value.strip():
+            current[field] = _resolve_api_key(value)
+            raw_values[field] = value.strip()
+
+    next_web = WebSearchConfig(**current)
+    next_web._raw_brave_api_key = raw_values["brave_api_key"]
+    next_web._raw_tavily_api_key = raw_values["tavily_api_key"]
+    next_web._raw_serpapi_api_key = raw_values["serpapi_api_key"]
+    return next_web
 
 
 # ---- Model ID hint table for auto-populating context / vision / name ----
@@ -226,6 +294,7 @@ def get_settings():
         "settings": cfg.settings.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
         "personal_agent": cfg.personal_agent.model_dump(),
+        "web_search": _web_search_settings_payload(cfg),
     }
 
 
@@ -414,6 +483,36 @@ def delete_provider(provider_name: str):
     del cfg.providers[provider_name]
     save_config(cfg)
     return {"status": "ok"}
+
+
+@router.put("/api/web-search/settings")
+def update_web_search_settings(req: WebSearchSettingsRequest):
+    cfg = load_config()
+    cfg.web_search = _apply_web_search_update(cfg.web_search, req)
+    save_config(cfg)
+    return {"status": "ok", "web_search": _web_search_settings_payload(cfg)}
+
+
+@router.post("/api/web-search/test")
+async def test_web_search(req: WebSearchTestRequest):
+    try:
+        cfg = load_config()
+        web = _apply_web_search_update(cfg.web_search, req)
+        override = web.model_dump()
+        results, provider = await perform_web_search(
+            req.query,
+            max_results=3,
+            config_override=override,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": f"Web search failed: {exc}"}
+    return {
+        "ok": True,
+        "message": f"Search succeeded via {provider}",
+        "provider": provider,
+        "result_count": len(results),
+        "results": [r.to_dict() for r in results],
+    }
 
 
 @router.post("/api/config/reload")

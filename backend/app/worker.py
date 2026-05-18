@@ -26,6 +26,7 @@ class WorkerProfile:
         "shell_execute", "shell_start",
         "browser_navigate", "browser_click", "browser_type",
         "browser_screenshot", "browser_evaluate", "browser_close",
+        "web_search", "web_fetch",
         "git_status", "git_commit", "git_diff",
     ])
     max_iterations: int = 1000
@@ -52,6 +53,7 @@ WorkerProfile(name="general", tools=[
     "shell_execute", "shell_start",
     "browser_navigate", "browser_click", "browser_type",
     "browser_screenshot", "browser_evaluate", "browser_close",
+    "web_search", "web_fetch",
     "screenshot", "mouse_click", "mouse_move", "type_text", "press_key", "scroll", "get_screen_size",
     "app_open", "app_list_windows", "app_find_window", "app_click", "app_type",
     "git_clone", "git_status", "git_commit", "git_pull", "git_push", "git_branch", "git_remote",
@@ -67,6 +69,7 @@ WorkerProfile(name="architect", tools=[
     "file_read", "file_list", "file_search",
     "git_status", "git_diff",
     "knowledge_search", "knowledge_list",
+    "web_search", "web_fetch",
 ], max_iterations=300, system_prompt_extra="""\
 ## Architect Worker: Read-Only Implementation Strategy
 
@@ -169,6 +172,7 @@ WorkerProfile(name="explorer", tools=[
     "file_read", "file_list", "file_search",
     "git_status", "git_diff",
     "knowledge_search", "knowledge_list",
+    "web_search", "web_fetch",
 ], max_iterations=200, system_prompt_extra="""\
 ## Explorer Worker: Focused Codebase Area Analysis
 
@@ -210,6 +214,7 @@ You explore ONE specific area of the codebase and produce a concise structured r
 WorkerProfile(name="reviewer", tools=[
     "repo_map", "code_search", "file_outline",
     "file_read", "git_diff", "git_status", "run_review",
+    "web_search", "web_fetch",
 ], max_iterations=500, system_prompt_extra="""\
 ## Reviewer Worker: Blocking Diff Review
 
@@ -251,6 +256,7 @@ WorkerProfile(name="code-expert", tools=[
     "git_status", "git_commit", "git_diff",
     "git_branch", "git_pull", "git_clone", "git_remote",
     "knowledge_search", "knowledge_index", "knowledge_list",
+    "web_search", "web_fetch",
 ], max_iterations=1000, system_prompt_extra="""\
 ## Code Expert Worker Guidelines
 You are a skilled full-stack engineer. The user may not understand programming, so you own technical decisions and report in plain product terms. Follow this workflow:
@@ -395,6 +401,7 @@ You are a systematic debugger. Never guess at fixes. Follow these phases:
 WorkerProfile(name="code-reviewer", tools=[
     "file_read", "file_search",
     "git_diff", "git_status",
+    "web_search", "web_fetch",
 ], max_iterations=500, system_prompt_extra="""\
 ## Code Reviewer: Spec Compliance + Code Quality Checklist
 

@@ -47,6 +47,18 @@ class CodingAgentConfig(BaseModel):
     model: str = ""
     thinking_intensity: str = "medium"
 
+class WebSearchConfig(BaseModel):
+    provider: str = "auto"
+    brave_api_key: str = ""
+    tavily_api_key: str = ""
+    serpapi_api_key: str = ""
+    fallback_enabled: bool = True
+    allow_private_network: bool = False
+
+    _raw_brave_api_key: str = PrivateAttr(default="")
+    _raw_tavily_api_key: str = PrivateAttr(default="")
+    _raw_serpapi_api_key: str = PrivateAttr(default="")
+
 class AutoApproveRule(BaseModel):
     """A permission rule for auto-approval of tool calls."""
     tool: str = ""             # Tool name pattern (supports * wildcard)
@@ -77,8 +89,10 @@ class AppConfig(BaseModel):
     rag: RagConfig = RagConfig()
     coding_agent: CodingAgentConfig = CodingAgentConfig()
     personal_agent: PersonalAgentConfig = PersonalAgentConfig()
+    web_search: WebSearchConfig = WebSearchConfig()
 
 _config: Optional[AppConfig] = None
+_WEB_SEARCH_KEY_FIELDS: tuple[str, ...] = ("brave_api_key", "tavily_api_key", "serpapi_api_key")
 
 
 def mask_api_key(key: str) -> str:
@@ -103,6 +117,8 @@ def load_config() -> AppConfig:
     # Backward compat: ensure personal_agent key exists
     if "personal_agent" not in raw:
         raw["personal_agent"] = {}
+    if "web_search" not in raw:
+        raw["web_search"] = {}
 
     # 保存原始 api_key（env var 解析前），用于 save_config 时写回
     raw_api_keys: Dict[str, str] = {}
@@ -113,11 +129,22 @@ def load_config() -> AppConfig:
             env_var = key[2:-1]
             provider["api_key"] = os.environ.get(env_var, "")
 
+    raw_web_keys: Dict[str, str] = {}
+    web_search = raw.get("web_search", {}) or {}
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        raw_web_keys[field] = web_search.get(field, "")
+        key = raw_web_keys[field]
+        if isinstance(key, str) and key.startswith("${") and key.endswith("}"):
+            web_search[field] = os.environ.get(key[2:-1], "")
+    raw["web_search"] = web_search
+
     _config = AppConfig(**raw)
     # Preserve the raw (un-expanded) api_key so save_config can round-trip env-var syntax.
     for provider_name, provider in _config.providers.items():
         if provider_name in raw_api_keys:
             provider._raw_api_key = raw_api_keys[provider_name]
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        setattr(_config.web_search, f"_raw_{field}", raw_web_keys.get(field, ""))
     return _config
 
 
@@ -133,12 +160,18 @@ def save_config(cfg: AppConfig) -> None:
             "models": [m.model_dump() for m in provider.models],
         }
 
+    web_search_data = cfg.web_search.model_dump()
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        raw_key = getattr(cfg.web_search, f"_raw_{field}", "") or getattr(cfg.web_search, field)
+        web_search_data[field] = raw_key
+
     data: Dict[str, object] = {
         "providers": providers_data,
         "settings": cfg.settings.model_dump(),
         "rag": cfg.rag.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
         "personal_agent": cfg.personal_agent.model_dump(),
+        "web_search": web_search_data,
     }
 
     # 原子写入：先写临时文件，再 os.replace

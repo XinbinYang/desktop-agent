@@ -1,20 +1,21 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   X, Plus, Trash2, Edit3, Save, Eye, EyeOff, Settings, Wifi, Download,
-  Database, Workflow, Server, Plug,
+  Database, Workflow, Server, Plug, Globe2,
 } from 'lucide-react';
-import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel, PersonalAgentSettings, CodingAgentSettings, ThinkingIntensity } from '../types';
+import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel, PersonalAgentSettings, CodingAgentSettings, ThinkingIntensity, WebSearchProvider, WebSearchSettings } from '../types';
 import { API_BASE } from '../config';
 import { KnowledgePanel } from './KnowledgePanel';
 import { WorkflowPanel } from './WorkflowPanel';
 import { McpPanel } from './McpPanel';
 import { ConnectionsPanel } from './ConnectionsPanel';
 
-type SettingsTab = 'general' | 'providers' | 'knowledge' | 'workflows' | 'mcp' | 'connections';
+type SettingsTab = 'general' | 'providers' | 'web' | 'knowledge' | 'workflows' | 'mcp' | 'connections';
 
 const SETTINGS_NAV: { key: SettingsTab; label: string; icon: React.FC<{ className?: string }> }[] = [
   { key: 'general', label: '通用', icon: Settings },
   { key: 'providers', label: 'Providers', icon: Server },
+  { key: 'web', label: 'Web Search', icon: Globe2 },
   { key: 'knowledge', label: '知识库', icon: Database },
   { key: 'workflows', label: '工作流', icon: Workflow },
   { key: 'mcp', label: 'MCP', icon: Wifi },
@@ -77,6 +78,26 @@ interface GeneralFormState extends AppSettings {
   coding_agent?: CodingAgentSettings;
 }
 
+type WebSearchKeyField = 'brave_api_key' | 'tavily_api_key' | 'serpapi_api_key';
+
+interface WebSearchFormState {
+  provider: WebSearchProvider;
+  brave_api_key: string;
+  tavily_api_key: string;
+  serpapi_api_key: string;
+  fallback_enabled: boolean;
+  allow_private_network: boolean;
+  showKeys: Record<WebSearchKeyField, boolean>;
+  keyDirty: Record<WebSearchKeyField, boolean>;
+}
+
+interface WebSearchTestResult {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  result_count?: number;
+}
+
 function providerToEditable(p: ProviderSettings): EditableProvider {
   return {
     name: p.name,
@@ -86,6 +107,27 @@ function providerToEditable(p: ProviderSettings): EditableProvider {
     models: p.models.map(m => ({ ...m })),
     showKey: true,
     keyDirty: false,
+  };
+}
+
+function webSearchToForm(web?: WebSearchSettings): WebSearchFormState {
+  return {
+    provider: web?.provider || 'auto',
+    brave_api_key: web?.providers?.brave?.api_key_masked || '',
+    tavily_api_key: web?.providers?.tavily?.api_key_masked || '',
+    serpapi_api_key: web?.providers?.serpapi?.api_key_masked || '',
+    fallback_enabled: web?.fallback_enabled ?? true,
+    allow_private_network: web?.allow_private_network ?? false,
+    showKeys: {
+      brave_api_key: false,
+      tavily_api_key: false,
+      serpapi_api_key: false,
+    },
+    keyDirty: {
+      brave_api_key: false,
+      tavily_api_key: false,
+      serpapi_api_key: false,
+    },
   };
 }
 
@@ -108,6 +150,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [pickerSelection, setPickerSelection] = useState<Record<string, boolean>>({});
   const [pickerSearch, setPickerSearch] = useState('');
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const [webSearchForm, setWebSearchForm] = useState<WebSearchFormState | null>(null);
+  const [testingWebSearch, setTestingWebSearch] = useState(false);
+  const [webSearchTestResult, setWebSearchTestResult] = useState<WebSearchTestResult | null>(null);
 
   useEffect(() => {
     if (isOpen) fetchSettings();
@@ -166,10 +211,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         personal_agent: ok.personal_agent || { model: '', thinking_intensity: 'medium' },
         coding_agent: ok.coding_agent || { model: '', thinking_intensity: 'medium', enabled: true, default_execution_mode: 'worktree', max_fix_rounds: 2, max_parallel_workers: 3, require_verification: true, require_review: true, auto_generate_repo_map: true },
       });
+      setWebSearchForm(webSearchToForm(ok.web_search));
       setEditingProvider(null);
       setProviderForm(null);
       setIsCreating(false);
       setTestResult(null);
+      setWebSearchTestResult(null);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       const looksLikeNetwork =
@@ -360,6 +407,80 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const webSearchRequestBody = () => {
+    if (!webSearchForm) return {};
+    return {
+      provider: webSearchForm.provider,
+      fallback_enabled: webSearchForm.fallback_enabled,
+      allow_private_network: webSearchForm.allow_private_network,
+      brave_api_key: webSearchForm.keyDirty.brave_api_key ? webSearchForm.brave_api_key.trim() : '',
+      tavily_api_key: webSearchForm.keyDirty.tavily_api_key ? webSearchForm.tavily_api_key.trim() : '',
+      serpapi_api_key: webSearchForm.keyDirty.serpapi_api_key ? webSearchForm.serpapi_api_key.trim() : '',
+    };
+  };
+
+  const saveWebSearchForm = async () => {
+    if (!webSearchForm) return;
+    const res = await fetch(`${API_BASE}/api/web-search/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(webSearchRequestBody()),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || 'Web Search settings save failed');
+    }
+  };
+
+  const handleSaveWebSearch = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      await saveWebSearchForm();
+      await fetchSettings();
+      onSettingsChanged();
+    } catch (e: any) {
+      setError(e.message || 'Web Search settings save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestWebSearch = async () => {
+    if (!webSearchForm) return;
+    setTestingWebSearch(true);
+    setError('');
+    setWebSearchTestResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/web-search/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...webSearchRequestBody(),
+          query: 'OpenAI API documentation',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || 'Web Search test failed');
+      }
+      setWebSearchTestResult(data);
+    } catch (e: any) {
+      setWebSearchTestResult({ ok: false, message: e.message || 'Web Search test failed' });
+    } finally {
+      setTestingWebSearch(false);
+    }
+  };
+
+  const updateWebSearchKey = (field: WebSearchKeyField, value: string) => {
+    if (!webSearchForm) return;
+    setWebSearchForm({
+      ...webSearchForm,
+      [field]: value,
+      keyDirty: { ...webSearchForm.keyDirty, [field]: true },
+    });
+  };
+
   const handleSaveAll = async () => {
     setSaving(true);
     setError('');
@@ -374,6 +495,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(generalForm),
         });
+      }
+      if (webSearchForm) {
+        await saveWebSearchForm();
       }
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
       onSettingsChanged();
@@ -1123,6 +1247,128 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 })}
               </div>
             )}
+          </section>
+          )}
+
+          {settingsTab === 'web' && webSearchForm && (
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-fg-secondary">Web Search</h3>
+              <span className="text-[10px] text-fg-muted">Used by Personal, Coding, and worker agents</span>
+            </div>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Provider</label>
+                  <select
+                    value={webSearchForm.provider}
+                    onChange={(e) => setWebSearchForm({ ...webSearchForm, provider: e.target.value as WebSearchProvider })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="brave">Brave Search</option>
+                    <option value="tavily">Tavily</option>
+                    <option value="serpapi">SerpAPI</option>
+                    <option value="duckduckgo">DuckDuckGo fallback</option>
+                  </select>
+                </div>
+                <div className="flex items-end gap-3">
+                  <label className="flex items-center gap-2 text-xs text-fg-secondary cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={webSearchForm.fallback_enabled}
+                      onChange={(e) => setWebSearchForm({ ...webSearchForm, fallback_enabled: e.target.checked })}
+                      className="w-3 h-3"
+                    />
+                    Enable fallback
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-fg-secondary cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={webSearchForm.allow_private_network}
+                      onChange={(e) => setWebSearchForm({ ...webSearchForm, allow_private_network: e.target.checked })}
+                      className="w-3 h-3"
+                    />
+                    Allow private URLs
+                  </label>
+                </div>
+              </div>
+
+              {([
+                ['brave_api_key', 'Brave Search API Key', settings?.web_search?.providers?.brave?.api_key_configured],
+                ['tavily_api_key', 'Tavily API Key', settings?.web_search?.providers?.tavily?.api_key_configured],
+                ['serpapi_api_key', 'SerpAPI Key', settings?.web_search?.providers?.serpapi?.api_key_configured],
+              ] as Array<[WebSearchKeyField, string, boolean | undefined]>).map(([field, label, configured]) => (
+                <div key={field}>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs text-fg-secondary">{label}</label>
+                    <span className={`text-[10px] ${configured ? 'text-success' : 'text-fg-muted'}`}>
+                      {configured ? 'Configured' : 'Not configured'}
+                    </span>
+                  </div>
+                  <div className="flex gap-1">
+                    <input
+                      type={webSearchForm.showKeys[field] ? 'text' : 'password'}
+                      value={webSearchForm[field]}
+                      onChange={(e) => updateWebSearchKey(field, e.target.value)}
+                      onFocus={() => {
+                        if (!webSearchForm.keyDirty[field]) {
+                          updateWebSearchKey(field, '');
+                        }
+                      }}
+                      placeholder="Leave blank to keep unchanged; ${ENV_VAR} is supported"
+                      className="flex-1 text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setWebSearchForm({
+                        ...webSearchForm,
+                        showKeys: { ...webSearchForm.showKeys, [field]: !webSearchForm.showKeys[field] },
+                      })}
+                      className="px-2 text-fg-secondary hover:text-fg bg-surface-alt border border-border-subtle rounded"
+                      title={webSearchForm.showKeys[field] ? 'Hide' : 'Show'}
+                    >
+                      {webSearchForm.showKeys[field] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {webSearchTestResult && (
+                <div
+                  className={`px-3 py-2 rounded text-xs border ${
+                    webSearchTestResult.ok
+                      ? 'bg-success/10 border-success/30 text-success'
+                      : 'bg-danger/10 border-danger/30 text-danger'
+                  }`}
+                >
+                  {webSearchTestResult.message}
+                  {typeof webSearchTestResult.result_count === 'number' && (
+                    <span className="ml-2 text-fg-secondary">({webSearchTestResult.result_count} results)</span>
+                  )}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleTestWebSearch}
+                  disabled={testingWebSearch || saving}
+                  className="flex items-center justify-center gap-1 px-3 py-1.5 rounded text-xs bg-surface-alt text-fg hover:bg-surface-hover transition-colors disabled:opacity-50"
+                >
+                  <Wifi className="w-3 h-3" />
+                  {testingWebSearch ? 'Testing...' : 'Test search'}
+                </button>
+                <button
+                  onClick={handleSaveWebSearch}
+                  disabled={saving}
+                  className="flex-1 flex items-center justify-center gap-1 px-3 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors disabled:opacity-50"
+                >
+                  <Save className="w-3 h-3" />
+                  {saving ? 'Saving...' : 'Save Web Search'}
+                </button>
+              </div>
+            </div>
           </section>
           )}
 

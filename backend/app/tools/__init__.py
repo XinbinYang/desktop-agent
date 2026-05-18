@@ -8,6 +8,7 @@ from app.tools.browser_tool import (
     BrowserNavigateTool, BrowserClickTool, BrowserTypeTool,
     BrowserScreenshotTool, BrowserEvaluateTool, BrowserCloseTool
 )
+from app.tools.web_tool import WebSearchTool, WebFetchTool
 from app.tools.desktop_tool import (
     ScreenshotTool, MouseClickTool, MouseMoveTool,
     TypeTextTool, PressKeyTool, ScrollTool, GetScreenSizeTool
@@ -77,6 +78,8 @@ ALL_TOOLS: list[BaseTool] = [
     BrowserScreenshotTool(),
     BrowserEvaluateTool(),
     BrowserCloseTool(),
+    WebSearchTool(),
+    WebFetchTool(),
     # 桌面操控工具
     ScreenshotTool(),
     MouseClickTool(),
@@ -180,6 +183,8 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     "skill_list", "skill_read", "skill_archive",
     # Knowledge base
     "knowledge_search", "knowledge_list",
+    # Web
+    "web_search", "web_fetch",
     # Plan mode
     "plan_ask_questions", "plan_write_draft", "plan_update_todos",
     # Testing & diagnostics
@@ -224,6 +229,7 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "browser_navigate", "browser_click", "browser_type",
         "browser_screenshot", "browser_evaluate", "browser_close",
     ],
+    "Web": ["web_search", "web_fetch"],
     "桌面操控": [
         "screenshot", "mouse_click", "mouse_move", "type_text",
         "press_key", "scroll", "get_screen_size",

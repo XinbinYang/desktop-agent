@@ -84,11 +84,30 @@ export interface CodingAgentSettings {
   thinking_intensity: ThinkingIntensity;
 }
 
+export type WebSearchProvider = "auto" | "brave" | "tavily" | "serpapi" | "duckduckgo";
+
+export interface WebSearchKeyStatus {
+  api_key_masked: string;
+  api_key_configured: boolean;
+}
+
+export interface WebSearchSettings {
+  provider: WebSearchProvider;
+  fallback_enabled: boolean;
+  allow_private_network: boolean;
+  providers: {
+    brave: WebSearchKeyStatus;
+    tavily: WebSearchKeyStatus;
+    serpapi: WebSearchKeyStatus;
+  };
+}
+
 export interface SettingsResponse {
   providers: Record<string, ProviderSettings>;
   settings: AppSettings;
   coding_agent?: CodingAgentSettings;
   personal_agent?: PersonalAgentSettings;
+  web_search?: WebSearchSettings;
 }
 
 export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video';

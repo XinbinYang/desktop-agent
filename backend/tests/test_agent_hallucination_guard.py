@@ -141,3 +141,33 @@ class TestHallucinationGuard:
         assert len(tool_events) >= 1
         assert tool_events[0]["data"]["name"] == "browser_navigate"
         assert "[INTENT_BLOCKED]" not in tool_events[0]["data"]["result"]
+
+    def test_web_search_blocked_without_external_intent(self, session):
+        ok, reason = session._check_tool_intent_consistency(
+            "web_search",
+            {"query": "latest docs"},
+            "inspect local project files",
+        )
+
+        assert ok is False
+        assert "[INTENT_BLOCKED]" in reason
+
+    def test_web_search_allowed_with_search_intent(self, session):
+        ok, reason = session._check_tool_intent_consistency(
+            "web_search",
+            {"query": "latest docs"},
+            "搜索一下最新官方文档",
+        )
+
+        assert ok is True
+        assert reason == ""
+
+    def test_web_fetch_localhost_allowed_without_external_intent(self, session):
+        ok, reason = session._check_tool_intent_consistency(
+            "web_fetch",
+            {"url": "http://localhost:5173"},
+            "check local app",
+        )
+
+        assert ok is True
+        assert reason == ""

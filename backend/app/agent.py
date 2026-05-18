@@ -78,6 +78,8 @@ READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
     "file_search",
     "knowledge_search",
     "knowledge_list",
+    "web_search",
+    "web_fetch",
     "git_status",
     "git_diff",
     "screenshot",
@@ -1180,13 +1182,17 @@ class AgentSession:
         return True
 
     # Tools that can break out of the current project context.
-    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone", "browser_navigate"})
+    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone", "browser_navigate", "web_search", "web_fetch"})
     _EXTERNAL_RESOURCE_KEYWORDS = [
         "clone", "github", "gitlab", "gitee", "bitbucket",
         "repo", "repository", "template", "模板",
         "url", "http", "下载", "download",
         "外部", "external", "website", "网站",
         "浏览", "browse", "navigate", "打开网页",
+        "search", "web search", "fetch", "lookup", "look up",
+        "latest", "current", "today", "news", "official docs", "documentation",
+        "search web", "read url", "open url",
+        "搜索", "查一下", "查找", "查询", "最新", "新闻", "官网", "官方", "文档",
     ]
 
     def _is_readonly_plan_tool(self, tool_name: str) -> bool:
@@ -1203,7 +1209,7 @@ class AgentSession:
 
         user_lower = (user_input or "").lower()
         # Localhost navigations are always allowed (common dev workflow)
-        if tool_name == "browser_navigate":
+        if tool_name in {"browser_navigate", "web_fetch"}:
             url = str(tool_args.get("url") or "").lower()
             if "localhost" in url or "127.0.0.1" in url:
                 return True, ""

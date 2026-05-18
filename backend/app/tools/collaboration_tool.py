@@ -60,7 +60,12 @@ class ConsultCodingAgentTool(BaseTool):
             user_intent=goal,
             context=context or {},
             acceptance_criteria=acceptance_criteria or ["Return a concise diagnosis and next step."],
-            allowed_tools=["repo_map", "code_search", "file_outline", "file_read", "file_list", "file_search", "git_status", "git_diff"],
+            allowed_tools=[
+                "repo_map", "code_search", "file_outline",
+                "file_read", "file_list", "file_search",
+                "git_status", "git_diff",
+                "web_search", "web_fetch",
+            ],
         )
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
