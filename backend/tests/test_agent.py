@@ -113,12 +113,13 @@ class TestAgentSession:
         assert result is not None
         assert result["skipped"] is False
         assert result["before_message_count"] == 12
-        assert result["after_message_count"] == 6
+        assert result["after_message_count"] == 12
         assert session.compaction_summary.startswith("Summary:")
         assert len([m for m in session.messages if m.get("role") == "system"]) == 1
         remaining_text = "\n".join(str(m.get("content")) for m in session.messages)
-        assert "user turn 0" not in remaining_text
+        assert "user turn 0" in remaining_text
         assert "user turn 5" in remaining_text
+        assert result["context_usage"]["context_message_count"] <= result["after_message_count"]
 
     def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
         import app.agent as agent_module
@@ -323,6 +324,123 @@ class TestAgentSession:
         assert streamed_text == "Recovered"
 
     @pytest.mark.asyncio
+    async def test_applied_task_guidance_is_injected_at_model_boundary(self, session):
+        captured_messages = []
+
+        async def stream_with_capture(*args, **kwargs):
+            captured_messages.append(kwargs.get("messages") or args[0])
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Used guidance",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        item = session.queue_task_guidance("Prefer the smaller fix")
+        session.apply_task_guidance()
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_with_capture):
+            events = []
+            async for event in session.run("fix the bug"):
+                events.append(event)
+
+        assert any(e["type"] == "task_guidance_consumed" for e in events)
+        assert all(item.id != active["id"] for active in session.active_task_guidance_items())
+        first_call_text = "\n".join(
+            str(msg.get("content", "")) for msg in captured_messages[0]
+        )
+        assert "[TASK GUIDANCE]" in first_call_text
+        assert "Prefer the smaller fix" in first_call_text
+
+    @pytest.mark.asyncio
+    async def test_run_payload_keeps_prior_session_suggestion_when_context_fits(self, session):
+        captured_messages = []
+
+        async def stream_with_capture(*args, **kwargs):
+            captured_messages.append(kwargs.get("messages") or args[0])
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "I can see the earlier recommendation.",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        session.messages.append({"role": "user", "content": "review this repository", "source": "user"})
+        session.messages.append({
+            "role": "assistant",
+            "content": "Overall recommendation: git_tools is missing and git_commit needs a real implementation.",
+        })
+        for i in range(25):
+            session.messages.append({"role": "user", "content": f"follow-up {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"answer {i}"})
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_with_capture):
+            async for _event in session.run("please fix according to your suggestion"):
+                pass
+
+        first_call_text = "\n".join(str(msg.get("content", "")) for msg in captured_messages[0])
+        assert "git_tools is missing" in first_call_text
+        assert "please fix according to your suggestion" in first_call_text
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compacts_before_trimming_when_context_exceeds_model_window(self, session):
+        captured_messages = []
+
+        session._model_context_limit = lambda: 4096
+        session._completion_max_tokens = lambda: 1024
+        session._tool_schema_token_estimate = lambda: 0
+
+        async def fake_summary(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Summary: old review context and decisions."}}]}
+
+        async def stream_with_capture(*args, **kwargs):
+            captured_messages.append(kwargs.get("messages") or args[0])
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Continued with compacted context.",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        session.router.chat_completion_non_stream = fake_summary
+        for i in range(8):
+            session.messages.append({
+                "role": "user",
+                "content": f"old long turn {i} " + ("context " * 500),
+                "source": "user",
+            })
+            session.messages.append({"role": "assistant", "content": "answer " + ("details " * 500)})
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_with_capture):
+            events = []
+            async for event in session.run("continue from the session"):
+                events.append(event)
+
+        assert any(e["type"] == "compacted" and e["data"].get("auto") for e in events)
+        assert session.compaction_summary.startswith("Summary:")
+        first_call_text = "\n".join(str(msg.get("content", "")) for msg in captured_messages[0])
+        assert "Conversation Summary" in first_call_text
+        assert "Summary: old review context" in first_call_text
+
+    @pytest.mark.asyncio
     async def test_invalid_tool_arguments_are_reported_as_tool_result(self, session):
         session.max_iterations = 1
         mock_response = {
@@ -401,7 +519,7 @@ class TestAgentSession:
             for msg in session.messages
         )
 
-    def test_trim_keeps_complete_tool_call_group(self, session):
+    def test_model_context_window_keeps_complete_user_turn(self, session):
         session.MAX_HISTORY_MESSAGES = 3
         session.messages.extend([
             {"role": "user", "content": "old"},
@@ -418,11 +536,79 @@ class TestAgentSession:
             {"role": "assistant", "content": "done"},
         ])
 
-        session._trim_messages()
+        context_messages = session._messages_for_llm()
 
-        roles = [m.get("role") for m in session.messages]
-        assert roles == ["system", "assistant", "tool", "assistant"]
-        assert session.messages[1].get("tool_calls")
+        roles = [m.get("role") for m in context_messages]
+        assert roles == ["system", "user", "assistant", "tool", "assistant"]
+        assert context_messages[1]["content"] == "old"
+        assert context_messages[2].get("tool_calls")
+
+    def test_messages_for_llm_repairs_interrupted_tool_call_before_next_user(self, session):
+        session.messages.extend([
+            {"role": "user", "content": "start task"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_interrupted",
+                    "type": "function",
+                    "function": {"name": "file_read", "arguments": "{\"path\":\"x\"}"},
+                }],
+            },
+            {"role": "user", "content": "are you stuck?"},
+        ])
+
+        context_messages = session._messages_for_llm()
+
+        roles = [m.get("role") for m in context_messages]
+        assert roles == ["system", "user", "assistant", "tool", "user"]
+        tool_msg = context_messages[3]
+        assert tool_msg["tool_call_id"] == "call_interrupted"
+        assert tool_msg["name"] == "file_read"
+        assert "interrupted" in tool_msg["content"].lower()
+
+    def test_save_and_load_preserves_long_transcript_over_context_window(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="long_history")
+        for i in range(30):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session._save()
+
+        loaded = AgentSession.load("long_history")
+
+        assert loaded is not None
+        user_messages = [m for m in loaded.messages if m.get("role") == "user" and m.get("source") != "internal"]
+        assert len(user_messages) == 30
+        assert user_messages[0]["content"] == "user turn 0"
+        assert user_messages[-1]["content"] == "user turn 29"
+        snapshot = loaded.to_snapshot()
+        assert snapshot["transcript_message_count"] == 60
+        assert len([m for m in snapshot["messages"] if m.get("role") == "user"]) == 30
+        assert snapshot["context_message_count"] == snapshot["transcript_message_count"]
+        assert snapshot["context_truncated"] is False
+
+    def test_refresh_mcp_tools_does_not_persist_transcript_side_effects(self, session, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        session.session_id = "mcp_no_save"
+        session.messages.append({"role": "user", "content": "keep me", "source": "user"})
+        session._save()
+        before = (tmp_path / "mcp_no_save.json").read_text(encoding="utf-8")
+
+        with patch("app.mcp.manager.get_mcp_manager") as mock_get_manager:
+            mock_manager = MagicMock()
+            mock_manager.list_servers.return_value = []
+            mock_get_manager.return_value = mock_manager
+            session.refresh_mcp_tools()
+
+        after = (tmp_path / "mcp_no_save.json").read_text(encoding="utf-8")
+        assert after == before
 
     def test_reset(self, session):
         session.messages.append({"role": "user", "content": "hi"})
@@ -1078,3 +1264,46 @@ class TestAgentType:
         loaded = AgentSession.load("at_migrate")
         assert loaded is not None
         assert loaded.agent_type == "personal"  # Migrated from role_id="desktop-agent"
+
+    def test_to_snapshot_excludes_internal_messages(self):
+        session = AgentSession(model_id="gpt-4o", session_id="snap_internal")
+        session.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "real question", "source": "user"},
+            {"role": "user", "content": "[BUILD ALREADY CLICKED] ...", "source": "internal"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "[VERIFICATION REQUIRED] ...", "source": "internal"},
+        ]
+        snap = session.to_snapshot()
+        snap_msgs = snap["messages"]
+        assert all(m.get("source") != "internal" for m in snap_msgs)
+        # Real conversation preserved, order intact.
+        contents = [m["content"] for m in snap_msgs]
+        assert "real question" in contents
+        assert "answer" in contents
+        assert contents.index("real question") < contents.index("answer")
+        # The model's own message list is untouched (LLM context intact).
+        assert any(m.get("source") == "internal" for m in session.messages)
+
+    def test_save_and_load_preserve_internal_messages_for_llm(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="at_internal")
+        session.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "real", "source": "user"},
+            {"role": "user", "content": "[BUILD ALREADY CLICKED] ...", "source": "internal"},
+        ]
+        session._save()
+
+        # Disk JSON keeps internal messages so the LLM keeps full context.
+        data = json.loads((tmp_path / "at_internal.json").read_text(encoding="utf-8"))
+        assert any(m.get("source") == "internal" for m in data["messages"])
+
+        loaded = AgentSession.load("at_internal")
+        assert loaded is not None
+        assert any(m.get("source") == "internal" for m in loaded.messages)
+        # But its frontend snapshot still hides them.
+        assert all(m.get("source") != "internal" for m in loaded.to_snapshot()["messages"])

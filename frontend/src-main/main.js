@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, nativeTheme, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -525,6 +525,77 @@ ipcMain.handle('select-file', async () => {
     filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }, { name: 'All', extensions: ['*'] }],
   });
   return result.filePaths[0] || null;
+});
+
+function resolveUserPath(value) {
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  return path.resolve(value);
+}
+
+function openExplorerFallback(resolved, isDirectory) {
+  if (process.platform !== 'win32') return null;
+  const args = isDirectory ? [resolved] : ['/select,', resolved];
+  const child = spawn('explorer.exe', args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  return null;
+}
+
+ipcMain.handle('reveal-path', async (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    if (!fs.existsSync(resolved)) return 'Path does not exist';
+    const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) {
+      const error = await shell.openPath(resolved);
+      if (!error) return null;
+      return openExplorerFallback(resolved, true) || error;
+    }
+    if (process.platform === 'win32') {
+      return openExplorerFallback(resolved, false);
+    }
+    shell.showItemInFolder(resolved);
+    return null;
+  } catch (err) {
+    return String(err);
+  }
+});
+
+ipcMain.handle('open-path', async (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    const error = await shell.openPath(resolved);
+    return error || null;
+  } catch (err) {
+    return String(err);
+  }
+});
+
+ipcMain.handle('open-terminal', (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    if (!fs.existsSync(resolved)) return 'Path does not exist';
+    const stat = fs.statSync(resolved);
+    const cwd = stat.isDirectory() ? resolved : path.dirname(resolved);
+    const command = process.platform === 'win32'
+      ? 'powershell.exe'
+      : (process.env.SHELL || '/bin/sh');
+    const args = process.platform === 'win32' ? ['-NoExit'] : [];
+    const child = spawn(command, args, {
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    return null;
+  } catch (err) {
+    return String(err);
+  }
 });
 
 ipcMain.handle('get-app-version', () => app.getVersion());

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { ProjectPanel } from '../../components/ProjectPanel'
 
 const project = {
@@ -38,5 +38,36 @@ describe('ProjectPanel', () => {
 
     expect(screen.getByLabelText('刷新项目文件')).toBeDisabled()
     expect(container.querySelector('.animate-spin')).toBeTruthy()
+  })
+
+  it('shows file actions from the project tree context menu', () => {
+    const onFileAction = vi.fn()
+    const node = { name: 'test_app.py', path: 'tests/test_app.py', type: 'file' as const, extension: 'py' }
+    render(<ProjectPanel {...baseProps} fileTree={[node]} onFileAction={onFileAction} />)
+
+    fireEvent.contextMenu(screen.getByText('test_app.py'))
+
+    const menu = screen.getByRole('menu', { name: '文件操作菜单' })
+    expect(within(menu).getByText('打开')).toBeInTheDocument()
+    expect(within(menu).getByText('打开到侧边')).toBeInTheDocument()
+    expect(within(menu).getByText('运行文件')).toBeInTheDocument()
+    fireEvent.click(within(menu).getByText('运行测试'))
+
+    expect(onFileAction).toHaveBeenCalledWith('run_tests', node)
+  })
+
+  it('shows directory actions from the project tree context menu', () => {
+    const onFileAction = vi.fn()
+    const node = { name: 'src', path: 'src', type: 'dir' as const, has_children: true }
+    render(<ProjectPanel {...baseProps} fileTree={[node]} onFileAction={onFileAction} />)
+
+    fireEvent.contextMenu(screen.getByText('src'))
+
+    const menu = screen.getByRole('menu', { name: '文件操作菜单' })
+    expect(within(menu).getByText('展开')).toBeInTheDocument()
+    expect(within(menu).queryByText('打开到侧边')).toBeNull()
+    fireEvent.click(within(menu).getByText('运行该目录测试'))
+
+    expect(onFileAction).toHaveBeenCalledWith('run_tests', node)
   })
 })

@@ -42,8 +42,8 @@ from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
 from app.tools.worker_tool import cancel_workers_for_session
 from app.tools.workflow_tool import get_recorder
-from app.message_utils import trim_messages, parse_tool_args, execute_tool, resolve_mentions
-from app.workflow.models import PlanState, PlanTodo, PlanQuestion, PlanQuestionOption, PlanDraft, PlanStep
+from app.message_utils import trim_messages, parse_tool_args, execute_tool, resolve_mentions, repair_tool_call_messages
+from app.workflow.models import PlanState, PlanTodo, PlanQuestion, PlanQuestionOption, PlanDraft, PlanStep, TaskGuidanceItem
 from app.workflow.plan_files import write_plan_file, read_plan_file
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ GLOBAL_PROJECT_KEY = "__global__"
 
 # Internal: resume agent loop after user clicks Build (WebSocket `build_plan`).
 PLAN_CONTINUE_MARKER = "__plan_continue__"
+MAX_TASK_GUIDANCE_ITEMS = 20
+MAX_TASK_GUIDANCE_TEXT_CHARS = 8000
 
 _LOCAL_MESSAGE_META_KEYS: frozenset[str] = frozenset({
     "message_id",
@@ -422,6 +424,7 @@ class AgentSession:
         self.chat_mode = "agent"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
+        self.task_guidance_items: List[TaskGuidanceItem] = []
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
         self.compaction_summary: str = ""
@@ -656,6 +659,143 @@ class AgentSession:
 
         self._refresh_system_prompt()
 
+    def active_task_guidance_items(self) -> List[Dict[str, Any]]:
+        return [
+            item.model_dump()
+            for item in self.task_guidance_items
+            if item.status != "consumed"
+        ]
+
+    def queue_task_guidance(
+        self,
+        text: str = "",
+        image_base64: Optional[str] = None,
+        *,
+        item_id: Optional[str] = None,
+    ) -> TaskGuidanceItem:
+        text_value = str(text or "").strip()
+        image_value = image_base64 if isinstance(image_base64, str) and image_base64.strip() else None
+        if not text_value and not image_value:
+            raise ValueError("Task guidance requires text or an image.")
+        truncated = len(text_value) > MAX_TASK_GUIDANCE_TEXT_CHARS
+        if truncated:
+            text_value = text_value[:MAX_TASK_GUIDANCE_TEXT_CHARS]
+        existing_ids = {item.id for item in self.task_guidance_items}
+        requested_id = str(item_id) if item_id else ""
+        safe_id = requested_id if requested_id and requested_id not in existing_ids else f"tg_{uuid.uuid4().hex[:12]}"
+        item = TaskGuidanceItem(
+            id=safe_id,
+            text=text_value,
+            image_base64=image_value,
+            status="queued",
+            created_at=time.time(),
+            truncated=truncated,
+        )
+        self.task_guidance_items = [
+            i for i in self.task_guidance_items if i.status != "consumed"
+        ]
+        self.task_guidance_items.append(item)
+        if len(self.task_guidance_items) > MAX_TASK_GUIDANCE_ITEMS:
+            self.task_guidance_items = self.task_guidance_items[-MAX_TASK_GUIDANCE_ITEMS:]
+        self._save()
+        return item
+
+    def apply_task_guidance(self) -> List[TaskGuidanceItem]:
+        applied: List[TaskGuidanceItem] = []
+        now = time.time()
+        for item in self.task_guidance_items:
+            if item.status in ("queued", "stale"):
+                item.status = "applied"
+                item.applied_at = now
+                applied.append(item)
+        if applied:
+            self._save()
+        return applied
+
+    def delete_task_guidance(self, item_id: str) -> bool:
+        before = len(self.task_guidance_items)
+        self.task_guidance_items = [
+            item for item in self.task_guidance_items if item.id != item_id
+        ]
+        changed = len(self.task_guidance_items) != before
+        if changed:
+            self._save()
+        return changed
+
+    def clear_task_guidance(self) -> List[TaskGuidanceItem]:
+        removed = [item for item in self.task_guidance_items if item.status != "consumed"]
+        if removed:
+            self.task_guidance_items = []
+            self._save()
+        return removed
+
+    def mark_applied_task_guidance_stale(self) -> List[TaskGuidanceItem]:
+        stale: List[TaskGuidanceItem] = []
+        for item in self.task_guidance_items:
+            if item.status == "applied":
+                item.status = "stale"
+                stale.append(item)
+        if stale:
+            self._save()
+        return stale
+
+    def _has_applied_task_guidance(self) -> bool:
+        return any(item.status == "applied" for item in self.task_guidance_items)
+
+    def _inject_applied_task_guidance(
+        self,
+        turn_id: str,
+        checkpoint_id: str,
+    ) -> List[Dict[str, Any]]:
+        items = [item for item in self.task_guidance_items if item.status == "applied"]
+        if not items:
+            return []
+
+        lines = [
+            "[TASK GUIDANCE]",
+            "The user sent the following guidance while you were already working. "
+            "Treat it as reference for the current task; do not restart or discard your existing progress.",
+            "",
+        ]
+        for idx, item in enumerate(items, start=1):
+            text = item.text.strip() or "(image attached)"
+            suffix = " [truncated]" if item.truncated else ""
+            lines.append(f"{idx}. {text}{suffix}")
+
+        content_text = "\n".join(lines)
+        image_parts = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{item.image_base64}"},
+            }
+            for item in items
+            if item.image_base64
+        ]
+        if image_parts:
+            content: Any = [{"type": "text", "text": content_text}] + image_parts
+        else:
+            content = content_text
+        guidance_msg = {
+            "role": "user",
+            "source": "internal",
+            "content": content,
+        }
+        self._stamp_message(guidance_msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
+        self.messages.append(guidance_msg)
+
+        now = time.time()
+        consumed_payload: List[Dict[str, Any]] = []
+        consumed_ids = {item.id for item in items}
+        for item in items:
+            item.status = "consumed"
+            item.consumed_at = now
+            consumed_payload.append(item.model_dump())
+        self.task_guidance_items = [
+            item for item in self.task_guidance_items if item.id not in consumed_ids
+        ]
+        self._save()
+        return consumed_payload
+
     def _setup_system_prompt(self):
         self.messages.append({"role": "system", "content": self._build_system_prompt()})
 
@@ -775,7 +915,6 @@ class AgentSession:
         user_msg["source"] = "user"
         self._stamp_message(user_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
         self.messages.append(user_msg)
-        self._trim_messages()
         yield self._event("context_usage", self.context_usage(), outer_run_id)
 
         if mention.mode == "handoff":
@@ -919,7 +1058,6 @@ class AgentSession:
         assistant_msg = {"role": "assistant", "content": final_text}
         self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
         self.messages.append(assistant_msg)
-        self._trim_messages()
         yield self._event("content", {"text": final_text}, outer_run_id)
         yield self._event("context_usage", self.context_usage(), outer_run_id)
         yield self._event("status", {"status": "completed"}, outer_run_id)
@@ -967,13 +1105,99 @@ class AgentSession:
             else:
                 self._stamp_message(msg)
 
+    def _estimate_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        total = 0
+        for msg in messages:
+            total += _estimate_tokens(msg.get("content", ""))
+            if msg.get("tool_calls"):
+                try:
+                    total += _estimate_tokens(json.dumps(msg.get("tool_calls"), ensure_ascii=False))
+                except (TypeError, ValueError):
+                    total += _estimate_tokens(str(msg.get("tool_calls")))
+            total += 4
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        total += 1200
+        return total
+
+    def _tool_schema_token_estimate(self) -> int:
+        try:
+            schemas = self._filter_tool_schemas_for_plan(
+                get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type)
+            )
+            return _estimate_tokens(json.dumps(schemas, ensure_ascii=False))
+        except Exception:
+            return 0
+
+    def _model_input_token_budget(self) -> int:
+        context_limit = self._model_context_limit()
+        completion_reserve = min(
+            max(self._completion_max_tokens(), 1024),
+            max(1024, context_limit // 3),
+        )
+        schema_reserve = min(self._tool_schema_token_estimate(), max(0, context_limit // 3))
+        return max(2048, int(context_limit * 0.94) - completion_reserve - schema_reserve)
+
+    def _context_window_messages(self, messages: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Return provider context without mutating the full persisted transcript.
+
+        The default path is the complete session transcript. Only when the
+        estimated provider payload would exceed the model window do we fall back
+        to a recent-turn window; any existing compaction summary stays in the
+        refreshed system prompt so older context is still represented.
+        """
+        if messages is None:
+            self._ensure_message_metadata()
+            source = self.messages
+        else:
+            source = messages
+        source_copy = copy.deepcopy(source)
+        budget = self._model_input_token_budget()
+        source_copy = repair_tool_call_messages(source_copy)
+        if self._estimate_messages_tokens(source_copy) <= budget:
+            return source_copy
+
+        non_system_count = len([m for m in source_copy if m.get("role") != "system"])
+        low = 1
+        high = max(1, non_system_count)
+        best = trim_messages(
+            source_copy,
+            1,
+            build_system_prompt_fn=self._build_system_prompt,
+            validate_tool_ids=True,
+        )
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = trim_messages(
+                source_copy,
+                mid,
+                build_system_prompt_fn=self._build_system_prompt,
+                validate_tool_ids=True,
+            )
+            if self._estimate_messages_tokens(candidate) <= budget:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
     def _messages_for_llm(self, messages: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-        """Strip local session/checkpoint metadata before sending to providers."""
+        """Build the trimmed provider payload while preserving full UI history."""
         safe_messages: list[dict[str, Any]] = []
-        for msg in messages or self.messages:
+        for msg in self._context_window_messages(messages):
             safe = {k: copy.deepcopy(v) for k, v in msg.items() if k in _LLM_MESSAGE_KEYS}
             safe_messages.append(safe)
         return safe_messages
+
+    def _repair_incomplete_tool_call_history(self) -> bool:
+        repaired = repair_tool_call_messages(copy.deepcopy(self.messages))
+        if repaired == self.messages:
+            return False
+        self.messages = repaired
+        self._ensure_message_metadata()
+        return True
 
     def _active_turn_metadata(self) -> tuple[str, str]:
         for msg in reversed(self.messages):
@@ -1024,7 +1248,11 @@ class AgentSession:
             "tool_schemas": 0,
         }
 
-        for msg in self.messages:
+        full_context_messages = copy.deepcopy(self.messages)
+        transcript_estimate = self._estimate_messages_tokens(full_context_messages)
+        context_messages = self._context_window_messages()
+        context_estimate = self._estimate_messages_tokens(context_messages)
+        for msg in context_messages:
             role = msg.get("role")
             content = msg.get("content")
             tokens = _estimate_tokens(content)
@@ -1071,6 +1299,11 @@ class AgentSession:
             "source": "provider" if exact else "estimate",
             "status": status,
             "breakdown": breakdown,
+            "transcript_message_count": len([m for m in self.messages if m.get("role") != "system"]),
+            "context_message_count": len([m for m in context_messages if m.get("role") != "system"]),
+            "transcript_estimated_tokens": transcript_estimate,
+            "context_estimated_tokens": context_estimate,
+            "context_truncated": len(context_messages) < len(full_context_messages),
         }
         self._last_context_usage = payload
         return payload
@@ -1120,9 +1353,13 @@ class AgentSession:
         }
 
     def _trim_messages(self):
-        """Trim history without splitting assistant tool_calls from their tool results."""
+        """Trim history without splitting turns.
+
+        Kept for older callers/tests. Normal agent runs use _messages_for_llm()
+        so the persisted transcript remains complete.
+        """
         self.messages = trim_messages(
-            self.messages,
+            repair_tool_call_messages(self.messages),
             self.MAX_HISTORY_MESSAGES,
             build_system_prompt_fn=self._build_system_prompt,
             validate_tool_ids=True,
@@ -1279,12 +1516,14 @@ class AgentSession:
         cfg = load_config().settings
         mode = getattr(cfg, "collaboration_mode", "serial") or "serial"
         lines = [
-            "[Plan execution — the user clicked Build]",
-            "The user clicked Build. This is FULL APPROVAL of the plan below. "
-            "Do NOT ask any further clarifying questions, do NOT re-confirm any decisions, "
-            "do NOT restate or rewrite the plan. Begin executing the first todo immediately. "
-            "For any open questions left in the plan, proceed using the assumptions/defaults "
-            "recorded in the plan; only mark a todo as blocked (with a reason) if you hit a real blocker.",
+            "[BUILD APPROVED — START EXECUTING NOW]",
+            "The user clicked Build. This is FULL APPROVAL. "
+            "Do NOT summarize the plan, do NOT say 'the plan has been submitted', do NOT restate or rewrite. "
+            "Do NOT ask clarifying questions. Do NOT wait for further confirmation. "
+            "Your FIRST action must be to call `plan_update_todos` to set the first pending todo to `in_progress`, "
+            "then immediately start executing that todo using the available tools. "
+            "For any open questions, proceed using assumptions/defaults recorded in the plan; "
+            "only mark a todo `blocked` (with a note) if you hit a concrete blocker.",
             "",
             "[Follow the approved plan below]",
             f"Collaboration mode: {mode}. Max parallel agents: {getattr(cfg, 'max_parallel_agents', 3)}.",
@@ -1339,7 +1578,9 @@ class AgentSession:
             "Direct execution is fine too — either way, you MUST keep the todo "
             "statuses current via `plan_update_todos`."
         )
-        self.messages.append({"role": "system", "content": "\n".join(lines)})
+        msg: Dict[str, Any] = {"role": "user", "source": "internal", "content": "\n".join(lines)}
+        self._stamp_message(msg)
+        self.messages.append(msg)
         self._plan_exec_hint_sent = True
 
     @staticmethod
@@ -1838,6 +2079,9 @@ class AgentSession:
                 reset_run_context(run_context_token)
                 run_context_token = None
 
+        if self._repair_incomplete_tool_call_history():
+            self._save()
+
         if user_input and not is_plan_continue:
             if self.chat_mode == "plan" and self.plan_state.phase == "awaiting_decision":
                 yield self._event(
@@ -1941,7 +2185,6 @@ class AgentSession:
             user_msg["source"] = "user"
             self._stamp_message(user_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
             self.messages.append(user_msg)
-            self._trim_messages()
             yield self._event("context_usage", self.context_usage(), run_id)
 
             if self.chat_mode == "plan":
@@ -2013,6 +2256,7 @@ class AgentSession:
         _latest_verification: Optional[Dict[str, Any]] = None
         _latest_review: Optional[Dict[str, Any]] = None
         stale_build_prompt_guarded = False
+        auto_compaction_attempted = False
         while self.iteration < self.max_iterations:
             if self._cancelled:
                 yield self._event("interrupted", {"message": "User cancelled"}, run_id)
@@ -2047,6 +2291,24 @@ class AgentSession:
                             checkpoint_id=active_checkpoint_id,
                         )
                         self.messages.append(screenshot_msg)
+
+            consumed_guidance = self._inject_applied_task_guidance(active_turn_id, active_checkpoint_id)
+            if consumed_guidance:
+                yield self._event("task_guidance_consumed", {"items": consumed_guidance}, run_id)
+                yield self._event("context_usage", self.context_usage(), run_id)
+
+            if not auto_compaction_attempted and not self.compaction_summary:
+                usage_before_call = self.context_usage()
+                if usage_before_call.get("context_truncated"):
+                    auto_compaction_attempted = True
+                    compacted = await self.compact_context(
+                        focus="Automatic compaction before model call because the full session transcript exceeds the model context window.",
+                        force=True,
+                    )
+                    if compacted and not compacted.get("skipped"):
+                        compacted["auto"] = True
+                        yield self._event("compacted", compacted, run_id)
+                        yield self._event("context_usage", self.context_usage(), run_id)
 
             tool_schemas = self._filter_tool_schemas_for_plan(get_tool_schemas(self.dynamic_registry, agent_type=self._agent_type))
             completion_max_tokens = self._completion_max_tokens()
@@ -2275,7 +2537,6 @@ class AgentSession:
                             "pending_clarification": self.plan_state.pending_clarification,
                         }, run_id)
                         yield self._event("plan_status", self._plan_event_payload(), run_id)
-                        self._trim_messages()
                         self._save()
                         yield self._event("context_usage", self.context_usage(), run_id)
                         yield self._event("status", {"status": "completed"}, run_id)
@@ -2311,7 +2572,9 @@ class AgentSession:
                     self.messages.append(verify_msg)
                     yield self._event("context_usage", self.context_usage(), run_id)
                     continue
-                self._trim_messages()
+                if self._has_applied_task_guidance():
+                    yield self._event("status", {"status": "thinking"}, run_id)
+                    continue
                 self._save()
                 yield self._event("context_usage", self.context_usage(), run_id)
                 yield self._event("status", {"status": "completed"}, run_id)
@@ -2559,7 +2822,6 @@ class AgentSession:
                     checkpoint_id=active_checkpoint_id,
                 )
             self.messages.extend(tool_results)
-            self._trim_messages()
             self._save()
             yield self._event("context_usage", self.context_usage(), run_id)
             yield self._event("status", {"status": "thinking"}, run_id)
@@ -2583,6 +2845,13 @@ class AgentSession:
         completion_status = "cancelled" if self._cancelled else (
             "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
         )
+        stale_guidance = self.mark_applied_task_guidance_stale()
+        if stale_guidance:
+            yield self._event(
+                "task_guidance_stale",
+                {"items": [item.model_dump() for item in stale_guidance]},
+                run_id,
+            )
         completion_summary = f"Run {completion_status} after {self.iteration} iteration(s)."
         completion_quality = _completion_quality_payload(
             files_modified=_files_modified,
@@ -2835,12 +3104,15 @@ class AgentSession:
             return None
 
         self.compaction_summary = summary[:6000]
-        self.messages = recent
         self._refresh_system_prompt()
         self._ensure_message_metadata()
         after_count = len([m for m in self.messages if m.get("role") != "system"])
         usage = self.context_usage()
-        logger.info("Context compacted: %d -> %d messages", before_count, after_count)
+        logger.info(
+            "Context compacted: transcript=%d context=%d",
+            before_count,
+            usage.get("context_message_count", after_count),
+        )
         self._save()
         return {
             "skipped": False,
@@ -2859,6 +3131,8 @@ class AgentSession:
                 worker.cancel()
             except Exception:
                 pass
+        if self._repair_incomplete_tool_call_history():
+            self._save()
 
     def retry_last(self) -> bool:
         for i in range(len(self.messages) - 1, -1, -1):
@@ -2955,7 +3229,6 @@ class AgentSession:
                     )
                     self.dynamic_registry.register(proxy)
         self._refresh_system_prompt()
-        self._save()
 
     def _save(self):
         path = SESSIONS_DIR / f"{self.session_id}.json"
@@ -2963,8 +3236,11 @@ class AgentSession:
         # Extract title from first user message
         title = ""
         for m in self.messages:
-            if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip():
-                title = m["content"].strip()[:80]
+            if m.get("role") == "user" and m.get("source") != "internal":
+                text = _text_from_content(m.get("content", "")).strip()
+                if not text:
+                    continue
+                title = text[:80]
                 break
         if not title and self.plan_state.goal:
             title = self.plan_state.goal[:80]
@@ -2989,6 +3265,7 @@ class AgentSession:
             "chat_mode": self.chat_mode,
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
+            "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
             "compaction_summary": self.compaction_summary,
             "last_usage": self._last_usage,
             "last_context_usage": self._last_context_usage,
@@ -3053,10 +3330,25 @@ class AgentSession:
                     session.plan_state = PlanState.model_validate(ps)
                 except Exception:
                     session.plan_state = PlanState()
+            guidance_items = data.get("task_guidance_items")
+            if isinstance(guidance_items, list):
+                restored_guidance: List[TaskGuidanceItem] = []
+                for item in guidance_items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        guidance = TaskGuidanceItem.model_validate(item)
+                    except Exception:
+                        continue
+                    if guidance.status != "consumed":
+                        restored_guidance.append(guidance)
+                session.task_guidance_items = restored_guidance[-MAX_TASK_GUIDANCE_ITEMS:]
             session._ensure_message_metadata()
-            session._trim_messages()
+            repaired_tool_calls = session._repair_incomplete_tool_call_history()
             session._refresh_system_prompt()
             session.refresh_mcp_tools()
+            if repaired_tool_calls:
+                session._save()
             return session
         except (OSError, json.JSONDecodeError):
             return None
@@ -3100,6 +3392,8 @@ class AgentSession:
 
     def to_snapshot(self) -> Dict[str, Any]:
         context_usage = self.context_usage()
+        transcript_message_count = len([m for m in self.messages if m.get("role") != "system"])
+        context_message_count = int(context_usage.get("context_message_count") or 0)
         return {
             "session_id": self.session_id,
             "model_id": self.model_id,
@@ -3107,14 +3401,23 @@ class AgentSession:
             "agent_type": self._agent_type,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
-            "messages": self.messages,
+            # Internal synthetic messages (source=="internal") are LLM-only
+            # correction/context prompts — never show them in the chat UI.
+            # _save()/load() persist the full list so model context is intact.
+            "messages": [m for m in self.messages if m.get("source") != "internal"],
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
+            "task_guidance_items": self.active_task_guidance_items(),
             "compaction_summary": self.compaction_summary,
             "context_usage": context_usage,
             "checkpoints": self.build_checkpoints(),
+            "transcript_message_count": transcript_message_count,
+            "context_message_count": context_message_count,
+            "context_truncated": bool(context_usage.get("context_truncated")),
+            "transcript_estimated_tokens": context_usage.get("transcript_estimated_tokens"),
+            "context_estimated_tokens": context_usage.get("context_estimated_tokens"),
         }
 
 

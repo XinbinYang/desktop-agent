@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.models import ModelRouter
-from app.message_utils import trim_messages, parse_tool_args, execute_tool
+from app.message_utils import trim_messages, parse_tool_args, execute_tool, repair_tool_call_messages
 
 WORKER_PROFILES: Dict[str, "WorkerProfile"] = {}
 
@@ -606,7 +606,7 @@ class WorkerSession:
 
             try:
                 response = await self.router.chat_completion_non_stream(
-                    messages=self.messages,
+                    messages=repair_tool_call_messages(self.messages),
                     tools=self._tool_schemas_cache,
                     temperature=0.5,
                     max_tokens=8192,
@@ -739,7 +739,7 @@ class WorkerSession:
         })
 
     def _trim_messages(self):
-        self.messages = trim_messages(self.messages, self.MAX_HISTORY_MESSAGES)
+        self.messages = trim_messages(repair_tool_call_messages(self.messages), self.MAX_HISTORY_MESSAGES)
 
     def _build_tool_schemas(self) -> List[Dict[str, Any]]:
         from app.tools import get_static_tool, list_static_tool_names

@@ -74,14 +74,14 @@ describe('PaneRenderer', () => {
     expect(onClosePane).toHaveBeenCalledWith('b');
   });
 
-  it('splits to the right from the plus button with explicit placement', () => {
+  it('creates a coding split session from the plus button with explicit placement', () => {
     const onSplit = vi.fn();
 
     renderPane(leaf('a'), { onSplit });
 
-    fireEvent.click(screen.getByLabelText('Split pane right'));
+    fireEvent.click(screen.getByLabelText('New Coding Session in Split Pane'));
 
-    expect(onSplit).toHaveBeenCalledWith('a', 'horizontal', { placement: 'after' });
+    expect(onSplit).toHaveBeenCalledWith('a', 'horizontal', { placement: 'after', agentType: 'coding' });
   });
 
   it('starts pane drags from the drag handle and includes session metadata', () => {

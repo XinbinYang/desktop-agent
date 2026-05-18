@@ -486,10 +486,10 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
         <button
           type="button"
           onPointerDown={(event) => event.stopPropagation()}
-          onClick={(event) => { event.stopPropagation(); onFocus(); onSplit(leafId, 'horizontal', { placement: 'after' }); }}
+          onClick={(event) => { event.stopPropagation(); onFocus(); onSplit(leafId, 'horizontal', { placement: 'after', agentType: 'coding' }); }}
           className="p-0.5 text-fg-muted hover:text-fg hover:bg-surface-hover rounded shrink-0"
-          title="Split pane right"
-          aria-label="Split pane right"
+          title="New Coding Session in Split Pane"
+          aria-label="New Coding Session in Split Pane"
         >
           <Plus className="w-3 h-3" />
         </button>

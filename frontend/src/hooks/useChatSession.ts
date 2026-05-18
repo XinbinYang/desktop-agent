@@ -20,6 +20,7 @@ import {
   AgentType,
   ContextUsage,
   ConversationCheckpoint,
+  TaskGuidanceItem,
 } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { API_BASE } from '../config';
@@ -272,19 +273,110 @@ function mergeWorkerEvents(existing: WorkerEvent[] = [], incoming: WorkerEvent[]
   return merged;
 }
 
+function imageUrlToBase64(value: any): string | undefined {
+  const url =
+    typeof value === 'string'
+      ? value
+      : typeof value?.url === 'string'
+        ? value.url
+        : typeof value?.image_url?.url === 'string'
+          ? value.image_url.url
+          : '';
+  const match = url.match(/^data:image\/[^;]+;base64,(.+)$/);
+  return match?.[1];
+}
+
+function extractBase64Image(content: any): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    const type = part.type;
+    if (type === 'image_url') {
+      const encoded = imageUrlToBase64(part.image_url || part);
+      if (encoded) return encoded;
+    }
+    if (type === 'image' && part.source?.type === 'base64' && typeof part.source.data === 'string') {
+      return part.source.data;
+    }
+  }
+  return undefined;
+}
+
+function countAttachments(content: any): number {
+  if (!Array.isArray(content)) return 0;
+  return content.filter((part) => {
+    if (!part || typeof part !== 'object') return false;
+    return part.type === 'image_url' || part.type === 'image';
+  }).length;
+}
+
+function partToText(part: any): string {
+  if (typeof part === 'string') return part;
+  if (!part || typeof part !== 'object') return '';
+  if (part.type === 'image_url' || part.type === 'image') return '';
+  const value =
+    part.text ??
+    part.input_text ??
+    part.output_text ??
+    part.content ??
+    part.value ??
+    '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return contentToText(value);
+  return value == null ? '' : String(value);
+}
+
 function contentToText(content: any): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') return part;
-        if (part?.type === 'text') return part.text || '';
-        return '';
-      })
+    const text = content
+      .map(partToText)
       .filter(Boolean)
       .join('\n');
+    return text || (countAttachments(content) > 0 ? '[image]' : '');
+  }
+  if (content && typeof content === 'object') {
+    const direct = partToText(content);
+    if (direct) return direct;
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return String(content);
+    }
   }
   return content == null ? '' : String(content);
+}
+
+function isRenderableMessage(message: ChatMessage): boolean {
+  if (message.role !== 'user') return true;
+  return !!(
+    (message.content && message.content.trim()) ||
+    message.imageBase64 ||
+    (message.attachmentCount || 0) > 0
+  );
+}
+
+function sanitizeCachedMessages(messages: any[]): ChatMessage[] {
+  if (!Array.isArray(messages)) return [];
+  return (messages as ChatMessage[]).filter(isRenderableMessage);
+}
+
+function mergeSnapshotWithOptimistic(current: ChatMessage[], restored: ChatMessage[]): ChatMessage[] {
+  const equivalentUser = (candidate: ChatMessage) =>
+    restored.some((msg) =>
+      msg.role === 'user' &&
+      msg.content === candidate.content &&
+      (msg.imageBase64 || '') === (candidate.imageBase64 || '')
+    );
+
+  const pending = current.filter((msg) =>
+    msg.role === 'user' &&
+    !msg.messageId &&
+    !msg.turnId &&
+    isRenderableMessage(msg) &&
+    !equivalentUser(msg)
+  );
+  return pending.length > 0 ? [...restored, ...pending] : restored;
 }
 
 function parseToolArgs(raw: any): Record<string, any> {
@@ -298,6 +390,25 @@ function parseToolArgs(raw: any): Record<string, any> {
   }
 }
 
+function mergeTaskGuidanceItems(
+  current: TaskGuidanceItem[],
+  incoming: TaskGuidanceItem[],
+): TaskGuidanceItem[] {
+  const byId = new Map<string, TaskGuidanceItem>();
+  for (const item of current) {
+    if (item?.id && item.status !== 'consumed') byId.set(item.id, item);
+  }
+  for (const item of incoming) {
+    if (!item?.id) continue;
+    if (item.status === 'consumed') {
+      byId.delete(item.id);
+    } else {
+      byId.set(item.id, item);
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+}
+
 function sessionSnapshotToState(snapshot: any): {
   messages: ChatMessage[];
   toolCalls: ToolCall[];
@@ -306,6 +417,7 @@ function sessionSnapshotToState(snapshot: any): {
   planState?: PlanState;
   contextUsage?: ContextUsage | null;
   checkpoints?: ConversationCheckpoint[];
+  taskGuidanceItems?: TaskGuidanceItem[];
 } {
   const restoredMessages: ChatMessage[] = [];
   const restoredToolCalls: ToolCall[] = [];
@@ -316,11 +428,20 @@ function sessionSnapshotToState(snapshot: any): {
     if (role === 'system') continue;
 
     if (role === 'user') {
+      // Internal synthetic prompts are LLM-only — never render them as
+      // user chat bubbles (defense-in-depth; backend to_snapshot also filters).
+      if (msg?.source === 'internal') continue;
       const text = contentToText(msg.content);
+      const imageBase64 = extractBase64Image(msg.content);
+      const attachmentCount = countAttachments(msg.content);
+      if (!text.trim() && !imageBase64 && attachmentCount === 0) continue;
       restoredMessages.push({
         id: msg.message_id || generateId(),
         role: 'user',
         content: text,
+        rawContent: msg.content,
+        imageBase64,
+        attachmentCount,
         messageId: msg.message_id,
         turnId: msg.turn_id,
         checkpointId: msg.checkpoint_id,
@@ -437,6 +558,9 @@ function sessionSnapshotToState(snapshot: any): {
     planState: snapshot?.plan_state,
     contextUsage: snapshot?.context_usage || null,
     checkpoints: Array.isArray(snapshot?.checkpoints) ? snapshot.checkpoints : [],
+    taskGuidanceItems: Array.isArray(snapshot?.task_guidance_items)
+      ? snapshot.task_guidance_items.filter((item: any) => item?.id && item?.status !== 'consumed') as TaskGuidanceItem[]
+      : [],
   };
 }
 
@@ -463,8 +587,10 @@ export function useChatSession(
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [checkpoints, setCheckpoints] = useState<ConversationCheckpoint[]>([]);
+  const [taskGuidanceItems, setTaskGuidanceItems] = useState<TaskGuidanceItem[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const isRunningRef = useRef(false);
   const [suggestAgentSwitch, setSuggestAgentSwitch] = useState<{
     from: string; to: string; reason: string;
   } | null>(null);
@@ -568,6 +694,10 @@ export function useChatSession(
     planStateRef.current = planState;
   }, [planState]);
 
+  useEffect(() => {
+    isRunningRef.current = isRunning;
+  }, [isRunning]);
+
   const takePendingWorkerEvents = useCallback((toolCallId?: string): WorkerEvent[] => {
     const pending = pendingWorkerEventsRef.current;
     const events = [
@@ -643,11 +773,12 @@ export function useChatSession(
       switch (event.type) {
         case 'history_snapshot': {
           const restored = sessionSnapshotToState(event.data);
-          setMessages(restored.messages);
+          setMessages((prev) => mergeSnapshotWithOptimistic(prev, restored.messages));
           setToolCalls(restored.toolCalls);
           setFileEdits([]);
           setContextUsage(restored.contextUsage || null);
           setCheckpoints(restored.checkpoints || []);
+          setTaskGuidanceItems(restored.taskGuidanceItems || []);
           const fromServer = restored.chatMode;
           const serverPlanPhase = (event.data as { plan_state?: { phase?: string } })?.plan_state?.phase;
           const prev = chatModeRef.current;
@@ -952,6 +1083,7 @@ export function useChatSession(
         case 'status': {
           const status = event.data.status;
           if (status === 'thinking' || status === 'executing' || status === 'running') {
+            isRunningRef.current = true;
             setIsRunning(true);
           }
           if (status === 'executing') {
@@ -975,6 +1107,7 @@ export function useChatSession(
               )),
             );
           } else if (status === 'completed' || status === 'max_iterations_reached') {
+            isRunningRef.current = false;
             setIsRunning(false);
             flushPlanBufferedContent();
             setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
@@ -1156,6 +1289,57 @@ export function useChatSession(
           }));
           break;
 
+        case 'task_guidance_queued': {
+          const incoming = Array.isArray(event.data?.items)
+            ? event.data.items as TaskGuidanceItem[]
+            : event.data?.item
+              ? [event.data.item as TaskGuidanceItem]
+              : [];
+          setTaskGuidanceItems((prev) => mergeTaskGuidanceItems(prev, incoming));
+          addTerminalLog(`[Guidance] Queued ${event.data?.item?.id || 'message'}`);
+          break;
+        }
+
+        case 'task_guidance_applied': {
+          const incoming = Array.isArray(event.data?.all_items)
+            ? event.data.all_items as TaskGuidanceItem[]
+            : Array.isArray(event.data?.items)
+              ? event.data.items as TaskGuidanceItem[]
+              : [];
+          setTaskGuidanceItems((prev) => mergeTaskGuidanceItems(prev, incoming));
+          addTerminalLog(`[Guidance] Applied ${Array.isArray(event.data?.items) ? event.data.items.length : 0} item(s)`);
+          break;
+        }
+
+        case 'task_guidance_consumed': {
+          const consumed = Array.isArray(event.data?.items) ? event.data.items as TaskGuidanceItem[] : [];
+          const consumedIds = new Set(consumed.map((item) => item.id));
+          setTaskGuidanceItems((prev) => prev.filter((item) => !consumedIds.has(item.id)));
+          if (consumed.length > 0) {
+            addTerminalLog(`[Guidance] Agent read ${consumed.length} item(s)`);
+          }
+          break;
+        }
+
+        case 'task_guidance_stale': {
+          const incoming = Array.isArray(event.data?.all_items)
+            ? event.data.all_items as TaskGuidanceItem[]
+            : Array.isArray(event.data?.items)
+              ? event.data.items as TaskGuidanceItem[]
+              : [];
+          setTaskGuidanceItems((prev) => mergeTaskGuidanceItems(prev, incoming));
+          addTerminalLog('[Guidance] Current run ended before reading guidance');
+          break;
+        }
+
+        case 'task_guidance_deleted':
+          setTaskGuidanceItems((prev) => prev.filter((item) => item.id !== event.data?.id));
+          break;
+
+        case 'task_guidance_cleared':
+          setTaskGuidanceItems([]);
+          break;
+
         case 'plan_file_ready':
           setPlanState((prev) => ({
             ...prev,
@@ -1241,6 +1425,7 @@ export function useChatSession(
           setRunEvents([]);
           setContextUsage(null);
           setCheckpoints([]);
+          setTaskGuidanceItems([]);
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -1323,9 +1508,13 @@ export function useChatSession(
       const data = await loadSession(sessionId);
       if (!mounted || userTouchedRef.current) return;
       if (data && ((data.messages || []).length > 0 || (data.toolCalls || []).length > 0)) {
-        setMessages(sanitizeThinkingPlaceholders(data.messages || []));
+        const cachedMessages = sanitizeThinkingPlaceholders(sanitizeCachedMessages(data.messages || []));
+        if (cachedMessages.length > 0) {
+          setMessages(cachedMessages);
+        }
         setToolCalls(data.toolCalls || []);
         setFileEdits(data.fileEdits || []);
+        setTaskGuidanceItems(Array.isArray(data.taskGuidanceItems) ? data.taskGuidanceItems as TaskGuidanceItem[] : []);
         if (data.chatMode === 'plan' || data.chatMode === 'agent') {
           setChatModeState(data.chatMode);
         }
@@ -1335,8 +1524,6 @@ export function useChatSession(
         if (data.planState) {
           setPlanState((prev) => ({ ...prev, ...data.planState }));
         }
-        setHydratedSessionId(sessionId);
-        return;
       }
 
       try {
@@ -1344,7 +1531,7 @@ export function useChatSession(
         const snapshot = await res.json();
         if (!mounted || userTouchedRef.current || snapshot?.error) return;
         const restored = sessionSnapshotToState(snapshot);
-        setMessages(restored.messages);
+        setMessages((prev) => mergeSnapshotWithOptimistic(prev, restored.messages));
         setToolCalls(restored.toolCalls);
         setFileEdits([]);
         if (restored.chatMode) setChatModeState(restored.chatMode);
@@ -1352,6 +1539,7 @@ export function useChatSession(
         if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
         setContextUsage(restored.contextUsage || null);
         setCheckpoints(restored.checkpoints || []);
+        setTaskGuidanceItems(restored.taskGuidanceItems || []);
       } catch {
         // The WebSocket history snapshot can still hydrate the session.
       } finally {
@@ -1413,12 +1601,52 @@ export function useChatSession(
         chatMode,
         thinkingIntensity,
         planState,
+        taskGuidanceItems,
       }).catch(console.error);
     }, 1000);
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [sessionId, hydratedSessionId, messages, toolCalls, fileEdits, chatMode, thinkingIntensity, planState]);
+  }, [sessionId, hydratedSessionId, messages, toolCalls, fileEdits, chatMode, thinkingIntensity, planState, taskGuidanceItems]);
+
+  const queueTaskGuidance = useCallback(
+    (text: string, imageBase64?: string) => {
+      if (!text.trim() && !imageBase64) return false;
+      const sent = send({
+        type: 'queue_task_guidance',
+        text: text.trim(),
+        image_base64: imageBase64,
+      });
+      if (sent === false) {
+        addTerminalLog('[错误] WebSocket 未连接，引导消息未排队');
+        return false;
+      }
+      return true;
+    },
+    [send, addTerminalLog],
+  );
+
+  const applyTaskGuidance = useCallback(() => {
+    const sent = send({ type: 'apply_task_guidance' });
+    if (sent === false) {
+      addTerminalLog('[错误] WebSocket 未连接，任务引导未发送');
+    }
+  }, [send, addTerminalLog]);
+
+  const deleteTaskGuidance = useCallback((id: string) => {
+    if (!id) return;
+    const sent = send({ type: 'delete_task_guidance', id });
+    if (sent === false) {
+      setTaskGuidanceItems((prev) => prev.filter((item) => item.id !== id));
+    }
+  }, [send]);
+
+  const clearTaskGuidance = useCallback(() => {
+    const sent = send({ type: 'clear_task_guidance' });
+    if (sent === false) {
+      setTaskGuidanceItems([]);
+    }
+  }, [send]);
 
   const sendMessage = useCallback(
     (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => {
@@ -1427,8 +1655,13 @@ export function useChatSession(
         addTerminalLog('[错误] 模型未加载，请等待页面加载完成');
         return;
       }
+      if (isRunningRef.current) {
+        queueTaskGuidance(text, imageBase64);
+        return;
+      }
       userTouchedRef.current = true;
       setHydratedSessionId(sessionId);
+      isRunningRef.current = true;
       setIsRunning(true);
       setMessages((prev) => [
         ...prev,
@@ -1451,11 +1684,12 @@ export function useChatSession(
         thinking_intensity: overrides?.thinkingIntensity || thinkingIntensityRef.current,
       });
       if (sent === false) {
+        isRunningRef.current = false;
         setIsRunning(false);
         addTerminalLog('[错误] WebSocket 未连接，消息未发送');
       }
     },
-    [send, sessionId, currentModel, agentType, roleId, addTerminalLog, thinkingIntensity]
+    [send, sessionId, currentModel, agentType, roleId, addTerminalLog, queueTaskGuidance]
   );
 
   const clearSession = useCallback(() => {
@@ -1648,6 +1882,7 @@ export function useChatSession(
     setRunEvents([]);
     setContextUsage(null);
     setCheckpoints([]);
+    setTaskGuidanceItems([]);
     setTerminalLogs([]);
     setIsRunning(false);
     setChatModeState(initialChatModeFromStorage());
@@ -1689,10 +1924,15 @@ export function useChatSession(
     runEvents,
     contextUsage,
     checkpoints,
+    taskGuidanceItems,
     terminalLogs,
     isRunning,
     isConnected,
     sendMessage,
+    queueTaskGuidance,
+    applyTaskGuidance,
+    deleteTaskGuidance,
+    clearTaskGuidance,
     clearSession,
     compactSession,
     loadCheckpoints,

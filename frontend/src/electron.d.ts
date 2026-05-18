@@ -12,6 +12,9 @@ declare global {
     electronAPI: {
       selectFolder: () => Promise<string | null>;
       selectFile: () => Promise<string | null>;
+      revealPath: (path: string) => Promise<string | null>;
+      openPath: (path: string) => Promise<string | null>;
+      openTerminal: (path: string) => Promise<string | null>;
       getAppVersion: () => Promise<string>;
       getAuthToken: () => Promise<string | null>;
       setTheme: (theme: 'dark' | 'light') => Promise<'dark' | 'light'>;

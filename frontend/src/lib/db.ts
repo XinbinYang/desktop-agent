@@ -8,6 +8,7 @@ interface SessionData {
   chatMode?: string;
   thinkingIntensity?: string;
   planState?: any;
+  taskGuidanceItems?: any[];
   timestamp: number;
 }
 
@@ -45,7 +46,7 @@ interface AgentDB extends DBSchema {
 }
 
 const DB_NAME = 'desktop-agent-db';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 let dbPromise: Promise<IDBPDatabase<AgentDB>> | null = null;
 
@@ -76,7 +77,7 @@ export async function saveSession(
   messages: any[],
   toolCalls: any[],
   fileEdits: any[] = [],
-  meta?: { chatMode?: string; thinkingIntensity?: string; planState?: any },
+  meta?: { chatMode?: string; thinkingIntensity?: string; planState?: any; taskGuidanceItems?: any[] },
 ): Promise<void> {
   const db = await getDB();
   await db.put('sessions', {
@@ -87,6 +88,7 @@ export async function saveSession(
     chatMode: meta?.chatMode,
     thinkingIntensity: meta?.thinkingIntensity,
     planState: meta?.planState,
+    taskGuidanceItems: meta?.taskGuidanceItems,
     timestamp: Date.now(),
   });
   // 清理旧会话，只保留最近 10 个

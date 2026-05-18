@@ -26,6 +26,11 @@ export interface ContextUsage {
   source: 'provider' | 'estimate' | string;
   status: 'ok' | 'warning' | 'critical' | string;
   breakdown: Record<string, number>;
+  transcript_message_count?: number;
+  context_message_count?: number;
+  transcript_estimated_tokens?: number;
+  context_estimated_tokens?: number;
+  context_truncated?: boolean;
 }
 
 export interface ConversationCheckpoint {
@@ -352,6 +357,19 @@ export interface PlanState {
   research_notes?: string;
 }
 
+export type TaskGuidanceStatus = "queued" | "applied" | "consumed" | "stale";
+
+export interface TaskGuidanceItem {
+  id: string;
+  text: string;
+  image_base64?: string | null;
+  status: TaskGuidanceStatus;
+  created_at: number;
+  applied_at?: number | null;
+  consumed_at?: number | null;
+  truncated?: boolean;
+}
+
 export type AssistantBlock =
   | {
       type: 'thinking';
@@ -400,6 +418,8 @@ export interface ChatMessage {
   checkpointId?: string;
   createdAt?: number;
   imageBase64?: string;
+  rawContent?: unknown;
+  attachmentCount?: number;
   isTool: boolean;
   reasoning?: string;
   skill?: string;
@@ -564,7 +584,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 

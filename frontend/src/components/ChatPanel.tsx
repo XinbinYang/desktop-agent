@@ -16,6 +16,7 @@ import {
   PlanTodo,
   ContextUsage,
   ConversationCheckpoint,
+  TaskGuidanceItem,
 } from '../types';
 import { API_BASE } from '../config';
 import { useTheme } from '../hooks/useTheme';
@@ -62,6 +63,11 @@ interface ChatPanelProps {
   onCommand?: (command: string, args: string) => void;
   contextUsage?: ContextUsage | null;
   checkpoints?: ConversationCheckpoint[];
+  taskGuidanceItems?: TaskGuidanceItem[];
+  onQueueTaskGuidance?: (text: string, imageBase64?: string) => void;
+  onApplyTaskGuidance?: () => void;
+  onDeleteTaskGuidance?: (id: string) => void;
+  onClearTaskGuidance?: () => void;
   onCompact?: (force?: boolean, focus?: string) => void;
   onClearSession?: () => void;
   onLoadCheckpoints?: () => Promise<ConversationCheckpoint[]>;
@@ -273,6 +279,81 @@ const PlanAnswersBlock: React.FC<{
     </div>
   </div>
 );
+
+const TaskGuidanceQueueCard: React.FC<{
+  items: TaskGuidanceItem[];
+  isRunning: boolean;
+  onApply?: () => void;
+  onDelete?: (id: string) => void;
+  onClear?: () => void;
+}> = ({ items, isRunning, onApply, onDelete, onClear }) => {
+  const visible = items.filter((item) => item.status !== 'consumed');
+  if (visible.length === 0) return null;
+
+  const actionableCount = visible.filter((item) => item.status === 'queued' || item.status === 'stale').length;
+  const waitingCount = visible.filter((item) => item.status === 'applied').length;
+
+  return (
+    <div className="mb-2 rounded-md border border-accent/25 bg-accent/5 px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="chat-text-xs font-semibold text-fg">任务引导队列 ({visible.length})</div>
+          <div className="chat-text-xs text-fg-muted">
+            {waitingCount > 0 ? `等待 Agent 读取 ${waitingCount} 条` : `${actionableCount} 条待引导`}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onApply}
+            disabled={!isRunning || actionableCount === 0}
+            className="chat-text-xs rounded-md bg-accent/85 px-2.5 py-1 font-medium text-fg-on-accent hover:bg-accent disabled:bg-surface-alt disabled:text-fg-muted"
+          >
+            任务引导
+          </button>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={visible.length === 0}
+            className="chat-text-xs rounded-md border border-border-subtle px-2 py-1 text-fg-muted hover:text-fg disabled:opacity-45"
+          >
+            清空
+          </button>
+        </div>
+      </div>
+      <div className="mt-2 space-y-1.5">
+        {visible.map((item) => {
+          const statusText =
+            item.status === 'applied'
+              ? '等待读取'
+              : item.status === 'stale'
+                ? '未读取'
+                : '已排队';
+          const preview = item.text?.trim() || (item.image_base64 ? 'Image attached' : '');
+          return (
+            <div key={item.id} className="flex items-center gap-2 rounded-md bg-surface/70 px-2 py-1.5">
+              <span className="shrink-0 rounded border border-border-subtle px-1.5 py-0.5 chat-text-xs text-fg-muted">
+                {statusText}
+              </span>
+              <span className="min-w-0 flex-1 truncate chat-text-xs text-fg-secondary" title={preview}>
+                {preview}{item.truncated ? ' ...' : ''}
+              </span>
+              <button
+                type="button"
+                onClick={() => onDelete?.(item.id)}
+                className="shrink-0 rounded p-1 text-fg-muted hover:bg-surface-hover hover:text-fg"
+                aria-label="Remove guidance"
+                title="Remove guidance"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
 
 const CreatingPlanStatus: React.FC = () => (
   <div className="rounded-md border border-[color:var(--plan-pill-border)] bg-surface/90 px-3 py-2 chat-text-sm text-fg-secondary flex items-center gap-2">
@@ -1206,6 +1287,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onCommand,
   contextUsage,
   checkpoints = [],
+  taskGuidanceItems = [],
+  onQueueTaskGuidance,
+  onApplyTaskGuidance,
+  onDeleteTaskGuidance,
+  onClearTaskGuidance,
   onCompact,
   onClearSession,
   onLoadCheckpoints,
@@ -1328,6 +1414,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const handleSend = () => {
     if (planBlocksChatSend) return;
     if (!input.trim() && !attachedImage) return;
+    if (isRunning) {
+      onQueueTaskGuidance?.(input.trim(), attachedImage || undefined);
+      setInput('');
+      setAttachedImage(null);
+      onDraftClear?.();
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      return;
+    }
     const slashCommand = parseSlashInput(input);
     if (slashCommand && !attachedImage) {
       onCommand?.(slashCommand.command, slashCommand.args);
@@ -1379,6 +1475,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.defaultPrevented) return;
+    if (e.key === 'Tab' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      onChatModeChange('plan');
+      return;
+    }
     if (showSlashMenu && COMMAND_KEYS.has(e.key)) {
       e.preventDefault();
       return;
@@ -1866,6 +1967,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             )}
           </div>
         )}
+        <TaskGuidanceQueueCard
+          items={taskGuidanceItems}
+          isRunning={isRunning}
+          onApply={onApplyTaskGuidance}
+          onDelete={onDeleteTaskGuidance}
+          onClear={onClearTaskGuidance}
+        />
         {attachedImage && (
           <div className="mb-2 flex items-center gap-2">
             <div className="relative inline-block">
@@ -2011,18 +2119,31 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           </button>
 
           <button
-            onClick={isRunning ? onStop : handleSend}
-            disabled={!isRunning && (planBlocksChatSend || (!input.trim() && !attachedImage))}
-            aria-label={isRunning ? 'Stop' : 'Send'}
-            title={planBlocksChatSend ? 'Send disabled until plan questions are answered' : undefined}
-            className={`p-2 rounded-lg transition-colors ${
-              isRunning
-                ? 'bg-danger hover:bg-danger/85 text-fg-on-danger'
-                : 'bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted'
-            }`}
+            onClick={handleSend}
+            disabled={planBlocksChatSend || (!input.trim() && !attachedImage)}
+            aria-label={isRunning ? 'Queue task guidance' : 'Send'}
+            title={
+              planBlocksChatSend
+                ? 'Send disabled until plan questions are answered'
+                : isRunning
+                  ? 'Add to task guidance queue'
+                  : undefined
+            }
+            className="p-2 rounded-lg transition-colors bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted"
           >
-            {isRunning ? <Square className="w-5 h-5" /> : <Send className="w-5 h-5" />}
+            <Send className="w-5 h-5" />
           </button>
+          {isRunning && (
+            <button
+              type="button"
+              onClick={onStop}
+              aria-label="Stop"
+              title="Stop"
+              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger"
+            >
+              <Square className="w-5 h-5" />
+            </button>
+          )}
         </div>
 
         <div

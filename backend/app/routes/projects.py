@@ -1,4 +1,8 @@
-from typing import Optional
+import asyncio
+import os
+import shlex
+import subprocess
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -8,6 +12,7 @@ from pathlib import Path
 from app.project_manager import ProjectManager
 from app.credential_manager import CredentialManager
 from app.coding_context import build_repo_map
+from app.security import is_relative_to, resolve_under_base
 from app.project_rules import (
     PROJECT_RULES_FILE,
     USER_RULES_DIR,
@@ -36,6 +41,146 @@ class CloneProjectRequest(BaseModel):
     url: str
     path: Optional[str] = None
     token: Optional[str] = None
+
+
+class ProjectPathRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    path: str
+
+
+class RenameProjectPathRequest(ProjectPathRequest):
+    new_name: str
+
+
+class ProjectRunRequest(ProjectPathRequest):
+    action: Literal["run_file", "run_tests"]
+
+
+RUN_FILE_EXTENSIONS = {".py", ".js", ".mjs", ".cjs", ".ps1", ".bat", ".cmd"}
+JS_TEST_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+
+
+def _current_project_root() -> tuple[Optional[Path], Optional[str]]:
+    project = ProjectManager.get_current()
+    if not project:
+        return None, "No current project"
+    try:
+        return Path(project["path"]).resolve(), None
+    except (OSError, ValueError) as e:
+        return None, f"Invalid project path: {e}"
+
+
+def _resolve_project_target(path: str) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
+    root, err = _current_project_root()
+    if err or root is None:
+        return root, None, err
+    if not (path or "").strip():
+        return root, None, "Path is required"
+
+    target, err = resolve_under_base(path, root, allow_relative=True)
+    if err:
+        return root, None, err
+    return root, target, None
+
+
+def _relative_project_path(root: Path, target: Path) -> str:
+    try:
+        return target.relative_to(root).as_posix()
+    except ValueError:
+        return str(target)
+
+
+def _validate_child_name(name: str) -> Optional[str]:
+    trimmed = (name or "").strip()
+    if not trimmed:
+        return "New name is required"
+    if trimmed in {".", ".."}:
+        return "Invalid new name"
+    if "/" in trimmed or "\\" in trimmed:
+        return "New name cannot contain path separators"
+    if Path(trimmed).is_absolute() or Path(trimmed).name != trimmed:
+        return "Invalid new name"
+    return None
+
+
+def _send_to_trash(path: Path) -> None:
+    from send2trash import send2trash
+
+    send2trash(str(path))
+
+
+def _command_display(command: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def _build_run_command(root: Path, target: Path, action: str) -> tuple[Optional[list[str]], int, Optional[str]]:
+    rel = _relative_project_path(root, target)
+    ext = target.suffix.lower()
+
+    if action == "run_file":
+        if not target.is_file():
+            return None, 0, "Run file requires a file path"
+        if ext not in RUN_FILE_EXTENSIONS:
+            return None, 0, f"Unsupported runnable file type: {ext or '(none)'}"
+        if ext == ".py":
+            return ["python", rel], 120, None
+        if ext in {".js", ".mjs", ".cjs"}:
+            return ["node", rel], 120, None
+        if ext == ".ps1":
+            shell = "powershell.exe" if os.name == "nt" else "pwsh"
+            return [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", rel], 120, None
+        return ["cmd", "/c", rel], 120, None
+
+    if action == "run_tests":
+        from app.test_runner import detect_framework
+
+        framework = detect_framework(str(root))
+        if framework == "pytest":
+            return ["python", "-m", "pytest", "-v", "--tb=short", rel], 300, None
+        node_cmd = "npx.cmd" if os.name == "nt" else "npx"
+        if framework == "vitest":
+            return [node_cmd, "vitest", "--run", "--reporter=verbose", rel], 300, None
+        if framework == "jest":
+            return [node_cmd, "jest", rel], 300, None
+        if ext == ".py" or target.is_dir():
+            return ["python", "-m", "pytest", "-v", "--tb=short", rel], 300, None
+        if ext in JS_TEST_EXTENSIONS:
+            return [node_cmd, "vitest", "--run", "--reporter=verbose", rel], 300, None
+        return None, 0, "No supported test framework detected"
+
+    return None, 0, f"Unsupported action: {action}"
+
+
+async def _run_project_command(command: list[str], cwd: Path, timeout: int) -> dict[str, Any]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        return {"exit_code": None, "output": "", "error": f"Failed to start command: {e}"}
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {"exit_code": None, "output": "", "error": f"Command timed out after {timeout}s"}
+
+    out_text = (stdout or b"").decode("utf-8", errors="replace")
+    err_text = (stderr or b"").decode("utf-8", errors="replace")
+    output = out_text
+    if err_text:
+        output = f"{output}\n{err_text}" if output else err_text
+    if len(output) > 16000:
+        output = output[:16000] + "\n... output truncated ..."
+
+    error = "" if proc.returncode == 0 else f"Exit code {proc.returncode}"
+    return {"exit_code": proc.returncode, "output": output, "error": error}
 
 
 @router.get("/api/projects")
@@ -131,6 +276,88 @@ def create_project(req: CreateProjectRequest):
 def get_project_tree(path: str = ""):
     """获取项目文件树"""
     return {"nodes": ProjectManager.get_tree(path)}
+
+
+@router.post("/api/projects/fs/rename")
+def rename_project_path(req: RenameProjectPathRequest):
+    root, target, err = _resolve_project_target(req.path)
+    if err or root is None or target is None:
+        return {"error": err}
+    if target == root:
+        return {"error": "Cannot rename the project root"}
+    if not target.exists():
+        return {"error": f"Path does not exist: {req.path}"}
+
+    name_err = _validate_child_name(req.new_name)
+    if name_err:
+        return {"error": name_err}
+
+    destination = (target.parent / req.new_name.strip()).resolve()
+    if not is_relative_to(destination, root):
+        return {"error": "Destination escapes project"}
+    if destination.exists():
+        return {"error": f"Destination already exists: {req.new_name}"}
+
+    try:
+        target.rename(destination)
+        project = ProjectManager.refresh_current()
+    except OSError as e:
+        return {"error": f"Rename failed: {e}"}
+
+    return {
+        "status": "ok",
+        "path": _relative_project_path(root, target),
+        "new_path": _relative_project_path(root, destination),
+        "project": project,
+    }
+
+
+@router.post("/api/projects/fs/delete")
+def delete_project_path(req: ProjectPathRequest):
+    root, target, err = _resolve_project_target(req.path)
+    if err or root is None or target is None:
+        return {"error": err}
+    if target == root:
+        return {"error": "Cannot delete the project root"}
+    if not target.exists():
+        return {"error": f"Path does not exist: {req.path}"}
+
+    try:
+        _send_to_trash(target)
+        project = ProjectManager.refresh_current()
+    except OSError as e:
+        return {"error": f"Delete failed: {e}"}
+    except Exception as e:
+        return {"error": f"Move to recycle bin failed: {e}"}
+
+    return {
+        "status": "ok",
+        "path": _relative_project_path(root, target),
+        "project": project,
+    }
+
+
+@router.post("/api/projects/actions/run")
+async def run_project_action(req: ProjectRunRequest):
+    root, target, err = _resolve_project_target(req.path)
+    if err or root is None or target is None:
+        return {"error": err}
+    if not target.exists():
+        return {"error": f"Path does not exist: {req.path}"}
+
+    command, timeout, err = _build_run_command(root, target, req.action)
+    if err or command is None:
+        return {"error": err}
+
+    result = await _run_project_command(command, root, timeout)
+    return {
+        "status": "ok" if not result.get("error") else "error",
+        "path": _relative_project_path(root, target),
+        "action": req.action,
+        "cwd": str(root),
+        "command": _command_display(command),
+        **result,
+    }
 
 
 # ── Agent rules (.desktop-agent.md / AGENTS.md) ──────────────────────────

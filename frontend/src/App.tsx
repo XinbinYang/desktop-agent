@@ -46,6 +46,7 @@ import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
+import type { FileTreeAction } from './components/FileTree';
 
 interface SessionListItem {
   id: string;
@@ -75,6 +76,7 @@ interface PendingProjectFileOpen {
   path: string;
   content: string;
   language: string;
+  openToSide?: boolean;
 }
 
 type SplitPlacement = 'before' | 'after';
@@ -197,6 +199,44 @@ function withDirectoryChildren(nodes: FileNode[], path: string, children: FileNo
     if (!node.children) return node;
     return { ...node, children: withDirectoryChildren(node.children, path, children) };
   });
+}
+
+function normalizeProjectPath(path: string): string {
+  return (path || '').replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function projectAbsolutePath(project: ProjectInfo, relativePath: string): string {
+  const root = normalizeProjectPath(project.path);
+  const rel = (relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  return rel ? `${root}/${rel}` : root;
+}
+
+function projectParentPath(project: ProjectInfo, node: FileNode): string {
+  if (node.type === 'dir') return projectAbsolutePath(project, node.path);
+  const normalized = node.path.replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? projectAbsolutePath(project, normalized.slice(0, idx)) : normalizeProjectPath(project.path);
+}
+
+function isProjectContained(project: ProjectInfo, absolutePath: string): boolean {
+  const root = normalizeProjectPath(project.path).toLowerCase();
+  const target = normalizeProjectPath(absolutePath).toLowerCase();
+  return target === root || target.startsWith(`${root}/`);
+}
+
+function editorPathMatches(openPath: string, targetPath: string, includeChildren = false): boolean {
+  const open = normalizePath(openPath);
+  const target = normalizePath(targetPath);
+  return includeChildren ? open === target || open.startsWith(`${target}/`) : open === target;
+}
+
+function apiErrorMessage(error: unknown): string {
+  if (!error) return 'Unknown error';
+  if (typeof error === 'string') return error;
+  if (typeof error === 'object' && 'message' in error) {
+    return String((error as { message?: unknown }).message || 'Unknown error');
+  }
+  return JSON.stringify(error);
 }
 
 const NOOP_ACTIONS: SessionActions = {
@@ -892,7 +932,11 @@ export default function App() {
   const openProjectFileInSession = useCallback((sessionId: string, file: PendingProjectFileOpen) => {
     const handle = sessionViewRefs.current.get(sessionId);
     if (!handle) return false;
-    handle.openFile(file.path, file.content, file.language);
+    if (file.openToSide) {
+      handle.openFile(file.path, file.content, file.language, { groupId: 'secondary' });
+    } else {
+      handle.openFile(file.path, file.content, file.language);
+    }
     revealWorkspaceEditor();
     return true;
   }, [revealWorkspaceEditor]);
@@ -942,7 +986,7 @@ export default function App() {
     resolveAgentSessionClient,
   ]);
 
-  const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir') => {
+  const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir', options: { openToSide?: boolean } = {}) => {
     if (type !== 'file' || !currentProject) return;
     try {
       const filePath = currentProject.path.replace(/\\/g, '/') + '/' + path;
@@ -960,7 +1004,7 @@ export default function App() {
       const name = path.split('/').pop() || path;
       const language = getLangFromFilename(name);
       const sessionId = await ensureCodingSessionForProject();
-      const pending: PendingProjectFileOpen = { sessionId, path, content, language };
+      const pending: PendingProjectFileOpen = { sessionId, path, content, language, openToSide: options.openToSide };
       if (!openProjectFileInSession(sessionId, pending)) {
         pendingProjectFileOpenRef.current = pending;
         revealWorkspaceEditor();
@@ -970,6 +1014,191 @@ export default function App() {
       addTerminalLog(`[Project] Read file error: ${err}`);
     }
   }, [addTerminalLog, currentProject, ensureCodingSessionForProject, openProjectFileInSession, revealWorkspaceEditor]);
+
+  const closeProjectEditorPaths = useCallback((path: string, includeChildren = false) => {
+    const matches: Array<{ groupId: string; fileId: string; path: string }> = [];
+    for (const group of focusedSnapshot?.editorGroups || []) {
+      for (const file of group.openFiles) {
+        if (editorPathMatches(file.path, path, includeChildren)) {
+          matches.push({ groupId: group.id, fileId: file.id, path: file.path });
+        }
+      }
+    }
+    for (const match of matches) {
+      focusedActions.onCloseFileInEditor(match.groupId, match.fileId);
+    }
+    return matches;
+  }, [focusedActions, focusedSnapshot?.editorGroups]);
+
+  const handleElectronPathAction = useCallback(async (
+    method: 'openPath' | 'revealPath' | 'openTerminal',
+    absolutePath: string,
+    label: string,
+  ) => {
+    if (!currentProject) return;
+    if (!isProjectContained(currentProject, absolutePath)) {
+      addTerminalLog(`[Project] Blocked path outside project: ${absolutePath}`);
+      return;
+    }
+    const handler = window.electronAPI?.[method];
+    if (!handler) {
+      addTerminalLog(`[Project] Electron action unavailable: ${label}`);
+      return;
+    }
+    try {
+      const error = await handler(absolutePath);
+      if (error) {
+        addTerminalLog(`[Project] ${label} failed: ${error}`);
+      }
+    } catch (err) {
+      addTerminalLog(`[Project] ${label} error: ${err}`);
+    }
+  }, [addTerminalLog, currentProject]);
+
+  const handleCopyProjectPath = useCallback(async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      addTerminalLog(`[Project] Copied ${label}: ${text}`);
+    } catch (err) {
+      addTerminalLog(`[Project] Copy failed: ${err}`);
+    }
+  }, [addTerminalLog]);
+
+  const handleRunProjectAction = useCallback(async (node: FileNode, action: 'run_file' | 'run_tests') => {
+    if (!currentProject) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/actions/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: node.path, action }),
+      });
+      const data = await res.json();
+      if (data.error && !data.command) {
+        addTerminalLog(`[Run] ${apiErrorMessage(data.error)}`);
+        return;
+      }
+      layout.setShowTerminal(true);
+      requestAnimationFrame(() => terminalPanelRef.current?.expand());
+      addTerminalLog(`[Run] ${data.command || action}`);
+      if (data.output) addTerminalLog(String(data.output));
+      if (data.error) addTerminalLog(`[Run] ${apiErrorMessage(data.error)}`);
+    } catch (err) {
+      addTerminalLog(`[Run] ${action} error: ${err}`);
+    }
+  }, [addTerminalLog, currentProject, layout]);
+
+  const handleProjectFileAction = useCallback(async (action: FileTreeAction, node: FileNode) => {
+    if (!currentProject) return;
+    const absolutePath = projectAbsolutePath(currentProject, node.path);
+    const terminalPath = projectParentPath(currentProject, node);
+
+    switch (action) {
+      case 'open':
+        if (node.type === 'file') await handleSelectFile(node.path, 'file');
+        else handleTogglePath(node.path);
+        return;
+      case 'open_side':
+        if (node.type === 'file') await handleSelectFile(node.path, 'file', { openToSide: true });
+        return;
+      case 'open_external':
+        await handleElectronPathAction('openPath', absolutePath, 'Open path');
+        return;
+      case 'reveal':
+        await handleElectronPathAction('revealPath', absolutePath, 'Reveal path');
+        return;
+      case 'open_terminal':
+        await handleElectronPathAction('openTerminal', terminalPath, 'Open terminal');
+        return;
+      case 'copy_path':
+        await handleCopyProjectPath(absolutePath, 'path');
+        return;
+      case 'copy_relative_path':
+        await handleCopyProjectPath(node.path, 'relative path');
+        return;
+      case 'toggle':
+        if (node.type === 'dir') handleTogglePath(node.path);
+        return;
+      case 'rename': {
+        const nextName = window.prompt('重命名', node.name)?.trim();
+        if (!nextName || nextName === node.name) return;
+        try {
+          const res = await fetch(`${API_BASE}/api/projects/fs/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: node.path, new_name: nextName }),
+          });
+          const data = await res.json();
+          if (data.error) {
+            addTerminalLog(`[Project] Rename failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          const matches = closeProjectEditorPaths(node.path, node.type === 'dir');
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
+            for (const expanded of Array.from(next)) {
+              if (editorPathMatches(expanded, node.path, true)) next.delete(expanded);
+            }
+            return next;
+          });
+          await refreshProject({ silent: true });
+          addTerminalLog(`[Project] Renamed ${node.path} -> ${data.new_path || nextName}`);
+          const firstMatch = matches[0];
+          if (node.type === 'file' && firstMatch && data.new_path) {
+            await handleSelectFile(data.new_path, 'file', { openToSide: firstMatch.groupId === 'secondary' });
+          }
+        } catch (err) {
+          addTerminalLog(`[Project] Rename error: ${err}`);
+        }
+        return;
+      }
+      case 'delete': {
+        if (!window.confirm(`删除 ${node.name}？文件会移入回收站。`)) return;
+        try {
+          const res = await fetch(`${API_BASE}/api/projects/fs/delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: node.path }),
+          });
+          const data = await res.json();
+          if (data.error) {
+            addTerminalLog(`[Project] Delete failed: ${apiErrorMessage(data.error)}`);
+            return;
+          }
+          closeProjectEditorPaths(node.path, node.type === 'dir');
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
+            for (const expanded of Array.from(next)) {
+              if (editorPathMatches(expanded, node.path, true)) next.delete(expanded);
+            }
+            return next;
+          });
+          await refreshProject({ silent: true });
+          addTerminalLog(`[Project] Moved to recycle bin: ${node.path}`);
+        } catch (err) {
+          addTerminalLog(`[Project] Delete error: ${err}`);
+        }
+        return;
+      }
+      case 'run_file':
+        await handleRunProjectAction(node, 'run_file');
+        return;
+      case 'run_tests':
+        await handleRunProjectAction(node, 'run_tests');
+        return;
+      default:
+        return;
+    }
+  }, [
+    addTerminalLog,
+    closeProjectEditorPaths,
+    currentProject,
+    handleCopyProjectPath,
+    handleElectronPathAction,
+    handleRunProjectAction,
+    handleSelectFile,
+    handleTogglePath,
+    refreshProject,
+  ]);
 
   const handleOpenFileFromPanel = useCallback((path: string) => {
     if (!currentProject) return;
@@ -1143,7 +1372,7 @@ export default function App() {
   ]);
 
   // Split a leaf into two panes (drag to edge)
-  const handleSplitPane = useCallback((
+  const handleSplitPane = useCallback(async (
     leafId: string,
     direction: 'horizontal' | 'vertical',
     options: SplitPaneOptions = {},
@@ -1157,10 +1386,28 @@ export default function App() {
       }
     }
     const agentType: AgentType = requestedAgent === 'personal' ? 'personal' : 'coding';
-    const newLeaf = createLeaf(agentType, options.model || agentModels[agentType] || agentModel, options.sessionId);
-    newLeaf.pane.role = options.role || roleForAgent(agentType);
+    let resolvedOptions = options;
+    if (agentType === 'coding' && !options.sessionId) {
+      try {
+        const resolved = await resolveAgentSessionClient('coding', 'new');
+        resolvedOptions = {
+          ...options,
+          sessionId: resolved.session_id,
+          model: resolved.model_id || options.model,
+          role: resolved.role_id || options.role,
+          agentType,
+        };
+        loadSessions(currentProject?.path ?? null);
+        addTerminalLog('[系统] 已创建 Coding Agent session');
+      } catch (err) {
+        console.error('[App] Failed to create split coding session:', err);
+        addTerminalLog(`[系统] 新建分屏 Coding session 失败，使用本地会话: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const newLeaf = createLeaf(agentType, resolvedOptions.model || agentModels[agentType] || agentModel, resolvedOptions.sessionId);
+    newLeaf.pane.role = resolvedOptions.role || roleForAgent(agentType);
     newLeaf.pane.isPrimary = agentType === 'personal';
-    const placement = options.placement || 'after';
+    const placement = resolvedOptions.placement || 'after';
 
     setPaneRoot((prev) => {
       const existing = findLeafById(prev, leafId);
@@ -1177,7 +1424,7 @@ export default function App() {
     });
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
-  }, [agentModel, agentModels, paneRoot]);
+  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, loadSessions, paneRoot, resolveAgentSessionClient]);
 
   // Move a session from one leaf to another (drag to center of pane)
   const handleMoveSession = useCallback((fromLeafId: string, toLeafId: string) => {
@@ -1470,6 +1717,7 @@ export default function App() {
               loadingPaths={loadingPaths}
               onTogglePath={handleTogglePath}
               onSelectFile={handleSelectFile}
+              onFileAction={handleProjectFileAction}
               onOpenFolder={handleOpenFolder}
               onOpenProjectModal={() => setShowProjectModal(true)}
               onCloseProject={handleCloseProject}

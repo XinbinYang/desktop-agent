@@ -204,7 +204,7 @@ describe('App', () => {
     expect(screen.getByText('○ Ready')).toBeInTheDocument()
   })
   it('resolves a coding session when clicking Coding Agent', async () => {
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
       if (url.endsWith('/api/sessions/resolve')) {
         return Promise.resolve({
           ok: true,
@@ -553,5 +553,73 @@ describe('App', () => {
 
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/file/read'))).toBe(false)
     expect((globalThis as any).__desktopAgentOpenFiles?.session_coding_file).toBeUndefined()
+  })
+
+  it('runs a project file from the file tree context menu', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
+    const project = {
+      path: 'C:/repo',
+      name: 'repo',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            project,
+            nodes: [{ name: 'script.py', path: 'script.py', type: 'file', extension: 'py' }],
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/actions/run')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            status: 'ok',
+            command: 'python script.py',
+            output: 'done',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      return Promise.resolve({ json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.contextMenu(await screen.findByText('script.py'))
+    fireEvent.click(await screen.findByText('运行文件'))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/actions/run'))
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: 'script.py', action: 'run_file' })
+    })
   })
 })

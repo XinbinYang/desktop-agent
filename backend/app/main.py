@@ -1037,6 +1037,34 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     if requested_chat_mode in ("agent", "plan")
                     else session.chat_mode
                 )
+                if runtime.is_running:
+                    try:
+                        item = session.queue_task_guidance(
+                            user_text,
+                            image_b64,
+                            item_id=msg.get("guidance_id") or msg.get("id"),
+                        )
+                        applied = session.apply_task_guidance()
+                    except ValueError as exc:
+                        await send_event({"type": "error", "data": validation_error(str(exc))})
+                        continue
+                    await send_event({
+                        "type": "task_guidance_queued",
+                        "data": {
+                            "item": item.model_dump(),
+                            "items": session.active_task_guidance_items(),
+                        },
+                    })
+                    if applied:
+                        await send_event({
+                            "type": "task_guidance_applied",
+                            "data": {
+                                "items": [i.model_dump() for i in applied],
+                                "all_items": session.active_task_guidance_items(),
+                                "auto": True,
+                            },
+                        })
+                    continue
 
                 async def _run_agent_events(
                     session=session,
@@ -1056,6 +1084,78 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         yield event
 
                 await runtime.start(session, _run_agent_events)
+
+            elif msg_type == "queue_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                try:
+                    item = session.queue_task_guidance(
+                        str(msg.get("text") or ""),
+                        msg.get("image_base64"),
+                        item_id=msg.get("guidance_id") or msg.get("id"),
+                    )
+                    applied = session.apply_task_guidance() if runtime.is_running else []
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                await send_event({
+                    "type": "task_guidance_queued",
+                    "data": {
+                        "item": item.model_dump(),
+                        "items": session.active_task_guidance_items(),
+                    },
+                })
+                if applied:
+                    await send_event({
+                        "type": "task_guidance_applied",
+                        "data": {
+                            "items": [i.model_dump() for i in applied],
+                            "all_items": session.active_task_guidance_items(),
+                            "auto": True,
+                        },
+                    })
+
+            elif msg_type == "apply_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                applied = session.apply_task_guidance()
+                await send_event({
+                    "type": "task_guidance_applied",
+                    "data": {
+                        "items": [item.model_dump() for item in applied],
+                        "all_items": session.active_task_guidance_items(),
+                    },
+                })
+                if applied and not runtime.is_running:
+                    stale = session.mark_applied_task_guidance_stale()
+                    await send_event({
+                        "type": "task_guidance_stale",
+                        "data": {
+                            "items": [item.model_dump() for item in stale],
+                            "all_items": session.active_task_guidance_items(),
+                        },
+                    })
+
+            elif msg_type == "delete_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                item_id = str(msg.get("id") or msg.get("guidance_id") or "")
+                if not item_id:
+                    await send_event({"type": "error", "data": validation_error("delete_task_guidance requires id")})
+                    continue
+                deleted = session.delete_task_guidance(item_id)
+                await send_event({
+                    "type": "task_guidance_deleted",
+                    "data": {"id": item_id, "deleted": deleted, "items": session.active_task_guidance_items()},
+                })
+
+            elif msg_type == "clear_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                removed = session.clear_task_guidance()
+                await send_event({
+                    "type": "task_guidance_cleared",
+                    "data": {
+                        "items": [item.model_dump() for item in removed],
+                        "all_items": session.active_task_guidance_items(),
+                    },
+                })
 
             elif msg_type == "collaborate":
                 goal = str(msg.get("goal") or msg.get("text") or "").strip()

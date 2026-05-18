@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 import uuid
@@ -284,6 +285,49 @@ class TestWebSocket:
             assert "skills_matched" in types
             assert "status" in types
             assert "done" in types
+
+    def test_websocket_chat_while_running_queues_guidance(self, client):
+        """A second chat during a live run becomes task guidance instead of cancelling."""
+        from unittest.mock import patch
+
+        async def slow_stream(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Long task done",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", slow_stream):
+            sid = f"test_guidance_ws_{uuid.uuid4().hex}"
+            with client.websocket_connect(f"/ws/{sid}") as ws:
+                ws.send_json({"type": "chat", "text": "long task", "model_id": "gpt-4o"})
+                receive_until(ws, "status")
+                ws.send_json({"type": "chat", "text": "prefer the smaller fix", "model_id": "gpt-4o"})
+                queued = receive_until(ws, "task_guidance_queued")
+                assert queued["data"]["item"]["text"] == "prefer the smaller fix"
+                applied = receive_until(ws, "task_guidance_applied")
+                assert applied["data"]["items"][0]["text"] == "prefer the smaller fix"
+                assert applied["data"]["items"][0]["status"] == "applied"
+
+                seen = []
+                for _ in range(30):
+                    msg = ws.receive_json()
+                    seen.append(msg["type"])
+                    if msg.get("type") == "done":
+                        break
+                assert "interrupted" not in seen
+                assert "task_guidance_consumed" in seen
+
+            snapshot = client.get(f"/api/sessions/{sid}").json()
+            assert snapshot["task_guidance_items"] == []
 
     def test_websocket_plan_chat_emits_plan_draft(self, client):
         """Plan mode: LLM calls plan_write_draft → frontend receives plan_draft."""
@@ -895,6 +939,105 @@ class TestProjectAPI:
         escape_response = client.get("/api/file/read", params={"path": str(sibling / "secret.txt")})
         assert escape_response.status_code == 200
         assert "error" in escape_response.json()
+
+    def test_project_fs_rename_validates_and_renames(self, client, temp_dir):
+        """POST /api/projects/fs/rename renames project-contained paths only."""
+        proj_dir = temp_dir / "renameproj"
+        proj_dir.mkdir()
+        (proj_dir / "old.txt").write_text("hello", encoding="utf-8")
+        (proj_dir / "taken.txt").write_text("taken", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        invalid = client.post("/api/projects/fs/rename", json={
+            "path": "old.txt",
+            "new_name": "../escape.txt",
+        })
+        assert invalid.status_code == 200
+        assert "error" in invalid.json()
+
+        duplicate = client.post("/api/projects/fs/rename", json={
+            "path": "old.txt",
+            "new_name": "taken.txt",
+        })
+        assert duplicate.status_code == 200
+        assert "error" in duplicate.json()
+
+        renamed = client.post("/api/projects/fs/rename", json={
+            "path": "old.txt",
+            "new_name": "new.txt",
+        })
+
+        assert renamed.status_code == 200
+        data = renamed.json()
+        assert data["status"] == "ok"
+        assert data["new_path"] == "new.txt"
+        assert not (proj_dir / "old.txt").exists()
+        assert (proj_dir / "new.txt").read_text(encoding="utf-8") == "hello"
+
+    def test_project_fs_delete_uses_recycle_bin(self, client, temp_dir, monkeypatch):
+        """POST /api/projects/fs/delete delegates to send-to-trash helper."""
+        import app.routes.projects as projects_route
+
+        proj_dir = temp_dir / "deleteproj"
+        proj_dir.mkdir()
+        target = proj_dir / "gone.txt"
+        target.write_text("bye", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+        calls = []
+        monkeypatch.setattr(projects_route, "_send_to_trash", lambda path: calls.append(path))
+
+        response = client.post("/api/projects/fs/delete", json={"path": "gone.txt"})
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert calls == [target.resolve()]
+
+    def test_project_run_action_builds_controlled_test_command(self, client, temp_dir, monkeypatch):
+        """POST /api/projects/actions/run builds a controlled pytest command."""
+        import app.routes.projects as projects_route
+
+        proj_dir = temp_dir / "runproj"
+        tests_dir = proj_dir / "tests"
+        tests_dir.mkdir(parents=True)
+        test_file = tests_dir / "test_app.py"
+        test_file.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+        captured = {}
+
+        async def fake_run(command, cwd, timeout):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            captured["timeout"] = timeout
+            return {"exit_code": 0, "output": "ok", "error": ""}
+
+        monkeypatch.setattr(projects_route, "_run_project_command", fake_run)
+
+        response = client.post("/api/projects/actions/run", json={
+            "path": "tests/test_app.py",
+            "action": "run_tests",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert captured["command"] == ["python", "-m", "pytest", "-v", "--tb=short", "tests/test_app.py"]
+        assert captured["cwd"] == proj_dir.resolve()
+        assert data["output"] == "ok"
+
+    def test_project_run_action_rejects_unsupported_file(self, client, temp_dir):
+        """POST /api/projects/actions/run rejects unsupported run_file extensions."""
+        proj_dir = temp_dir / "unsupportedrun"
+        proj_dir.mkdir()
+        (proj_dir / "README.md").write_text("# Hi\n", encoding="utf-8")
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        response = client.post("/api/projects/actions/run", json={
+            "path": "README.md",
+            "action": "run_file",
+        })
+
+        assert response.status_code == 200
+        assert "Unsupported runnable file type" in response.json()["error"]
 
     def test_clone_project_api_opens_cloned_repo(self, client, temp_dir):
         """POST /api/projects/clone clones a local repo and opens the target."""

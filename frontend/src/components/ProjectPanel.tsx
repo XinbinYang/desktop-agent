@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { FolderOpen, FolderX, GitBranch, Plus, FileText, Save, Loader, RefreshCw } from 'lucide-react';
 import { ProjectInfo, FileNode } from '../types';
-import { FileTree } from './FileTree';
+import { FileTree, type FileTreeAction } from './FileTree';
 import { API_BASE, withAuthQuery } from '../config';
 
 interface ProjectPanelProps {
@@ -11,6 +11,7 @@ interface ProjectPanelProps {
   loadingPaths?: Set<string>;
   onTogglePath: (path: string) => void;
   onSelectFile: (path: string, type: 'file' | 'dir') => void;
+  onFileAction?: (action: FileTreeAction, node: FileNode) => void;
   onOpenFolder: () => void;
   onOpenModal: () => void;
   onCloseProject: () => void;
@@ -25,6 +26,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
   loadingPaths = new Set(),
   onTogglePath,
   onSelectFile,
+  onFileAction,
   onOpenFolder,
   onOpenModal,
   onCloseProject,
@@ -210,6 +212,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
           expandedPaths={expandedPaths}
           onToggle={onTogglePath}
           loadingPaths={loadingPaths}
+          onAction={onFileAction}
         />
       </div>
     </div>

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { useChatSession } from '../../hooks/useChatSession'
 import type { WS_EVENT } from '../../types'
+import { loadSession } from '../../lib/db'
 
 // Mock useWebSocket
 vi.mock('../../hooks/useWebSocket', () => ({
@@ -25,6 +26,7 @@ vi.mock('../../lib/db', () => ({
 import { useWebSocket } from '../../hooks/useWebSocket'
 
 const mockedUseWebSocket = vi.mocked(useWebSocket)
+const mockedLoadSession = vi.mocked(loadSession)
 
 describe('useChatSession', () => {
   const mockSend = vi.fn()
@@ -87,6 +89,74 @@ describe('useChatSession', () => {
 
     expect(result.current.isRunning).toBe(false)
     expect(result.current.terminalLogs.some((line) => line.includes('WebSocket'))).toBe(true)
+  })
+
+  it('queues guidance instead of chat when sending while running', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+      result.current.sendMessage('prefer the smaller fix')
+    })
+
+    expect(mockSend).toHaveBeenLastCalledWith({
+      type: 'queue_task_guidance',
+      text: 'prefer the smaller fix',
+      image_base64: undefined,
+    })
+    expect(result.current.messages).toHaveLength(0)
+  })
+
+  it('tracks task guidance websocket events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'task_guidance_queued',
+        data: {
+          item: { id: 'tg_1', text: 'note', status: 'queued', created_at: 1 },
+        },
+      })
+    })
+    expect(result.current.taskGuidanceItems).toHaveLength(1)
+
+    act(() => {
+      messageHandler?.({
+        type: 'task_guidance_applied',
+        data: {
+          items: [{ id: 'tg_1', text: 'note', status: 'applied', created_at: 1, applied_at: 2 }],
+        },
+      })
+    })
+    expect(result.current.taskGuidanceItems[0].status).toBe('applied')
+
+    act(() => {
+      messageHandler?.({
+        type: 'task_guidance_consumed',
+        data: {
+          items: [{ id: 'tg_1', text: 'note', status: 'consumed', created_at: 1, consumed_at: 3 }],
+        },
+      })
+    })
+    expect(result.current.taskGuidanceItems).toHaveLength(0)
   })
 
   it('marks the session running when reconnect receives live run status', () => {
@@ -336,6 +406,156 @@ describe('useChatSession', () => {
     expect(result.current.messages[0].content).toBe('hello history')
     expect(result.current.messages[1].blocks?.some((b) => b.type === 'tool_call')).toBe(true)
     expect(result.current.toolCalls[0].result).toBe('file body')
+  })
+
+  it('does not render internal-source messages as user bubbles', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [
+            { role: 'system', content: 'system' },
+            { role: 'user', content: 'real question', source: 'user' },
+            { role: 'user', content: '[BUILD ALREADY CLICKED] ...', source: 'internal' },
+            { role: 'assistant', content: 'answer' },
+            { role: 'user', content: '[VERIFICATION REQUIRED] ...', source: 'internal' },
+          ],
+        },
+      })
+    })
+
+    const userMsgs = result.current.messages.filter((m) => m.role === 'user')
+    expect(userMsgs).toHaveLength(1)
+    expect(userMsgs[0].content).toBe('real question')
+    expect(
+      result.current.messages.some((m) => m.content.includes('BUILD ALREADY CLICKED')),
+    ).toBe(false)
+    expect(
+      result.current.messages.some((m) => m.content.includes('VERIFICATION REQUIRED')),
+    ).toBe(false)
+  })
+
+  it('hydrates multimodal and image-only user snapshot messages without empty bubbles', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'input_text', text: 'describe this' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,abc123' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,imgonly' } },
+              ],
+            },
+          ],
+        },
+      })
+    })
+
+    expect(result.current.messages).toHaveLength(2)
+    expect(result.current.messages[0].content).toBe('describe this')
+    expect(result.current.messages[0].imageBase64).toBe('abc123')
+    expect(result.current.messages[1].content).toBe('[image]')
+    expect(result.current.messages[1].imageBase64).toBe('imgonly')
+  })
+
+  it('merges history snapshots without dropping optimistic user messages', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('still pending')
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [
+            { role: 'user', content: 'old server message', message_id: 'server-1' },
+          ],
+        },
+      })
+    })
+
+    expect(result.current.messages.map((m) => m.content)).toEqual([
+      'old server message',
+      'still pending',
+    ])
+  })
+
+  it('uses IndexedDB as warm cache but lets backend snapshot repair empty cached users', async () => {
+    mockedLoadSession.mockResolvedValueOnce({
+      sessionId: 'session-cache',
+      messages: [{ id: 'bad-user', role: 'user', content: '', isTool: false }],
+      toolCalls: [],
+      timestamp: Date.now(),
+    } as any)
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        json: () => Promise.resolve({
+          session_id: 'session-cache',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [{ role: 'user', content: 'server repaired', message_id: 'm1' }],
+        }),
+      })
+    ))
+
+    const { result } = renderHook(() => useChatSession('session-cache', 'gpt-4o'))
+
+    await waitFor(() => {
+      expect(result.current.messages.map((m) => m.content)).toEqual(['server repaired'])
+    })
   })
 
   it('handles tool_call event', async () => {

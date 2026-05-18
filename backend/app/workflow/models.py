@@ -114,3 +114,14 @@ class PlanState(BaseModel):
             return False
         self.phase = new_phase
         return True
+
+
+class TaskGuidanceItem(BaseModel):
+    id: str
+    text: str = ""
+    image_base64: Optional[str] = None
+    status: Literal["queued", "applied", "consumed", "stale"] = "queued"
+    created_at: float
+    applied_at: Optional[float] = None
+    consumed_at: Optional[float] = None
+    truncated: bool = False

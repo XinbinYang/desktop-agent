@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { ProjectInfo, FileNode, SidebarSection, type AgentType } from '../types';
 import { ProjectPanel } from './ProjectPanel';
+import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
 import { AGENT_LABEL } from '../lib/agentProfiles';
@@ -38,6 +39,7 @@ interface SidebarProps {
   loadingPaths?: Set<string>;
   onTogglePath?: (path: string) => void;
   onSelectFile?: (path: string, type: 'file' | 'dir') => void;
+  onFileAction?: (action: FileTreeAction, node: FileNode) => void;
   onOpenFolder?: () => void;
   onOpenProjectModal?: () => void;
   onCloseProject?: () => void;
@@ -84,6 +86,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   loadingPaths = new Set(),
   onTogglePath,
   onSelectFile,
+  onFileAction,
   onOpenFolder,
   onOpenProjectModal,
   onCloseProject,
@@ -187,6 +190,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   loadingPaths={loadingPaths}
                   onTogglePath={onTogglePath || (() => {})}
                   onSelectFile={onSelectFile || (() => {})}
+                  onFileAction={onFileAction}
                   onOpenFolder={onOpenFolder || (() => {})}
                   onOpenModal={onOpenProjectModal || (() => {})}
                   onCloseProject={onCloseProject || (() => {})}
@@ -223,6 +227,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               loadingPaths={loadingPaths}
               onTogglePath={onTogglePath || (() => {})}
               onSelectFile={onSelectFile || (() => {})}
+              onFileAction={onFileAction}
               onOpenFolder={onOpenFolder || (() => {})}
               onOpenModal={onOpenProjectModal || (() => {})}
               onCloseProject={onCloseProject || (() => {})}

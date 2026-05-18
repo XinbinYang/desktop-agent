@@ -199,6 +199,16 @@ describe('ChatPanel', () => {
     expect(screen.getByLabelText('Plan mode')).toHaveAttribute('aria-pressed', 'true')
   })
 
+  it('switches to plan mode when pressing Shift+Tab in the chat input', () => {
+    const onChatModeChange = vi.fn()
+    render(<ChatPanel {...defaultProps} onChatModeChange={onChatModeChange} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.keyDown(input, { key: 'Tab', shiftKey: true })
+
+    expect(onChatModeChange).toHaveBeenCalledWith('plan')
+  })
+
   it('sends messages without overriding the live mode ref with a stale prop', () => {
     const onSend = vi.fn()
     render(<ChatPanel {...defaultProps} onSend={onSend} />)
@@ -464,6 +474,58 @@ describe('ChatPanel', () => {
     const stopButton = screen.getByLabelText('Stop')
     fireEvent.click(stopButton)
     expect(onStop).toHaveBeenCalled()
+  })
+
+  it('queues task guidance instead of sending or stopping while running', () => {
+    const onSend = vi.fn()
+    const onStop = vi.fn()
+    const onQueueTaskGuidance = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        isRunning={true}
+        onSend={onSend}
+        onStop={onStop}
+        onQueueTaskGuidance={onQueueTaskGuidance}
+      />,
+    )
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: 'prefer the smaller fix' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(onQueueTaskGuidance).toHaveBeenCalledWith('prefer the smaller fix', undefined)
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onStop).not.toHaveBeenCalled()
+  })
+
+  it('renders task guidance queue controls', () => {
+    const onApplyTaskGuidance = vi.fn()
+    const onDeleteTaskGuidance = vi.fn()
+    const onClearTaskGuidance = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        isRunning={true}
+        taskGuidanceItems={[{
+          id: 'tg_1',
+          text: 'prefer the smaller fix',
+          status: 'queued',
+          created_at: 1,
+        }]}
+        onApplyTaskGuidance={onApplyTaskGuidance}
+        onDeleteTaskGuidance={onDeleteTaskGuidance}
+        onClearTaskGuidance={onClearTaskGuidance}
+      />,
+    )
+
+    expect(screen.getByText('任务引导队列 (1)')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('任务引导'))
+    expect(onApplyTaskGuidance).toHaveBeenCalled()
+    fireEvent.click(screen.getByLabelText('Remove guidance'))
+    expect(onDeleteTaskGuidance).toHaveBeenCalledWith('tg_1')
+    fireEvent.click(screen.getByText('清空'))
+    expect(onClearTaskGuidance).toHaveBeenCalled()
   })
 
   it('renders context meter and compacts on click', () => {

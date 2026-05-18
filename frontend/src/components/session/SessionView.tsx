@@ -41,7 +41,12 @@ interface SessionViewProps {
 }
 
 export interface SessionViewHandle {
-  openFile: (relativePath: string, content: string, language: string, options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>>) => void;
+  openFile: (
+    relativePath: string,
+    content: string,
+    language: string,
+    options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> & { groupId?: EditorGroup['id'] },
+  ) => void;
   switchModel: (modelId: string) => void;
   openRewind: () => void;
 }
@@ -89,10 +94,15 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     runEvents,
     contextUsage,
     checkpoints,
+    taskGuidanceItems,
     terminalLogs,
     isRunning,
     isConnected,
     sendMessage,
+    queueTaskGuidance,
+    applyTaskGuidance,
+    deleteTaskGuidance,
+    clearTaskGuidance,
     clearSession,
     compactSession,
     loadCheckpoints,
@@ -150,7 +160,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       relativePath: string,
       content: string,
       language: string,
-      options: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> = {},
+      options: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> & { groupId?: EditorGroup['id'] } = {},
     ) => {
       const normalizedPath = relativePath.replace(/\\/g, '/');
       const openFile: OpenFile = {
@@ -166,8 +176,13 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       };
 
       setEditorGroups((prev) => {
-        const groupIdx = 0; // main group
-        const group = prev[groupIdx];
+        const targetGroupId: EditorGroup['id'] = options.groupId === 'secondary' ? 'secondary' : 'main';
+        let groups = prev;
+        if (targetGroupId === 'secondary' && !groups.some((group) => group.id === 'secondary')) {
+          groups = [...groups, { id: 'secondary', activeFileId: null, openFiles: [] }];
+        }
+        const groupIdx = Math.max(0, groups.findIndex((group) => group.id === targetGroupId));
+        const group = groups[groupIdx];
         const existingIdx = group.openFiles.findIndex(
           (f) => f.path.replace(/\\/g, '/') === normalizedPath,
         );
@@ -193,12 +208,15 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
           newActiveId = openFile.id;
         }
 
-        const newGroups = [...prev];
+        const newGroups = [...groups];
         newGroups[groupIdx] = { ...group, openFiles: newOpenFiles, activeFileId: newActiveId };
         return newGroups;
       });
 
       layout.setRightZone('workspace');
+      if (options.groupId === 'secondary') {
+        setActiveEditorGroup('secondary');
+      }
     },
     [layout],
   );
@@ -485,6 +503,11 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         onSend={sendMessage}
         contextUsage={contextUsage}
         checkpoints={checkpoints}
+        taskGuidanceItems={taskGuidanceItems}
+        onQueueTaskGuidance={queueTaskGuidance}
+        onApplyTaskGuidance={applyTaskGuidance}
+        onDeleteTaskGuidance={deleteTaskGuidance}
+        onClearTaskGuidance={clearTaskGuidance}
         onCompact={compactSession}
         onClearSession={clearSession}
         onLoadCheckpoints={loadCheckpoints}
