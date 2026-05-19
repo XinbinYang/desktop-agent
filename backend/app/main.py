@@ -21,6 +21,7 @@ from app.agent import (
     _load_session_data,
     archive_session_record,
     clear_session,
+    forget_session_record_cache,
     get_or_create_session,
     list_session_records,
     refresh_all_sessions_mcp_tools,
@@ -237,7 +238,14 @@ def _history_project_name(path: str) -> str:
     return Path(normalized).name or normalized
 
 
-def _session_activity_state(session_id: str, is_running: bool) -> str:
+async def _close_browser_session_after_delete(session_id: str) -> None:
+    try:
+        await close_browser_session(session_id)
+    except Exception as exc:
+        print(f"[Session] Browser cleanup failed for {session_id}: {exc}")
+
+
+def _session_activity_state(session_id: str, is_running: bool, plan_phase: Optional[str] = None) -> str:
     if is_running:
         return "running"
 
@@ -245,6 +253,8 @@ def _session_activity_state(session_id: str, is_running: bool) -> str:
     live = _sessions.get(session_id)
     if live is not None:
         phase = getattr(getattr(live, "plan_state", None), "phase", "") or ""
+    elif plan_phase is not None:
+        phase = plan_phase
     else:
         data = _load_session_data(session_id)
         plan_state = data.get("plan_state") if isinstance(data, dict) else None
@@ -261,9 +271,10 @@ def _session_history_item(record: Dict[str, Any], connection_counts: Dict[str, i
     runtime = session_runtime_status(session_id)
     is_running = bool(runtime.get("is_running"))
     item = dict(record)
+    plan_phase = item.pop("_plan_phase", None)
     item["is_running"] = is_running
     item["active_connections"] = int(connection_counts.get(session_id, 0))
-    item["activity_state"] = _session_activity_state(session_id, is_running)
+    item["activity_state"] = _session_activity_state(session_id, is_running, plan_phase)
     return item
 
 
@@ -284,7 +295,7 @@ def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
     }
     session_items: List[Dict[str, Any]] = []
     archived_counts: Dict[str, int] = {}
-    for record in list_session_records():
+    for record in list_session_records(include_internal=True):
         item = _session_history_item(record, connection_counts)
         project_path = item.get("project_path")
         if item.get("archived_at"):
@@ -597,10 +608,7 @@ async def delete_session(session_id: str):
     runtime_terminated = await terminate_session_runtime(session_id, session)
     cancel_workers_for_session(session_id)
     clear_recorder(session_id)
-    try:
-        await close_browser_session(session_id)
-    except Exception as exc:
-        print(f"[Session] Browser cleanup failed for {session_id}: {exc}")
+    asyncio.create_task(_close_browser_session_after_delete(session_id))
     if session_id in _sessions:
         del _sessions[session_id]
     path = SESSIONS_DIR / f"{session_id}.json"
@@ -609,6 +617,7 @@ async def delete_session(session_id: str):
             path.unlink()
         except OSError:
             pass
+    forget_session_record_cache(session_id)
     return {
         "status": "ok",
         "message": f"Session {session_id} deleted",

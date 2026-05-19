@@ -32,6 +32,7 @@ import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionC
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
 import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
 import { API_BASE } from './config';
+import { deleteDraft, deleteSessionData } from './lib/db';
 import {
   DEFAULT_MAIN_LAYOUT,
   DEFAULT_SIDEBAR_WIDTH,
@@ -1884,6 +1885,7 @@ export default function App() {
         setDeleteSessionError(apiErrorMessage(data.detail || data.error || res.statusText));
         return;
       }
+      void Promise.allSettled([deleteSessionData(id), deleteDraft(id)]);
       setDeleteSessionTarget(null);
       loadSessions(currentProject?.path ?? null);
       await replaceFocusedSessionAfterRemoval(id);

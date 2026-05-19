@@ -1,4 +1,5 @@
 import base64
+from contextlib import suppress
 from typing import Optional
 import contextvars
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, async_playwright
@@ -35,11 +36,14 @@ async def close_browser_session(session_id: str) -> None:
     if not sess:
         return
     if sess.get("page"):
-        await sess["page"].close()
+        with suppress(Exception):
+            await sess["page"].close()
     if sess.get("browser"):
-        await sess["browser"].close()
+        with suppress(Exception):
+            await sess["browser"].close()
     if sess.get("playwright"):
-        await sess["playwright"].stop()
+        with suppress(Exception):
+            await sess["playwright"].stop()
 
 
 class BrowserNavigateTool(BaseTool):

@@ -8,6 +8,7 @@ import uuid
 import copy
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from app.config import load_config, get_provider_for_model, get_model_for_agent, get_thinking_intensity_for_agent
@@ -55,6 +56,7 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR = runtime_dir("sessions")
 SESSION_REGISTRY_PATH = runtime_file("session_registry.json")
 GLOBAL_PROJECT_KEY = "__global__"
+_SESSION_RECORD_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 
 # Internal: resume agent loop after user clicks Build (WebSocket `build_plan`).
 PLAN_CONTINUE_MARKER = "__plan_continue__"
@@ -132,11 +134,26 @@ def _project_key_for_path(project_path: str | None) -> str:
     return ProjectManager.history_key(project_path) or GLOBAL_PROJECT_KEY
 
 
+def _project_key_for_canonical_path(project_path: str | None) -> str:
+    if not project_path or project_path == GLOBAL_PROJECT_KEY:
+        return GLOBAL_PROJECT_KEY
+    return str(project_path).replace("\\", "/").rstrip("/").lower()
+
+
 def _canonical_project_path(project_path: str | None) -> str | None:
     if not project_path:
         return None
     canonical = ProjectManager.canonical_project_path(project_path)
     return canonical or None
+
+
+def _canonical_project_path_cached(project_path: str | None, cache: Dict[str, str | None]) -> str | None:
+    if not project_path:
+        return None
+    key = str(project_path)
+    if key not in cache:
+        cache[key] = _canonical_project_path(key)
+    return cache[key]
 
 
 def _normalize_project_key(project_path: str | None = None) -> str:
@@ -281,6 +298,51 @@ def _session_title_from_data(data: Dict[str, Any]) -> str:
     return ""
 
 
+def _session_record_from_path(path: Path, canonical_cache: Dict[str, str | None]) -> Optional[Dict[str, Any]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        _SESSION_RECORD_CACHE.pop(str(path), None)
+        return None
+
+    cache_key = str(path)
+    cached = _SESSION_RECORD_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return dict(cached[2])
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+
+        stored_agent_type = _resolve_stored_agent_type(data)
+        session_id = data.get("session_id", path.stem)
+        messages = data.get("messages", [])
+        plan_state = data.get("plan_state")
+        record = {
+            "id": session_id,
+            "title": _session_title_from_data(data),
+            "project_path": _canonical_project_path_cached(data.get("project_path"), canonical_cache),
+            "model_id": data.get("model_id", ""),
+            "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
+            "agent_type": stored_agent_type,
+            "message_count": len(messages) if isinstance(messages, list) else 0,
+            "updated_at": stat.st_mtime,
+            "archived_at": data.get("archived_at"),
+            "_plan_phase": str(plan_state.get("phase") or "") if isinstance(plan_state, dict) else "",
+        }
+        _SESSION_RECORD_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, dict(record))
+        return record
+    except Exception:
+        _SESSION_RECORD_CACHE.pop(cache_key, None)
+        return None
+
+
+def forget_session_record_cache(session_id: str) -> None:
+    _SESSION_RECORD_CACHE.pop(str(SESSIONS_DIR / f"{session_id}.json"), None)
+
+
 def _session_title_from_messages(messages: List[Dict[str, Any]], plan_state: PlanState) -> str:
     for msg in messages:
         if msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
@@ -325,36 +387,27 @@ def _session_record_matches(
     return True
 
 
-def list_session_records(project_path: str = "", agent_type: str = "") -> List[Dict[str, Any]]:
+def list_session_records(project_path: str = "", agent_type: str = "", include_internal: bool = False) -> List[Dict[str, Any]]:
     registry = _load_session_registry()
     primary_id = registry.get("personal", {}).get("primary_session_id")
+    project_filter_key = _project_key_for_path(project_path) if project_path else ""
+    canonical_cache: Dict[str, str | None] = {}
     sessions: List[Dict[str, Any]] = []
     for path in SESSIONS_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            stored_agent_type = _resolve_stored_agent_type(data)
-            if agent_type and stored_agent_type != agent_type:
-                continue
-            sp = _canonical_project_path(data.get("project_path"))
-            if project_path and _project_key_for_path(sp) != _project_key_for_path(project_path):
-                continue
-            session_id = data.get("session_id", path.stem)
-            is_primary = stored_agent_type == "personal" and session_id == primary_id
-            sessions.append({
-                "id": session_id,
-                "title": _session_title_from_data(data),
-                "project_path": sp,
-                "model_id": data.get("model_id", ""),
-                "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
-                "agent_type": stored_agent_type,
-                "message_count": len(data.get("messages", [])),
-                "updated_at": path.stat().st_mtime,
-                "is_primary": is_primary,
-                "archived_at": data.get("archived_at"),
-            })
-        except Exception:
-            pass
+        record = _session_record_from_path(path, canonical_cache)
+        if not record:
+            continue
+        stored_agent_type = str(record.get("agent_type") or "")
+        if agent_type and stored_agent_type != agent_type:
+            continue
+        sp = record.get("project_path")
+        if project_filter_key and _project_key_for_canonical_path(sp) != project_filter_key:
+            continue
+        session_id = str(record.get("id") or path.stem)
+        record["is_primary"] = stored_agent_type == "personal" and session_id == primary_id
+        if not include_internal:
+            record.pop("_plan_phase", None)
+        sessions.append(record)
     return sorted(
         sessions,
         key=lambda s: (0 if s.get("is_primary") else 1, -float(s.get("updated_at", 0))),
