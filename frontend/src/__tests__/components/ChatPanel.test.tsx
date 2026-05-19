@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { ChatPanel } from '../../components/ChatPanel'
+import { __resetSlashCommandCacheForTests } from '../../components/SlashCommandMenu'
 import type { ChatMessage, PlanState } from '../../types'
 
 vi.mock('react-virtuoso', () => {
@@ -38,6 +39,14 @@ const idlePlanState: PlanState = {
 }
 
 describe('ChatPanel', () => {
+  beforeEach(() => {
+    __resetSlashCommandCacheForTests()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
   const defaultProps = {
     messages: [] as ChatMessage[],
     toolCalls: [],
@@ -257,6 +266,31 @@ describe('ChatPanel', () => {
   it('selects an open slash menu command without sending chat', async () => {
     const onSend = vi.fn()
     const onCommand = vi.fn()
+    const onDraftClear = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      json: async () => ({
+        commands: [
+          { name: 'help', description: 'Show help', args: '', category: 'general' },
+        ],
+      }),
+    })))
+
+    render(<ChatPanel {...defaultProps} onSend={onSend} onCommand={onCommand} onDraftClear={onDraftClear} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: '/' } })
+    await screen.findByText('/help')
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledWith('help', ''))
+    expect(onDraftClear).toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('can select a slash menu command more than once', async () => {
+    const onSend = vi.fn()
+    const onCommand = vi.fn()
     vi.stubGlobal('fetch', vi.fn(async () => ({
       json: async () => ({
         commands: [
@@ -273,6 +307,29 @@ describe('ChatPanel', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
 
     await waitFor(() => expect(onCommand).toHaveBeenCalledWith('help', ''))
+    fireEvent.change(input, { target: { value: '/' } })
+    await screen.findByText('/help')
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(2))
+    expect(onSend).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('does not swallow direct slash commands when the menu has no matches', () => {
+    const onSend = vi.fn()
+    const onCommand = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      json: async () => ({ commands: [] }),
+    })))
+
+    render(<ChatPanel {...defaultProps} onSend={onSend} onCommand={onCommand} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: '/clear' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(onCommand).toHaveBeenCalledWith('clear', '')
     expect(onSend).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })

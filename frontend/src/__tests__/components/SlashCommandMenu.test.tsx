@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useRef } from 'react'
-import { SlashCommandMenu } from '../../components/SlashCommandMenu'
+import { __resetSlashCommandCacheForTests, SlashCommandMenu } from '../../components/SlashCommandMenu'
 
 const commands = [
   { name: 'help', description: 'Show help', args: '', category: 'general' },
@@ -27,6 +27,7 @@ function Harness({ onSelect }: { onSelect: (cmd: any) => void }) {
 
 describe('SlashCommandMenu', () => {
   beforeEach(() => {
+    __resetSlashCommandCacheForTests()
     Element.prototype.scrollIntoView = vi.fn()
     vi.stubGlobal('fetch', vi.fn(async () => ({
       json: async () => ({ commands }),

@@ -1505,6 +1505,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const [hideToolNoise, setHideToolNoise] = useState<boolean>(getInitialNoiseFilter);
   const [slashQuery, setSlashQuery] = useState('');
   const showSlashMenu = slashQuery !== '';
+  const [slashVisibleCommandCount, setSlashVisibleCommandCount] = useState(0);
   const [atQuery, setAtQuery] = useState('');
   const showAtMenu = atQuery !== '';
 
@@ -1678,6 +1679,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       onCommand?.(slashCommand.command, slashCommand.args);
       setInput('');
       setSlashQuery('');
+      setSlashVisibleCommandCount(0);
       onDraftClear?.();
       if (textareaRef.current) {
         textareaRef.current.style.height = '40px';
@@ -1709,9 +1711,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   const handleCommand = useCallback((cmd: { name: string; args: string }) => {
     setSlashQuery('');
+    setSlashVisibleCommandCount(0);
     if (DIRECT_COMMANDS.has(cmd.name)) {
-      onCommand?.(cmd.name, '');
       setInput('');
+      onDraftClear?.();
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      onCommand?.(cmd.name, '');
     } else if (ARG_COMMANDS.has(cmd.name) || cmd.args) {
       // For commands with args, fill the command prefix and let user type args
       setInput(`/${cmd.name} `);
@@ -1720,7 +1727,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setInput(`/${cmd.name} `);
       setTimeout(() => textareaRef.current?.focus(), 0);
     }
-  }, [onCommand]);
+  }, [onCommand, onDraftClear]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.defaultPrevented) return;
@@ -1729,7 +1736,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       onChatModeChange('plan');
       return;
     }
-    if (showSlashMenu && COMMAND_KEYS.has(e.key)) {
+    if (showSlashMenu && e.key === 'Escape') {
+      e.preventDefault();
+      setSlashQuery('');
+      setSlashVisibleCommandCount(0);
+      return;
+    }
+    if (showSlashMenu && slashVisibleCommandCount > 0 && COMMAND_KEYS.has(e.key)) {
       e.preventDefault();
       return;
     }
@@ -2484,6 +2497,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                   setSlashQuery(val);
                 } else {
                   setSlashQuery('');
+                  setSlashVisibleCommandCount(0);
                 }
                 // @Mention detection: @ anywhere in input (look for last @)
                 const atIdx = val.lastIndexOf('@');
@@ -2516,8 +2530,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               <SlashCommandMenu
                 query={slashQuery}
                 onSelect={(cmd) => handleCommand(cmd)}
-                onClose={() => setSlashQuery('')}
+                onClose={() => {
+                  setSlashQuery('');
+                  setSlashVisibleCommandCount(0);
+                }}
                 inputRef={textareaRef}
+                onVisibleCommandsChange={setSlashVisibleCommandCount}
               />
             )}
             {showAtMenu && (

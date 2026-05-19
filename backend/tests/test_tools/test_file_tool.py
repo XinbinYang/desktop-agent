@@ -223,6 +223,10 @@ class TestFileSandbox:
     def write_tool(self):
         return FileWriteTool()
 
+    @pytest.fixture
+    def delete_tool(self):
+        return FileDeleteTool()
+
     @pytest.mark.asyncio
     async def test_read_outside_project_is_blocked(self, read_tool):
         result = await read_tool.execute(path="C:/Windows/System32/notepad.exe")
@@ -262,7 +266,7 @@ class TestFileSandbox:
         from app.runtime_paths import agents_dir, repo_root
 
         probe_rel = "AGENTS/personal/__test_probe__.md"
-        expected = agents_dir() / "personal" / "__test_probe__.md"
+        expected = agents_dir() / "personal" / "WORKSPACE" / "__test_probe__.md"
         repo_template = repo_root() / probe_rel
         # Clean up any leftover from previous runs
         if expected.exists():
@@ -283,6 +287,46 @@ class TestFileSandbox:
         assert not wrong.exists(), f"File incorrectly landed at {wrong}"
 
         # Cleanup
+        expected.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_personal_agent_protected_rules_write_is_blocked(self, write_tool):
+        result = await write_tool.execute(
+            path="AGENTS/personal/AGENTS.md",
+            content="bad",
+            agent_type="personal",
+        )
+        assert "Protected Agent system files" in result.error
+
+    @pytest.mark.asyncio
+    async def test_personal_agent_protected_rules_delete_is_blocked(self, delete_tool):
+        from app.runtime_paths import agents_dir
+
+        protected = agents_dir() / "personal" / "AGENTS.md"
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        if not protected.exists():
+            protected.write_text("protected", encoding="utf-8")
+
+        result = await delete_tool.execute(path="AGENTS/personal/AGENTS.md", agent_type="personal")
+
+        assert "Protected Agent system files" in result.error
+        assert protected.exists()
+
+    @pytest.mark.asyncio
+    async def test_shared_preferences_alias_writes_to_shared_workspace(self, write_tool):
+        from app.runtime_paths import agents_dir
+
+        expected = agents_dir() / "_shared" / "WORKSPACE" / "user_preferences.md"
+        expected.unlink(missing_ok=True)
+
+        result = await write_tool.execute(
+            path="AGENTS/_shared/user_preferences.md",
+            content="prefs ok",
+            agent_type="personal",
+        )
+
+        assert result.error == ""
+        assert expected.read_text(encoding="utf-8") == "prefs ok"
         expected.unlink(missing_ok=True)
 
 
@@ -316,7 +360,7 @@ class TestFileSandboxUnrestricted:
         from app.runtime_paths import agents_dir, repo_root
 
         probe_rel = "AGENTS/personal/__test_probe_unrestricted__.md"
-        expected = agents_dir() / "personal" / "__test_probe_unrestricted__.md"
+        expected = agents_dir() / "personal" / "WORKSPACE" / "__test_probe_unrestricted__.md"
         repo_template = repo_root() / probe_rel
         if expected.exists():
             expected.unlink()

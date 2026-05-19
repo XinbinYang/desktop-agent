@@ -76,6 +76,10 @@ def _seed_personal_from_bundle(source: Path, target: Path) -> None:
     for child in personal_src.iterdir():
         if child.is_symlink():
             continue
+        if child.name == PERSONAL_WORKSPACE_DIRNAME:
+            if child.is_dir():
+                _copy_regular_tree(child, workspace_dst)
+            continue
         if child.name in PERSONAL_SYSTEM_FILES:
             if child.is_file():
                 _copy_regular_file(child, personal_dst / child.name)
@@ -98,6 +102,10 @@ def _seed_shared_from_bundle(source: Path, target: Path) -> None:
 
     for child in shared_src.iterdir():
         if child.is_symlink():
+            continue
+        if child.name == PERSONAL_WORKSPACE_DIRNAME:
+            if child.is_dir():
+                _copy_regular_tree(child, workspace_dst)
             continue
         if child.name in SHARED_SYSTEM_FILES:
             if child.is_file():
@@ -140,7 +148,7 @@ _AGENT_HOME_REPLACEMENTS: dict[str, tuple[tuple[str, str], ...]] = {
             "- 只有当用户**明确要求**时，才使用 `git_clone` 或访问外部网站（`browser_navigate`）。\n"
             "- 用户让你\"熟悉代码库\"\"了解项目\"时，应直接读取当前目录下的文件，而不是去外部搜索。",
             "## 运行环境锚定\n\n"
-            "- Personal Agent 的默认身份不绑定任何代码项目；它的身份、记忆、日记和技能位于 runtime `AGENTS/personal/`。\n"
+            "- Personal Agent 的默认身份不绑定任何代码项目；它的身份、记忆、日记和技能位于 runtime `AGENTS/personal/WORKSPACE/`。\n"
             "- Coding Agent 才绑定当前打开的项目；涉及项目代码、测试、Git 和 repo 规则时，以 Coding Agent 收到的项目路径为准。\n"
             "- **禁止主动克隆外部仓库、搜索外部模板、或访问与当前任务无关的外部资源。**\n"
             "- 只有当用户**明确要求**时，才使用 `git_clone` 或访问外部网站（`browser_navigate`）。\n"
@@ -151,7 +159,7 @@ _AGENT_HOME_REPLACEMENTS: dict[str, tuple[tuple[str, str], ...]] = {
         (
             "> - 工作区根 = 项目仓库根目录（即 `desktop-agent` 所在的目录）。\n"
             "> - 你的身份与记忆文件统一位于运行时 `AGENTS/personal/`。",
-            "> - Personal home = 运行时 `AGENTS/personal/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。\n"
+            "> - Personal home = 运行时 `AGENTS/personal/WORKSPACE/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。\n"
             "> - 当前打开的代码项目只是用户可能正在处理的工作目标，不是你的身份、家或源码位置。",
         ),
     ),
@@ -159,12 +167,12 @@ _AGENT_HOME_REPLACEMENTS: dict[str, tuple[tuple[str, str], ...]] = {
         (
             "> - 工作区根 = 项目仓库根目录（即 `desktop-agent` 所在的目录）。\n"
             "> - 你的身份与记忆文件统一位于 `AGENTS/personal/`。",
-            "> - Personal home = 运行时 `AGENTS/personal/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。\n"
+            "> - Personal home = 运行时 `AGENTS/personal/WORKSPACE/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。\n"
             "> - 当前打开的代码项目只是用户可能正在处理的工作目标，不是你的身份、家或源码位置。",
         ),
         (
             ">   相对路径如 `AGENTS/personal/USER.md` 会相对工作区根解析。",
-            ">   相对路径如 `AGENTS/personal/USER.md` 会被解析到 runtime AGENTS workspace。",
+            ">   相对路径如 `AGENTS/personal/USER.md` 会被兼容映射到 runtime `AGENTS/personal/WORKSPACE/USER.md`。",
         ),
     ),
     "coding/AGENTS.md": (

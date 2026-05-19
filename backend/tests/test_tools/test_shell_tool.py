@@ -85,12 +85,21 @@ class TestShellExecuteTool:
         # Should return non-zero exit code
         assert result.error != "" or "无输出" in result.output
 
-    def test_personal_default_work_dir_is_runtime_home(self):
+    def test_personal_default_work_dir_is_runtime_workspace(self):
         from app.runtime_paths import agents_dir
         from app.tools.shell_tool import _default_work_dir
 
-        expected = agents_dir() / "personal"
+        expected = agents_dir() / "personal" / "WORKSPACE"
         assert _default_work_dir("personal") == str(expected)
+
+    @pytest.mark.asyncio
+    async def test_personal_shell_rejects_protected_agent_cwd(self, tool):
+        from app.runtime_paths import agents_dir
+
+        protected = agents_dir() / "personal"
+        result = await tool.execute(command="echo no", cwd=str(protected), agent_type="personal")
+
+        assert "Personal Agent shell cwd must be inside AGENTS/personal/WORKSPACE" in result.error
 
     def test_coding_default_work_dir_uses_bound_project(self, tmp_path, isolate_projects):
         from app.coding_runs import reset_session_project, set_session_project
@@ -157,3 +166,12 @@ class TestShellStartTool:
         else:
             result = await tool.execute(command="echo safe_test")
         assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_personal_start_rejects_protected_agent_cwd(self, tool):
+        from app.runtime_paths import agents_dir
+
+        protected = agents_dir() / "personal"
+        result = await tool.execute(command="echo no", cwd=str(protected), agent_type="personal")
+
+        assert "Personal Agent shell cwd must be inside AGENTS/personal/WORKSPACE" in result.error

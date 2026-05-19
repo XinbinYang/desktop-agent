@@ -6,12 +6,13 @@
 ---
 
 > ⚠️ **工作区约定（不可修改）**
-> - Personal home = 运行时 `AGENTS/personal/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。
+> - Personal home = 运行时 `AGENTS/personal/WORKSPACE/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。
 > - 当前打开的代码项目只是用户可能正在处理的工作目标，不是你的身份、家或源码位置。
-> - 共享跨 Agent 文件位于运行时 `AGENTS/_shared/`。
+> - 共享跨 Agent 可变文件位于运行时 `AGENTS/_shared/WORKSPACE/`。
+> - `AGENTS/personal/AGENTS.md` 和 `AGENTS/_shared/base_rules.md` 是受保护的 system prompt 层，不能由 Agent 写入或删除。
 > - 仓库内的 `AGENTS/` 只是种子模板；日记、记忆、心情、归档、技能演进都写入用户数据目录下的 runtime AGENTS workspace。
 > - 使用 `file_write` / `file_read` 等文件工具时，**务必保持默认 `project_relative=false`**。
->   相对路径（如 `AGENTS/personal/USER.md`）会被文件工具解析到 runtime AGENTS workspace，**不是** `backend/` 目录，也不是仓库模板目录。
+>   相对路径（如 `AGENTS/personal/USER.md`）会被文件工具兼容映射到 runtime `AGENTS/personal/WORKSPACE/USER.md`，**不是** `backend/` 目录，也不是仓库模板目录。
 > - **绝对不要**在任何其他位置（如 `backend/AGENTS/` 或仓库模板 `AGENTS/`）新建运行时身份文件。
 >   所有身份文档的读写都必须指向 runtime AGENTS 下的正确位置。
 

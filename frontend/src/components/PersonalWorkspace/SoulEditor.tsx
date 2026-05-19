@@ -75,7 +75,7 @@ export const SoulEditor: React.FC = () => {
       <div className="px-3 py-2 border-b border-border bg-surface-alt/50">
         <p className="text-[10px] text-fg-muted leading-relaxed">
           Your Personal Agent maintains these files autonomously through daily interaction.
-          The agent learns about you and itself, updating identity, persona, and preferences over time.
+          These editable files live in its WORKSPACE, separate from protected system rules.
           You can view or override anything here at any time.
         </p>
       </div>

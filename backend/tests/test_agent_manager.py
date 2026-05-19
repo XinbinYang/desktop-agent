@@ -36,10 +36,10 @@ class TestAgentManagerPromptRendering:
         from app.project_manager import ProjectManager
 
         agents_root = tmp_path / "AGENTS"
-        (agents_root / "personal").mkdir(parents=True)
+        (agents_root / "personal" / "WORKSPACE").mkdir(parents=True)
         (agents_root / "_shared").mkdir(parents=True)
         (agents_root / "personal" / "AGENTS.md").write_text("Personal Agent rules", encoding="utf-8")
-        (agents_root / "personal" / "SOUL.md").write_text("Personal Agent soul", encoding="utf-8")
+        (agents_root / "personal" / "WORKSPACE" / "SOUL.md").write_text("Personal Agent soul", encoding="utf-8")
         (agents_root / "_shared" / "base_rules.md").write_text("Shared non-project rules", encoding="utf-8")
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
 
@@ -87,7 +87,7 @@ class TestAgentManagerPromptRendering:
 
     def test_bootstrap_injection(self, tmp_path, monkeypatch):
         """When BOOTSTRAP.md exists, it must be injected at highest priority."""
-        personal_dir = tmp_path / "personal"
+        personal_dir = tmp_path / "personal" / "WORKSPACE"
         personal_dir.mkdir(parents=True)
         (personal_dir / "BOOTSTRAP.md").write_text("# BOOTSTRAP CONTENT HERE", encoding="utf-8")
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
@@ -98,7 +98,7 @@ class TestAgentManagerPromptRendering:
 
     def test_empty_user_md_triggers_bootstrap_hint(self, tmp_path, monkeypatch):
         """When USER.md contains template placeholders, a bootstrap hint is appended."""
-        personal_dir = tmp_path / "personal"
+        personal_dir = tmp_path / "personal" / "WORKSPACE"
         personal_dir.mkdir(parents=True)
         (personal_dir / "USER.md").write_text("- **称呼**: （请填写你的名字或昵称）", encoding="utf-8")
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
@@ -137,9 +137,11 @@ class TestAgentManagerWorkspaceFiles:
         from app import runtime_paths
 
         bundle = tmp_path / "bundle"
-        template_file = bundle / "AGENTS" / "personal" / "USER.md"
+        template_file = bundle / "AGENTS" / "personal" / "WORKSPACE" / "USER.md"
         template_file.parent.mkdir(parents=True)
         template_file.write_text("seed user", encoding="utf-8")
+        (bundle / "AGENTS" / "personal" / "WORKSPACE" / "BOOTSTRAP.md").write_text("seed bootstrap", encoding="utf-8")
+        (bundle / "AGENTS" / "personal" / "AGENTS.md").write_text("protected rules", encoding="utf-8")
         user_data = tmp_path / "user-data"
 
         monkeypatch.setenv(runtime_paths.USER_DATA_ENV, str(user_data))
@@ -147,12 +149,17 @@ class TestAgentManagerWorkspaceFiles:
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", None)
 
         root = AgentManager._agents_root()
-        runtime_file = root / "personal" / "USER.md"
+        runtime_file = root / "personal" / "WORKSPACE" / "USER.md"
+        runtime_bootstrap = root / "personal" / "WORKSPACE" / "BOOTSTRAP.md"
         assert root == user_data / "backend" / "AGENTS"
+        assert (root / "personal" / "AGENTS.md").read_text(encoding="utf-8") == "protected rules"
         assert runtime_file.read_text(encoding="utf-8") == "seed user"
+        assert runtime_bootstrap.read_text(encoding="utf-8") == "seed bootstrap"
 
         runtime_file.write_text("custom user", encoding="utf-8")
-        assert AgentManager._agents_root().joinpath("personal", "USER.md").read_text(encoding="utf-8") == "custom user"
+        runtime_bootstrap.unlink()
+        assert AgentManager._agents_root().joinpath("personal", "WORKSPACE", "USER.md").read_text(encoding="utf-8") == "custom user"
+        assert not AgentManager._agents_root().joinpath("personal", "WORKSPACE", "BOOTSTRAP.md").exists()
 
     def test_save_and_load_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
@@ -170,6 +177,15 @@ class TestAgentManagerWorkspaceFiles:
         assert "a.md" in names
         assert "b.md" in names
 
+    def test_shared_preferences_logical_file_maps_to_shared_workspace(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
+
+        ok = AgentManager.save_workspace_file("_shared", "user_preferences.md", "prefs")
+
+        assert ok
+        assert (tmp_path / "_shared" / "WORKSPACE" / "user_preferences.md").read_text(encoding="utf-8") == "prefs"
+        assert AgentManager.load_workspace_file("_shared", "user_preferences.md") == "prefs"
+
     def test_list_agents(self):
         agents = AgentManager.list_agents()
         assert len(agents) == 2
@@ -178,7 +194,7 @@ class TestAgentManagerWorkspaceFiles:
 
     def test_agents_files_api_reads_runtime_workspace(self, client, tmp_path, monkeypatch):
         runtime_agents = tmp_path / "AGENTS"
-        personal = runtime_agents / "personal"
+        personal = runtime_agents / "personal" / "WORKSPACE"
         personal.mkdir(parents=True)
         (personal / "USER.md").write_text("runtime user profile", encoding="utf-8")
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", runtime_agents)
@@ -222,6 +238,36 @@ class TestAgentManagerWorkspaceFiles:
         assert "CUSTOM_PERSONAL_LINE" in personal_text
         assert any(tmp_path.glob("AGENTS-personal-home-migration-*"))
 
+    def test_personal_workspace_layout_migration_moves_mutable_files(self, tmp_path):
+        from app import runtime_paths
+
+        runtime_agents = tmp_path / "AGENTS"
+        personal = runtime_agents / "personal"
+        shared = runtime_agents / "_shared"
+        (personal / "memory").mkdir(parents=True)
+        (personal / "skills").mkdir()
+        shared.mkdir(parents=True)
+        (personal / "AGENTS.md").write_text("protected personal rules", encoding="utf-8")
+        (personal / "SOUL.md").write_text("old soul", encoding="utf-8")
+        (personal / "USER.md").write_text("old user", encoding="utf-8")
+        (personal / "memory" / "day.md").write_text("diary", encoding="utf-8")
+        (personal / "skills" / "one.md").write_text("skill", encoding="utf-8")
+        (shared / "base_rules.md").write_text("protected shared rules", encoding="utf-8")
+        (shared / "user_preferences.md").write_text("prefs", encoding="utf-8")
+
+        runtime_paths._migrate_personal_workspace_layout(runtime_agents)
+
+        workspace = personal / "WORKSPACE"
+        shared_workspace = shared / "WORKSPACE"
+        assert (personal / "AGENTS.md").read_text(encoding="utf-8") == "protected personal rules"
+        assert (shared / "base_rules.md").read_text(encoding="utf-8") == "protected shared rules"
+        assert (workspace / "SOUL.md").read_text(encoding="utf-8") == "old soul"
+        assert (workspace / "USER.md").read_text(encoding="utf-8") == "old user"
+        assert (workspace / "memory" / "day.md").read_text(encoding="utf-8") == "diary"
+        assert (workspace / "skills" / "one.md").read_text(encoding="utf-8") == "skill"
+        assert (shared_workspace / "user_preferences.md").read_text(encoding="utf-8") == "prefs"
+        assert (runtime_agents / ".personal-workspace-migration-v1").exists()
+
 
 class TestBootstrapManagement:
     """Verify bootstrap lifecycle."""
@@ -232,25 +278,25 @@ class TestBootstrapManagement:
 
     def test_is_bootstrapped_false_when_file_exists(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-        (tmp_path / "personal").mkdir(parents=True)
-        (tmp_path / "personal" / "BOOTSTRAP.md").write_text("test", encoding="utf-8")
+        (tmp_path / "personal" / "WORKSPACE").mkdir(parents=True)
+        (tmp_path / "personal" / "WORKSPACE" / "BOOTSTRAP.md").write_text("test", encoding="utf-8")
         assert AgentManager.is_bootstrapped() is False
 
     def test_reset_bootstrap_creates_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
         assert AgentManager.reset_bootstrap() is True
-        assert (tmp_path / "personal" / "BOOTSTRAP.md").exists()
+        assert (tmp_path / "personal" / "WORKSPACE" / "BOOTSTRAP.md").exists()
         assert AgentManager.is_bootstrapped() is False
 
     def test_reset_bootstrap_idempotent(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
         AgentManager.reset_bootstrap()
         AgentManager.reset_bootstrap()
-        assert (tmp_path / "personal" / "BOOTSTRAP.md").exists()
+        assert (tmp_path / "personal" / "WORKSPACE" / "BOOTSTRAP.md").exists()
 
     def test_complete_bootstrap_archives_and_removes_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-        bootstrap = tmp_path / "personal" / "BOOTSTRAP.md"
+        bootstrap = tmp_path / "personal" / "WORKSPACE" / "BOOTSTRAP.md"
         bootstrap.parent.mkdir(parents=True)
         bootstrap.write_text("bootstrap body", encoding="utf-8")
 
@@ -258,13 +304,13 @@ class TestBootstrapManagement:
 
         assert AgentManager.is_bootstrapped() is True
         assert not bootstrap.exists()
-        archives = list((tmp_path / "personal" / ".archive" / "bootstrap").glob("BOOTSTRAP.completed.*.md"))
+        archives = list((tmp_path / "personal" / "WORKSPACE" / ".archive" / "bootstrap").glob("BOOTSTRAP.completed.*.md"))
         assert archives
         assert archives[0].read_text(encoding="utf-8") == "bootstrap body"
 
     def test_complete_bootstrap_endpoint(self, client, tmp_path, monkeypatch):
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-        bootstrap = tmp_path / "personal" / "BOOTSTRAP.md"
+        bootstrap = tmp_path / "personal" / "WORKSPACE" / "BOOTSTRAP.md"
         bootstrap.parent.mkdir(parents=True)
         bootstrap.write_text("bootstrap body", encoding="utf-8")
 

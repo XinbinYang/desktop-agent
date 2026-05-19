@@ -144,7 +144,7 @@ export const EvolutionPanel: React.FC = () => {
             {/* Trigger info */}
             <div className="text-[10px] text-fg-muted">
               <p>Evolution triggers automatically after 15 completed tasks or 5 user feedback items.</p>
-              <p className="mt-1">Before each evolution, a snapshot of SOUL.md, INNER.md, IDENTITY.md, AGENTS.md, and MEMORY.md is archived.</p>
+              <p className="mt-1">Before each evolution, a snapshot of mutable WORKSPACE identity files and protected AGENTS.md is archived.</p>
             </div>
           </>
         )}

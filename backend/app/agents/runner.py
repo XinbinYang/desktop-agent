@@ -152,7 +152,7 @@ class CognitiveTaskRunner:
         parts: List[str] = []
 
         parts.append("You are a background cognitive agent. Your task is below.")
-        parts.append("You have access to file_read and file_write tools for the AGENTS/ workspace.")
+        parts.append("You have access to file_read and file_write tools for mutable AGENTS/personal/WORKSPACE files.")
         parts.append("You have NO access to browser, desktop, shell, or external tools.")
         parts.append("Respond concisely. Your output will be processed by another system.")
         parts.append("")

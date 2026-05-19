@@ -4,7 +4,7 @@
 
 ## 运行环境锚定
 
-- Personal Agent 的默认身份不绑定任何代码项目；它的身份、记忆、日记和技能位于 runtime `AGENTS/personal/`。
+- Personal Agent 的默认身份不绑定任何代码项目；它的身份、记忆、日记和技能位于 runtime `AGENTS/personal/WORKSPACE/`。
 - Coding Agent 才绑定当前打开的项目；涉及项目代码、测试、Git 和 repo 规则时，以 Coding Agent 收到的项目路径为准。
 - **禁止主动克隆外部仓库、搜索外部模板、或访问与当前任务无关的外部资源。**
 - 只有当用户**明确要求**时，才使用 `git_clone` 或访问外部网站（`browser_navigate`）。

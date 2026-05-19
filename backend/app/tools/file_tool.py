@@ -177,7 +177,7 @@ def _resolve_agent_workspace_path(
         resolved, protected, err = _resolve_agent_logical_path(root, rel)
         if err:
             return resolved, err
-        if access in {"write", "delete"} and protected:
+        if access in {"write", "delete"} and (protected or _is_protected_agent_path(resolved, root)):
             return resolved, "Protected Agent system files cannot be modified by file tools. Use the Personal WORKSPACE instead."
         return resolved, None
     except (OSError, ValueError) as e:
@@ -194,10 +194,9 @@ def _validate_path(
     """Validate that a path is within the sandbox. Returns (resolved_path, error_message)."""
     from app.config import load_config
 
-    if not project_relative:
-        agent_path, agent_err = _resolve_agent_workspace_path(path, agent_type=agent_type, access=access)
-        if agent_path is not None or agent_err:
-            return agent_path or Path(path), agent_err
+    agent_path, agent_err = _resolve_agent_workspace_path(path, agent_type=agent_type, access=access)
+    if agent_path is not None or agent_err:
+        return agent_path or Path(path), agent_err
 
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
