@@ -120,6 +120,58 @@ class TestAgentSession:
         assert "user turn 0" in remaining_text
         assert "user turn 5" in remaining_text
         assert result["context_usage"]["context_message_count"] <= result["after_message_count"]
+        assert result["preserved_recent_turns"] == 4
+        assert session.compaction_state["compacted_through_checkpoint_id"]
+        assert result["context_usage"]["compaction_active"] is True
+        assert result["context_usage"]["summarized_message_count"] > 0
+
+    @pytest.mark.asyncio
+    async def test_compact_context_merges_existing_summary_with_new_delta(self, session):
+        captured_summary_messages = []
+
+        async def fake_summary(*args, **kwargs):
+            messages = kwargs.get("messages") or args[0]
+            captured_summary_messages.append(messages)
+            return {"choices": [{"message": {"content": f"Summary v{len(captured_summary_messages)}"}}]}
+
+        for i in range(6):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session.router.chat_completion_non_stream = fake_summary
+
+        first = await session.compact_context(force=True)
+        for i in range(6, 8):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        second = await session.compact_context(force=True)
+
+        assert first is not None and first["skipped"] is False
+        assert second is not None and second["skipped"] is False
+        assert session.compaction_summary == "Summary v2"
+        assert session.compaction_state["compacted_turn_count"] == 8
+        second_prompt = captured_summary_messages[1][0]["content"]
+        assert "Previous compacted summary to merge" in second_prompt
+        assert "Summary v1" in second_prompt
+        assert "user turn 2" in second_prompt
+        assert "user turn 7" not in second_prompt
+
+    @pytest.mark.asyncio
+    async def test_compact_context_failure_preserves_existing_summary(self, session):
+        async def failing_summary(*args, **kwargs):
+            raise RuntimeError("summary model unavailable")
+
+        session.compaction_summary = "Existing summary"
+        session.compaction_state["compacted_turn_count"] = 4
+        for i in range(8):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session.router.chat_completion_non_stream = failing_summary
+
+        result = await session.compact_context(force=True, trigger="hard")
+
+        assert result is None
+        assert session.compaction_summary == "Existing summary"
+        assert "summary model unavailable" in session.compaction_state["last_auto_error"]
 
     def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
         import app.agent as agent_module
@@ -445,6 +497,59 @@ class TestAgentSession:
         assert "Summary: old review context" in first_call_text
 
     @pytest.mark.asyncio
+    async def test_run_auto_compacts_at_soft_pressure_before_trimming(self, session):
+        captured_messages = []
+        run_input = "continue from the session"
+
+        async def fake_summary(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Summary: proactive context continuity."}}]}
+
+        async def stream_with_capture(*args, **kwargs):
+            captured_messages.append(kwargs.get("messages") or args[0])
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Continued after proactive compaction.",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        session.router.chat_completion_non_stream = fake_summary
+        session._tool_schema_token_estimate = lambda: 0
+        for i in range(6):
+            session.messages.append({
+                "role": "user",
+                "content": f"older turn {i} " + ("context " * 80),
+                "source": "user",
+            })
+            session.messages.append({"role": "assistant", "content": "answer " + ("details " * 80)})
+        session._last_user_message = run_input
+        session._refresh_system_prompt()
+        session._ensure_message_metadata()
+        projected_messages = session.messages + [{"role": "user", "content": run_input, "source": "user"}]
+        projected_tokens = session._estimate_messages_tokens(projected_messages)
+        budget = max(projected_tokens + 1, int(projected_tokens / 0.80))
+        session._model_input_token_budget = lambda: budget
+        session._model_context_limit = lambda: budget * 2
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_with_capture):
+            events = []
+            async for event in session.run(run_input):
+                events.append(event)
+
+        compacted = next(e for e in events if e["type"] == "compacted")
+        assert compacted["data"].get("auto") is True
+        assert compacted["data"].get("trigger") == "soft"
+        assert compacted["data"].get("preserved_recent_turns") == 4
+        assert session.compaction_summary.startswith("Summary:")
+        assert captured_messages
+
+    @pytest.mark.asyncio
     async def test_invalid_tool_arguments_are_reported_as_tool_result(self, session):
         session.max_iterations = 1
         mock_response = {
@@ -595,6 +700,57 @@ class TestAgentSession:
         assert len([m for m in snapshot["messages"] if m.get("role") == "user"]) == 30
         assert snapshot["context_message_count"] == snapshot["transcript_message_count"]
         assert snapshot["context_truncated"] is False
+
+    def test_save_and_load_preserves_compaction_state(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="compacted_history")
+        session.messages.append({"role": "user", "content": "historical task", "source": "user"})
+        session.messages.append({"role": "assistant", "content": "historical answer"})
+        session._ensure_message_metadata()
+        boundary = session.messages[-1]
+        session.compaction_summary = "Summary: persisted context."
+        session.compaction_state.update({
+            "compacted_through_checkpoint_id": boundary["checkpoint_id"],
+            "compacted_through_message_id": boundary["message_id"],
+            "compacted_turn_count": 1,
+            "last_compacted_at": "2026-05-19T00:00:00+00:00",
+        })
+        session._save()
+
+        loaded = AgentSession.load("compacted_history")
+
+        assert loaded is not None
+        assert loaded.compaction_summary == "Summary: persisted context."
+        assert loaded.compaction_state["compacted_through_checkpoint_id"] == boundary["checkpoint_id"]
+        assert loaded.compaction_state["compacted_through_message_id"] == boundary["message_id"]
+        assert loaded.to_snapshot()["compaction_state"]["compacted_turn_count"] == 1
+
+    def test_load_old_session_without_compaction_state_is_uncompacted(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+        (tmp_path / "old_compaction.json").write_text(json.dumps({
+            "session_id": "old_compaction",
+            "model_id": "gpt-4o",
+            "role_id": "desktop-agent",
+            "messages": [
+                {"role": "system", "content": "old system"},
+                {"role": "user", "content": "old user", "source": "user"},
+            ],
+            "compaction_summary": "Legacy summary should not activate without state.",
+        }), encoding="utf-8")
+
+        loaded = AgentSession.load("old_compaction")
+
+        assert loaded is not None
+        assert loaded.compaction_summary == ""
+        assert loaded.compaction_state["compacted_turn_count"] == 0
+        assert loaded.context_usage()["compaction_active"] is False
 
     def test_refresh_mcp_tools_does_not_persist_transcript_side_effects(self, session, tmp_path, monkeypatch):
         import app.agent as agent_module

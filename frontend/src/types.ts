@@ -31,6 +31,10 @@ export interface ContextUsage {
   transcript_estimated_tokens?: number;
   context_estimated_tokens?: number;
   context_truncated?: boolean;
+  compaction_active?: boolean;
+  compacted_through_checkpoint_id?: string;
+  summarized_message_count?: number;
+  unsummarized_context_truncated?: boolean;
 }
 
 export interface ConversationCheckpoint {

@@ -60,6 +60,12 @@ GLOBAL_PROJECT_KEY = "__global__"
 PLAN_CONTINUE_MARKER = "__plan_continue__"
 MAX_TASK_GUIDANCE_ITEMS = 20
 MAX_TASK_GUIDANCE_TEXT_CHARS = 8000
+COMPACTION_STATE_VERSION = 1
+COMPACTION_SOFT_PRESSURE = 0.78
+COMPACTION_HARD_PRESSURE = 0.90
+COMPACTION_RECENT_USER_TURNS = 4
+COMPACTION_MIN_NEW_USER_TURNS = 2
+COMPACTION_SUMMARY_MAX_CHARS = 6000
 
 _LOCAL_MESSAGE_META_KEYS: frozenset[str] = frozenset({
     "message_id",
@@ -521,6 +527,7 @@ class AgentSession:
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
         self.compaction_summary: str = ""
+        self.compaction_state: Dict[str, Any] = self._default_compaction_state()
         self._last_usage: Dict[str, Any] = {}
         self._last_context_usage: Dict[str, Any] = {}
         self.team_id: str | None = None
@@ -1205,6 +1212,122 @@ class AgentSession:
             else:
                 self._stamp_message(msg)
 
+    @staticmethod
+    def _default_compaction_state() -> Dict[str, Any]:
+        return {
+            "version": COMPACTION_STATE_VERSION,
+            "compacted_through_checkpoint_id": "",
+            "compacted_through_message_id": "",
+            "compacted_turn_count": 0,
+            "last_compacted_at": "",
+            "last_auto_error": "",
+        }
+
+    def _normalize_compaction_state(self, raw: Any = None) -> Dict[str, Any]:
+        state = self._default_compaction_state()
+        if not isinstance(raw, dict):
+            return state
+
+        for key in (
+            "compacted_through_checkpoint_id",
+            "compacted_through_message_id",
+            "last_compacted_at",
+            "last_auto_error",
+        ):
+            value = raw.get(key)
+            if value is not None:
+                state[key] = str(value)
+
+        try:
+            state["compacted_turn_count"] = max(0, int(raw.get("compacted_turn_count") or 0))
+        except (TypeError, ValueError):
+            state["compacted_turn_count"] = 0
+        return state
+
+    def _reset_compaction_state(self) -> None:
+        self.compaction_summary = ""
+        self.compaction_state = self._default_compaction_state()
+
+    def _real_user_checkpoint_ids(self) -> List[str]:
+        self._ensure_message_metadata()
+        checkpoint_ids: list[str] = []
+        for msg in self.messages:
+            if msg.get("role") != "user" or msg.get("source") == "internal":
+                continue
+            checkpoint_id = msg.get("checkpoint_id")
+            if checkpoint_id and checkpoint_id not in checkpoint_ids:
+                checkpoint_ids.append(str(checkpoint_id))
+        return checkpoint_ids
+
+    def _real_user_turn_count(self) -> int:
+        return len(self._real_user_checkpoint_ids())
+
+    def _compacted_boundary_index(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        if not self.compaction_summary:
+            return None
+
+        state = self._normalize_compaction_state(self.compaction_state)
+        message_id = state.get("compacted_through_message_id") or ""
+        if message_id:
+            for index, msg in enumerate(messages):
+                if msg.get("message_id") == message_id:
+                    return index
+
+        checkpoint_id = state.get("compacted_through_checkpoint_id") or ""
+        if checkpoint_id:
+            boundary_index = -1
+            for index, msg in enumerate(messages):
+                if msg.get("checkpoint_id") == checkpoint_id:
+                    boundary_index = index
+            if boundary_index >= 0:
+                return boundary_index
+        return None
+
+    def _messages_after_compaction_boundary(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        boundary_index = self._compacted_boundary_index(messages)
+        if boundary_index is None:
+            return messages, 0
+
+        summarized_count = len([
+            msg
+            for index, msg in enumerate(messages)
+            if index <= boundary_index and msg.get("role") != "system"
+        ])
+        if not messages or messages[0].get("role") != "system":
+            return messages[boundary_index + 1:], summarized_count
+        return [messages[0]] + messages[boundary_index + 1:], summarized_count
+
+    def _auto_compaction_has_new_turns(self) -> bool:
+        if not self.compaction_summary:
+            return True
+        compacted_turn_count = int(
+            self._normalize_compaction_state(self.compaction_state).get("compacted_turn_count") or 0
+        )
+        if compacted_turn_count <= 0:
+            return True
+        return self._real_user_turn_count() - compacted_turn_count >= COMPACTION_MIN_NEW_USER_TURNS
+
+    def _auto_compaction_trigger(self, usage: Dict[str, Any]) -> str:
+        try:
+            context_tokens = float(usage.get("context_estimated_tokens") or usage.get("estimated_tokens") or 0)
+        except (TypeError, ValueError):
+            context_tokens = 0.0
+        pressure = context_tokens / max(1, self._model_input_token_budget())
+        hard_trimmed = bool(
+            usage.get("unsummarized_context_truncated")
+            or (usage.get("context_truncated") and not usage.get("compaction_active"))
+        )
+        if not hard_trimmed and pressure < COMPACTION_SOFT_PRESSURE:
+            return ""
+        if not self._auto_compaction_has_new_turns():
+            return ""
+        if hard_trimmed or pressure >= COMPACTION_HARD_PRESSURE:
+            return "hard"
+        return "soft"
+
     def _estimate_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
         total = 0
         for msg in messages:
@@ -1256,14 +1379,15 @@ class AgentSession:
         source_copy = copy.deepcopy(source)
         budget = self._model_input_token_budget()
         source_copy = repair_tool_call_messages(source_copy)
-        if self._estimate_messages_tokens(source_copy) <= budget:
-            return source_copy
+        provider_source, _summarized_count = self._messages_after_compaction_boundary(source_copy)
+        if self._estimate_messages_tokens(provider_source) <= budget:
+            return provider_source
 
-        non_system_count = len([m for m in source_copy if m.get("role") != "system"])
+        non_system_count = len([m for m in provider_source if m.get("role") != "system"])
         low = 1
         high = max(1, non_system_count)
         best = trim_messages(
-            source_copy,
+            provider_source,
             1,
             build_system_prompt_fn=self._build_system_prompt,
             validate_tool_ids=True,
@@ -1271,7 +1395,7 @@ class AgentSession:
         while low <= high:
             mid = (low + high) // 2
             candidate = trim_messages(
-                source_copy,
+                provider_source,
                 mid,
                 build_system_prompt_fn=self._build_system_prompt,
                 validate_tool_ids=True,
@@ -1350,8 +1474,12 @@ class AgentSession:
 
         full_context_messages = copy.deepcopy(self.messages)
         transcript_estimate = self._estimate_messages_tokens(full_context_messages)
+        provider_source, summarized_message_count = self._messages_after_compaction_boundary(
+            repair_tool_call_messages(copy.deepcopy(full_context_messages))
+        )
         context_messages = self._context_window_messages()
         context_estimate = self._estimate_messages_tokens(context_messages)
+        unsummarized_context_truncated = len(context_messages) < len(provider_source)
         for msg in context_messages:
             role = msg.get("role")
             content = msg.get("content")
@@ -1404,6 +1532,12 @@ class AgentSession:
             "transcript_estimated_tokens": transcript_estimate,
             "context_estimated_tokens": context_estimate,
             "context_truncated": len(context_messages) < len(full_context_messages),
+            "compaction_active": bool(self.compaction_summary and summarized_message_count > 0),
+            "compacted_through_checkpoint_id": (
+                self._normalize_compaction_state(self.compaction_state).get("compacted_through_checkpoint_id") or ""
+            ),
+            "summarized_message_count": summarized_message_count,
+            "unsummarized_context_truncated": unsummarized_context_truncated,
         }
         self._last_context_usage = payload
         return payload
@@ -1440,6 +1574,16 @@ class AgentSession:
         if target_index < 0 or target is None:
             return None
         self.messages = self.messages[:target_index + 1]
+        if self.compaction_summary:
+            state = self._normalize_compaction_state(self.compaction_state)
+            boundary_message_id = state.get("compacted_through_message_id") or ""
+            boundary_message_present = bool(boundary_message_id) and any(
+                msg.get("message_id") == boundary_message_id for msg in self.messages
+            )
+            if (boundary_message_id and not boundary_message_present) or (
+                not boundary_message_id and self._compacted_boundary_index(self.messages) is None
+            ):
+                self._reset_compaction_state()
         self.iteration = 0
         self._cancelled = False
         self._last_user_message = _text_from_content(target.get("content", ""))
@@ -2403,13 +2547,18 @@ class AgentSession:
                 yield self._event("task_guidance_consumed", {"items": consumed_guidance}, run_id)
                 yield self._event("context_usage", self.context_usage(), run_id)
 
-            if not auto_compaction_attempted and not self.compaction_summary:
+            if not auto_compaction_attempted:
                 usage_before_call = self.context_usage()
-                if usage_before_call.get("context_truncated"):
+                auto_trigger = self._auto_compaction_trigger(usage_before_call)
+                if auto_trigger:
                     auto_compaction_attempted = True
                     compacted = await self.compact_context(
-                        focus="Automatic compaction before model call because the full session transcript exceeds the model context window.",
+                        focus=(
+                            "Automatic compaction before model call because context pressure "
+                            f"reached the {auto_trigger} threshold."
+                        ),
                         force=True,
+                        trigger=auto_trigger,
                     )
                     if compacted and not compacted.get("skipped"):
                         compacted["auto"] = True
@@ -3104,7 +3253,7 @@ class AgentSession:
                         return True
         return self.iteration % 5 == 0
 
-    async def compact_context(self, focus: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
+    async def compact_context(self, focus: str = "", force: bool = False, trigger: str = "manual") -> Optional[Dict[str, Any]]:
         """Compress older conversation turns into the session summary.
 
         The summary is injected into the rebuilt system prompt instead of being
@@ -3112,9 +3261,9 @@ class AgentSession:
         handling predictable while preserving recent turns verbatim.
         """
         COMPACTION_THRESHOLD = 15
-        RECENT_USER_TURNS = 3
 
         self._ensure_message_metadata()
+        self.compaction_state = self._normalize_compaction_state(self.compaction_state)
         before_count = len([m for m in self.messages if m.get("role") != "system"])
         current_usage = self.context_usage()
         if not force and before_count < COMPACTION_THRESHOLD and current_usage["used_percent"] < 70:
@@ -3126,24 +3275,29 @@ class AgentSession:
                 "before_message_count": before_count,
                 "after_message_count": before_count,
                 "context_usage": current_usage,
+                "trigger": trigger,
+                "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+                "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
             }
 
         history = [m for m in self.messages if m.get("role") != "system"]
-        real_user_checkpoint_ids: list[str] = []
-        for msg in history:
-            if msg.get("role") == "user" and msg.get("source") != "internal":
-                checkpoint_id = msg.get("checkpoint_id")
-                if checkpoint_id and checkpoint_id not in real_user_checkpoint_ids:
-                    real_user_checkpoint_ids.append(str(checkpoint_id))
-        recent_checkpoint_ids = set(real_user_checkpoint_ids[-RECENT_USER_TURNS:])
+        real_user_checkpoint_ids = self._real_user_checkpoint_ids()
+        recent_checkpoint_ids = set(real_user_checkpoint_ids[-COMPACTION_RECENT_USER_TURNS:])
         if not recent_checkpoint_ids and history:
             recent_checkpoint_ids = {str(history[-1].get("checkpoint_id") or "")}
 
-        recent: list[dict[str, Any]] = []
+        previous_boundary_index = self._compacted_boundary_index(self.messages)
+        if previous_boundary_index is None:
+            previous_boundary_index = -1
+
         to_summarize: list[dict[str, Any]] = []
-        for msg in history:
+        for index, msg in enumerate(self.messages):
+            if msg.get("role") == "system":
+                continue
+            if index <= previous_boundary_index:
+                continue
             if msg.get("checkpoint_id") in recent_checkpoint_ids:
-                recent.append(copy.deepcopy(msg))
+                continue
             else:
                 to_summarize.append(msg)
 
@@ -3156,6 +3310,9 @@ class AgentSession:
                 "before_message_count": before_count,
                 "after_message_count": before_count,
                 "context_usage": current_usage,
+                "trigger": trigger,
+                "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+                "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
             }
 
         conv_lines: list[str] = []
@@ -3175,7 +3332,11 @@ class AgentSession:
 
         prompt_parts = [
             "Summarize the older part of this Desktop Agent session for future continuation.",
-            "Preserve durable facts, user preferences, decisions, open tasks, plan/todo state, files touched, tool results, blockers, and warnings.",
+            (
+                "Preserve durable facts, user preferences, key decisions, current objective, "
+                "plan/todo state, file paths, files touched, tool results, unfinished tasks, "
+                "blockers, warnings, and the latest working state."
+            ),
             "Do not include filler or transcript-like detail. Use the same primary language as the conversation.",
         ]
         if focus:
@@ -3203,12 +3364,27 @@ class AgentSession:
             self._update_usage_from_response(response)
             summary = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not summary or len(summary) < 10:
+                if trigger != "manual":
+                    self.compaction_state["last_auto_error"] = "Compaction summary was empty or too short."
+                    self._save()
                 return None
         except Exception as e:
             logger.warning("Context compaction failed: %s", e)
+            if trigger != "manual":
+                self.compaction_state["last_auto_error"] = str(e)[:500]
+                self._save()
             return None
 
-        self.compaction_summary = summary[:6000]
+        last_summarized = to_summarize[-1]
+        self.compaction_summary = summary[:COMPACTION_SUMMARY_MAX_CHARS]
+        self.compaction_state.update({
+            "version": COMPACTION_STATE_VERSION,
+            "compacted_through_checkpoint_id": str(last_summarized.get("checkpoint_id") or ""),
+            "compacted_through_message_id": str(last_summarized.get("message_id") or ""),
+            "compacted_turn_count": len(real_user_checkpoint_ids),
+            "last_compacted_at": datetime.now(timezone.utc).isoformat(),
+            "last_auto_error": "",
+        })
         self._refresh_system_prompt()
         self._ensure_message_metadata()
         after_count = len([m for m in self.messages if m.get("role") != "system"])
@@ -3226,6 +3402,9 @@ class AgentSession:
             "before_message_count": before_count,
             "after_message_count": after_count,
             "context_usage": usage,
+            "trigger": trigger,
+            "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+            "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
         }
 
     def cancel(self):
@@ -3258,7 +3437,7 @@ class AgentSession:
         self.messages = []
         self.iteration = 0
         self._cancelled = False
-        self.compaction_summary = ""
+        self._reset_compaction_state()
         self._last_usage = {}
         self._last_context_usage = {}
         self.archived_at = None
@@ -3369,6 +3548,7 @@ class AgentSession:
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
             "compaction_summary": self.compaction_summary,
+            "compaction_state": self._normalize_compaction_state(self.compaction_state),
             "last_usage": self._last_usage,
             "last_context_usage": self._last_context_usage,
             "archived_at": self.archived_at,
@@ -3406,7 +3586,12 @@ class AgentSession:
             session.iteration = 0
             archived_at = data.get("archived_at")
             session.archived_at = str(archived_at) if archived_at else None
-            session.compaction_summary = str(data.get("compaction_summary") or "")
+            stored_compaction_state = data.get("compaction_state")
+            if isinstance(stored_compaction_state, dict):
+                session.compaction_summary = str(data.get("compaction_summary") or "")
+                session.compaction_state = session._normalize_compaction_state(stored_compaction_state)
+            else:
+                session._reset_compaction_state()
             last_usage = data.get("last_usage")
             session._last_usage = last_usage if isinstance(last_usage, dict) else {}
             last_context_usage = data.get("last_context_usage")
@@ -3518,6 +3703,7 @@ class AgentSession:
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": self.active_task_guidance_items(),
             "compaction_summary": self.compaction_summary,
+            "compaction_state": self._normalize_compaction_state(self.compaction_state),
             "context_usage": context_usage,
             "checkpoints": self.build_checkpoints(),
             "transcript_message_count": transcript_message_count,
