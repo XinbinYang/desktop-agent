@@ -32,6 +32,7 @@ interface SidebarProps {
   onCompactSession?: () => void;
   onRewindSession?: () => void;
   onSwitchSession?: (id: string, projectPath?: string | null) => void;
+  onArchiveSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
   onOpenProject?: (path: string) => void;
   onProjectAction?: (action: ProjectHistoryAction, project: SessionHistoryResponse['projects'][number]) => void;
@@ -70,6 +71,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCompactSession,
   onRewindSession,
   onSwitchSession,
+  onArchiveSession,
   onDeleteSession,
   onOpenProject,
   onProjectAction,
@@ -98,7 +100,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   return (
-    <div className="w-56 bg-surface border-r border-border flex flex-col">
+    <div className="h-full w-full bg-surface border-r border-border flex flex-col">
       {/* Logo / Status */}
       <div className="p-4 border-b border-border">
         <div className="flex items-center gap-2 mb-2">
@@ -185,6 +187,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onCompactSession={onCompactSession}
               onRewindSession={onRewindSession}
               onSwitchSession={onSwitchSession}
+              onArchiveSession={onArchiveSession}
               onDeleteSession={onDeleteSession}
               onOpenProject={onOpenProject}
               onOpenProjectModal={onOpenProjectModal}

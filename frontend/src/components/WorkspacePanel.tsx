@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Panel, Group, Separator } from 'react-resizable-panels';
 import { Plus, Archive, RotateCcw, FolderOpen } from 'lucide-react';
 import type { ProjectInfo, FileNode, SessionHistoryItem, SessionHistoryResponse } from '../types';
@@ -32,6 +32,7 @@ interface WorkspacePanelProps {
   onCompactSession?: () => void;
   onRewindSession?: () => void;
   onSwitchSession?: (id: string, projectPath?: string | null) => void;
+  onArchiveSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
   onOpenProject?: (path: string) => void;
   onOpenProjectModal?: () => void;
@@ -60,6 +61,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   onCompactSession,
   onRewindSession,
   onSwitchSession,
+  onArchiveSession,
   onDeleteSession,
   onOpenProject,
   onOpenProjectModal,
@@ -77,24 +79,45 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   onRefreshTree,
   isRefreshingProject = false,
 }) => {
-  const persistLayout = (layout: Record<string, number>) => {
-    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch { /* ignore */ }
-  };
+  const [initialLayout] = useState(loadLayout);
+  const persistTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+      }
+    };
+  }, []);
+
+  const persistLayout = useCallback((layout: Record<string, number>) => {
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+    }
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch { /* ignore */ }
+    }, 180);
+  }, []);
+
+  const handleLayoutChanged = useCallback((layout: Record<string, number>) => {
+    persistLayout({
+      'ws-sessions': layout['ws-sessions'] ?? DEFAULT_LAYOUT['ws-sessions'],
+      'ws-files': layout['ws-files'] ?? DEFAULT_LAYOUT['ws-files'],
+    });
+  }, [persistLayout]);
 
   return (
     <Group
       id="workspace-split"
       orientation="vertical"
-      defaultLayout={loadLayout()}
-      onLayoutChanged={(layout) => persistLayout({
-        'ws-sessions': layout['ws-sessions'] ?? DEFAULT_LAYOUT['ws-sessions'],
-        'ws-files': layout['ws-files'] ?? DEFAULT_LAYOUT['ws-files'],
-      })}
+      defaultLayout={initialLayout}
+      onLayoutChanged={handleLayoutChanged}
       className="flex flex-col h-full min-h-0"
     >
       {/* Top zone: projects + session history */}
       <Panel id="ws-sessions" defaultSize="58%" minSize="160px">
-        <div className="h-full overflow-y-auto pr-0.5 space-y-2">
+        <div className="h-full min-h-0 overflow-y-auto overscroll-contain pr-0.5 space-y-2">
           <button
             onClick={onNewSession}
             className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors"
@@ -128,6 +151,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
             currentSession={currentSession}
             currentProjectPath={currentProjectPath}
             onSwitchSession={onSwitchSession}
+            onArchiveSession={onArchiveSession}
             onDeleteSession={onDeleteSession}
             onOpenProject={onOpenProject}
             onOpenProjectModal={onOpenProjectModal}
@@ -137,12 +161,12 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
         </div>
       </Panel>
 
-      <Separator className="h-px bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-row-resize" />
+      <Separator className="my-1 h-2 border-t border-border transition-colors cursor-row-resize hover:border-accent/50 active:border-accent/70" />
 
       {/* Bottom zone: file tree of the focused session's project */}
       <Panel id="ws-files" defaultSize="42%" minSize="120px">
         {currentProject ? (
-          <div className="h-full flex flex-col">
+          <div className="h-full min-h-0 flex flex-col overflow-hidden">
             <ProjectPanel
               currentProject={currentProject}
               fileTree={fileTree}

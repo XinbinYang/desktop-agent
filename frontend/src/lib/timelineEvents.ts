@@ -9,6 +9,7 @@ import type {
   ToolCall,
   WorkerEvent,
 } from '../types';
+import { filterVisibleToolCalls, isInternalToolName } from './internalTools';
 
 export type TimelineEventKind =
   | 'user'
@@ -325,7 +326,9 @@ export function buildTimelineEvents({
   const seenToolIds = new Set<string>();
   const seenEditIds = new Set<string>();
   const safeMessages = messages.filter((message): message is ChatMessage => Boolean(message));
-  const safeToolCalls = toolCalls.filter((call): call is ToolCall => Boolean(call));
+  const safeToolCalls = filterVisibleToolCalls(
+    toolCalls.filter((call): call is ToolCall => Boolean(call)),
+  );
   const safeFileEdits = fileEdits.filter((edit): edit is FileEdit => Boolean(edit));
 
   for (const message of safeMessages) {
@@ -406,6 +409,7 @@ export function buildTimelineEvents({
             });
             break;
           case 'tool_call': {
+            if (isInternalToolName(block.name)) break;
             const item = toToolItem(block, message, blockIndex);
             const key = toolEventId(item);
             if (!item.toolCallId || !editToolCallIds.has(item.toolCallId)) {

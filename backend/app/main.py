@@ -19,6 +19,7 @@ from app.agent import (
     SESSIONS_DIR,
     _sessions,
     _load_session_data,
+    archive_session_record,
     clear_session,
     get_or_create_session,
     list_session_records,
@@ -26,7 +27,7 @@ from app.agent import (
     resolve_agent_session,
     PLAN_CONTINUE_MARKER,
 )
-from app.config import list_all_models, load_config
+from app.config import get_model_for_agent, list_all_models, load_config
 from app.credential_manager import CredentialManager
 from app.errors import (
     ErrorCategory,
@@ -120,7 +121,7 @@ app = FastAPI(title="Desktop Agent API", lifespan=lifespan)
 # CORSï¼šå…è®¸å‰ç«¯è®¿é—®
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null", "file://"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,7 +129,7 @@ app.add_middleware(
 
 _LOCAL_ORIGINS = frozenset({
     "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174",
-    "http://localhost:5175", "null",  # null = file:// (Electron renderer)
+    "http://localhost:5175", "null", "file://",  # packaged Electron renderer
 })
 
 
@@ -286,9 +287,10 @@ def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
     for record in list_session_records():
         item = _session_history_item(record, connection_counts)
         project_path = item.get("project_path")
-        if item.get("agent_type") == "coding" and project_path and item.get("archived_at"):
-            key = _history_project_key(str(project_path))
-            archived_counts[key] = archived_counts.get(key, 0) + 1
+        if item.get("archived_at"):
+            if item.get("agent_type") == "coding" and project_path:
+                key = _history_project_key(str(project_path))
+                archived_counts[key] = archived_counts.get(key, 0) + 1
             if not include_archived:
                 continue
         session_items.append(item)
@@ -409,7 +411,7 @@ class StoreCredentialRequest(BaseModel):
 def get_models():
     """èŽ·å–æ‰€æœ‰å¯ç”¨æ¨¡åž‹åˆ—è¡¨"""
     try:
-        return {"models": list_all_models(), "default": load_config().settings.default_model}
+        return {"models": list_all_models(), "default": get_model_for_agent("personal")}
     except Exception as e:
         raise HTTPException(
             status_code=503,
@@ -438,8 +440,8 @@ def get_roles():
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """éžæµå¼èŠå¤©ï¼ˆæµ‹è¯•ç”¨ï¼‰"""
-    model_id = req.model_id or load_config().settings.default_model
     agent_type = _resolve_agent_type(req.agent_type, req.role_id)
+    model_id = req.model_id or get_model_for_agent(agent_type)
     role_id = req.role_id or AgentManager.get_default_role(agent_type)
     try:
         session = get_or_create_session(req.session_id, model_id, role_id, agent_type=agent_type)
@@ -565,6 +567,22 @@ def rewind_session(session_id: str, req: RewindSessionRequest):
     if not result:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     return {**result, "retry": False, "snapshot": session.to_snapshot()}
+
+
+@app.post("/api/sessions/{session_id}/archive")
+def archive_session(session_id: str):
+    """Archive a saved session without deleting its transcript."""
+    runtime = session_runtime_status(session_id)
+    if runtime.get("is_running"):
+        raise HTTPException(status_code=409, detail="Cannot archive a running session")
+    try:
+        archived = archive_session_record(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not archived:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "ok", "session": archived}
+
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
@@ -1154,7 +1172,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             print(f"[WS] 403 — auth token rejected for session={session_id}: "
                   f"header={'set' if websocket.headers.get(AUTH_HEADER) else 'missing'}, "
                   f"query={'set' if websocket.query_params.get('token') else 'missing'}")
-            await websocket.accept()
             await websocket.close(code=1008, reason="Unauthorized")
             return
 
@@ -1172,12 +1189,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     await websocket.accept()
     register_session_websocket(session_id, websocket)
-    current_model = load_config().settings.default_model
+    current_model = get_model_for_agent("personal")
     current_role_id = "desktop-agent"
     current_agent_type = "personal"
 
     # å‘é€åŽ†å²ä¼šè¯æ¶ˆæ¯ï¼ˆå¦‚æžœæœ‰ï¼‰
-    session = get_or_create_session(session_id, current_model)
+    session = get_or_create_session(session_id, current_model, preserve_existing_model=True)
     current_model = session.model_id  # æ¢å¤å·²ä¿å­˜çš„ model
     current_role_id = session.role_id  # æ¢å¤å·²ä¿å­˜çš„ role
     current_agent_type = session.agent_type  # æ¢å¤å·²ä¿å­˜çš„ agent_type

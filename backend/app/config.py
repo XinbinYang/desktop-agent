@@ -67,8 +67,10 @@ class AutoApproveRule(BaseModel):
     risk: str = ""             # Optional: only match specific risk level ("low", "medium", "high")
 
 class Settings(BaseModel):
-    default_model: str
-    default_provider: str
+    # Legacy fields kept for older runtime config files and clients. Runtime
+    # model selection now comes from personal_agent/coding_agent settings.
+    default_model: str = ""
+    default_provider: str = ""
     max_iterations: int = 10000
     auto_approve: bool = False
     screenshot_on_step: bool = True
@@ -114,9 +116,22 @@ def load_config() -> AppConfig:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    # Backward compat: ensure personal_agent key exists
-    if "personal_agent" not in raw:
+    if raw is None:
+        raw = {}
+
+    # Backward compat: migrate old global default_model into explicit per-agent
+    # defaults so runtime decisions no longer depend on global model fields.
+    settings = raw.setdefault("settings", {})
+    legacy_default_model = str(settings.get("default_model") or "")
+    if "personal_agent" not in raw or not isinstance(raw.get("personal_agent"), dict):
         raw["personal_agent"] = {}
+    if "coding_agent" not in raw or not isinstance(raw.get("coding_agent"), dict):
+        raw["coding_agent"] = {}
+    if legacy_default_model:
+        if not str(raw["personal_agent"].get("model") or "").strip():
+            raw["personal_agent"]["model"] = legacy_default_model
+        if not str(raw["coding_agent"].get("model") or "").strip():
+            raw["coding_agent"]["model"] = legacy_default_model
     if "web_search" not in raw:
         raw["web_search"] = {}
 
@@ -217,17 +232,15 @@ def list_all_models() -> List[dict]:
 def get_model_for_agent(agent_type: str) -> str:
     """Resolve the effective model ID for a given agent type.
 
-    Priority: agent-specific override -> global default_model.
+    Runtime model selection is agent-scoped. Old global default_model values
+    are migrated into agent configs in load_config().
     """
     cfg = load_config()
-    default = cfg.settings.default_model
     if agent_type == "coding":
-        override = cfg.coding_agent.model
-    elif agent_type == "personal":
-        override = cfg.personal_agent.model
-    else:
-        override = ""
-    return override if override else default
+        return (cfg.coding_agent.model or "").strip()
+    if agent_type == "personal":
+        return (cfg.personal_agent.model or "").strip()
+    return ""
 
 def get_thinking_intensity_for_agent(agent_type: str) -> str:
     """Resolve the effective thinking intensity for a given agent type."""

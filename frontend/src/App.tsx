@@ -34,6 +34,9 @@ import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, typ
 import { API_BASE } from './config';
 import {
   DEFAULT_MAIN_LAYOUT,
+  DEFAULT_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
   DEFAULT_TERMINAL_LAYOUT,
   useLayoutState,
   type PanelLayout,
@@ -46,6 +49,7 @@ import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } f
 import { ProjectModal } from './components/ProjectModal';
 import { ProjectRenameDialog } from './components/ProjectRenameDialog';
 import { ProjectHistoryConfirmDialog } from './components/ProjectHistoryConfirmDialog';
+import { SessionDeleteConfirmDialog } from './components/SessionDeleteConfirmDialog';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
@@ -84,15 +88,40 @@ interface SplitPaneOptions {
 
 const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
 
-function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
-  if (!settings?.settings || !settings.providers) return false;
-  const defaultProvider = settings.providers[settings.settings.default_provider];
-  if (!defaultProvider) return true;
-  if (typeof defaultProvider.api_key_configured === 'boolean') {
-    return !defaultProvider.api_key_configured;
+function clampSidebarWidth(width: number): number {
+  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+}
+
+function providerNeedsSetup(provider: SettingsResponse['providers'][string] | undefined): boolean {
+  if (!provider) return true;
+  if (typeof provider.api_key_configured === 'boolean') {
+    return !provider.api_key_configured;
   }
-  const masked = defaultProvider.api_key_masked || '';
+  const masked = provider.api_key_masked || '';
   return !masked || (masked.startsWith('${') && masked.endsWith('}'));
+}
+
+function providerForModel(settings: SettingsResponse, modelId: string | undefined): SettingsResponse['providers'][string] | undefined {
+  if (!modelId) return undefined;
+  const providers = Object.values(settings.providers || {});
+  const matched = providers.find((provider) =>
+    (provider.models || []).some((model) => model.id === modelId)
+  );
+  if (matched) return matched;
+  const providersWithoutModelLists = providers.filter((provider) => (provider.models || []).length === 0);
+  return providers.length === 1 && providersWithoutModelLists.length === 1
+    ? providersWithoutModelLists[0]
+    : undefined;
+}
+
+function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
+  if (!settings?.providers) return false;
+  const personalModel = settings.personal_agent?.model;
+  const codingModel = settings.coding_agent?.model;
+  if (!personalModel && !codingModel) return true;
+  return [personalModel, codingModel]
+    .filter(Boolean)
+    .some((modelId) => providerNeedsSetup(providerForModel(settings, modelId)));
 }
 
 function normalizePath(path: string): string {
@@ -315,9 +344,14 @@ export default function App() {
   } | null>(null);
   const [confirmProjectError, setConfirmProjectError] = useState('');
   const [isConfirmingProjectAction, setIsConfirmingProjectAction] = useState(false);
+  const [deleteSessionTarget, setDeleteSessionTarget] = useState<SessionHistoryItem | null>(null);
+  const [deleteSessionError, setDeleteSessionError] = useState('');
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
   const [isRefreshingProject, setIsRefreshingProject] = useState(false);
 
   const layout = useLayoutState();
+  const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
+  const sidebarWidth = sidebarDragWidth ?? layout.sidebarWidth;
   const agentModel = agentModels[layout.activeAgent] || '';
   const sessionMetaById = React.useMemo(() => {
     const map: Record<string, SessionListItem> = {};
@@ -379,6 +413,48 @@ export default function App() {
   const projectRefreshTimerRef = useRef<number | null>(null);
   const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
   const manualProjectLockLeafRef = useRef<string | null>(null);
+
+  const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    let latestWidth = startWidth;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      latestWidth = clampSidebarWidth(startWidth + moveEvent.clientX - startX);
+      setSidebarDragWidth(latestWidth);
+    };
+
+    const finishResize = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', finishResize);
+      window.removeEventListener('pointercancel', finishResize);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      setSidebarDragWidth(null);
+      layout.setSidebarWidth(latestWidth);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', finishResize);
+    window.addEventListener('pointercancel', finishResize);
+  }, [layout, sidebarWidth]);
+
+  const handleSidebarResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home') return;
+    event.preventDefault();
+    if (event.key === 'Home') {
+      layout.setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+      return;
+    }
+    const delta = event.key === 'ArrowRight' ? 16 : -16;
+    layout.setSidebarWidth(layout.sidebarWidth + delta);
+  }, [layout]);
 
   useEffect(() => {
     const panel = rightPanelRef.current;
@@ -648,18 +724,17 @@ export default function App() {
         if (!cancelled) {
           const modelsList = data.models || [];
           setModels(modelsList);
-          const defaultModel = data.default || modelsList[0]?.id || '';
 
           // Also load settings to get per-agent model preferences
           try {
             const settingsRes = await fetch(`${API_BASE}/api/settings`);
             const settingsData = await settingsRes.json();
             setAgentModels({
-              personal: settingsData.personal_agent?.model || defaultModel,
-              coding: settingsData.coding_agent?.model || defaultModel,
+              personal: settingsData.personal_agent?.model || '',
+              coding: settingsData.coding_agent?.model || '',
             });
           } catch {
-            setAgentModels({ personal: defaultModel, coding: defaultModel });
+            setAgentModels({ personal: '', coding: '' });
           }
         }
       } catch (err) {
@@ -674,7 +749,7 @@ export default function App() {
         if (!cancelled && !didPromptModelSetup.current && defaultProviderNeedsSetup(data)) {
           didPromptModelSetup.current = true;
           setShowSettings(true);
-          addTerminalLog('[系统] 默认模型尚未配置 API Key，请先在设置中填写。');
+          addTerminalLog('[System] Agent model provider is not configured. Please update Settings first.');
         }
       } catch (err) {
         console.error('[App] Failed to check model settings:', err);
@@ -1201,7 +1276,7 @@ export default function App() {
         project.path &&
         normalizeProjectPath(currentProject.path).toLowerCase() === normalizeProjectPath(project.path).toLowerCase(),
       );
-      if (isCurrentProjectAction) {
+      if (action === 'remove' && isCurrentProjectAction) {
         try {
           await fetch(`${API_BASE}/api/projects/close`, { method: 'POST' });
         } catch (closeErr) {
@@ -1730,31 +1805,27 @@ export default function App() {
     openNewSessionPane();
   }, [openNewSessionPane]);
 
-  const deleteSession = useCallback(async (id: string) => {
-    await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
-    loadSessions();
-    // If the deleted session is the focused one, create a new one in that leaf
-    if (focusedSessionId === id) {
-      const agentType: AgentType = layout.activeAgent === 'personal' ? 'personal' : 'coding';
-      try {
-        const resolved = await resolveAgentSessionClient(agentType, agentType === 'personal' ? 'canonical' : 'new');
-        applyResolvedSessionToFocusedPane(resolved);
-      } catch {
-        const newId = createDefaultSessionId(agentType);
-        setPaneRoot((prev) => {
-          const leaf = findLeafById(prev, focusedLeafId);
-          if (!leaf) return prev;
-          const newPane: SessionPane = {
-            ...leaf.pane,
-            sessionId: newId,
-            model: agentModels[agentType] || agentModel,
-            agentType,
-            role: roleForAgent(agentType),
-            isPrimary: agentType === 'personal',
-          };
-          return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
-        });
-      }
+  const replaceFocusedSessionAfterRemoval = useCallback(async (id: string) => {
+    if (focusedSessionId !== id) return;
+    const agentType: AgentType = layout.activeAgent === 'personal' ? 'personal' : 'coding';
+    try {
+      const resolved = await resolveAgentSessionClient(agentType, agentType === 'personal' ? 'canonical' : 'new');
+      applyResolvedSessionToFocusedPane(resolved);
+    } catch {
+      const newId = createDefaultSessionId(agentType);
+      setPaneRoot((prev) => {
+        const leaf = findLeafById(prev, focusedLeafId);
+        if (!leaf) return prev;
+        const newPane: SessionPane = {
+          ...leaf.pane,
+          sessionId: newId,
+          model: agentModels[agentType] || agentModel,
+          agentType,
+          role: roleForAgent(agentType),
+          isPrimary: agentType === 'personal',
+        };
+        return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+      });
     }
   }, [
     focusedSessionId,
@@ -1762,10 +1833,66 @@ export default function App() {
     agentModel,
     agentModels,
     layout.activeAgent,
-    loadSessions,
     resolveAgentSessionClient,
     applyResolvedSessionToFocusedPane,
   ]);
+
+  const archiveSession = useCallback(async (id: string) => {
+    const res = await fetch(`${API_BASE}/api/sessions/${id}/archive`, { method: 'POST' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      addTerminalLog(`[Session] Archive failed: ${apiErrorMessage(data.detail || data.error || res.statusText)}`);
+      return;
+    }
+    loadSessions();
+    await replaceFocusedSessionAfterRemoval(id);
+  }, [addTerminalLog, loadSessions, replaceFocusedSessionAfterRemoval]);
+
+  const requestDeleteSession = useCallback((id: string) => {
+    const existing = sessionMetaById[id];
+    setDeleteSessionTarget(existing || {
+      id,
+      title: '',
+      project_path: null,
+      model_id: '',
+      role_id: '',
+      agent_type: 'coding',
+      message_count: 0,
+      is_primary: false,
+      is_running: false,
+      active_connections: 0,
+      activity_state: 'idle',
+    });
+    setDeleteSessionError('');
+  }, [sessionMetaById]);
+
+  const closeSessionDeleteDialog = useCallback(() => {
+    if (isDeletingSession) return;
+    setDeleteSessionTarget(null);
+    setDeleteSessionError('');
+  }, [isDeletingSession]);
+
+  const submitSessionDelete = useCallback(async () => {
+    if (!deleteSessionTarget) return;
+    const id = deleteSessionTarget.id;
+    setIsDeletingSession(true);
+    setDeleteSessionError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setDeleteSessionError(apiErrorMessage(data.detail || data.error || res.statusText));
+        return;
+      }
+      setDeleteSessionTarget(null);
+      loadSessions(currentProject?.path ?? null);
+      await replaceFocusedSessionAfterRemoval(id);
+    } catch (err) {
+      setDeleteSessionError(String(err));
+    } finally {
+      setIsDeletingSession(false);
+    }
+  }, [currentProject?.path, deleteSessionTarget, loadSessions, replaceFocusedSessionAfterRemoval]);
 
   // Split a leaf into two panes (drag to edge)
   const handleSplitPane = useCallback(async (
@@ -2090,45 +2217,64 @@ export default function App() {
         {/* Left sidebar */}
         {!layout.sidebarCollapsed && (
           <>
-            <Sidebar
-              activeSection={layout.activeSection}
-              activeAgent={layout.activeAgent}
-              onSectionChange={layout.setActiveSection}
-              agentModel={focusedModel}
-              onAgentChange={handleAgentNavigate}
-              onOpenPersonalWorkspace={() => {
-                layout.setRightPanelVisible(true);
-                layout.setRightZone('workspace');
-              }}
-              onOpenSettings={() => setShowSettings(true)}
-              onClear={focusedActions.clearSession}
-              onExecuteTool={focusedActions.executeToolDirect}
-              isConnected={isConnected}
-              sessionHistory={sessionHistory}
-              sessions={sessions}
-              currentSession={focusedSessionId}
-              onNewSession={startFocusedSession}
-              onCompactSession={() => focusedActions.compactSession(false)}
-              onRewindSession={openFocusedRewind}
-              onSwitchSession={switchSession}
-              onDeleteSession={deleteSession}
-              onOpenProject={(path) => { void handleOpenProjectPath(path, { touchRecent: false }); }}
-              onProjectAction={handleProjectHistoryAction}
-              onNewProjectSession={handleNewProjectSession}
-              currentProjectPath={currentProject?.path ?? null}
-              currentProject={currentProject}
-              fileTree={fileTree}
-              expandedPaths={expandedPaths}
-              loadingPaths={loadingPaths}
-              onTogglePath={handleTogglePath}
-              onSelectFile={handleSelectFile}
-              onFileAction={handleProjectFileAction}
-              onOpenFolder={handleOpenFolder}
-              onOpenProjectModal={() => setShowProjectModal(true)}
-              onCloseProject={handleCloseProject}
-              onRefreshTree={refreshProject}
-              isRefreshingProject={isRefreshingProject}
-            />
+            <div className="min-w-0 shrink-0" style={{ width: sidebarWidth }}>
+              <Sidebar
+                activeSection={layout.activeSection}
+                activeAgent={layout.activeAgent}
+                onSectionChange={layout.setActiveSection}
+                agentModel={focusedModel}
+                onAgentChange={handleAgentNavigate}
+                onOpenPersonalWorkspace={() => {
+                  layout.setRightPanelVisible(true);
+                  layout.setRightZone('workspace');
+                }}
+                onOpenSettings={() => setShowSettings(true)}
+                onClear={focusedActions.clearSession}
+                onExecuteTool={focusedActions.executeToolDirect}
+                isConnected={isConnected}
+                sessionHistory={sessionHistory}
+                sessions={sessions}
+                currentSession={focusedSessionId}
+                onNewSession={startFocusedSession}
+                onCompactSession={() => focusedActions.compactSession(false)}
+                onRewindSession={openFocusedRewind}
+                onSwitchSession={switchSession}
+                onArchiveSession={archiveSession}
+                onDeleteSession={requestDeleteSession}
+                onOpenProject={(path) => { void handleOpenProjectPath(path, { touchRecent: false }); }}
+                onProjectAction={handleProjectHistoryAction}
+                onNewProjectSession={handleNewProjectSession}
+                currentProjectPath={currentProject?.path ?? null}
+                currentProject={currentProject}
+                fileTree={fileTree}
+                expandedPaths={expandedPaths}
+                loadingPaths={loadingPaths}
+                onTogglePath={handleTogglePath}
+                onSelectFile={handleSelectFile}
+                onFileAction={handleProjectFileAction}
+                onOpenFolder={handleOpenFolder}
+                onOpenProjectModal={() => setShowProjectModal(true)}
+                onCloseProject={handleCloseProject}
+                onRefreshTree={refreshProject}
+                isRefreshingProject={isRefreshingProject}
+              />
+            </div>
+            <div
+              role="separator"
+              aria-label="Resize left sidebar"
+              aria-orientation="vertical"
+              aria-valuemin={MIN_SIDEBAR_WIDTH}
+              aria-valuemax={MAX_SIDEBAR_WIDTH}
+              aria-valuenow={Math.round(sidebarWidth)}
+              title="Resize left sidebar"
+              tabIndex={0}
+              onPointerDown={handleSidebarResizeStart}
+              onKeyDown={handleSidebarResizeKeyDown}
+              onDoubleClick={() => layout.setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+              className="group flex h-full w-2 shrink-0 cursor-col-resize items-stretch justify-center bg-surface transition-colors hover:bg-accent/5"
+            >
+              <div className="h-full w-px bg-border transition-colors group-hover:bg-accent/60" />
+            </div>
             <ProjectModal
               isOpen={showProjectModal}
               onClose={() => setShowProjectModal(false)}
@@ -2160,6 +2306,14 @@ export default function App() {
               onClose={closeProjectHistoryConfirm}
               onConfirm={submitProjectHistoryConfirm}
             />
+            <SessionDeleteConfirmDialog
+              isOpen={!!deleteSessionTarget}
+              session={deleteSessionTarget}
+              loading={isDeletingSession}
+              error={deleteSessionError}
+              onClose={closeSessionDeleteDialog}
+              onConfirm={submitSessionDelete}
+            />
           </>
         )}
 
@@ -2174,18 +2328,17 @@ export default function App() {
               const data = await res.json();
               const modelsList = data.models || [];
               setModels(modelsList);
-              const defaultModel = data.default || modelsList[0]?.id || '';
 
               // Re-fetch per-agent model settings
               try {
                 const settingsRes = await fetch(`${API_BASE}/api/settings`);
                 const settingsData = await settingsRes.json();
                 setAgentModels({
-                  personal: settingsData.personal_agent?.model || defaultModel,
-                  coding: settingsData.coding_agent?.model || defaultModel,
+                  personal: settingsData.personal_agent?.model || '',
+                  coding: settingsData.coding_agent?.model || '',
                 });
               } catch {
-                setAgentModels({ personal: defaultModel, coding: defaultModel });
+                setAgentModels({ personal: '', coding: '' });
               }
             } catch (err) {
               console.error('[App] Failed to refresh models after settings change:', err);

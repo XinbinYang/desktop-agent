@@ -81,6 +81,7 @@ describe('SessionHistoryPanel', () => {
 
   it('renders project sessions with running state and session actions', () => {
     const onSwitchSession = vi.fn();
+    const onArchiveSession = vi.fn();
     const onDeleteSession = vi.fn();
     const onOpenProject = vi.fn();
     const onOpenProjectModal = vi.fn();
@@ -92,6 +93,7 @@ describe('SessionHistoryPanel', () => {
         currentSession="session_running"
         currentProjectPath="C:/repo"
         onSwitchSession={onSwitchSession}
+        onArchiveSession={onArchiveSession}
         onDeleteSession={onDeleteSession}
         onOpenProject={onOpenProject}
         onOpenProjectModal={onOpenProjectModal}
@@ -116,9 +118,14 @@ describe('SessionHistoryPanel', () => {
     fireEvent.click(screen.getByLabelText('Open session Idle task'));
     expect(onSwitchSession).toHaveBeenCalledWith('session_idle', 'C:/repo');
 
-    fireEvent.click(screen.getByLabelText('Delete session Idle task'));
+    fireEvent.click(screen.getByLabelText('Session actions for Idle task'));
+    fireEvent.click(screen.getByText('归档会话'));
+    expect(onArchiveSession).toHaveBeenCalledWith('session_idle');
+
+    fireEvent.click(screen.getByLabelText('Session actions for Idle task'));
+    fireEvent.click(screen.getByText('永久删除'));
     expect(onDeleteSession).toHaveBeenCalledWith('session_idle');
-    expect(screen.queryByLabelText('Delete session Personal Agent · Main')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Session actions for Personal Agent · Main')).not.toBeInTheDocument();
   });
 
   it('expands and collapses project groups', () => {
@@ -170,7 +177,7 @@ describe('SessionHistoryPanel', () => {
     expect(screen.getByText('在资源管理器中打开')).toBeInTheDocument();
     expect(screen.getByText('创建永久工作树')).toBeInTheDocument();
     expect(screen.getByText('重命名项目')).toBeInTheDocument();
-    expect(screen.getByText('归档项目')).toBeInTheDocument();
+    expect(screen.getByText('归档会话')).toBeInTheDocument();
     expect(screen.getByText('移除')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('置顶项目'));

@@ -3,6 +3,7 @@ import { RotateCcw } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ChatMessage, AssistantBlock, PlanState } from '../types';
+import { isInternalToolName } from '../lib/internalTools';
 
 interface ChatMessageItemProps {
   msg: ChatMessage;
@@ -110,7 +111,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
             {(() => {
               const toolBlocks = msg.blocks.filter(
                 (block): block is Extract<AssistantBlock, { type: 'tool_call' }> => block.type === 'tool_call'
-              );
+              ).filter((block) => !isInternalToolName(block.name));
               const nonToolBlocks = msg.blocks.filter((block) => block.type !== 'tool_call');
               const isExpanded = expandedToolDetails[msg.id] === true;
               const showAll = showAllToolDetails[msg.id] === true;

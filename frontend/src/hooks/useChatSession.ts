@@ -25,6 +25,11 @@ import {
 import { useWebSocket } from './useWebSocket';
 import { API_BASE } from '../config';
 import { saveSession, loadSession, saveDraft, loadDraft, deleteDraft } from '../lib/db';
+import {
+  filterVisibleAssistantBlocks,
+  filterVisibleToolCalls,
+  isInternalToolName,
+} from '../lib/internalTools';
 
 function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -106,7 +111,8 @@ function toolBucketLabel(name: string): string {
 
 function buildToolSummary(blocks?: AssistantBlock[]): ToolSummary | undefined {
   if (!blocks || blocks.length === 0) return undefined;
-  const toolBlocks = blocks.filter((b): b is Extract<AssistantBlock, { type: 'tool_call' }> => b.type === 'tool_call');
+  const toolBlocks = filterVisibleAssistantBlocks(blocks)
+    .filter((b): b is Extract<AssistantBlock, { type: 'tool_call' }> => b.type === 'tool_call');
   if (toolBlocks.length === 0) return undefined;
 
   const total = toolBlocks.length;
@@ -143,7 +149,7 @@ function hasOnlyPlanQuestionNoise(blocks: AssistantBlock[] = []): boolean {
   return blocks.every((block) =>
     block.type === 'thinking' ||
     block.type === 'text' ||
-    (block.type === 'tool_call' && block.name === 'plan_ask_questions')
+    (block.type === 'tool_call' && isInternalToolName(block.name))
   );
 }
 
@@ -358,7 +364,25 @@ function isRenderableMessage(message: ChatMessage): boolean {
 
 function sanitizeCachedMessages(messages: any[]): ChatMessage[] {
   if (!Array.isArray(messages)) return [];
-  return (messages as ChatMessage[]).filter(isRenderableMessage);
+  return (messages as ChatMessage[])
+    .map((message) => {
+      if (message.role !== 'assistant' || !message.blocks) return message;
+      const blocks = filterVisibleAssistantBlocks(message.blocks);
+      return {
+        ...message,
+        blocks,
+        toolSummary: buildToolSummary(blocks),
+      };
+    })
+    .filter((message) => {
+      if (!isRenderableMessage(message)) return false;
+      if (message.role !== 'assistant') return true;
+      return Boolean(
+        (message.content && message.content.trim()) ||
+        message.reasoning ||
+        (message.blocks && message.blocks.length > 0)
+      );
+    });
 }
 
 function mergeSnapshotWithOptimistic(current: ChatMessage[], restored: ChatMessage[]): ChatMessage[] {
@@ -466,7 +490,7 @@ function sessionSnapshotToState(snapshot: any): {
       }
       for (const tc of msg.tool_calls || []) {
         const func = tc.function || {};
-        if (func.name === 'plan_ask_questions') {
+        if (isInternalToolName(func.name)) {
           continue;
         }
         const args = parseToolArgs(func.arguments);
@@ -508,6 +532,8 @@ function sessionSnapshotToState(snapshot: any): {
     if (role === 'tool') {
       const toolCallId = msg.tool_call_id || '';
       const pending = pendingTools.get(toolCallId);
+      const toolName = pending?.name || msg.name || '';
+      if (isInternalToolName(toolName)) continue;
       const result = contentToText(msg.content);
       if (pending) {
         const target = restoredMessages[pending.messageIndex];
@@ -526,7 +552,7 @@ function sessionSnapshotToState(snapshot: any): {
           };
         }
         restoredToolCalls.push({
-          name: pending.name || msg.name || '',
+          name: toolName,
           args: pending.args,
           result,
           timestamp: Date.now(),
@@ -534,7 +560,7 @@ function sessionSnapshotToState(snapshot: any): {
         });
       } else {
         restoredToolCalls.push({
-          name: msg.name || '',
+          name: toolName,
           args: {},
           result,
           timestamp: Date.now(),
@@ -552,7 +578,7 @@ function sessionSnapshotToState(snapshot: any): {
 
   return {
     messages: sanitizeThinkingPlaceholders(restoredMessages),
-    toolCalls: restoredToolCalls,
+    toolCalls: filterVisibleToolCalls(restoredToolCalls),
     chatMode,
     thinkingIntensity,
     planState: snapshot?.plan_state,
@@ -895,14 +921,17 @@ export function useChatSession(
             durationMs: event.data.duration_ms,
             workerEvents,
           };
+          if (isInternalToolName(event.data.name)) {
+            setMessages((prev) =>
+              event.data.name === 'plan_ask_questions'
+                ? dropOpenPlanQuestionNoise(completeOpenThinking(prev))
+                : completeOpenThinking(prev)
+            );
+            break;
+          }
           setToolCalls((prev) => [...prev, tc]);
           addTerminalLog(`[工具] ${event.data.name}: ${event.data.result}`);
           onToolCallRef.current?.(tc);
-
-          if (event.data.name === 'plan_ask_questions') {
-            setMessages((prev) => dropOpenPlanQuestionNoise(completeOpenThinking(prev)));
-            break;
-          }
 
           setMessages((prev0) => {
             // A tool landing seals any open thinking block (covers the case
@@ -962,6 +991,14 @@ export function useChatSession(
             toolCallId: event.data.tool_call_id,
             durationMs: event.data.duration_ms,
           };
+          if (isInternalToolName(event.data.name)) {
+            setMessages((prev) =>
+              event.data.name === 'plan_ask_questions'
+                ? dropOpenPlanQuestionNoise(completeOpenThinking(prev))
+                : completeOpenThinking(prev)
+            );
+            break;
+          }
           setToolCalls((prev) => [...prev, tc]);
           addTerminalLog(`[工具] ${event.data.name}: ${resultText}`);
           onToolCallRef.current?.(tc);
@@ -1087,7 +1124,7 @@ export function useChatSession(
             setIsRunning(true);
           }
           if (status === 'executing') {
-            if (event.data.tool === 'plan_ask_questions') {
+            if (isInternalToolName(event.data.tool)) {
               break;
             }
             // Tool execution starting seals the preceding thinking block.
@@ -1512,7 +1549,7 @@ export function useChatSession(
         if (cachedMessages.length > 0) {
           setMessages(cachedMessages);
         }
-        setToolCalls(data.toolCalls || []);
+        setToolCalls(filterVisibleToolCalls(data.toolCalls || []));
         setFileEdits(data.fileEdits || []);
         setTaskGuidanceItems(Array.isArray(data.taskGuidanceItems) ? data.taskGuidanceItems as TaskGuidanceItem[] : []);
         if (data.chatMode === 'plan' || data.chatMode === 'agent') {

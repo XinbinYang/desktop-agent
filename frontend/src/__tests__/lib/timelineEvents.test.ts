@@ -82,6 +82,35 @@ describe('timelineEvents', () => {
     expect(toolEvent).toMatchObject({ kind: 'tool', label: 'Read 3 files', grouped: true });
   });
 
+  it('omits internal plan tools from message blocks and global tool calls', () => {
+    const messages: ChatMessage[] = [{
+      id: 'a1',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [
+        { type: 'tool_call', name: 'plan_ask_questions', args: {}, result: 'ok', status: 'success', toolCallId: 'p1', timestamp: 1 },
+        { type: 'tool_call', name: 'plan_write_draft', args: {}, result: 'ok', status: 'success', toolCallId: 'p2', timestamp: 2 },
+        { type: 'tool_call', name: 'plan_update_todos', args: {}, result: 'ok', status: 'success', toolCallId: 'p3', timestamp: 3 },
+        { type: 'tool_call', name: 'file_read', args: { path: 'a.ts' }, result: 'a', status: 'success', toolCallId: 'r1', timestamp: 4 },
+      ],
+    }];
+
+    const events = buildTimelineEvents({
+      messages,
+      toolCalls: [
+        { name: 'plan_write_draft', args: {}, result: 'ok', timestamp: 5, toolCallId: 'p4' },
+        { name: 'file_search', args: { query: 'x' }, result: 'x', timestamp: 6, toolCallId: 's1' },
+      ],
+      planState: idlePlanState,
+      mode: 'coding',
+    });
+
+    expect(JSON.stringify(events)).not.toContain('plan_');
+    expect(events.filter((event) => event.kind === 'tool')).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: 'tool', label: 'Read/search 2 calls', grouped: true });
+  });
+
   it('collapses adjacent personal tool calls into a disclosure', () => {
     const messages: ChatMessage[] = [{
       id: 'a1',

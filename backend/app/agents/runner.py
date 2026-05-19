@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.agent import AgentSession
-from app.config import load_config
+from app.config import get_model_for_agent
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ class CognitiveTaskRunner:
         if cls.DEFAULT_MODEL:
             return cls.DEFAULT_MODEL
         try:
-            return load_config().settings.default_model
+            return get_model_for_agent("personal")
         except Exception:
             return "kimi-for-coding"
 

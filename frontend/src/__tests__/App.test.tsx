@@ -728,7 +728,7 @@ describe('App', () => {
         return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', archived_sessions: 2 }) }) as any
       }
       if (url.endsWith('/api/projects/history/remove')) {
-        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok', archived_sessions: 2 }) }) as any
+        return Promise.resolve({ json: () => Promise.resolve({ status: 'ok' }) }) as any
       }
       if (url.endsWith('/api/projects/worktrees/persistent')) {
         return Promise.resolve({
@@ -771,16 +771,14 @@ describe('App', () => {
     expect(promptSpy).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByLabelText('Project actions for repo'))
-    fireEvent.click(await screen.findByText('归档项目'))
+    fireEvent.click(await screen.findByText('归档会话'))
     const archiveDialog = await screen.findByRole('dialog')
     const archiveButtons = within(archiveDialog).getAllByRole('button')
     fireEvent.click(archiveButtons[archiveButtons.length - 1])
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/history/archive-sessions'))).toBe(true)
     })
-    await waitFor(() => {
-      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/close'))).toBe(true)
-    })
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/close'))).toBe(false)
     expect(confirmSpy).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByLabelText('Project actions for repo'))

@@ -1,7 +1,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +12,28 @@ class ConnectorConfig(BaseModel):
     description: str = ""
     enabled: bool = False
     config: Dict[str, Any] = Field(default_factory=dict)
+
+
+CONNECTOR_AGENT_OPTIONS = ("personal", "coding")
+
+
+def normalize_connector_target_agent(value: Any) -> str:
+    target = str(value or "personal").strip().lower()
+    return target if target in CONNECTOR_AGENT_OPTIONS else "personal"
+
+
+def target_agent_config_schema() -> Dict[str, Any]:
+    return {
+        "type": "string",
+        "label": "Target Agent",
+        "description": "Agent that handles messages from this connector",
+        "enum": ["personal", "coding"],
+        "enumLabels": {
+            "personal": "Personal / Main Agent",
+            "coding": "Coding Agent",
+        },
+        "default": "personal",
+    }
 
 
 class PlatformConnector(ABC):
@@ -60,9 +82,23 @@ class PlatformConnector(ABC):
         self._config = config
 
     def get_session_id(self, user_id: str, channel_id: str = "") -> str:
+        target_agent = self.target_agent
         if channel_id:
-            return f"{self.name}:{user_id}:{channel_id}"
-        return f"{self.name}:{user_id}"
+            return f"{self.name}:{target_agent}:{user_id}:{channel_id}"
+        return f"{self.name}:{target_agent}:{user_id}"
+
+    @property
+    def target_agent(self) -> str:
+        return normalize_connector_target_agent(self._config.config.get("target_agent"))
+
+    def resolve_agent_target(self) -> Tuple[str, str, str]:
+        from app.agents.manager import AgentManager
+        from app.config import get_model_for_agent
+
+        agent_type = self.target_agent
+        role_id = AgentManager.get_default_role(agent_type)
+        model_id = get_model_for_agent(agent_type)
+        return agent_type, role_id, model_id
 
     def get_config_schema(self) -> Dict[str, Any]:
         return {

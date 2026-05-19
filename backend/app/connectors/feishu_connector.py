@@ -4,8 +4,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from app.connectors.base import ConnectorConfig, PlatformConnector
-from app.config import load_config
+from app.connectors.base import ConnectorConfig, PlatformConnector, target_agent_config_schema
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +59,7 @@ class FeishuConnector(PlatformConnector):
                     "description": "飞书事件订阅的 Verification Token（可选，WebSocket 模式可留空）",
                     "sensitive": True,
                 },
+                "target_agent": target_agent_config_schema(),
             },
             "required": ["app_id", "app_secret"],
         }
@@ -270,8 +270,8 @@ class FeishuConnector(PlatformConnector):
 
         from app.agent import get_or_create_session
 
-        default_model = load_config().settings.default_model
-        session = get_or_create_session(session_id, default_model, role_id="desktop-agent")
+        agent_type, role_id, model_id = self.resolve_agent_target()
+        session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type=agent_type)
 
         reply_msg_id = self._send_text_message(chat_id, message_id, "⏳ 思考中...")
 

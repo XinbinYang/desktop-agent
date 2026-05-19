@@ -95,14 +95,31 @@ $env:DESKTOP_AGENT_USER_DATA_DIR="D:\DesktopAgentData"
 
 ## 环境要求
 
-- Windows 是主要目标平台；桌面和应用控制依赖 Windows API。
-- Python 3.11+。
-- Node.js 18+。
-- Playwright Chromium：后端浏览器工具需要安装。
+- 客户安装包：Windows 10/11；不需要客户预装 Python、Node.js 或前端依赖。
+- 开发/源码模式：Windows 是主要目标平台；需要 Python 3.11+、Node.js 18+、npm、Playwright Chromium。
+- 桌面和应用控制能力依赖 Windows API；其他平台只作为代码结构兼容目标。
 
-## 安装
+## 客户安装
 
-一键安装：
+客户只需要下载生产安装器并双击安装：
+
+```text
+Desktop-Agent-Setup-<version>.exe
+```
+
+安装后从桌面快捷方式或开始菜单打开 `Desktop Agent`。Electron 主应用会静默启动内置 Python 后端，运行时数据写入 `%APPDATA%\Desktop Agent`，后端日志写入：
+
+```text
+%APPDATA%\Desktop Agent\logs\backend.log
+```
+
+关闭窗口会隐藏到托盘；从托盘可重新打开主界面、打开日志目录或退出应用。退出应用时会停止由主进程托管的后端进程。
+
+## 开发/源码安装
+
+`install.ps1` 和 `start-all.ps1` 只用于开发者从源码运行，不是客户交付入口。
+
+一键安装开发依赖：
 
 ```powershell
 .\install.ps1
@@ -121,9 +138,9 @@ cd ..\frontend
 npm install
 ```
 
-## 启动
+## 开发启动
 
-一键启动：
+一键启动开发环境：
 
 ```powershell
 .\start-all.ps1
@@ -204,11 +221,21 @@ git status --short
 
 ```powershell
 cd frontend
-npm run build
 npm run dist
 ```
 
-`npm run build` 输出到 `frontend/dist/`，`npm run dist` 调用 electron-builder 并输出到 `frontend/release/`。当前后端仍以源码方式运行；如需完整分发安装包，需要单独补齐 Python 后端 exe 打包流程。
+`npm run dist` 会先用 PyInstaller 构建 `backend/desktop-agent-backend.exe`，再构建 Vite renderer，最后调用 electron-builder 输出 Windows 安装器和 `win-unpacked` 验收目录。产物位于：
+
+```text
+frontend/release-packaged/<stamp>/Desktop-Agent-Setup-<version>.exe
+frontend/release-packaged/<stamp>/win-unpacked/
+```
+
+完整 GUI 验收：
+
+```powershell
+npm run dist:verify
+```
 
 ## WebSocket 协议概览
 

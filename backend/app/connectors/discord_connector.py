@@ -4,8 +4,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.connectors.base import ConnectorConfig, PlatformConnector
-from app.config import load_config
+from app.connectors.base import ConnectorConfig, PlatformConnector, target_agent_config_schema
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,7 @@ class DiscordConnector(PlatformConnector):
                     "description": "Discord 开发者门户中创建的 Bot Token",
                     "sensitive": True,
                 },
+                "target_agent": target_agent_config_schema(),
             },
             "required": ["bot_token"],
         }
@@ -193,8 +193,8 @@ class DiscordConnector(PlatformConnector):
 
         from app.agent import get_or_create_session
 
-        default_model = load_config().settings.default_model
-        session = get_or_create_session(session_id, default_model, role_id="desktop-agent")
+        agent_type, role_id, model_id = self.resolve_agent_target()
+        session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type=agent_type)
 
         placeholder = None
         try:

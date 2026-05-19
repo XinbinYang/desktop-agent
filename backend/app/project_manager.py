@@ -234,7 +234,7 @@ class ProjectManager:
     @classmethod
     def remove_project_from_history(cls, path: str | Path) -> Dict[str, Any]:
         now = cls._now_iso()
-        return cls._update_history_entry(path, {"removed_at": now, "archived_at": now})
+        return cls._update_history_entry(path, {"removed_at": now, "archived_at": None})
 
     @classmethod
     def restore_project_to_history(cls, path: str | Path) -> Dict[str, Any]:

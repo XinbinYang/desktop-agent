@@ -60,18 +60,37 @@
   "build": {
     "appId": "com.desktop.agent",
     "productName": "Desktop Agent",
+    "artifactName": "Desktop-Agent-Setup-${version}.${ext}",
     "directories": {
       "output": "release-packaged"
     },
     "win": {
+      "icon": "assets/icons/app.ico",
       "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
         "dir"
       ],
       "signAndEditExecutable": false
     },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Desktop Agent",
+      "installerIcon": "assets/icons/app.ico",
+      "uninstallerIcon": "assets/icons/app.ico"
+    },
     "files": [
       "dist/**/*",
-      "src-main/**/*"
+      "src-main/**/*",
+      "assets/icons/**/*"
     ],
     "extraResources": [
       {

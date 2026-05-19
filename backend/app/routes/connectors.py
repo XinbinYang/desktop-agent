@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.connectors import get_connector_manager
+from app.connectors.base import CONNECTOR_AGENT_OPTIONS
 
 router = APIRouter(prefix="/api/connectors", tags=["connectors"])
 
@@ -103,6 +104,9 @@ def update_connector(name: str, req: UpdateConnectorRequest):
                 status_code=422,
                 detail=f"Missing required fields: {', '.join(missing)}",
             )
+    target_agent = req.config.get("target_agent")
+    if target_agent not in (None, "") and target_agent not in CONNECTOR_AGENT_OPTIONS:
+        raise HTTPException(status_code=422, detail="target_agent must be personal or coding")
 
     success = manager.update_config(name, req.config)
     if not success:

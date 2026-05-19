@@ -12,6 +12,7 @@ import {
   Pencil,
   Pin,
   SquarePen,
+  Trash2,
   X,
 } from 'lucide-react';
 import type { AgentType, SessionHistoryItem, SessionHistoryProject, SessionHistoryResponse } from '../types';
@@ -26,6 +27,7 @@ interface SessionHistoryPanelProps {
   currentSession?: string;
   currentProjectPath?: string | null;
   onSwitchSession?: (id: string, projectPath?: string | null) => void;
+  onArchiveSession?: (id: string) => void;
   onDeleteSession?: (id: string) => void;
   onOpenProject?: (path: string) => void;
   onOpenProjectModal?: () => void;
@@ -78,6 +80,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   currentSession,
   currentProjectPath,
   onSwitchSession,
+  onArchiveSession,
   onDeleteSession,
   onOpenProject,
   onOpenProjectModal,
@@ -88,6 +91,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   const standaloneSessions = history?.standalone_sessions || fallbackSessions;
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [openProjectMenu, setOpenProjectMenu] = useState<string | null>(null);
+  const [openSessionMenu, setOpenSessionMenu] = useState<string | null>(null);
 
   useEffect(() => {
     setExpandedProjects((prev) => {
@@ -176,7 +180,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => handleProjectAction('archive', project)}>
           <Archive className="h-3.5 w-3.5" />
-          <span>归档项目</span>
+          <span>归档会话</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem destructive onSelect={() => handleProjectAction('remove', project)}>
@@ -187,9 +191,46 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
     </DropdownMenu>
   );
 
+  const renderSessionMenu = (session: SessionHistoryItem, label: string) => (
+    <DropdownMenu open={openSessionMenu === session.id} onOpenChange={(open) => setOpenSessionMenu(open ? session.id : null)}>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setOpenSessionMenu(session.id);
+          }}
+          className="rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100"
+          aria-label={`Session actions for ${label}`}
+          title="Session actions"
+        >
+          <MoreHorizontal className="h-3.5 w-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-[148px]">
+        <DropdownMenuItem onSelect={() => {
+          setOpenSessionMenu(null);
+          onArchiveSession?.(session.id);
+        }}>
+          <Archive className="h-3.5 w-3.5" />
+          <span>归档会话</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem destructive onSelect={() => {
+          setOpenSessionMenu(null);
+          onDeleteSession?.(session.id);
+        }}>
+          <Trash2 className="h-3.5 w-3.5" />
+          <span>永久删除</span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
   const renderSession = (session: SessionHistoryItem) => {
     const label = isPrimaryPersonal(session) ? 'Personal Agent · Main' : formatSessionLabel(session);
     const type = session.agent_type || 'personal';
+    const canManageSession = !isPrimaryPersonal(session) && !session.is_running;
     return (
       <div
         key={session.id}
@@ -218,29 +259,13 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
             {agentLabel(type)}
           </span>
         </button>
-        <div className="flex min-w-[34px] items-center justify-end gap-1 text-[10px] text-fg-muted">
+        <div className="flex min-w-[42px] items-center justify-end gap-1 text-[10px] text-fg-muted">
           {session.is_running ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Session running" />
           ) : (
             <span className="whitespace-nowrap group-hover:hidden">{formatRelativeTime(session.updated_at)}</span>
           )}
-          {!isPrimaryPersonal(session) && (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                onDeleteSession?.(session.id);
-              }}
-              className={cn(
-                'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-danger group-hover:opacity-100',
-                session.is_running && 'opacity-0',
-              )}
-              aria-label={`Delete session ${label}`}
-              title="Delete session"
-            >
-              <X className="h-3 w-3" />
-            </button>
-          )}
+          {canManageSession && renderSessionMenu(session, label)}
         </div>
       </div>
     );

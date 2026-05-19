@@ -395,16 +395,19 @@ class TestAPIRoutes:
         archive = client.post("/api/projects/history/archive-sessions", json={"path": str(project_b)})
         assert archive.status_code == 200
         assert archive.json()["archived_sessions"] == 1
-        assert archive.json()["project"]["archived_at"]
+        assert not archive.json()["project"].get("archived_at")
         archived_record = json.loads((sessions_dir / "coding_b.json").read_text(encoding="utf-8"))
         assert archived_record["archived_at"]
 
         data = client.get("/api/session-history").json()
-        assert str(project_b) not in {project["path"] for project in data["projects"]}
+        project_b_active = next(project for project in data["projects"] if project["path"] == str(project_b))
+        assert project_b_active["is_archived"] is False
+        assert project_b_active["archived_sessions_count"] == 1
+        assert project_b_active["sessions"] == []
 
         data_with_archived = client.get("/api/session-history?include_archived=true").json()
         project_b_archived = next(project for project in data_with_archived["projects"] if project["path"] == str(project_b))
-        assert project_b_archived["is_archived"] is True
+        assert project_b_archived["is_archived"] is False
         assert project_b_archived["archived_sessions_count"] == 1
         assert project_b_archived["sessions"][0]["id"] == "coding_b"
 
@@ -425,9 +428,11 @@ class TestAPIRoutes:
 
         removed = client.post("/api/projects/history/remove", json={"path": str(project)})
         assert removed.status_code == 200
-        assert removed.json()["archived_sessions"] == 1
+        assert "archived_sessions" not in removed.json()
         assert project.exists()
         assert (sessions_dir / "coding_remove.json").exists()
+        remove_record = json.loads((sessions_dir / "coding_remove.json").read_text(encoding="utf-8"))
+        assert "archived_at" not in remove_record
 
         ProjectManager.close_project()
         data = client.get("/api/session-history").json()
@@ -436,7 +441,40 @@ class TestAPIRoutes:
         reopened = client.post("/api/projects/open", json={"path": str(project)})
         assert reopened.status_code == 200
         data = client.get("/api/session-history").json()
-        assert str(project) in {item["path"] for item in data["projects"]}
+        restored = next(item for item in data["projects"] if item["path"] == str(project))
+        assert restored["sessions"][0]["id"] == "coding_remove"
+
+    def test_archive_session_hides_without_deleting(self, client, monkeypatch, tmp_path, isolate_projects):
+        import app.agent as agent_module
+        from app.project_manager import ProjectManager
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        project = tmp_path / "repo"
+        project.mkdir()
+        ProjectManager.open_project(str(project))
+        self._write_session_record(sessions_dir, "coding_archive_one", project_path=str(project), updated_at=3000)
+
+        archived = client.post("/api/sessions/coding_archive_one/archive")
+
+        assert archived.status_code == 200
+        assert archived.json()["session"]["archived_at"]
+        assert (sessions_dir / "coding_archive_one.json").exists()
+        record = json.loads((sessions_dir / "coding_archive_one.json").read_text(encoding="utf-8"))
+        assert record["archived_at"] == archived.json()["session"]["archived_at"]
+
+        data = client.get("/api/session-history").json()
+        project_entry = next(project_item for project_item in data["projects"] if project_item["path"] == str(project))
+        assert project_entry["sessions"] == []
+        assert project_entry["archived_sessions_count"] == 1
+
+        data_with_archived = client.get("/api/session-history?include_archived=true").json()
+        project_entry = next(project_item for project_item in data_with_archived["projects"] if project_item["path"] == str(project))
+        assert project_entry["sessions"][0]["id"] == "coding_archive_one"
 
     def test_persistent_worktree_endpoint_creates_runtime_worktree(self, client, tmp_path, isolate_projects):
         git = subprocess.run(["git", "--version"], capture_output=True, text=True)
@@ -517,10 +555,10 @@ class TestLocalAuth:
     def test_websocket_requires_token_when_enabled(self, client, monkeypatch):
         monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
 
-        with client.websocket_connect("/ws/auth_missing") as ws:
-            with pytest.raises(WebSocketDisconnect) as exc:
-                ws.receive_json()
-            assert exc.value.code == 1008
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect("/ws/auth_missing"):
+                pass
+        assert exc.value.code == 1008
 
     def test_websocket_accepts_valid_query_token(self, client, monkeypatch):
         monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
@@ -530,6 +568,30 @@ class TestLocalAuth:
             msg = receive_until(ws, "cleared")
 
         assert msg["type"] == "cleared"
+
+    def test_websocket_accepts_packaged_electron_file_origin(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        with client.websocket_connect(
+            "/ws/auth_file_origin?token=test-token",
+            headers={"origin": "file://"},
+        ) as ws:
+            ws.send_json({"type": "clear"})
+            msg = receive_until(ws, "cleared")
+
+        assert msg["type"] == "cleared"
+
+    def test_websocket_rejects_nonlocal_origin(self, client, monkeypatch):
+        monkeypatch.setenv("DESKTOP_AGENT_AUTH_TOKEN", "test-token")
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                "/ws/auth_bad_origin?token=test-token",
+                headers={"origin": "https://example.com"},
+            ):
+                pass
+
+        assert exc.value.code == 1008
 
 
 class TestWebSocket:

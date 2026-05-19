@@ -596,6 +596,96 @@ describe('useChatSession', () => {
     expect(result.current.messages[0].blocks![0].type).toBe('tool_call')
   })
 
+  it('hides internal plan tool events from visible tool state', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'status',
+        data: { status: 'executing', tool: 'plan_write_draft', tool_call_id: 'plan-status' },
+      })
+      for (const name of ['plan_ask_questions', 'plan_write_draft', 'plan_update_todos']) {
+        messageHandler?.({
+          type: 'tool_call',
+          data: {
+            name,
+            args: {},
+            result: 'ok',
+            run_id: 'run-1',
+            tool_call_id: `call-${name}`,
+          },
+        })
+      }
+      messageHandler?.({
+        type: 'tool_result',
+        data: {
+          name: 'plan_update_todos',
+          args: {},
+          output: 'ok',
+          error: '',
+          tool_call_id: 'direct-plan-update',
+        },
+      })
+    })
+
+    expect(result.current.toolCalls).toEqual([])
+    expect(result.current.messages.flatMap((msg) => msg.blocks || [])).not.toContainEqual(
+      expect.objectContaining({ type: 'tool_call' }),
+    )
+  })
+
+  it('filters internal plan tool calls from history snapshots', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          messages: [
+            {
+              role: 'assistant',
+              content: '',
+              message_id: 'assistant-plan',
+              tool_calls: [{
+                id: 'plan-call',
+                function: { name: 'plan_write_draft', arguments: '{}' },
+              }],
+            },
+            {
+              role: 'tool',
+              name: 'plan_write_draft',
+              tool_call_id: 'plan-call',
+              content: 'Plan draft submitted for review.',
+            },
+          ],
+        },
+      })
+    })
+
+    expect(result.current.toolCalls).toEqual([])
+    expect(result.current.messages).toEqual([])
+  })
+
   it('seals an open thinking block when a tool lands and starts a new one after', async () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {

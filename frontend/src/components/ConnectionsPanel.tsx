@@ -105,7 +105,7 @@ export function ConnectionsPanel() {
     const props = schema?.properties || {};
 
     for (const key of Object.keys(props)) {
-      fields[key] = c.config?.[key] || '';
+      fields[key] = c.config?.[key] || props[key]?.default || '';
       showValue[key] = !props[key]?.sensitive;
     }
 
@@ -273,19 +273,35 @@ export function ConnectionsPanel() {
                       {Object.entries(c.config_schema.properties).map(([key, prop]: [string, any]) => {
                         const isSensitive = prop.sensitive;
                         const show = editing.showValue[key] ?? !isSensitive;
+                        const enumOptions = Array.isArray(prop.enum) ? prop.enum : [];
+                        const enumLabels = prop.enumLabels || {};
                         return (
                           <div key={key}>
                             <label className="text-[10px] text-fg-secondary block font-medium">
                               {prop.label || key}
                             </label>
                             <div className="flex gap-1 mt-0.5">
-                              <input
-                                type={show ? 'text' : 'password'}
-                                value={editing.fields[key] || ''}
-                                onChange={(e) => updateField(key, e.target.value)}
-                                placeholder={prop.description || `输入 ${prop.label || key}...`}
-                                className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
-                              />
+                              {enumOptions.length > 0 ? (
+                                <select
+                                  value={editing.fields[key] || prop.default || enumOptions[0] || ''}
+                                  onChange={(e) => updateField(key, e.target.value)}
+                                  className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
+                                >
+                                  {enumOptions.map((option: string) => (
+                                    <option key={option} value={option}>
+                                      {enumLabels[option] || option}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <input
+                                  type={show ? 'text' : 'password'}
+                                  value={editing.fields[key] || ''}
+                                  onChange={(e) => updateField(key, e.target.value)}
+                                  placeholder={prop.description || `输入 ${prop.label || key}...`}
+                                  className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
+                                />
+                              )}
                               {isSensitive && (
                                 <button
                                   onClick={() => toggleShow(key)}

@@ -137,6 +137,11 @@ function webSearchToForm(web?: WebSearchSettings): WebSearchFormState {
   };
 }
 
+function generalSettingsPayload(form: GeneralFormState): Omit<GeneralFormState, 'default_model' | 'default_provider'> {
+  const { default_model: _legacyDefaultModel, default_provider: _legacyDefaultProvider, ...payload } = form;
+  return payload;
+}
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen, onClose, models, currentModel, onSettingsChanged,
 }) => {
@@ -402,7 +407,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await fetch(`${API_BASE}/api/settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(generalForm),
+        body: JSON.stringify(generalSettingsPayload(generalForm)),
       });
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
       onSettingsChanged();
@@ -499,7 +504,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         await fetch(`${API_BASE}/api/settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(generalForm),
+          body: JSON.stringify(generalSettingsPayload(generalForm)),
         });
       }
       if (webSearchForm) {
@@ -617,7 +622,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     settings && typeof settings.providers === 'object' && settings.providers !== null
       ? Object.keys(settings.providers)
       : [];
-  const defaultProvider = settings?.settings.default_provider || '';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
@@ -668,30 +672,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 全局设置
               </h3>
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs text-fg-secondary block mb-1">默认模型</label>
-                  <select
-                    value={generalForm.default_model}
-                    onChange={(e) => setGeneralForm({ ...generalForm, default_model: e.target.value })}
-                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
-                  >
-                    {models.map(m => (
-                      <option key={m.id} value={m.id}>{m.name} ({m.provider})</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-fg-secondary block mb-1">默认 Provider</label>
-                  <select
-                    value={generalForm.default_provider}
-                    onChange={(e) => setGeneralForm({ ...generalForm, default_provider: e.target.value })}
-                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
-                  >
-                    {allProviderNames.map(p => (
-                      <option key={p} value={p}>{p}</option>
-                    ))}
-                  </select>
-                </div>
                 <div>
                   <label className="text-xs text-fg-secondary block mb-1">最大迭代次数</label>
                   <input
@@ -774,13 +754,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     })}
                     className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
                   >
-                    <option value="">使用默认 ({generalForm.default_model})</option>
+                    {!generalForm.personal_agent?.model && <option value="" disabled>请选择模型</option>}
                     {models.map(m => (
                       <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
                     ))}
                   </select>
                   <div className="text-[10px] text-fg-muted mt-1">
-                    留空使用全局默认。推荐多模态模型（GPT-4o、Claude）以获得视觉能力。
+                    Personal/Main Agent 会使用这里选择的模型；推荐多模态模型以获得视觉能力。
                   </div>
                 </div>
                 <div>
@@ -816,13 +796,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     })}
                     className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
                   >
-                    <option value="">使用默认 ({generalForm.default_model})</option>
+                    {!generalForm.coding_agent?.model && <option value="" disabled>请选择模型</option>}
                     {models.map(m => (
                       <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
                     ))}
                   </select>
                   <div className="text-[10px] text-fg-muted mt-1">
-                    留空使用全局默认。推荐推理能力强的模型（DeepSeek、Claude）以获得更好的代码生成质量。
+                    Coding Agent 会使用这里选择的模型；推荐推理能力强的模型以获得更好的代码生成质量。
                   </div>
                 </div>
                 <div>
@@ -1208,7 +1188,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 {allProviderNames.map((pname) => {
                   const p = settings.providers[pname];
                   if (!p) return null;
-                  const isDefault = defaultProvider === pname;
+                  const isPersonalProvider = p.models.some((m) => m.id === generalForm?.personal_agent?.model);
+                  const isCodingProvider = p.models.some((m) => m.id === generalForm?.coding_agent?.model);
+                  const providerInUse = isPersonalProvider || isCodingProvider;
                   const isDeleting = deletingProvider === pname;
                   return (
                     <div
@@ -1219,9 +1201,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="text-xs font-medium text-fg">{pname}</span>
-                          {isDefault && (
+                          {isPersonalProvider && (
                             <span className="text-[10px] bg-accent/10 text-accent px-1 py-0.5 rounded border border-accent/25">
-                              默认
+                              Personal
+                            </span>
+                          )}
+                          {isCodingProvider && (
+                            <span className="text-[10px] bg-success/10 text-success px-1 py-0.5 rounded border border-success/25">
+                              Coding
                             </span>
                           )}
                         </div>
@@ -1242,9 +1229,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </button>
                       <button
                         onClick={() => handleDeleteProvider(pname)}
-                        disabled={isDefault || isDeleting}
+                        disabled={providerInUse || isDeleting}
                         className="p-1 text-fg-secondary hover:text-danger disabled:opacity-30 disabled:cursor-not-allowed"
-                        title={isDefault ? '不能删除默认 Provider' : '删除'}
+                        title={providerInUse ? 'Provider is used by an Agent model' : '删除'}
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>

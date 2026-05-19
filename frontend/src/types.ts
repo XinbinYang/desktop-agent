@@ -60,8 +60,8 @@ export interface ProviderSettings {
 }
 
 export interface AppSettings {
-  default_model: string;
-  default_provider: string;
+  default_model?: string;
+  default_provider?: string;
   max_iterations: number;
   auto_approve: boolean;
   screenshot_on_step: boolean;
@@ -483,6 +483,7 @@ export interface SessionHistoryItem {
   message_count: number;
   updated_at?: number;
   is_primary?: boolean;
+  archived_at?: string | null;
   is_running: boolean;
   active_connections: number;
   activity_state: 'idle' | 'running' | 'needs_input';

@@ -377,10 +377,45 @@ def archive_session_records_for_project(project_path: str, agent_type: str = "co
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, path)
+            live = _sessions.get(str(data.get("session_id") or path.stem))
+            if live:
+                live.archived_at = archived_at
             changed += 1
         except Exception:
             pass
     return changed
+
+
+def archive_session_record(session_id: str) -> Optional[Dict[str, Any]]:
+    """Mark a single session as archived without deleting its transcript."""
+    data = _load_session_data(session_id)
+    live = _sessions.get(session_id)
+    if data is None and live:
+        live._save()
+        data = _load_session_data(session_id)
+    if not isinstance(data, dict):
+        return None
+
+    registry = _load_session_registry()
+    primary_id = registry.get("personal", {}).get("primary_session_id")
+    stored_agent_type = _resolve_stored_agent_type(data)
+    if stored_agent_type == "personal" and (session_id == primary_id or session_id == "session_personal_main"):
+        raise ValueError("The primary Personal Agent session cannot be archived.")
+
+    already_archived = bool(data.get("archived_at"))
+    archived_at = str(data.get("archived_at") or datetime.now(timezone.utc).isoformat())
+    data["archived_at"] = archived_at
+    path = SESSIONS_DIR / f"{session_id}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    if live:
+        live.archived_at = archived_at
+    return {
+        "id": session_id,
+        "archived_at": archived_at,
+        "already_archived": already_archived,
+    }
 
 
 def _shell_command_looks_like_verification(command: str) -> bool:
@@ -490,6 +525,7 @@ class AgentSession:
         self._last_context_usage: Dict[str, Any] = {}
         self.team_id: str | None = None
         self.team_name: str = ""
+        self.archived_at: str | None = None
         # Project this session is bound to. Set at resolve time and persisted.
         # Authoritative for this session's execution — independent of the
         # global ProjectManager.get_current() (which is now UI-only).
@@ -3225,6 +3261,7 @@ class AgentSession:
         self.compaction_summary = ""
         self._last_usage = {}
         self._last_context_usage = {}
+        self.archived_at = None
         self.chat_mode = "agent"
         self.thinking_intensity = getattr(
             load_config().settings, "thinking_intensity_default", "medium"
@@ -3252,7 +3289,7 @@ class AgentSession:
 
         # Switch to the agent's configured model
         effective = self._resolve_agent_model()
-        if effective != self.model_id:
+        if effective and effective != self.model_id:
             self.model_id = effective
             try:
                 self.router = ModelRouter(effective)
@@ -3334,6 +3371,7 @@ class AgentSession:
             "compaction_summary": self.compaction_summary,
             "last_usage": self._last_usage,
             "last_context_usage": self._last_context_usage,
+            "archived_at": self.archived_at,
             "title": title,
             "project_path": stored_project_path,
         }
@@ -3366,6 +3404,8 @@ class AgentSession:
             )
             session.messages = data.get("messages", [])
             session.iteration = 0
+            archived_at = data.get("archived_at")
+            session.archived_at = str(archived_at) if archived_at else None
             session.compaction_summary = str(data.get("compaction_summary") or "")
             last_usage = data.get("last_usage")
             session._last_usage = last_usage if isinstance(last_usage, dict) else {}
@@ -3504,7 +3544,14 @@ def _evict_if_needed() -> None:
         _sessions.popitem(last=False)
 
 
-def get_or_create_session(session_id: str, model_id: str, role_id: str | None = None, agent_type: str | None = None) -> AgentSession:
+def get_or_create_session(
+    session_id: str,
+    model_id: str,
+    role_id: str | None = None,
+    agent_type: str | None = None,
+    *,
+    preserve_existing_model: bool = False,
+) -> AgentSession:
     existing = _sessions.get(session_id)
     provided_role_id = role_id
     role_id = role_id or (AgentManager.get_default_role(agent_type) if agent_type else "desktop-agent")
@@ -3539,7 +3586,10 @@ def get_or_create_session(session_id: str, model_id: str, role_id: str | None = 
         session.switch_role(role_id)
         changed = True
 
-    should_keep_loaded_model = loaded_from_disk and agent_type is None and provided_role_id is None
+    should_keep_loaded_model = (
+        preserve_existing_model
+        or (loaded_from_disk and agent_type is None and provided_role_id is None)
+    )
     if model_id and session.model_id != model_id and not should_keep_loaded_model:
         session.model_id = model_id
         session.router = ModelRouter(model_id)
@@ -3604,7 +3654,13 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
             session_id = _newest_matching_session_id("personal") or "session_personal_main"
 
         created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
-        session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type="personal")
+        session = get_or_create_session(
+            session_id,
+            model_id,
+            role_id=role_id,
+            agent_type="personal",
+            preserve_existing_model=not created,
+        )
         if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
             session._save()
 
@@ -3628,7 +3684,13 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
         session_id = _new_coding_session_id()
 
     created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
-    session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type="coding")
+    session = get_or_create_session(
+        session_id,
+        model_id,
+        role_id=role_id,
+        agent_type="coding",
+        preserve_existing_model=not created,
+    )
     bound_path = canonical_project_path or None
     binding_changed = bound_path is not None and session.project_path != bound_path
     if binding_changed:

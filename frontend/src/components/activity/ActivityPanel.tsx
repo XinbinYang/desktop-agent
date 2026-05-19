@@ -4,6 +4,7 @@ import {
   ChevronDown, ChevronRight, Sparkles,
 } from 'lucide-react';
 import type { ToolCall, FileEdit, RunEvent, MatchedSkillTrace } from '../../types';
+import { filterVisibleToolCalls } from '../../lib/internalTools';
 import { ToolCallView } from '../ToolCallView';
 import { ChangesPanel } from '../ChangesPanel';
 import { RunSummaryPanel } from '../RunSummaryPanel';
@@ -58,6 +59,7 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
   const disabledMatches = (latestSkillsEvent?.data?.disabled_matches || []) as MatchedSkillTrace[];
   const skillTraceCount = matchedSkills.length + disabledMatches.length;
   const codingRunEvents = runEvents.filter((event) => event.type !== 'skills_matched');
+  const visibleToolCalls = filterVisibleToolCalls(toolCalls);
 
   const toggle = (s: ActivitySection) => {
     setExpanded((prev) => {
@@ -81,9 +83,9 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
               <Icon className="w-3.5 h-3.5" />
               {label}
               {/* Summary chips */}
-              {key === 'tools' && toolCalls.length > 0 && (
+              {key === 'tools' && visibleToolCalls.length > 0 && (
                 <span className="ml-auto text-[10px] text-fg-muted bg-surface-alt px-1.5 py-0.5 rounded">
-                  {toolCalls.length}
+                  {visibleToolCalls.length}
                 </span>
               )}
               {key === 'skills' && skillTraceCount > 0 && (
@@ -156,10 +158,10 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
                   </div>
                 )}
                 {key === 'tools' && (
-                  toolCalls.length === 0 ? (
+                  visibleToolCalls.length === 0 ? (
                     <div className="text-xs text-fg-muted text-center py-4">暂无工具调用</div>
                   ) : (
-                    toolCalls.map((tc, i) => (
+                    visibleToolCalls.map((tc, i) => (
                       <ToolCallView
                         key={`${tc.timestamp}-${i}`}
                         name={tc.name}

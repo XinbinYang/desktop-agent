@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -8,10 +9,12 @@ from pydantic import BaseModel
 from app.config import load_config, mask_api_key, save_config, reload_config
 from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig, PersonalAgentConfig, WebSearchConfig
 from app.roles import RoleManager
+from app.runtime_paths import runtime_dir
 from app.skills import SkillManager
 from app.tools.web_tool import perform_web_search
 
 router = APIRouter()
+SESSIONS_DIR = runtime_dir("sessions")
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -103,6 +106,20 @@ def _is_local_provider(provider_name: str | None, base_url: str) -> bool:
         or "127.0.0.1" in lowered_url
         or lowered_url.startswith("http://[::1]")
     )
+
+
+def _session_ids_using_models(model_ids: set[str]) -> list[str]:
+    if not model_ids or not SESSIONS_DIR.exists():
+        return []
+    session_ids: list[str] = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(data.get("model_id") or "") in model_ids:
+            session_ids.append(str(data.get("session_id") or path.stem))
+    return session_ids
 
 
 def _web_search_settings_payload(cfg) -> dict[str, Any]:
@@ -486,12 +503,29 @@ def create_provider(req: NewProviderRequest):
 
 @router.delete("/api/providers/{provider_name}")
 def delete_provider(provider_name: str):
-    """删除 Provider（拒绝删除 default_provider）"""
+    """删除 Provider（拒绝删除正在被 Agent 或会话使用的 Provider）"""
     cfg = load_config()
     if provider_name not in cfg.providers:
         raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
-    if cfg.settings.default_provider == provider_name:
-        raise HTTPException(status_code=400, detail="Cannot delete the default provider. Change the default first.")
+    model_ids = {m.id for m in cfg.providers[provider_name].models}
+    in_use_agents: list[str] = []
+    if cfg.personal_agent.model in model_ids:
+        in_use_agents.append("Personal Agent")
+    if cfg.coding_agent.model in model_ids:
+        in_use_agents.append("Coding Agent")
+    session_ids = _session_ids_using_models(model_ids)
+    if in_use_agents or session_ids:
+        details = []
+        if in_use_agents:
+            details.append(f"agents: {', '.join(in_use_agents)}")
+        if session_ids:
+            preview = ", ".join(session_ids[:5])
+            suffix = "..." if len(session_ids) > 5 else ""
+            details.append(f"sessions: {preview}{suffix}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete provider '{provider_name}' because it is in use by {'; '.join(details)}.",
+        )
     del cfg.providers[provider_name]
     save_config(cfg)
     return {"status": "ok"}
@@ -531,7 +565,11 @@ async def test_web_search(req: WebSearchTestRequest):
 def force_config_reload():
     """强制刷新后端配置缓存"""
     cfg = reload_config()
-    return {"status": "ok", "default_model": cfg.settings.default_model}
+    return {
+        "status": "ok",
+        "personal_model": cfg.personal_agent.model,
+        "coding_model": cfg.coding_agent.model,
+    }
 
 
 @router.post("/api/roles/reload")

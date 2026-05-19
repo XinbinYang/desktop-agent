@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, AsyncGenerator, Dict, List, Tuple
 
 from app.collaboration.models import ResultPacket, TaskPacket
-from app.config import get_model_for_agent, load_config
+from app.config import get_model_for_agent
 from app.worker import WorkerSession
 
 
@@ -46,7 +46,7 @@ async def run_consult_worker(
     task_id: str,
 ) -> Tuple[ResultPacket, List[Dict[str, Any]]]:
     """Run a read-only Coding specialist using the architect worker profile."""
-    model_id = get_model_for_agent("coding") or load_config().settings.default_model
+    model_id = get_model_for_agent("coding")
     worker = WorkerSession(
         worker_id=f"coding_consult_{task_id[-6:]}",
         task=_task_text(packet),
@@ -81,7 +81,7 @@ async def run_execute_agent_events(
     from app.agent import AgentSession
     from app.agents.manager import AgentManager
 
-    model_id = get_model_for_agent("coding") or load_config().settings.default_model
+    model_id = get_model_for_agent("coding")
     coding_session = AgentSession(
         model_id=model_id,
         session_id=f"{session_id}_coding_delegate_{run_id[-6:]}",

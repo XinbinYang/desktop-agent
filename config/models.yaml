@@ -29,7 +29,7 @@ providers:
       vision: true
   local:
     base_url: http://localhost:11434/v1
-    api_key: ollama
+    api_key: ${OLLAMA_API_KEY}
     models:
     - id: gemma3:4b
       name: Gemma 3 (4B)
@@ -51,8 +51,8 @@ rag:
   top_k: 5
 
 settings:
-  default_model: kimi-for-coding
-  default_provider: kimi
+  default_model: ""
+  default_provider: ""
   max_iterations: 10000
   auto_approve: false
   screenshot_on_step: true
@@ -70,3 +70,7 @@ coding_agent:
   require_verification: true
   require_review: true
   auto_generate_repo_map: true
+  model: kimi-for-coding
+
+personal_agent:
+  model: kimi-for-coding

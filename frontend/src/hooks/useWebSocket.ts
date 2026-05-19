@@ -112,14 +112,18 @@ export function useWebSocket(
       };
     };
 
-    const shouldLoadElectronToken =
-      !getAuthToken() &&
-      !getAuthUnavailableReason() &&
-      typeof window !== 'undefined' &&
-      !!window.electronAPI?.getAuthToken;
+    const prepareAuthAndOpen = async () => {
+      if (!getAuthToken() && !getAuthUnavailableReason()) {
+        await ensureApiAuth();
+      }
+      if (!getAuthToken() && !getAuthUnavailableReason()) {
+        await refreshAuthRequirement();
+      }
+      openWebSocket();
+    };
 
-    if (shouldLoadElectronToken) {
-      void ensureApiAuth().then(openWebSocket).catch((err) => {
+    if (!getAuthToken() && !getAuthUnavailableReason()) {
+      void prepareAuthAndOpen().catch((err) => {
         console.error('Failed to initialize WebSocket auth:', err);
         if (shouldReconnectRef.current) {
           scheduleReconnect();

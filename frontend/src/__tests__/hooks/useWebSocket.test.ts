@@ -12,6 +12,7 @@ describe('useWebSocket', () => {
     __setAuthTokenForTests('')
     delete (window as any).electronAPI
     mockWsInstances = []
+    vi.spyOn(global, 'fetch').mockResolvedValue({ status: 200 } as Response)
 
     MockWebSocket = vi.fn(function (this: any, url: string | URL, protocols?: string | string[]) {
       const instance = {
@@ -80,6 +81,18 @@ describe('useWebSocket', () => {
     expect(MockWebSocket).toHaveBeenCalledWith('ws://127.0.0.1:8765/ws/test-session?token=late-token')
   })
 
+  it('does not open an unauthenticated WebSocket when local auth is required', async () => {
+    vi.mocked(global.fetch).mockResolvedValue({ status: 403 } as Response)
+    const onMessage = vi.fn()
+
+    renderHook(() => useWebSocket('test-session', onMessage))
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalled()
+    })
+    expect(MockWebSocket).not.toHaveBeenCalled()
+  })
+
   it('sets isConnected to true on open', async () => {
     const onMessage = vi.fn()
     const { result } = renderHook(() => useWebSocket('test-session', onMessage))
@@ -128,11 +141,11 @@ describe('useWebSocket', () => {
     expect(ws.send).not.toHaveBeenCalled()
   })
 
-  it('reconnects with exponential backoff on close', () => {
+  it('reconnects with exponential backoff on close', async () => {
     vi.useFakeTimers()
     const onMessage = vi.fn()
     renderHook(() => useWebSocket('test-session', onMessage))
-    vi.runOnlyPendingTimers()
+    await vi.runOnlyPendingTimersAsync()
 
     expect(MockWebSocket).toHaveBeenCalledTimes(1)
 
@@ -140,41 +153,41 @@ describe('useWebSocket', () => {
     ws.onclose?.()
 
     // First reconnect after 1s
-    vi.advanceTimersByTime(1000)
+    await vi.advanceTimersByTimeAsync(1000)
     expect(MockWebSocket).toHaveBeenCalledTimes(2)
 
     // Second reconnect after 2s
     const ws2 = getLatestWs()
     ws2.onclose?.()
-    vi.advanceTimersByTime(2000)
+    await vi.advanceTimersByTimeAsync(2000)
     expect(MockWebSocket).toHaveBeenCalledTimes(3)
     vi.useRealTimers()
   })
 
-  it('does not reconnect after explicit disconnect', () => {
+  it('does not reconnect after explicit disconnect', async () => {
     vi.useFakeTimers()
     const onMessage = vi.fn()
     const { result } = renderHook(() => useWebSocket('test-session', onMessage))
-    vi.runOnlyPendingTimers()
+    await vi.runOnlyPendingTimersAsync()
 
     const ws = getLatestWs()
     result.current.disconnect()
     ws.onclose?.()
-    vi.advanceTimersByTime(30000)
+    await vi.advanceTimersByTimeAsync(30000)
 
     expect(MockWebSocket).toHaveBeenCalledTimes(1)
     vi.useRealTimers()
   })
 
-  it('does not reconnect when the backend closes a deleted session', () => {
+  it('does not reconnect when the backend closes a deleted session', async () => {
     vi.useFakeTimers()
     const onMessage = vi.fn()
     renderHook(() => useWebSocket('deleted-session', onMessage))
-    vi.runOnlyPendingTimers()
+    await vi.runOnlyPendingTimersAsync()
 
     const ws = getLatestWs()
     ws.onclose?.({ code: 4004, reason: 'Session deleted', wasClean: true } as CloseEvent)
-    vi.advanceTimersByTime(30000)
+    await vi.advanceTimersByTimeAsync(30000)
 
     expect(MockWebSocket).toHaveBeenCalledTimes(1)
     vi.useRealTimers()
@@ -182,18 +195,21 @@ describe('useWebSocket', () => {
 
   it('stops reconnecting after an abnormal close reveals auth is required', async () => {
     vi.useFakeTimers()
-    const fetchMock = vi.spyOn(global, 'fetch').mockResolvedValue({ status: 403 } as Response)
+    const fetchMock = vi.mocked(global.fetch)
+    fetchMock
+      .mockResolvedValueOnce({ status: 200 } as Response)
+      .mockResolvedValueOnce({ status: 403 } as Response)
     const onMessage = vi.fn()
     renderHook(() => useWebSocket('test-session', onMessage))
-    vi.runOnlyPendingTimers()
+    await vi.runOnlyPendingTimersAsync()
 
     const ws = getLatestWs()
     ws.onclose?.({ code: 1006, reason: '', wasClean: false } as CloseEvent)
 
     await Promise.resolve()
-    expect(fetchMock).toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
     await Promise.resolve()
-    vi.advanceTimersByTime(30000)
+    await vi.advanceTimersByTimeAsync(30000)
 
     expect(MockWebSocket).toHaveBeenCalledTimes(1)
     vi.useRealTimers()

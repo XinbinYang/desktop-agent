@@ -235,6 +235,10 @@ class TestAgentSession:
 
     @pytest.mark.asyncio
     async def test_run_with_file_write_emits_file_edit(self, session, temp_dir):
+        from app import config
+
+        cfg = config.load_config()
+        cfg.settings.sandbox_mode = "unrestricted"
         session.max_iterations = 1
         target = temp_dir / "agent-edit.txt"
         args = json.dumps({"path": str(target), "content": "hello"})
@@ -1232,6 +1236,26 @@ class TestAgentType:
 
         assert loaded.agent_type == "coding"
         assert loaded.role_id == "code-expert"
+
+    def test_get_or_create_can_preserve_saved_model_with_agent_type(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        saved = AgentSession(model_id="gpt-4o", session_id="saved_model_coding", agent_type="coding")
+        saved._save()
+        agent_module._sessions.clear()
+
+        loaded = get_or_create_session(
+            "saved_model_coding",
+            "kimi-for-coding",
+            role_id="code-expert",
+            agent_type="coding",
+            preserve_existing_model=True,
+        )
+
+        assert loaded.model_id == "gpt-4o"
 
     def test_session_save_and_load_preserves_agent_type(self, tmp_path, monkeypatch):
         import app.agent as agent_module

@@ -332,7 +332,7 @@ def archive_project_sessions(req: ProjectPathRequest):
 
     try:
         archived_count = archive_session_records_for_project(req.path, agent_type="coding")
-        metadata = ProjectManager.archive_project_history(req.path)
+        metadata = ProjectManager.get_project_history(req.path)
         return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
     except ValueError as e:
         return {"error": str(e)}
@@ -340,12 +340,9 @@ def archive_project_sessions(req: ProjectPathRequest):
 
 @router.post("/api/projects/history/remove")
 def remove_project_from_history(req: ProjectPathRequest):
-    from app.agent import archive_session_records_for_project
-
     try:
-        archived_count = archive_session_records_for_project(req.path, agent_type="coding")
         metadata = ProjectManager.remove_project_from_history(req.path)
-        return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
+        return {"status": "ok", "project": metadata}
     except ValueError as e:
         return {"error": str(e)}
 

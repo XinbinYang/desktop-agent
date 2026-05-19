@@ -172,11 +172,12 @@ settings:
         assert response.status_code == 404
 
     def test_config_reload(self, client):
-        """POST /api/config/reload returns default model."""
+        """POST /api/config/reload returns per-agent models."""
         response = client.post("/api/config/reload")
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
-        assert "default_model" in response.json()
+        assert response.json()["personal_model"] == "kimi-for-coding"
+        assert response.json()["coding_model"] == "kimi-for-coding"
 
     def test_provider_connection_test_success(self, client, monkeypatch):
         """POST /api/providers/test validates model listing without exposing keys."""

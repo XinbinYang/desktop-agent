@@ -6,6 +6,9 @@ export type PanelLayout = Record<string, number>;
 
 export const DEFAULT_MAIN_LAYOUT: PanelLayout = { center: 68, right: 32 };
 export const DEFAULT_TERMINAL_LAYOUT: PanelLayout = { conversation: 76, terminal: 24 };
+export const DEFAULT_SIDEBAR_WIDTH = 224;
+export const MIN_SIDEBAR_WIDTH = 184;
+export const MAX_SIDEBAR_WIDTH = 420;
 
 const REQUIRED_MAIN_KEYS = Object.keys(DEFAULT_MAIN_LAYOUT);
 const REQUIRED_TERMINAL_KEYS = Object.keys(DEFAULT_TERMINAL_LAYOUT);
@@ -47,6 +50,7 @@ interface LayoutState {
   rightZone: RightZone;
   rightPanelVisible: boolean;
   sidebarCollapsed: boolean;
+  sidebarWidth: number;
   mainLayout: PanelLayout;
   terminalLayout: PanelLayout;
 }
@@ -79,6 +83,12 @@ function normalizeSidebarSection(value: unknown): SidebarSection {
   return DEFAULT_SIDEBAR_SECTION;
 }
 
+function normalizeSidebarWidth(value: unknown): number {
+  const width = Number(value);
+  if (!Number.isFinite(width)) return DEFAULT_SIDEBAR_WIDTH;
+  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+}
+
 function loadLayout(): LayoutState {
   try {
     const raw = localStorage.getItem('desktop-agent-layout');
@@ -91,6 +101,7 @@ function loadLayout(): LayoutState {
         rightZone: parsed.rightZone ?? mapLegacyTab(parsed.rightTab) ?? 'workspace',
         rightPanelVisible: parsed.rightPanelVisible ?? true,
         sidebarCollapsed: parsed.sidebarCollapsed ?? false,
+        sidebarWidth: normalizeSidebarWidth(parsed.sidebarWidth),
         mainLayout: normalizeLayout(parsed.mainLayout, DEFAULT_MAIN_LAYOUT, REQUIRED_MAIN_KEYS),
         terminalLayout: normalizeLayout(parsed.terminalLayout, DEFAULT_TERMINAL_LAYOUT, REQUIRED_TERMINAL_KEYS),
       };
@@ -103,6 +114,7 @@ function loadLayout(): LayoutState {
     rightZone: 'workspace',
     rightPanelVisible: true,
     sidebarCollapsed: false,
+    sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
     mainLayout: DEFAULT_MAIN_LAYOUT,
     terminalLayout: DEFAULT_TERMINAL_LAYOUT,
   };
@@ -153,6 +165,10 @@ export function useLayoutState() {
     setState((state) => ({ ...state, sidebarCollapsed: !state.sidebarCollapsed }));
   }, []);
 
+  const setSidebarWidth = useCallback((value: number) => {
+    setState((state) => ({ ...state, sidebarWidth: normalizeSidebarWidth(value) }));
+  }, []);
+
   const setMainLayout = useCallback((layout: PanelLayout) => {
     setState((state) => ({
       ...state,
@@ -175,6 +191,7 @@ export function useLayoutState() {
       rightZone: 'workspace',
       rightPanelVisible: true,
       sidebarCollapsed: false,
+      sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
       mainLayout: DEFAULT_MAIN_LAYOUT,
       terminalLayout: DEFAULT_TERMINAL_LAYOUT,
     });
@@ -191,6 +208,7 @@ export function useLayoutState() {
     toggleRightPanel,
     setSidebarCollapsed,
     toggleSidebar,
+    setSidebarWidth,
     setMainLayout,
     setTerminalLayout,
     resetLayout,

@@ -39,6 +39,18 @@ const mockSettingsResponse: SettingsResponse = {
     screenshot_on_step: true,
     sandbox_mode: 'sandbox',
   },
+  personal_agent: { model: 'gpt-4o', thinking_intensity: 'medium' },
+  coding_agent: {
+    enabled: true,
+    default_execution_mode: 'worktree',
+    max_fix_rounds: 2,
+    max_parallel_workers: 3,
+    require_verification: true,
+    require_review: true,
+    auto_generate_repo_map: true,
+    model: 'claude-sonnet',
+    thinking_intensity: 'medium',
+  },
   web_search: {
     provider: 'auto',
     fallback_enabled: true,
@@ -96,7 +108,7 @@ describe('SettingsModal', () => {
     );
 
     expect(await screen.findByText('设置')).toBeInTheDocument();
-    // Provider names appear in both cards and dropdowns
+    fireEvent.click(screen.getByText('Providers'));
     const openaiElements = screen.getAllByText('openai');
     const anthropicElements = screen.getAllByText('anthropic');
     expect(openaiElements.length).toBeGreaterThanOrEqual(1);
@@ -121,6 +133,25 @@ describe('SettingsModal', () => {
     expect(await screen.findByText('sk-...BwOW')).toBeInTheDocument();
   });
 
+  it('does not render global default model/provider controls', async () => {
+    fetchMock.mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByText('设置');
+    expect(screen.queryByText('默认模型')).not.toBeInTheDocument();
+    expect(screen.queryByText('默认 Provider')).not.toBeInTheDocument();
+    expect(screen.queryByText(/使用默认/)).not.toBeInTheDocument();
+  });
+
   it('shows model count badges', async () => {
     fetchMock.mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
 
@@ -140,7 +171,7 @@ describe('SettingsModal', () => {
     expect(screen.getByText('1 个模型')).toBeInTheDocument();
   });
 
-  it('default provider has "默认" badge', async () => {
+  it('shows Agent provider badges instead of a global default badge', async () => {
     fetchMock.mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
 
     render(
@@ -155,7 +186,9 @@ describe('SettingsModal', () => {
 
     await screen.findByText('设置');
     fireEvent.click(screen.getByText('Providers'));
-    expect(await screen.findByText('默认')).toBeInTheDocument();
+    expect(await screen.findByText('Personal')).toBeInTheDocument();
+    expect(screen.getByText('Coding')).toBeInTheDocument();
+    expect(screen.queryByText('默认')).not.toBeInTheDocument();
   });
 
   it('closes when X button is clicked', async () => {

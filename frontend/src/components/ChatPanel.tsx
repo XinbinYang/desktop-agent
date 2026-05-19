@@ -39,6 +39,7 @@ import {
   type TimelineRenderMode,
   type TimelineToolEvent,
 } from '../lib/timelineEvents';
+import { isInternalToolName } from '../lib/internalTools';
 
 interface ChatPanelProps {
   sessionId?: string;
@@ -151,6 +152,7 @@ function getInitialNoiseFilter(): boolean {
 }
 
 function isNoisyToolBlock(block: Extract<AssistantBlock, { type: 'tool_call' }>): boolean {
+  if (isInternalToolName(block.name)) return true;
   if (block.status !== 'success') return false;
   const n = (block.name || '').toLowerCase();
   return n === 'file_read' || n === 'file_search' || n === 'file_list';
@@ -1950,6 +1952,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       case 'knowledge_context':
         return <KnowledgeContextBlock key={`kc-${block.timestamp}`} sources={block.sources} />;
       case 'tool_call':
+        if (isInternalToolName(block.name)) return null;
         return (
           <ToolCallView
             key={`tc-${block.toolCallId || block.timestamp}`}

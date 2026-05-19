@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, nativeThem
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const crypto = require('crypto');
 const { spawn, exec } = require('child_process');
 
@@ -18,15 +19,72 @@ function resolveAppDataDir() {
   if (process.platform === 'darwin') return path.join(process.env.HOME || '', 'Library', 'Application Support');
   return process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '', '.config');
 }
-const STABLE_USER_DATA_DIR = path.join(resolveAppDataDir(), 'Desktop Agent');
-app.setPath('userData', STABLE_USER_DATA_DIR);
+
+function resolveUserDataOverride() {
+  const arg = process.argv.find((value) => value.startsWith('--user-data-dir='));
+  if (!arg) return null;
+  const value = arg.slice('--user-data-dir='.length).trim();
+  return value ? path.resolve(value) : null;
+}
+
+const DEFAULT_USER_DATA_DIR = path.join(resolveAppDataDir(), 'Desktop Agent');
+const APP_USER_DATA_DIR = path.resolve(
+  process.env.DESKTOP_AGENT_USER_DATA_DIR || resolveUserDataOverride() || DEFAULT_USER_DATA_DIR
+);
+app.setPath('userData', APP_USER_DATA_DIR);
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.desktop.agent');
+}
 
 function getStorePath() {
   return path.join(app.getPath('userData'), 'window-state.json');
 }
+
+function getLogDir() {
+  return path.join(app.getPath('userData'), 'logs');
+}
+
+function getBackendLogPath() {
+  return path.join(getLogDir(), 'backend.log');
+}
+
+function ensureLogDir() {
+  fs.mkdirSync(getLogDir(), { recursive: true });
+}
+
+function getIconPath(name) {
+  return path.join(__dirname, '..', 'assets', 'icons', name);
+}
+
+function createNativeIcon(name) {
+  const iconPath = getIconPath(name);
+  const icon = nativeImage.createFromPath(iconPath);
+  if (icon.isEmpty()) {
+    console.warn('[Electron] Icon failed to load:', iconPath);
+  }
+  return icon;
+}
+
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function openLogsFolder() {
+  try {
+    ensureLogDir();
+    shell.openPath(getLogDir());
+  } catch (error) {
+    console.error('[Electron] Failed to open logs folder:', error);
+  }
+}
 let mainWindow;
 let tray = null;
 let backendProcess = null;
+let backendLogStream = null;
 
 const isDev = process.argv.includes('--dev');
 const isPackaged = app.isPackaged;
@@ -115,53 +173,93 @@ if (!gotTheLock) {
 }
 
 app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-  }
+  showMainWindow();
 });
 
 // ========== 后端进程管理 ==========
-function waitForBackendHealth(timeoutMs = isPackaged ? 90000 : 15000) {
-  const started = Date.now();
+function requestBackendHealth(timeoutMs = 2000) {
   const token = getAuthToken();
 
+  return new Promise((resolve) => {
+    const options = token ? { headers: { 'X-Desktop-Agent-Token': token } } : undefined;
+    const req = http.get('http://127.0.0.1:8765/api/health', options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        let body = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        } catch {
+          body = null;
+        }
+        resolve({ ok: res.statusCode === 200, statusCode: res.statusCode, body });
+      });
+    });
+
+    req.on('error', (error) => resolve({ ok: false, error }));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error('Backend health request timed out'));
+    });
+  });
+}
+
+function isBackendPortListening(timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: 8765 });
+    const finish = (listening) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(timeoutMs, () => finish(false));
+  });
+}
+
+function waitForBackendHealth(timeoutMs = isPackaged ? 90000 : 15000) {
+  const started = Date.now();
+
   return new Promise((resolve, reject) => {
-    const retry = () => {
+    const check = async () => {
+      const result = await requestBackendHealth();
+      if (result.ok) {
+        resolve(true);
+        return;
+      }
       if (Date.now() - started > timeoutMs) {
-        reject(new Error('Backend health check timed out at http://127.0.0.1:8765/api/health'));
+        reject(new Error(`Backend health check timed out at http://127.0.0.1:8765/api/health. Log: ${getBackendLogPath()}`));
         return;
       }
       setTimeout(check, 500);
-    };
-
-    const check = () => {
-      const options = token ? { headers: { 'X-Desktop-Agent-Token': token } } : undefined;
-      const req = http.get('http://127.0.0.1:8765/api/health', options, (res) => {
-        if (res.statusCode === 200) {
-          res.resume();
-          resolve(true);
-          return;
-        }
-        res.resume();
-        retry();
-      });
-
-      req.on('error', retry);
-      req.setTimeout(2000, () => {
-        req.destroy();
-        retry();
-      });
     };
 
     check();
   });
 }
 
-function startBackend() {
+function openBackendLogStream() {
+  ensureLogDir();
+  if (backendLogStream && !backendLogStream.destroyed) {
+    return backendLogStream;
+  }
+  backendLogStream = fs.createWriteStream(getBackendLogPath(), { flags: 'a' });
+  backendLogStream.write(`\n[${new Date().toISOString()}] [electron] Starting backend\n`);
+  return backendLogStream;
+}
+
+function writeBackendLog(channel, data) {
+  const stream = openBackendLogStream();
+  const text = data.toString();
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    stream.write(`[${new Date().toISOString()}] [${channel}] ${line}\n`);
+  }
+}
+
+async function startBackend() {
   if (isDev) {
-    return Promise.resolve();
+    return;
   }
 
   const backendExe = isPackaged
@@ -184,14 +282,28 @@ function startBackend() {
     backendEnv.DESKTOP_AGENT_AUTH_TOKEN = token;
   }
 
+  const existing = await requestBackendHealth();
+  if (existing.ok) {
+    console.log('[Electron] Reusing existing Desktop Agent backend on port 8765');
+    return;
+  }
+
+  if (await isBackendPortListening()) {
+    throw new Error(
+      `Port 8765 is already in use, but it is not this Desktop Agent backend session. ` +
+      `Close the other process using 127.0.0.1:8765 and try again. Backend log: ${getBackendLogPath()}`
+    );
+  }
+
   console.log('[Electron] Starting backend:', backendExe, backendArgs);
 
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(backendExe)) {
-      reject(new Error(`Backend executable not found: ${backendExe}. Run "npm run build:backend" before packaging.`));
+      reject(new Error(`Backend executable not found: ${backendExe}. Run "npm run build:backend" before packaging. Log: ${getBackendLogPath()}`));
       return;
     }
 
+    openBackendLogStream();
     backendProcess = spawn(backendExe, backendArgs, {
       cwd: backendCwd,
       windowsHide: true,
@@ -202,6 +314,7 @@ function startBackend() {
     backendProcess.stdout.on('data', (data) => {
       const str = data.toString();
       console.log('[Backend]', str);
+      writeBackendLog('stdout', data);
       if (str.includes('Uvicorn running')) {
         waitForBackendHealth().then(resolve).catch(reject);
       }
@@ -209,11 +322,17 @@ function startBackend() {
 
     backendProcess.stderr.on('data', (data) => {
       console.error('[Backend Error]', data.toString());
+      writeBackendLog('stderr', data);
     });
 
     backendProcess.on('error', (err) => {
       console.error('[Backend Failed]', err);
+      writeBackendLog('error', String(err));
       reject(err);
+    });
+
+    backendProcess.on('exit', (code, signal) => {
+      writeBackendLog('exit', `Backend process exited with code=${code} signal=${signal}`);
     });
 
     setTimeout(() => {
@@ -238,6 +357,12 @@ function stopBackend() {
     setTimeout(() => {
       if (!backendProcess.killed) backendProcess.kill('SIGKILL');
     }, 2000);
+  }
+
+  if (backendLogStream && !backendLogStream.destroyed) {
+    const stream = backendLogStream;
+    backendLogStream = null;
+    stream.end(`[${new Date().toISOString()}] [electron] Stopping backend\n`);
   }
 }
 
@@ -270,12 +395,8 @@ function saveWindowState() {
 
 // ========== 托盘 ==========
 function createTray() {
-  // 使用一个极简的 16x16 内联图标（1px 透明占位，可被替换）
-  const iconData = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAABpJREFUeNpi/P//PwMlgImBQjBqwKgBwAADAA7XA/5l9V8AAAAASUVORK5CYII=',
-    'base64'
-  );
-  const icon = nativeImage.createFromBuffer(iconData);
+  // Use the packaged brand icon so the tray entry stays visible after hiding the window.
+  const icon = createNativeIcon(process.platform === 'win32' ? 'tray.ico' : 'tray.png');
   tray = new Tray(icon);
   tray.setToolTip('Desktop Agent');
 
@@ -283,10 +404,7 @@ function createTray() {
     {
       label: '显示主窗口',
       click: () => {
-        if (mainWindow) {
-          mainWindow.show();
-          mainWindow.focus();
-        }
+        showMainWindow();
       },
     },
     {
@@ -294,6 +412,10 @@ function createTray() {
       click: () => {
         if (mainWindow) mainWindow.hide();
       },
+    },
+    {
+      label: '打开日志',
+      click: openLogsFolder,
     },
     { type: 'separator' },
     {
@@ -310,8 +432,7 @@ function createTray() {
       if (mainWindow.isVisible()) {
         mainWindow.hide();
       } else {
-        mainWindow.show();
-        mainWindow.focus();
+        showMainWindow();
       }
     }
   });
@@ -330,6 +451,7 @@ function createWindow() {
     minHeight: 600,
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'darwin' ? {} : { titleBarOverlay: getTitleBarOverlay('dark') }),
+    icon: getIconPath('app.ico'),
     backgroundColor: WINDOW_THEMES.dark.background,
     autoHideMenuBar: true,
     show: false, // 先隐藏，等加载完成再显示，避免闪烁
@@ -490,6 +612,7 @@ app.whenReady().then(async () => {
     createTray();
     buildMenu();
   } catch (e) {
+    e.message = `${e.message}\n\nLog file:\n${getBackendLogPath()}`;
     dialog.showErrorBox('启动失败', '后端服务启动失败: ' + e.message);
     app.quit();
   }
@@ -509,7 +632,7 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   } else if (mainWindow) {
-    mainWindow.show();
+    showMainWindow();
   }
 });
 

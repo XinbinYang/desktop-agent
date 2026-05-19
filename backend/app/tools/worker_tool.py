@@ -138,9 +138,9 @@ class DispatchWorkerTool(BaseTool):
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
-        from app.config import load_config
+        from app.config import get_model_for_agent
         if not model_id:
-            model_id = load_config().settings.default_model
+            model_id = get_model_for_agent(agent_type)
 
         full_task = task
         if prior_context:
@@ -274,9 +274,9 @@ class DispatchParallelTool(BaseTool):
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
-        from app.config import load_config
+        from app.config import get_model_for_agent
         if not model_id:
-            model_id = load_config().settings.default_model
+            model_id = get_model_for_agent("coding")
 
         if not tasks:
             msg = "[ERROR] dispatch_parallel requires at least one task."

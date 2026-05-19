@@ -36,11 +36,11 @@ export const ProjectHistoryConfirmDialog: React.FC<ProjectHistoryConfirmDialogPr
   if (!isOpen || !project) return null;
 
   const isRemove = action === 'remove';
-  const title = isRemove ? '移除项目' : '归档项目';
+  const title = isRemove ? '移除项目' : '归档会话';
   const confirmLabel = loading ? (isRemove ? '移除中...' : '归档中...') : (isRemove ? '移除' : '归档');
   const description = isRemove
-    ? `从历史中移除 ${project.name}。该项目下的对话会被归档，项目文件不会被删除。`
-    : `将 ${project.name} 下的对话移入归档，并从项目列表隐藏。项目文件不会被删除。重新打开该文件夹可恢复显示。`;
+    ? `从左侧项目历史中移除 ${project.name}。项目文件不会被删除，会话也不会被归档或删除；重新打开该文件夹可恢复显示。`
+    : `将 ${project.name} 下的会话移入归档并从当前列表隐藏。项目仍会保留在左侧，文件不会被删除。`;
 
   return (
     <div

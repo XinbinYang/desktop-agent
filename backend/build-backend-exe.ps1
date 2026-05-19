@@ -69,6 +69,7 @@ Write-Host "[build-backend] PyInstaller: $($versionOutput | Select-Object -Last 
 $WorkDir = Join-Path $BackendDir "build\pyinstaller"
 $ConfigDir = Join-Path $RepoRoot "config"
 $PromptsDir = Join-Path $BackendDir "prompts"
+$AgentsDir = Join-Path $RepoRoot "AGENTS"
 
 $addData = @()
 if (Test-Path $ConfigDir) {
@@ -76,6 +77,9 @@ if (Test-Path $ConfigDir) {
 }
 if (Test-Path $PromptsDir) {
     $addData += @("--add-data", "$PromptsDir;prompts")
+}
+if (Test-Path $AgentsDir) {
+    $addData += @("--add-data", "$AgentsDir;AGENTS")
 }
 
 Push-Location $BackendDir
