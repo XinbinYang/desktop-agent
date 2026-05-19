@@ -2,8 +2,10 @@ import asyncio
 import os
 import re
 import shutil
+from pathlib import Path
 from typing import Optional
 from app.tools.base import BaseTool, ToolResult
+from app.security import is_relative_to
 
 # 危险命令检测（模块级共享，供所有 shell 工具使用）
 _DANGEROUS_COMMAND_PATTERNS = [
@@ -57,8 +59,8 @@ def _default_work_dir(agent_type: str = "") -> str:
 
     if agent_type == "personal":
         try:
-            from app.runtime_paths import agents_dir
-            home = agents_dir() / "personal"
+            from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir
+            home = agents_dir() / "personal" / PERSONAL_WORKSPACE_DIRNAME
             home.mkdir(parents=True, exist_ok=True)
             return str(home)
         except Exception:
@@ -73,6 +75,39 @@ def _default_work_dir(agent_type: str = "") -> str:
         pass
 
     return os.getcwd()
+
+
+def _resolve_shell_cwd(cwd: str, agent_type: str = "") -> tuple[str, Optional[str]]:
+    if not cwd:
+        return _default_work_dir(agent_type), None
+
+    if agent_type != "personal":
+        return cwd, None
+
+    try:
+        from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir
+
+        raw = Path(cwd).expanduser()
+        parts = raw.parts
+        if not raw.is_absolute() and parts and parts[0].lower() == "agents":
+            rest = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+            resolved = (agents_dir() / rest).resolve()
+        else:
+            resolved = raw.resolve()
+
+        agents_root = agents_dir().resolve()
+        personal_root = agents_root / "personal"
+        personal_workspace = personal_root / PERSONAL_WORKSPACE_DIRNAME
+        shared_root = agents_root / "_shared"
+        shared_workspace = shared_root / PERSONAL_WORKSPACE_DIRNAME
+
+        protected_personal = is_relative_to(resolved, personal_root) and not is_relative_to(resolved, personal_workspace)
+        protected_shared = is_relative_to(resolved, shared_root) and not is_relative_to(resolved, shared_workspace)
+        if resolved == agents_root or protected_personal or protected_shared:
+            return str(resolved), "Personal Agent shell cwd must be inside AGENTS/personal/WORKSPACE or an allowed project path."
+        return str(resolved), None
+    except (OSError, ValueError) as exc:
+        return cwd, f"Invalid cwd: {cwd} ({exc})"
 
 
 class ShellExecuteTool(BaseTool):
@@ -95,7 +130,9 @@ class ShellExecuteTool(BaseTool):
         if _is_dangerous_command(command):
             return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
         
-        work_dir = cwd if cwd else _default_work_dir(agent_type)
+        work_dir, cwd_err = _resolve_shell_cwd(cwd, agent_type)
+        if cwd_err:
+            return ToolResult(error=cwd_err)
         
         # 根据系统选择 shell
         if os.name == "nt":
@@ -148,7 +185,9 @@ class ShellStartTool(BaseTool):
     async def execute(self, command: str, cwd: str = "", agent_type: str = "") -> ToolResult:
         if _is_dangerous_command(command):
             return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
-        work_dir = cwd if cwd else _default_work_dir(agent_type)
+        work_dir, cwd_err = _resolve_shell_cwd(cwd, agent_type)
+        if cwd_err:
+            return ToolResult(error=cwd_err)
         try:
             if os.name == "nt":
                 subprocess = await asyncio.create_subprocess_shell(

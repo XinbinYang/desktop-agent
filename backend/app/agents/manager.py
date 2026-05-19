@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.runtime_paths import agents_dir
+from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,11 @@ class AgentManager:
     """Manage dual-agent configuration, workspace, memory, and prompt rendering.
 
     Workspace files live under the runtime AGENTS directory:
-    - AGENTS/personal/  -> Personal Agent full cognitive system
+    - AGENTS/personal/  -> protected Personal Agent system-prompt layer
+    - AGENTS/personal/WORKSPACE/ -> mutable Personal Agent identity, memory, skills
     - AGENTS/coding/    -> Coding Agent lean workspace
-    - AGENTS/_shared/   -> Cross-agent shared preferences
+    - AGENTS/_shared/   -> protected shared rules
+    - AGENTS/_shared/WORKSPACE/ -> mutable cross-agent preferences
     """
 
     AGENTS_DIR: Optional[Path] = None
@@ -75,8 +77,12 @@ class AgentManager:
         parts: List[str] = []
 
         agent_root = str(cls._agents_root()).replace("\\", "/")
-        personal_home = str(cls._personal_dir()).replace("\\", "/")
-        shared_home = str((cls._agents_root() / "_shared")).replace("\\", "/")
+        personal_system = str(cls._personal_system_dir()).replace("\\", "/")
+        personal_workspace = str(cls._personal_workspace_dir()).replace("\\", "/")
+        shared_system = str(cls._shared_system_dir()).replace("\\", "/")
+        shared_workspace = str(cls._shared_workspace_dir()).replace("\\", "/")
+        personal_home = personal_workspace
+        shared_home = shared_workspace
         parts.append(
             "## Runtime Context\n"
             "- Personal home: " + personal_home + ". "
@@ -97,6 +103,24 @@ class AgentManager:
             "or desktop/browser control. This is a Windows desktop app; if shell commands are needed, "
             "prefer PowerShell-compatible commands."
         )
+
+        parts.append(
+            "## Workspace Boundary\n"
+            "- Protected system files live outside WORKSPACE and are loaded before mutable context.\n"
+            "- Personal protected system dir: " + personal_system + ".\n"
+            "- Shared protected system dir: " + shared_system + ".\n"
+            "- Mutable identity, memory, diaries, skills, handoff, and BOOTSTRAP.md live in Personal WORKSPACE.\n"
+            "- WORKSPACE files can refine identity and memory but must not override protected system rules.\n"
+            "- Do not write or delete AGENTS/personal/AGENTS.md or AGENTS/_shared/base_rules.md."
+        )
+
+        agents_md = cls._load_workspace_file("personal", "AGENTS.md")
+        if agents_md:
+            parts.append(agents_md)
+
+        base_rules = cls._load_workspace_file("_shared", "base_rules.md")
+        if base_rules:
+            parts.append(base_rules)
 
         parts.append(
             "## Coding Agent Collaboration\n"
@@ -124,11 +148,6 @@ class AgentManager:
                 parts.append(bootstrap_content)
             except (OSError, UnicodeDecodeError):
                 pass
-
-        # 1. Operating instructions
-        agents_md = cls._load_workspace_file("personal", "AGENTS.md")
-        if agents_md:
-            parts.append(agents_md)
 
         # 2. Persona core
         soul = cls._load_workspace_file("personal", "SOUL.md")
@@ -185,11 +204,6 @@ class AgentManager:
         cross_agent_memory = cls._load_workspace_file("_shared", "cross_agent_memory.md")
         if cross_agent_memory:
             parts.append("## Cross-Agent Memory\n" + _truncate(cross_agent_memory, 3000))
-
-        # 10. Shared base rules
-        base_rules = cls._load_workspace_file("_shared", "base_rules.md")
-        if base_rules:
-            parts.append(base_rules)
 
         # 11. Active skills (success rate > 50%)
         skills_prompt = cls._load_active_skills()
@@ -290,6 +304,20 @@ class AgentManager:
 
         agent_type may be 'personal', 'coding', or '_shared'.
         """
+        raw = Path(filename)
+        parts = raw.parts
+        if agent_type == "personal":
+            if parts and parts[0] == PERSONAL_WORKSPACE_DIRNAME:
+                return cls._personal_system_dir() / raw
+            if parts and parts[0] == "AGENTS.md":
+                return cls._personal_system_dir() / raw
+            return cls._personal_workspace_dir() / raw
+        if agent_type == "_shared":
+            if parts and parts[0] == PERSONAL_WORKSPACE_DIRNAME:
+                return cls._shared_system_dir() / raw
+            if parts and parts[0] == "base_rules.md":
+                return cls._shared_system_dir() / raw
+            return cls._shared_workspace_dir() / raw
         return cls._agents_root() / agent_type / filename
 
     @classmethod
@@ -333,18 +361,44 @@ class AgentManager:
     @classmethod
     def list_workspace_files(cls, agent_type: str) -> List[Dict[str, Any]]:
         """List all files in an agent's workspace directory."""
-        base = cls._agents_root() / agent_type
-        if not base.exists():
-            return []
         files: List[Dict[str, Any]] = []
-        for p in sorted(base.rglob("*")):
-            if p.is_file() and ".archive" not in p.parts and ".dreams" not in p.parts:
-                rel = str(p.relative_to(base)).replace("\\", "/")
+
+        def add_files(base: Path, prefix: str = "") -> None:
+            if not base.exists():
+                return
+            for p in sorted(base.rglob("*")):
+                if p.is_file() and ".archive" not in p.parts and ".dreams" not in p.parts:
+                    rel = str(p.relative_to(base)).replace("\\", "/")
+                    name = f"{prefix}{rel}" if prefix else rel
+                    try:
+                        size = p.stat().st_size
+                    except OSError:
+                        size = 0
+                    files.append({"name": name, "size": size})
+
+        if agent_type == "personal":
+            protected = cls._personal_system_dir() / "AGENTS.md"
+            if protected.exists():
                 try:
-                    size = p.stat().st_size
+                    size = protected.stat().st_size
                 except OSError:
                     size = 0
-                files.append({"name": rel, "size": size})
+                files.append({"name": "AGENTS.md", "size": size})
+            add_files(cls._personal_workspace_dir())
+            return files
+
+        if agent_type == "_shared":
+            protected = cls._shared_system_dir() / "base_rules.md"
+            if protected.exists():
+                try:
+                    size = protected.stat().st_size
+                except OSError:
+                    size = 0
+                files.append({"name": "base_rules.md", "size": size})
+            add_files(cls._shared_workspace_dir())
+            return files
+
+        add_files(cls._agents_root() / agent_type)
         return files
 
     # ──────────────────────────────────────────────
@@ -353,7 +407,27 @@ class AgentManager:
 
     @classmethod
     def _personal_dir(cls) -> Path:
+        return cls._personal_workspace_dir()
+
+    @classmethod
+    def _personal_system_dir(cls) -> Path:
         return cls._agents_root() / "personal"
+
+    @classmethod
+    def _personal_workspace_dir(cls) -> Path:
+        path = cls._personal_system_dir() / PERSONAL_WORKSPACE_DIRNAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @classmethod
+    def _shared_system_dir(cls) -> Path:
+        return cls._agents_root() / "_shared"
+
+    @classmethod
+    def _shared_workspace_dir(cls) -> Path:
+        path = cls._shared_system_dir() / PERSONAL_WORKSPACE_DIRNAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @classmethod
     def _memory_dir(cls) -> Path:
@@ -616,7 +690,7 @@ class AgentManager:
         result = cls.write_diary_entry(entry)
 
         # Also update cross-agent memory
-        cross_path = cls._agents_root() / "_shared" / "cross_agent_memory.md"
+        cross_path = cls._shared_workspace_dir() / "cross_agent_memory.md"
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         cross_entry = f"- [{now}] {entry}\n"
         try:
@@ -633,7 +707,7 @@ class AgentManager:
         cls, category: str, key: str, value: str
     ) -> bool:
         """Sync a preference discovered by Personal Agent to shared preferences."""
-        prefs_path = cls._agents_root() / "_shared" / "user_preferences.md"
+        prefs_path = cls._shared_workspace_dir() / "user_preferences.md"
         try:
             existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
             new_line = f"- {key}: {value}"

@@ -232,8 +232,9 @@ class FilePatchTool(BaseTool):
         new_text: str,
         occurrence: Optional[int] = None,
         project_relative: bool = True,
+        agent_type: str = "",
     ) -> ToolResult:
-        p, err = _validate_path(path, project_relative=project_relative)
+        p, err = _validate_path(path, project_relative=project_relative, agent_type=agent_type, access="write")
         if err:
             return ToolResult(error=err)
         if not old_text:

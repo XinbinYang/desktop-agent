@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, waitFor } from '@testing-library/react'
-import { useWebSocket } from '../../hooks/useWebSocket'
+import { __resetSharedWebSocketsForTests, useWebSocket } from '../../hooks/useWebSocket'
 import { __setAuthTokenForTests } from '../../config'
 import type { WS_EVENT } from '../../types'
 
@@ -9,6 +9,7 @@ describe('useWebSocket', () => {
   let MockWebSocket: any
 
   beforeEach(() => {
+    __resetSharedWebSocketsForTests()
     __setAuthTokenForTests('')
     delete (window as any).electronAPI
     mockWsInstances = []
@@ -176,6 +177,34 @@ describe('useWebSocket', () => {
     await vi.advanceTimersByTimeAsync(30000)
 
     expect(MockWebSocket).toHaveBeenCalledTimes(1)
+    vi.useRealTimers()
+  })
+
+  it('reuses a live socket across a quick same-session remount', async () => {
+    vi.useFakeTimers()
+    const onMessage = vi.fn()
+    const { unmount } = renderHook(() => useWebSocket('test-session', onMessage))
+    await vi.runOnlyPendingTimersAsync()
+
+    const ws = getLatestWs()
+    ws.readyState = 1
+    ws.onopen?.()
+
+    unmount()
+    expect(ws.close).not.toHaveBeenCalled()
+
+    const nextMessage = vi.fn()
+    renderHook(() => useWebSocket('test-session', nextMessage))
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(MockWebSocket).toHaveBeenCalledTimes(1)
+    expect(ws.close).not.toHaveBeenCalled()
+
+    const event: WS_EVENT = { type: 'content', data: { text: 'still here' } }
+    ws.onmessage?.({ data: JSON.stringify(event) })
+    expect(onMessage).not.toHaveBeenCalled()
+    expect(nextMessage).toHaveBeenCalledWith(event)
+
     vi.useRealTimers()
   })
 

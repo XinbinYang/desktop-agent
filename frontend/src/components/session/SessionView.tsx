@@ -112,7 +112,6 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     switchModel,
     switchRole,
     executeToolDirect,
-    resetSession,
     addTerminalLog,
     onToolCallRef,
     onFileEditRef,
@@ -487,14 +486,6 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   useEffect(() => {
     onSnapshot(snapshot, actions);
   }, [snapshot, actions, onSnapshot]);
-
-  // ---- Cleanup ----
-
-  useEffect(() => {
-    return () => {
-      resetSession();
-    };
-  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="h-full min-h-0 flex flex-col" onClick={onFocus}>

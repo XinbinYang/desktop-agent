@@ -4,144 +4,261 @@ import { ensureApiAuth, getAuthToken, getAuthUnavailableReason, refreshAuthRequi
 
 const MAX_RECONNECT_DELAY = 30000;
 const INITIAL_CONNECT_DELAY = 0;
+const IDLE_RELEASE_DELAY = 300;
 const STOP_RECONNECT_CLOSE_CODES = new Set([1008, 4004]);
-const QUIET_DROP_TYPES = new Set(["set_chat_mode", "set_team", "set_thinking_intensity"]);
+const QUIET_DROP_TYPES = new Set(['set_chat_mode', 'set_team', 'set_thinking_intensity']);
 
 function messageType(data: object): string {
-  return typeof (data as { type?: unknown }).type === "string" ? (data as { type: string }).type : "";
+  return typeof (data as { type?: unknown }).type === 'string' ? (data as { type: string }).type : '';
 }
 
-export function useWebSocket(
-  sessionId: string,
-  onMessage: (msg: WS_EVENT) => void
-) {
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttempt = useRef(0);
-  const onMessageRef = useRef(onMessage);
-  const shouldReconnectRef = useRef(true);
-  const connectRef = useRef<() => void>(() => {});
+type MessageSubscriber = (msg: WS_EVENT) => void;
+type ConnectionSubscriber = (connected: boolean) => void;
 
-  const [isConnected, setIsConnected] = useState(false);
+interface SharedSocketEntry {
+  sessionId: string;
+  ws: WebSocket | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  releaseTimer: ReturnType<typeof setTimeout> | null;
+  reconnectAttempt: number;
+  shouldReconnect: boolean;
+  authInFlight: boolean;
+  messageSubscribers: Set<MessageSubscriber>;
+  connectionSubscribers: Set<ConnectionSubscriber>;
+}
 
-  // 保持回调引用最新，避免 ws 连接重建
-  useEffect(() => {
-    onMessageRef.current = onMessage;
-  }, [onMessage]);
+const sharedSockets = new Map<string, SharedSocketEntry>();
 
-  const scheduleReconnect = useCallback(() => {
-    const delay = Math.min(1000 * 2 ** reconnectAttempt.current, MAX_RECONNECT_DELAY);
-    reconnectAttempt.current += 1;
-    reconnectTimer.current = setTimeout(connectRef.current, delay);
-  }, []);
+export function __resetSharedWebSocketsForTests() {
+  for (const entry of Array.from(sharedSockets.values())) {
+    if (entry.releaseTimer) clearTimeout(entry.releaseTimer);
+    clearReconnectTimer(entry);
+    entry.shouldReconnect = false;
+    const ws = entry.ws;
+    entry.ws = null;
+    ws?.close();
+  }
+  sharedSockets.clear();
+}
 
-  const connect = useCallback(() => {
-    const openWebSocket = () => {
-      if (getAuthUnavailableReason()) {
-        shouldReconnectRef.current = false;
-        return;
-      }
-      if (!shouldReconnectRef.current) {
-        return;
-      }
-      if (
-        wsRef.current?.readyState === WebSocket.OPEN ||
-        wsRef.current?.readyState === WebSocket.CONNECTING
-      ) {
-        return;
-      }
+function notifyConnection(entry: SharedSocketEntry, connected: boolean) {
+  for (const subscriber of Array.from(entry.connectionSubscribers)) {
+    subscriber(connected);
+  }
+}
 
-      shouldReconnectRef.current = true;
+function clearReconnectTimer(entry: SharedSocketEntry) {
+  if (entry.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer);
+    entry.reconnectTimer = null;
+  }
+}
 
-      const ws = new WebSocket(withAuthQuery(`${WS_BASE}/ws/${sessionId}`));
-      wsRef.current = ws;
+function scheduleReconnect(entry: SharedSocketEntry) {
+  if (entry.messageSubscribers.size === 0 || !entry.shouldReconnect) return;
+  clearReconnectTimer(entry);
+  const delay = Math.min(1000 * 2 ** entry.reconnectAttempt, MAX_RECONNECT_DELAY);
+  entry.reconnectAttempt += 1;
+  entry.reconnectTimer = setTimeout(() => connectEntry(entry), delay);
+}
 
-      ws.onopen = () => {
-        setIsConnected(true);
-        reconnectAttempt.current = 0;
-      };
+function openWebSocket(entry: SharedSocketEntry) {
+  if (sharedSockets.get(entry.sessionId) !== entry) return;
+  if (getAuthUnavailableReason()) {
+    entry.shouldReconnect = false;
+    return;
+  }
+  if (!entry.shouldReconnect || entry.messageSubscribers.size === 0) return;
+  if (
+    entry.ws?.readyState === WebSocket.OPEN ||
+    entry.ws?.readyState === WebSocket.CONNECTING
+  ) {
+    return;
+  }
 
-      ws.onmessage = (event) => {
-        let msg: WS_EVENT;
-        try {
-          msg = JSON.parse(event.data);
-        } catch (e) {
-          console.error('Failed to parse WS message:', e);
+  const ws = new WebSocket(withAuthQuery(`${WS_BASE}/ws/${entry.sessionId}`));
+  entry.ws = ws;
+
+  ws.onopen = () => {
+    if (entry.ws !== ws) return;
+    entry.reconnectAttempt = 0;
+    notifyConnection(entry, true);
+  };
+
+  ws.onmessage = (event) => {
+    let msg: WS_EVENT;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (e) {
+      console.error('Failed to parse WS message:', e);
+      return;
+    }
+
+    for (const subscriber of Array.from(entry.messageSubscribers)) {
+      subscriber(msg);
+    }
+  };
+
+  ws.onclose = (event) => {
+    if (entry.ws !== ws) return;
+    entry.ws = null;
+    notifyConnection(entry, false);
+    if (!entry.shouldReconnect || entry.messageSubscribers.size === 0) return;
+    if (event?.code !== 1000) {
+      console.warn('WS closed:', { code: event?.code, reason: event?.reason, wasClean: event?.wasClean });
+    }
+    if (typeof event?.code === 'number' && STOP_RECONNECT_CLOSE_CODES.has(event.code)) {
+      entry.shouldReconnect = false;
+      return;
+    }
+    if (event?.code === 1006) {
+      refreshAuthRequirement().then(() => {
+        if (!entry.shouldReconnect || entry.messageSubscribers.size === 0) return;
+        if (getAuthUnavailableReason()) {
+          entry.shouldReconnect = false;
           return;
         }
+        scheduleReconnect(entry);
+      });
+      return;
+    }
+    scheduleReconnect(entry);
+  };
 
-        try {
-          onMessageRef.current(msg);
-        } catch (e) {
-          console.error('Failed to handle WS message:', e);
-        }
-      };
+  ws.onerror = (err) => {
+    console.error('WS error:', err);
+  };
+}
 
-      ws.onclose = (event) => {
-        if (wsRef.current !== ws) {
-          return;
-        }
-        wsRef.current = null;
-        setIsConnected(false);
-        if (!shouldReconnectRef.current) {
-          return;
-        }
-        if (event?.code !== 1000) {
-          console.warn('WS closed:', { code: event?.code, reason: event?.reason, wasClean: event?.wasClean });
-        }
-        if (STOP_RECONNECT_CLOSE_CODES.has(event?.code)) {
-          shouldReconnectRef.current = false;
-          return;
-        }
-        if (event?.code === 1006) {
-          refreshAuthRequirement().then(() => {
-            if (!shouldReconnectRef.current) return;
-            if (getAuthUnavailableReason()) {
-              shouldReconnectRef.current = false;
-              return;
-            }
-            scheduleReconnect();
-          });
-          return;
-        }
-        scheduleReconnect();
-      };
+function connectEntry(entry: SharedSocketEntry) {
+  if (entry.messageSubscribers.size === 0 || !entry.shouldReconnect) return;
 
-      ws.onerror = (err) => {
-        console.error('WS error:', err);
-      };
-    };
-
-    const prepareAuthAndOpen = async () => {
+  const prepareAuthAndOpen = async () => {
+    try {
       if (!getAuthToken() && !getAuthUnavailableReason()) {
         await ensureApiAuth();
       }
       if (!getAuthToken() && !getAuthUnavailableReason()) {
         await refreshAuthRequirement();
       }
-      openWebSocket();
-    };
-
-    if (!getAuthToken() && !getAuthUnavailableReason()) {
-      void prepareAuthAndOpen().catch((err) => {
-        console.error('Failed to initialize WebSocket auth:', err);
-        if (shouldReconnectRef.current) {
-          scheduleReconnect();
-        }
-      });
-      return;
+      openWebSocket(entry);
+    } catch (err) {
+      console.error('Failed to initialize WebSocket auth:', err);
+      if (entry.shouldReconnect && entry.messageSubscribers.size > 0) {
+        scheduleReconnect(entry);
+      }
+    } finally {
+      entry.authInFlight = false;
     }
+  };
 
-    openWebSocket();
-  }, [scheduleReconnect, sessionId]);
+  if (!getAuthToken() && !getAuthUnavailableReason()) {
+    if (entry.authInFlight) return;
+    entry.authInFlight = true;
+    void prepareAuthAndOpen();
+    return;
+  }
+
+  openWebSocket(entry);
+}
+
+function getSharedSocketEntry(sessionId: string): SharedSocketEntry {
+  let entry = sharedSockets.get(sessionId);
+  if (!entry) {
+    entry = {
+      sessionId,
+      ws: null,
+      reconnectTimer: null,
+      releaseTimer: null,
+      reconnectAttempt: 0,
+      shouldReconnect: true,
+      authInFlight: false,
+      messageSubscribers: new Set(),
+      connectionSubscribers: new Set(),
+    };
+    sharedSockets.set(sessionId, entry);
+  }
+  return entry;
+}
+
+function retainSocket(
+  sessionId: string,
+  onMessage: MessageSubscriber,
+  onConnection: ConnectionSubscriber,
+): SharedSocketEntry {
+  const entry = getSharedSocketEntry(sessionId);
+  if (entry.releaseTimer) {
+    clearTimeout(entry.releaseTimer);
+    entry.releaseTimer = null;
+  }
+  clearReconnectTimer(entry);
+  entry.shouldReconnect = true;
+  entry.messageSubscribers.add(onMessage);
+  entry.connectionSubscribers.add(onConnection);
+  onConnection(entry.ws?.readyState === WebSocket.OPEN);
+  entry.reconnectTimer = setTimeout(() => connectEntry(entry), INITIAL_CONNECT_DELAY);
+  return entry;
+}
+
+function releaseSocket(
+  entry: SharedSocketEntry,
+  onMessage: MessageSubscriber,
+  onConnection: ConnectionSubscriber,
+  immediate: boolean,
+) {
+  entry.messageSubscribers.delete(onMessage);
+  entry.connectionSubscribers.delete(onConnection);
+  onConnection(false);
+
+  if (entry.messageSubscribers.size > 0) return;
+
+  const closeIfIdle = () => {
+    entry.releaseTimer = null;
+    if (entry.messageSubscribers.size > 0) return;
+    entry.shouldReconnect = false;
+    clearReconnectTimer(entry);
+    const ws = entry.ws;
+    entry.ws = null;
+    sharedSockets.delete(entry.sessionId);
+    ws?.close();
+  };
+
+  if (entry.releaseTimer) {
+    clearTimeout(entry.releaseTimer);
+    entry.releaseTimer = null;
+  }
+
+  if (immediate) {
+    closeIfIdle();
+  } else {
+    entry.releaseTimer = setTimeout(closeIfIdle, IDLE_RELEASE_DELAY);
+  }
+}
+
+export function useWebSocket(
+  sessionId: string,
+  onMessage: (msg: WS_EVENT) => void,
+) {
+  const onMessageRef = useRef(onMessage);
+  const entryRef = useRef<SharedSocketEntry | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    connectRef.current = connect;
-  }, [connect]);
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
+
+  const handleSharedMessage = useCallback((msg: WS_EVENT) => {
+    try {
+      onMessageRef.current(msg);
+    } catch (e) {
+      console.error('Failed to handle WS message:', e);
+    }
+  }, []);
 
   const send = useCallback((data: object): boolean => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
+    const entry = entryRef.current || sharedSockets.get(sessionId);
+    if (entry?.ws?.readyState === WebSocket.OPEN) {
+      entry.ws.send(JSON.stringify(data));
       return true;
     }
     const type = messageType(data);
@@ -149,28 +266,25 @@ export function useWebSocket(
       console.warn('WebSocket is not connected; dropping message:', data);
     }
     return false;
-  }, []);
+  }, [sessionId]);
 
   const disconnect = useCallback(() => {
-    shouldReconnectRef.current = false;
-    if (reconnectTimer.current) {
-      clearTimeout(reconnectTimer.current);
-      reconnectTimer.current = null;
+    const entry = entryRef.current || sharedSockets.get(sessionId);
+    if (entry) {
+      releaseSocket(entry, handleSharedMessage, setIsConnected, true);
+      if (entryRef.current === entry) entryRef.current = null;
     }
-    const ws = wsRef.current;
-    wsRef.current = null;
-    ws?.close();
     setIsConnected(false);
-  }, []);
+  }, [handleSharedMessage, sessionId]);
 
   useEffect(() => {
-    shouldReconnectRef.current = true;
-    const initialConnectTimer = setTimeout(connect, INITIAL_CONNECT_DELAY);
+    const entry = retainSocket(sessionId, handleSharedMessage, setIsConnected);
+    entryRef.current = entry;
     return () => {
-      clearTimeout(initialConnectTimer);
-      disconnect();
+      releaseSocket(entry, handleSharedMessage, setIsConnected, false);
+      if (entryRef.current === entry) entryRef.current = null;
     };
-  }, [connect, disconnect]);
+  }, [handleSharedMessage, sessionId]);
 
   return { isConnected, send, disconnect };
 }

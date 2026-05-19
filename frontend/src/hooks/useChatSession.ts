@@ -1535,11 +1535,42 @@ export function useChatSession(
     send({ type: 'set_thinking_intensity', thinking_intensity: thinkingIntensityRef.current });
   }, [isConnected, sessionId, send]);
 
+  const resetLocalSessionState = useCallback(() => {
+    userTouchedRef.current = false;
+    buildRequestInFlightRef.current = false;
+    discardPlanBufferedContent();
+    setHydratedSessionId('');
+    setMessages([]);
+    setToolCalls([]);
+    setFileEdits([]);
+    setRunEvents([]);
+    setContextUsage(null);
+    setCheckpoints([]);
+    setTaskGuidanceItems([]);
+    setTerminalLogs([]);
+    setIsRunning(false);
+    setChatModeState(initialChatModeFromStorage());
+    setPlanState({
+      mode: 'agent',
+      phase: 'idle',
+      goal: '',
+      draft: '',
+      structured_plan: null,
+      questions: [],
+      todos: [],
+      decisions: {},
+      decision_notes: {},
+      approved: false,
+      pending_clarification: false,
+      plan_file_path: null,
+      research_notes: '',
+    });
+  }, [discardPlanBufferedContent]);
+
   // 加载持久化数据（不强制 WS：连接后的 effect 会同步 chat_mode）
   useEffect(() => {
     let mounted = true;
-    userTouchedRef.current = false;
-    setHydratedSessionId('');
+    resetLocalSessionState();
 
     const hydrate = async () => {
       const data = await loadSession(sessionId);
@@ -1586,7 +1617,7 @@ export function useChatSession(
 
     hydrate();
     return () => { mounted = false; };
-  }, [sessionId]);
+  }, [resetLocalSessionState, sessionId]);
 
   // 自动保存到 IndexedDB（debounce 1s）
   useEffect(() => {
@@ -1909,36 +1940,8 @@ export function useChatSession(
 
   const resetSession = useCallback(() => {
     disconnect();
-    userTouchedRef.current = false;
-    buildRequestInFlightRef.current = false;
-    discardPlanBufferedContent();
-    setHydratedSessionId('');
-    setMessages([]);
-    setToolCalls([]);
-    setFileEdits([]);
-    setRunEvents([]);
-    setContextUsage(null);
-    setCheckpoints([]);
-    setTaskGuidanceItems([]);
-    setTerminalLogs([]);
-    setIsRunning(false);
-    setChatModeState(initialChatModeFromStorage());
-    setPlanState({
-      mode: 'agent',
-      phase: 'idle',
-      goal: '',
-      draft: '',
-      structured_plan: null,
-      questions: [],
-      todos: [],
-      decisions: {},
-      decision_notes: {},
-      approved: false,
-      pending_clarification: false,
-      plan_file_path: null,
-      research_notes: '',
-    });
-  }, [discardPlanBufferedContent, disconnect]);
+    resetLocalSessionState();
+  }, [disconnect, resetLocalSessionState]);
 
   const saveInputDraft = useCallback(async (text: string) => {
     await saveDraft(sessionId, text);

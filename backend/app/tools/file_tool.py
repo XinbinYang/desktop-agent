@@ -4,7 +4,13 @@ import aiofiles
 from pathlib import Path
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
-from app.runtime_paths import agents_dir, workspace_root
+from app.runtime_paths import (
+    PERSONAL_SYSTEM_FILES,
+    PERSONAL_WORKSPACE_DIRNAME,
+    SHARED_SYSTEM_FILES,
+    agents_dir,
+    workspace_root,
+)
 from app.security import is_relative_to, resolve_under_base
 
 # File operations are sandboxed under the project root or current project directory
@@ -97,7 +103,61 @@ def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]
     return _PROJECT_ROOT, None
 
 
-def _resolve_agent_workspace_path(path: str) -> tuple[Optional[Path], Optional[str]]:
+def _is_protected_agent_path(resolved: Path, root: Path) -> bool:
+    personal_root = root / "personal"
+    personal_workspace = personal_root / PERSONAL_WORKSPACE_DIRNAME
+    shared_root = root / "_shared"
+    shared_workspace = shared_root / PERSONAL_WORKSPACE_DIRNAME
+
+    if is_relative_to(resolved, personal_root) and not is_relative_to(resolved, personal_workspace):
+        return resolved.name in PERSONAL_SYSTEM_FILES
+    if is_relative_to(resolved, shared_root) and not is_relative_to(resolved, shared_workspace):
+        return resolved.name in SHARED_SYSTEM_FILES
+    return False
+
+
+def _resolve_agent_logical_path(root: Path, rel: Path) -> tuple[Path, bool, Optional[str]]:
+    parts = rel.parts
+    if not parts:
+        return root, False, None
+
+    agent = parts[0].lower()
+    rest = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+
+    if agent == "personal":
+        rest_parts = rest.parts
+        personal_root = root / "personal"
+        if rest_parts and rest_parts[0] == PERSONAL_WORKSPACE_DIRNAME:
+            resolved, err = resolve_under_base(str(rest), personal_root, allow_relative=True)
+            return resolved, False, err
+        if rest_parts and rest_parts[0] in PERSONAL_SYSTEM_FILES:
+            resolved, err = resolve_under_base(str(rest), personal_root, allow_relative=True)
+            return resolved, True, err
+        resolved, err = resolve_under_base(str(rest), personal_root / PERSONAL_WORKSPACE_DIRNAME, allow_relative=True)
+        return resolved, False, err
+
+    if agent == "_shared":
+        rest_parts = rest.parts
+        shared_root = root / "_shared"
+        if rest_parts and rest_parts[0] == PERSONAL_WORKSPACE_DIRNAME:
+            resolved, err = resolve_under_base(str(rest), shared_root, allow_relative=True)
+            return resolved, False, err
+        if rest_parts and rest_parts[0] in SHARED_SYSTEM_FILES:
+            resolved, err = resolve_under_base(str(rest), shared_root, allow_relative=True)
+            return resolved, True, err
+        resolved, err = resolve_under_base(str(rest), shared_root / PERSONAL_WORKSPACE_DIRNAME, allow_relative=True)
+        return resolved, False, err
+
+    resolved, err = resolve_under_base(str(rel), root, allow_relative=True)
+    return resolved, False, err
+
+
+def _resolve_agent_workspace_path(
+    path: str,
+    *,
+    agent_type: str = "",
+    access: str = "read",
+) -> tuple[Optional[Path], Optional[str]]:
     """Resolve AGENTS/* paths to the mutable runtime Agent workspace."""
     try:
         raw = Path(path)
@@ -105,6 +165,8 @@ def _resolve_agent_workspace_path(path: str) -> tuple[Optional[Path], Optional[s
         if raw.is_absolute():
             resolved = raw.resolve()
             if is_relative_to(resolved, root):
+                if access in {"write", "delete"} and _is_protected_agent_path(resolved, root):
+                    return resolved, "Protected Agent system files cannot be modified by file tools. Use the Personal WORKSPACE instead."
                 return resolved, None
             return None, None
 
@@ -112,20 +174,28 @@ def _resolve_agent_workspace_path(path: str) -> tuple[Optional[Path], Optional[s
         if not parts or parts[0].lower() != "agents":
             return None, None
         rel = Path(*parts[1:]) if len(parts) > 1 else Path(".")
-        resolved, err = resolve_under_base(str(rel), root, allow_relative=True)
+        resolved, protected, err = _resolve_agent_logical_path(root, rel)
         if err:
             return resolved, err
+        if access in {"write", "delete"} and protected:
+            return resolved, "Protected Agent system files cannot be modified by file tools. Use the Personal WORKSPACE instead."
         return resolved, None
     except (OSError, ValueError) as e:
         return Path(path), f"Invalid path: {path} ({e})"
 
 
-def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Optional[str]]:
+def _validate_path(
+    path: str,
+    project_relative: bool = False,
+    *,
+    agent_type: str = "",
+    access: str = "read",
+) -> tuple[Path, Optional[str]]:
     """Validate that a path is within the sandbox. Returns (resolved_path, error_message)."""
     from app.config import load_config
 
     if not project_relative:
-        agent_path, agent_err = _resolve_agent_workspace_path(path)
+        agent_path, agent_err = _resolve_agent_workspace_path(path, agent_type=agent_type, access=access)
         if agent_path is not None or agent_err:
             return agent_path or Path(path), agent_err
 
@@ -173,12 +243,13 @@ class FileReadTool(BaseTool):
         limit: int = 200,
         project_relative: bool = False,
         file_path: str = "",
+        agent_type: str = "",
     ) -> ToolResult:
         if not path:
             path = file_path
         if not path:
             return ToolResult(error="Missing required argument: path")
-        p, err = _validate_path(path, project_relative)
+        p, err = _validate_path(path, project_relative, agent_type=agent_type, access="read")
         if err:
             return ToolResult(error=err)
         try:
@@ -225,8 +296,9 @@ class FileWriteTool(BaseTool):
         tool_call_id: str = "",
         worker_id: str = "",
         parent_tool_call_id: str = "",
+        agent_type: str = "",
     ) -> ToolResult:
-        p, err = _validate_path(path, project_relative)
+        p, err = _validate_path(path, project_relative, agent_type=agent_type, access="write")
         if err:
             return ToolResult(error=err)
         try:
@@ -267,8 +339,14 @@ class FileListTool(BaseTool):
         "required": ["path"]
     }
 
-    async def execute(self, path: str, recursive: bool = False, project_relative: bool = False) -> ToolResult:
-        p, err = _validate_path(path, project_relative)
+    async def execute(
+        self,
+        path: str,
+        recursive: bool = False,
+        project_relative: bool = False,
+        agent_type: str = "",
+    ) -> ToolResult:
+        p, err = _validate_path(path, project_relative, agent_type=agent_type, access="read")
         if err:
             return ToolResult(error=err)
         try:
@@ -311,8 +389,14 @@ class FileSearchTool(BaseTool):
         "required": ["path", "keyword"]
     }
 
-    async def execute(self, path: str, keyword: str, project_relative: bool = False) -> ToolResult:
-        p, err = _validate_path(path, project_relative)
+    async def execute(
+        self,
+        path: str,
+        keyword: str,
+        project_relative: bool = False,
+        agent_type: str = "",
+    ) -> ToolResult:
+        p, err = _validate_path(path, project_relative, agent_type=agent_type, access="read")
         if err:
             return ToolResult(error=err)
         try:
@@ -340,8 +424,8 @@ class FileDeleteTool(BaseTool):
         "required": ["path"]
     }
 
-    async def execute(self, path: str, project_relative: bool = False) -> ToolResult:
-        p, err = _validate_path(path, project_relative)
+    async def execute(self, path: str, project_relative: bool = False, agent_type: str = "") -> ToolResult:
+        p, err = _validate_path(path, project_relative, agent_type=agent_type, access="delete")
         if err:
             return ToolResult(error=err)
         try:

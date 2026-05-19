@@ -137,11 +137,15 @@ class EvolutionEngine:
         try:
             snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-            # Copy key persona files
-            for filename in ["SOUL.md", "INNER.md", "IDENTITY.md", "AGENTS.md", "MEMORY.md"]:
+            # Copy key mutable workspace files plus the protected Personal rules.
+            for filename in ["SOUL.md", "INNER.md", "IDENTITY.md", "MEMORY.md"]:
                 src = AgentManager._personal_dir() / filename
                 if src.exists():
                     shutil.copy2(src, snapshot_dir / filename)
+
+            protected_rules = AgentManager._personal_system_dir() / "AGENTS.md"
+            if protected_rules.exists():
+                shutil.copy2(protected_rules, snapshot_dir / "AGENTS.md")
 
             # Copy skills
             skills_dir = AgentManager._personal_dir() / "skills"

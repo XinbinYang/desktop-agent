@@ -313,7 +313,6 @@ class DreamEngine:
     # ── Stage 3: REM ──
 
     @classmethod
-    @classmethod
     async def _rem_async(
         cls, passed: List[Tuple[str, float]], candidates: List[str]
     ) -> Dict[str, Any]:
