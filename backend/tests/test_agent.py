@@ -286,6 +286,62 @@ class TestAgentSession:
             assert tool_call_events[0]["data"]["name"] == "get_screen_size"
 
     @pytest.mark.asyncio
+    async def test_dispatch_worker_inherits_active_session_model(self):
+        session = AgentSession(model_id="gpt-4o-mini", session_id="dispatch_model_session", agent_type="coding")
+        seen_worker_models = []
+
+        async def replacement_worker_run(self):
+            seen_worker_models.append(self.model_id)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Worker completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        worker_call_response = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_worker",
+                        "type": "function",
+                        "function": {
+                            "name": "dispatch_worker",
+                            "arguments": json.dumps({"task": "Inspect this", "profile": "explorer"}),
+                        },
+                    }],
+                }
+            }]
+        }
+        final_response = {
+            "choices": [{
+                "message": {
+                    "content": "Done.",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        streams = [_make_stream_mock(worker_call_response), _make_stream_mock(final_response)]
+
+        async def stream_sequence(*args, **kwargs):
+            stream = streams.pop(0)
+            async for event in stream(*args, **kwargs):
+                yield event
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence),
+            patch("app.worker.WorkerSession.run", new=replacement_worker_run),
+        ):
+            events = [event async for event in session.run("dispatch a worker")]
+
+        assert seen_worker_models == ["gpt-4o-mini"]
+        assert any(e["type"] == "tool_call" and e["data"]["name"] == "dispatch_worker" for e in events)
+
+    @pytest.mark.asyncio
     async def test_run_with_file_write_emits_file_edit(self, session, temp_dir):
         from app import config
 

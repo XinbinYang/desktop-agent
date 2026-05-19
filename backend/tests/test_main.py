@@ -1045,6 +1045,18 @@ class TestWebSocket:
             assert msg["type"] == "error"
             assert "not allowed" in msg["data"]["message"].lower()
 
+    def test_websocket_tool_direct_blocks_memory_list(self, client):
+        """Personal memory tools stay agent-only, not renderer-direct."""
+        with client.websocket_connect("/ws/test_tool_block_memory") as ws:
+            ws.send_json({
+                "type": "tool_direct",
+                "tool_name": "memory_list",
+                "args": {}
+            })
+            msg = receive_until(ws, "error")
+            assert msg["type"] == "error"
+            assert "not allowed" in msg["data"]["message"].lower()
+
     def test_websocket_set_chat_mode_persists(self, client):
         """set_chat_mode updates session, echoes chat_mode, and persists to snapshot."""
         sid = "test_ws_set_chat_mode_persist"

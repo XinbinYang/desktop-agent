@@ -7,7 +7,7 @@ from app.agents.manager import AgentManager
 @pytest.mark.asyncio
 async def test_dream_run_handles_empty_candidates(tmp_path, monkeypatch):
     monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-    memory_dir = tmp_path / "personal" / "memory"
+    memory_dir = AgentManager._memory_dir()
     memory_dir.mkdir(parents=True)
 
     result = await DreamEngine.run()

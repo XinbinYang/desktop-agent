@@ -44,7 +44,15 @@ from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool, PlanUp
 from app.tools.test_tool import RunTestsTool
 from app.tools.diagnostics_tool import ListDiagnosticsTool
 from app.tools.ocr_tool import OCRClickTool, OCRFindTool, OCRReadTool
-from app.tools.memory_tool import MemorySearchTool, MemoryHandoffTool, MemoryListTool
+from app.tools.memory_tool import (
+    MemorySearchTool,
+    MemoryHandoffTool,
+    MemoryListTool,
+    MemoryRememberTool,
+    MemoryUpdateTool,
+    MemoryForgetTool,
+    MemoryRebuildTool,
+)
 from app.tools.collaboration_tool import (
     ConsultCodingAgentTool,
     DelegateToCodingAgentTool,
@@ -145,6 +153,10 @@ ALL_TOOLS: list[BaseTool] = [
     OCRReadTool(),
     # 记忆管理工具
     MemorySearchTool(),
+    MemoryRememberTool(),
+    MemoryUpdateTool(),
+    MemoryForgetTool(),
+    MemoryRebuildTool(),
     MemoryHandoffTool(),
     MemoryListTool(),
     ConsultCodingAgentTool(),
@@ -254,7 +266,15 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "skill_draft_save", "skill_validate", "skill_publish",
         "skill_list", "skill_read", "skill_archive",
     ],
-    "记忆管理": ["memory_search", "memory_list", "memory_handoff_write"],
+    "记忆管理": [
+        "memory_search",
+        "memory_remember",
+        "memory_update",
+        "memory_forget",
+        "memory_rebuild",
+        "memory_list",
+        "memory_handoff_write",
+    ],
 }
 
 

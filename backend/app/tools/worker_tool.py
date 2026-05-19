@@ -44,6 +44,18 @@ def _coerce_worker_limit(value: Any, default: int = 3) -> int:
     return max(1, min(16, limit))
 
 
+def _resolve_worker_model(model_id: str, session_model_id: str, agent_type: str) -> str:
+    explicit = str(model_id or "").strip()
+    if explicit:
+        return explicit
+    inherited = str(session_model_id or "").strip()
+    if inherited:
+        return inherited
+    from app.config import get_model_for_agent
+
+    return get_model_for_agent(agent_type)
+
+
 def get_parallel_worker_limit() -> int:
     """Return the user-visible maximum for dispatch_parallel.
 
@@ -89,7 +101,10 @@ def cancel_workers_for_session(session_id: str) -> None:
 
 class DispatchWorkerTool(BaseTool):
     name = "dispatch_worker"
-    description = "Dispatch a single worker agent to execute a subtask. The worker is an independent AI agent with restricted tools. Use this to offload focused work."
+    description = (
+        "Dispatch a single worker agent to execute a subtask. The worker is an independent AI agent "
+        "with restricted tools. If model_id is omitted, the worker inherits the current session model."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -105,7 +120,7 @@ class DispatchWorkerTool(BaseTool):
             },
             "model_id": {
                 "type": "string",
-                "description": "Model ID for the worker. Defaults to the configured default model.",
+                "description": "Model ID for the worker. Defaults to the current session model.",
             },
             "context_files": {
                 "type": "array",
@@ -137,10 +152,9 @@ class DispatchWorkerTool(BaseTool):
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
+        session_model_id: str = "",
     ) -> ToolResult:
-        from app.config import get_model_for_agent
-        if not model_id:
-            model_id = get_model_for_agent(agent_type)
+        model_id = _resolve_worker_model(model_id, session_model_id, agent_type)
 
         full_task = task
         if prior_context:
@@ -232,7 +246,7 @@ class DispatchParallelTool(BaseTool):
             },
             "model_id": {
                 "type": "string",
-                "description": "Model ID for ALL workers. Defaults to configured default model.",
+                "description": "Model ID for ALL workers. Defaults to the current session model.",
             },
         },
         "required": ["tasks"],
@@ -273,10 +287,9 @@ class DispatchParallelTool(BaseTool):
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
+        session_model_id: str = "",
     ) -> ToolResult:
-        from app.config import get_model_for_agent
-        if not model_id:
-            model_id = get_model_for_agent("coding")
+        model_id = _resolve_worker_model(model_id, session_model_id, "coding")
 
         if not tasks:
             msg = "[ERROR] dispatch_parallel requires at least one task."
@@ -304,7 +317,7 @@ class DispatchParallelTool(BaseTool):
         async def run_one(idx: int, task_spec: Dict[str, Any]) -> Dict[str, Any]:
             worker_id = f"worker_{uuid.uuid4().hex[:6]}_{idx}"
             profile_name = task_spec.get("profile", "code")
-            worker_model = task_spec.get("model_id") or model_id
+            worker_model = str(task_spec.get("model_id") or "").strip() or model_id
             worker_task = task_spec["task"]
             prior_context = task_spec.get("prior_context") or ""
             acceptance = task_spec.get("acceptance_criteria") or []

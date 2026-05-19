@@ -114,6 +114,29 @@ class AgentManager:
             "- Do not write or delete AGENTS/personal/AGENTS.md or AGENTS/_shared/base_rules.md."
         )
 
+        parts.append(
+            "## Personal Memory OS Protocol\n"
+            "- Treat Memory OS as your primary long-term recall system. Use `memory_search` before answering "
+            "when the user asks about past conversations, preferences, prior decisions, recurring workflows, "
+            "or anything likely to depend on personal history.\n"
+            "- Memory layers: `working` = short-lived continuity and current-session handoff; "
+            "`episodic` = dated conversation events, diary-like facts, and what happened; "
+            "`semantic` = stable user preferences, durable facts, decisions, and agreements; "
+            "`procedural` = reusable methods, workflows, corrections, and lessons; "
+            "`identity` = USER/SOUL/IDENTITY-level profile or persona facts, only when the user explicitly "
+            "confirms them or confidence is very high.\n"
+            "- When the user states a durable preference, correction, agreement, or reusable lesson, call "
+            "`memory_remember` with the right layer instead of writing raw memory files. Use concise, factual "
+            "content and a source_ref such as `user_explicit:current_session`.\n"
+            "- If a memory is stale or contradicted, first call `memory_search`, then `memory_update` on the "
+            "specific item id. Prefer updating over creating duplicates.\n"
+            "- If the user asks you to forget something, call `memory_search` to find the item, then "
+            "`memory_forget` only for the matching id. Mention when nothing matching is found.\n"
+            "- Use `memory_rebuild` only when search looks stale, the user asks to rebuild/reindex memory, "
+            "or after memory files have been migrated.\n"
+            "- Do not expose private memory details unnecessarily. Summarize only the relevant recalled context."
+        )
+
         agents_md = cls._load_workspace_file("personal", "AGENTS.md")
         if agents_md:
             parts.append(agents_md)
@@ -121,6 +144,17 @@ class AgentManager:
         base_rules = cls._load_workspace_file("_shared", "base_rules.md")
         if base_rules:
             parts.append(base_rules)
+
+        parts.append(
+            "## Authoritative Memory OS Rules\n"
+            "- If any workspace AGENTS.md text says to write durable memory directly to Markdown files, "
+            "prefer these newer Memory OS rules instead.\n"
+            "- Use `memory_search` for recall, `memory_remember` for new durable memory, "
+            "`memory_update` for corrections, `memory_forget` for user-requested forgetting, "
+            "and `memory_rebuild` only for stale indexes or explicit rebuild requests.\n"
+            "- Record durable memory in the correct layer: working, episodic, semantic, procedural, or identity. "
+            "Use identity only for explicit or very high-confidence USER/SOUL/IDENTITY-level facts."
+        )
 
         parts.append(
             "## Coding Agent Collaboration\n"

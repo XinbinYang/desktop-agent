@@ -2988,6 +2988,7 @@ class AgentSession:
                     run_id=run_id,
                     tool_call_id=tool_id,
                     agent_type=self._agent_type,
+                    session_model_id=self.model_id,
                     get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
                 )
 

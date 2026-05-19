@@ -13,6 +13,7 @@ import { useTheme } from '../hooks/useTheme';
 import { AGENT_LABEL } from '../lib/agentProfiles';
 import { type ProjectHistoryAction } from './SessionHistoryPanel';
 import { WorkspacePanel } from './WorkspacePanel';
+import type { PersonalWorkspaceTab } from './PersonalWorkspace/PersonalWorkspacePanel';
 
 interface SidebarProps {
   activeSection: SidebarSection;
@@ -20,7 +21,7 @@ interface SidebarProps {
   onSectionChange: (section: SidebarSection) => void;
   onAgentChange?: (agent: AgentType) => void;
   agentModel?: string;
-  onOpenPersonalWorkspace?: () => void;
+  onOpenPersonalWorkspace?: (tab?: PersonalWorkspaceTab) => void;
   onOpenSettings: () => void;
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
@@ -125,7 +126,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <button
                 type="button"
-                onClick={onOpenPersonalWorkspace}
+                onClick={() => onOpenPersonalWorkspace?.('persona')}
                 className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <UserCog className="w-3.5 h-3.5" />
@@ -140,11 +141,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => onExecuteTool?.('memory_list', {})}
+                onClick={() => onOpenPersonalWorkspace?.('memory')}
                 className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <BookOpen className="w-3.5 h-3.5" />
-                Search Memory
+                Memory OS
               </button>
             </div>
 

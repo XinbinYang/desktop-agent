@@ -85,6 +85,12 @@ class DreamEngine:
         # Write passed entries to MEMORY.md
         if passed:
             entries = [e for e, _ in passed]
+            try:
+                from app.agents.memory_os import get_memory_os
+                score_map = {e: s for e, s in passed}
+                get_memory_os().record_dream_entries(entries, score_map)
+            except Exception as e:
+                logger.warning("DREAM: failed to write Memory OS entries: %s", e)
             AgentManager.consolidate_memory(entries)
 
         # ── Stage 3: REM — associate + reflect (via isolated background session) ──

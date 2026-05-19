@@ -26,7 +26,7 @@ import {
 import { TerminalPanel } from './components/TerminalPanel';
 import { WorkspacePanel, type WorkspaceView } from './components/workspace/WorkspacePanel';
 import { ActivityPanel } from './components/activity/ActivityPanel';
-import { PersonalWorkspacePanel } from './components/PersonalWorkspace/PersonalWorkspacePanel';
+import { PersonalWorkspacePanel, type PersonalWorkspaceTab } from './components/PersonalWorkspace/PersonalWorkspacePanel';
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
@@ -330,6 +330,8 @@ export default function App() {
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryResponse | null>(null);
   const sessions = React.useMemo(() => flattenSessionHistory(sessionHistory), [sessionHistory]);
   const [showSettings, setShowSettings] = useState(false);
+  const [personalWorkspaceTab, setPersonalWorkspaceTab] = useState<PersonalWorkspaceTab>('persona');
+  const [personalWorkspaceFocusSignal, setPersonalWorkspaceFocusSignal] = useState(0);
 
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -353,6 +355,12 @@ export default function App() {
   const layout = useLayoutState();
   const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
   const sidebarWidth = sidebarDragWidth ?? layout.sidebarWidth;
+  const openPersonalWorkspace = useCallback((tab: PersonalWorkspaceTab = 'persona') => {
+    setPersonalWorkspaceTab(tab);
+    setPersonalWorkspaceFocusSignal((value) => value + 1);
+    layout.setRightPanelVisible(true);
+    layout.setRightZone('workspace');
+  }, [layout]);
   const agentModel = agentModels[layout.activeAgent] || '';
   const sessionMetaById = React.useMemo(() => {
     const map: Record<string, SessionListItem> = {};
@@ -2226,10 +2234,7 @@ export default function App() {
                 onSectionChange={layout.setActiveSection}
                 agentModel={focusedModel}
                 onAgentChange={handleAgentNavigate}
-                onOpenPersonalWorkspace={() => {
-                  layout.setRightPanelVisible(true);
-                  layout.setRightZone('workspace');
-                }}
+                onOpenPersonalWorkspace={openPersonalWorkspace}
                 onOpenSettings={() => setShowSettings(true)}
                 onClear={focusedActions.clearSession}
                 onExecuteTool={focusedActions.executeToolDirect}
@@ -2505,7 +2510,10 @@ export default function App() {
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
-                  <PersonalWorkspacePanel />
+                  <PersonalWorkspacePanel
+                    activeTabHint={personalWorkspaceTab}
+                    focusSignal={personalWorkspaceFocusSignal}
+                  />
                 )}
                 {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
                   <FocusedDataProvider value={focusedSnapshot}>

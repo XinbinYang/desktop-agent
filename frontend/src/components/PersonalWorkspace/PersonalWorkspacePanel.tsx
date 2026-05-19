@@ -8,11 +8,11 @@ import { LearningsPanel } from './LearningsPanel';
 import { EvolutionPanel } from './EvolutionPanel';
 import { DreamsViewer } from './DreamsViewer';
 
-type TabId = 'memory' | 'persona' | 'learnings' | 'heartbeat' | 'evolution' | 'dreams';
+export type PersonalWorkspaceTab = 'memory' | 'persona' | 'learnings' | 'heartbeat' | 'evolution' | 'dreams';
 
-const TABS: { id: TabId; icon: React.FC<{ className?: string }>; label: string }[] = [
+const TABS: { id: PersonalWorkspaceTab; icon: React.FC<{ className?: string }>; label: string }[] = [
   { id: 'persona', icon: FileText, label: '人格' },
-  { id: 'memory', icon: Brain, label: '记忆' },
+  { id: 'memory', icon: Brain, label: 'Memory OS' },
   { id: 'learnings', icon: Zap, label: '学习' },
   { id: 'heartbeat', icon: Activity, label: '心跳' },
   { id: 'dreams', icon: Moon, label: '梦境' },
@@ -21,14 +21,23 @@ const TABS: { id: TabId; icon: React.FC<{ className?: string }>; label: string }
 
 interface PersonalWorkspacePanelProps {
   className?: string;
+  activeTabHint?: PersonalWorkspaceTab;
+  focusSignal?: number;
 }
 
-export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({ className }) => {
-  const [activeTab, setActiveTab] = useState<TabId>('persona');
+export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
+  className,
+  activeTabHint,
+  focusSignal = 0,
+}) => {
+  const [activeTab, setActiveTab] = useState<PersonalWorkspaceTab>(activeTabHint || 'persona');
+
+  React.useEffect(() => {
+    if (activeTabHint) setActiveTab(activeTabHint);
+  }, [activeTabHint, focusSignal]);
 
   return (
     <div className={cn('flex flex-col h-full min-h-0', className)}>
-      {/* Tab bar */}
       <div className="flex border-b border-border shrink-0 overflow-x-auto">
         {TABS.map((tab) => (
           <button
@@ -48,10 +57,9 @@ export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({ 
         ))}
       </div>
 
-      {/* Tab content */}
       <div className="flex-1 min-h-0 overflow-hidden">
         {activeTab === 'persona' && <SoulEditor />}
-        {activeTab === 'memory' && <MemoryManager />}
+        {activeTab === 'memory' && <MemoryManager focusSignal={focusSignal} />}
         {activeTab === 'learnings' && <LearningsPanel />}
         {activeTab === 'heartbeat' && <HeartbeatConfig />}
         {activeTab === 'dreams' && <DreamsViewer />}

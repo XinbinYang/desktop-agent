@@ -10,7 +10,7 @@ from app.agents.manager import AgentManager
 @pytest.mark.asyncio
 async def test_heartbeat_runs_dream_when_threshold_met(tmp_path, monkeypatch):
     monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-    memory_dir = tmp_path / "personal" / "memory"
+    memory_dir = AgentManager._memory_dir()
     memory_dir.mkdir(parents=True)
     for idx in range(HeartbeatEngine.DREAM_SESSION_COUNT_THRESHOLD):
         (memory_dir / f"2026-05-{idx + 1:02d}.md").write_text(
@@ -39,8 +39,8 @@ async def test_heartbeat_runs_dream_when_threshold_met(tmp_path, monkeypatch):
 
 def test_should_trigger_dream_counts_only_diaries_after_last_dream(tmp_path, monkeypatch):
     monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
-    personal_dir = tmp_path / "personal"
-    memory_dir = personal_dir / "memory"
+    personal_dir = AgentManager._personal_dir()
+    memory_dir = AgentManager._memory_dir()
     memory_dir.mkdir(parents=True)
     diary = memory_dir / "2026-05-01.md"
     diary.write_text("x" * (HeartbeatEngine.DREAM_DIARY_SIZE_THRESHOLD + 1), encoding="utf-8")

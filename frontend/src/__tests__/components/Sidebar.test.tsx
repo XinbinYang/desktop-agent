@@ -181,6 +181,24 @@ describe('Sidebar', () => {
     expect(onClear).toHaveBeenCalled()
   })
 
+  it('opens Memory OS panel without direct tool invocation', () => {
+    const onOpenPersonalWorkspace = vi.fn()
+    const onExecuteTool = vi.fn()
+    render(
+      <Sidebar
+        {...defaultProps}
+        activeSection="personal"
+        onOpenPersonalWorkspace={onOpenPersonalWorkspace}
+        onExecuteTool={onExecuteTool}
+      />
+    )
+
+    fireEvent.click(screen.getByText('Memory OS'))
+
+    expect(onOpenPersonalWorkspace).toHaveBeenCalledWith('memory')
+    expect(onExecuteTool).not.toHaveBeenCalled()
+  })
+
   it('saves skill preference when toggling a skill', async () => {
     const fetchMock = vi.mocked(fetch)
     render(<Sidebar {...defaultProps} />)
