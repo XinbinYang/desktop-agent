@@ -261,6 +261,7 @@ async def execute_tool(
     tool_call_id: str = "",
     worker_id: str = "",
     parent_tool_call_id: str = "",
+    agent_type: str = "",
     get_tool_fn: Optional[Callable[..., Any]] = None,
 ) -> ToolCallResult:
     """Execute a single tool call with validation and timing.
@@ -304,6 +305,7 @@ async def execute_tool(
         "tool_call_id": tool_call_id,
         "worker_id": worker_id,
         "parent_tool_call_id": parent_tool_call_id,
+        "agent_type": agent_type,
     }
     for key, value in context_args.items():
         if key in tool_params and key not in tool_args and value:

@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plug, Play, Square, RotateCw, Loader2, Eye, EyeOff, Save, Trash2 } from 'lucide-react';
+import { Plug, Play, Square, RotateCw, Loader2, Eye, EyeOff, Save, Trash2, Send } from 'lucide-react';
 import { API_BASE } from '../config';
 import type { ConnectorInfo } from '../types';
 
 type EditState = {
   connectorName: string;
-  fields: Record<string, string>;
+  fields: Record<string, string | boolean>;
   showValue: Record<string, boolean>;
 };
 
@@ -18,6 +18,8 @@ function fmtUptime(seconds: number): string {
 export function ConnectionsPanel() {
   const [connectors, setConnectors] = useState<ConnectorInfo[]>([]);
   const [operatingId, setOperatingId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testStatus, setTestStatus] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<EditState | null>(null);
 
@@ -100,12 +102,12 @@ export function ConnectionsPanel() {
 
   const startEdit = (c: ConnectorInfo) => {
     const schema = c.config_schema;
-    const fields: Record<string, string> = {};
+    const fields: Record<string, string | boolean> = {};
     const showValue: Record<string, boolean> = {};
     const props = schema?.properties || {};
 
     for (const key of Object.keys(props)) {
-      fields[key] = c.config?.[key] || props[key]?.default || '';
+      fields[key] = c.config?.[key] ?? props[key]?.default ?? (props[key]?.type === 'boolean' ? false : '');
       showValue[key] = !props[key]?.sensitive;
     }
 
@@ -116,7 +118,7 @@ export function ConnectionsPanel() {
     setEditing(null);
   };
 
-  const updateField = (key: string, value: string) => {
+  const updateField = (key: string, value: string | boolean) => {
     if (!editing) return;
     setEditing({ ...editing, fields: { ...editing.fields, [key]: value } });
   };
@@ -145,6 +147,28 @@ export function ConnectionsPanel() {
     }
   };
 
+  const handleTestMessage = async (name: string) => {
+    setTestingId(name);
+    setError(null);
+    setTestStatus((prev) => ({ ...prev, [name]: '' }));
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/${name}/test-message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Desktop Agent connector test message.' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || 'Test message failed');
+      }
+      setTestStatus((prev) => ({ ...prev, [name]: 'Test message sent' }));
+    } catch (err: any) {
+      setError(`Test message failed: ${err.message || err}`);
+    } finally {
+      setTestingId(null);
+    }
+  };
+
   const statusColor = (status: string): string => {
     switch (status) {
       case 'running': return 'bg-success';
@@ -164,6 +188,11 @@ export function ConnectionsPanel() {
   const hasConfig = (c: ConnectorInfo) => {
     const schema = c.config_schema;
     return schema?.properties && Object.keys(schema.properties).length > 0;
+  };
+
+  const hasNotificationConfig = (c: ConnectorInfo) => {
+    const props = c.config_schema?.properties || {};
+    return Object.keys(props).some((key) => key.startsWith('notification') || key === 'notifications_enabled');
   };
 
   return (
@@ -275,15 +304,26 @@ export function ConnectionsPanel() {
                         const show = editing.showValue[key] ?? !isSensitive;
                         const enumOptions = Array.isArray(prop.enum) ? prop.enum : [];
                         const enumLabels = prop.enumLabels || {};
+                        const isBoolean = prop.type === 'boolean';
                         return (
                           <div key={key}>
                             <label className="text-[10px] text-fg-secondary block font-medium">
                               {prop.label || key}
                             </label>
                             <div className="flex gap-1 mt-0.5">
-                              {enumOptions.length > 0 ? (
+                              {isBoolean ? (
+                                <label className="flex flex-1 items-center gap-2 text-[11px] text-fg-secondary bg-surface border border-border rounded px-2 py-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(editing.fields[key])}
+                                    onChange={(e) => updateField(key, e.target.checked)}
+                                    className="h-3 w-3 accent-accent"
+                                  />
+                                  <span>{prop.description || prop.label || key}</span>
+                                </label>
+                              ) : enumOptions.length > 0 ? (
                                 <select
-                                  value={editing.fields[key] || prop.default || enumOptions[0] || ''}
+                                  value={String(editing.fields[key] || prop.default || enumOptions[0] || '')}
                                   onChange={(e) => updateField(key, e.target.value)}
                                   className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
                                 >
@@ -296,7 +336,7 @@ export function ConnectionsPanel() {
                               ) : (
                                 <input
                                   type={show ? 'text' : 'password'}
-                                  value={editing.fields[key] || ''}
+                                  value={String(editing.fields[key] || '')}
                                   onChange={(e) => updateField(key, e.target.value)}
                                   placeholder={prop.description || `输入 ${prop.label || key}...`}
                                   className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
@@ -318,12 +358,23 @@ export function ConnectionsPanel() {
                       <div className="flex gap-1 pt-1">
                         <button
                           onClick={handleSave}
+                          title="Save connector config"
                           disabled={operatingId === c.name}
                           className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-accent/10 text-accent border border-accent/25 hover:bg-accent/15 disabled:opacity-50"
                         >
                           <Save size={10} />
                           保存
                         </button>
+                        {hasNotificationConfig(c) && (
+                          <button
+                            onClick={() => handleTestMessage(c.name)}
+                            disabled={testingId === c.name || operatingId === c.name}
+                            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-success/10 text-success border border-success/25 hover:bg-success/15 disabled:opacity-50"
+                          >
+                            {testingId === c.name ? <Loader2 size={10} className="animate-spin" /> : <Send size={10} />}
+                            Test message
+                          </button>
+                        )}
                         <button
                           onClick={cancelEdit}
                           className="px-2 py-1 rounded text-[10px] text-fg-secondary hover:text-fg hover:bg-surface-hover"
@@ -331,12 +382,16 @@ export function ConnectionsPanel() {
                           取消
                         </button>
                       </div>
+                      {testStatus[c.name] && (
+                        <p className="text-[10px] text-success">{testStatus[c.name]}</p>
+                      )}
                     </div>
                   ) : (
                     hasConfig(c) && (
                       <div className="mt-2">
                         <button
                           onClick={() => startEdit(c)}
+                          title="Configure connector"
                           className="inline-flex items-center px-2 py-1 rounded border border-accent/25 bg-accent/10 text-[10px] font-medium text-accent hover:bg-accent/15 hover:border-accent/40 focus:outline-none focus:ring-2 focus:ring-accent/30"
                         >
                           配置凭据

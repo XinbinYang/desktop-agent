@@ -3,12 +3,12 @@ import logging
 import sqlite3
 import threading
 import uuid
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import List, Optional
 
-import sqlite_vec
-
-from app.rag.embedding import encode_query, encode_texts, get_embedding_dim
+from app.rag.embedding import encode_query, encode_texts, get_embedding_dim, get_model_cache_dir, get_model_name
 from app.rag.models import DocumentChunk, SearchResult
 from app.rag.splitter import split_document
 from app.runtime_paths import runtime_file
@@ -16,6 +16,92 @@ from app.runtime_paths import runtime_file
 logger = logging.getLogger(__name__)
 
 DB_PATH = runtime_file("data", "knowledge.db")
+
+
+def _sqlite_vec_available() -> bool:
+    return importlib.util.find_spec("sqlite_vec") is not None
+
+
+def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    try:
+        sqlite_vec = importlib.import_module("sqlite_vec")
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception as exc:
+        try:
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "sqlite-vec is not available. Install backend requirements or rebuild the packaged backend "
+            "with `--collect-all sqlite_vec`."
+        ) from exc
+
+
+def get_rag_status() -> dict:
+    """Return knowledge-base health without forcing vec/model initialization."""
+    sqlite_ok = _sqlite_vec_available()
+    total_chunks = 0
+    source_count = 0
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    db_error = ""
+    if DB_PATH.exists():
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_chunks' LIMIT 1"
+            ).fetchone()
+            if table:
+                total = conn.execute("SELECT COUNT(*) FROM doc_chunks").fetchone()
+                sources = conn.execute("SELECT COUNT(DISTINCT source_path) FROM doc_chunks").fetchone()
+                total_chunks = int(total[0]) if total else 0
+                source_count = int(sources[0]) if sources else 0
+        except sqlite3.Error as exc:
+            db_error = str(exc)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    error = ""
+    if not sqlite_ok:
+        error = "sqlite-vec is not installed or was not bundled into the packaged backend."
+    elif db_error:
+        error = db_error
+
+    return {
+        "status": "ok" if not error else "unavailable",
+        "sqlite_vec_available": sqlite_ok,
+        "total_chunks": total_chunks,
+        "source_count": source_count,
+        "db_size_mb": round(db_size / 1024 / 1024, 2),
+        "embedding_model": get_model_name(),
+        "embedding_dim": get_embedding_dim(),
+        "model_cache_dir": get_model_cache_dir(),
+        "error": error,
+    }
+
+
+def has_indexed_docs() -> bool:
+    """Return whether the knowledge DB has indexed docs without loading vec0."""
+    if not DB_PATH.exists():
+        return False
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_chunks' LIMIT 1"
+        ).fetchone()
+        if not table:
+            return False
+        row = conn.execute("SELECT 1 FROM doc_chunks LIMIT 1").fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _get_chunk_config():
@@ -26,9 +112,7 @@ def _get_chunk_config():
 
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
+    _load_sqlite_vec(conn)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -64,10 +148,20 @@ class RAGEngine:
 
     def __init__(self):
         self._write_lock = threading.Lock()
-        _init_db()
+        self._availability_error = ""
+        try:
+            _init_db()
+        except RuntimeError as exc:
+            self._availability_error = str(exc)
+
+    def _ensure_available(self) -> None:
+        if self._availability_error:
+            raise RuntimeError(self._availability_error)
 
     def index_file(self, file_path: str, recursive: bool = False) -> dict:
         """索引单个文件或文件夹。重复索引同一路径会先删除旧 chunks 再重写。"""
+        if self._availability_error:
+            return {"error": self._availability_error}
         path = Path(file_path).resolve()
         if not path.exists():
             return {"error": f"路径不存在: {file_path}"}
@@ -157,6 +251,7 @@ class RAGEngine:
 
     def search(self, query: str, top_k: int = 5, source_filter: Optional[str] = None) -> List[SearchResult]:
         """语义检索知识库。"""
+        self._ensure_available()
         query_embedding = encode_query(query)
         conn = _get_connection()
         try:
@@ -199,6 +294,7 @@ class RAGEngine:
 
     def list_docs(self) -> List[dict]:
         """列出所有已索引的源文件及其 chunk 数量。"""
+        self._ensure_available()
         conn = _get_connection()
         try:
             rows = conn.execute("""
@@ -220,6 +316,7 @@ class RAGEngine:
 
     def delete_doc(self, source_path: str) -> dict:
         """删除指定路径的所有 chunks。"""
+        self._ensure_available()
         with self._write_lock:
             conn = _get_connection()
             try:
@@ -239,6 +336,7 @@ class RAGEngine:
 
     def clear_all(self) -> dict:
         """清空整个知识库。"""
+        self._ensure_available()
         with self._write_lock:
             conn = _get_connection()
             try:
@@ -251,18 +349,26 @@ class RAGEngine:
 
     def get_stats(self) -> dict:
         """返回知识库统计信息。"""
-        from app.rag.embedding import get_embedding_dim, get_model_name
+        if self._availability_error:
+            status = get_rag_status()
+            status["error"] = self._availability_error
+            status["status"] = "unavailable"
+            return status
         conn = _get_connection()
         try:
             total = conn.execute("SELECT COUNT(*) as cnt FROM doc_chunks").fetchone()
             sources = conn.execute("SELECT COUNT(DISTINCT source_path) as cnt FROM doc_chunks").fetchone()
             db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
             return {
+                "status": "ok",
+                "sqlite_vec_available": True,
                 "total_chunks": total["cnt"] if total else 0,
                 "source_count": sources["cnt"] if sources else 0,
                 "db_size_mb": round(db_size / 1024 / 1024, 2),
                 "embedding_model": get_model_name(),
                 "embedding_dim": get_embedding_dim(),
+                "model_cache_dir": get_model_cache_dir(),
+                "error": "",
             }
         finally:
             conn.close()

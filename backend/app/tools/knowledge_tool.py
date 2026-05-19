@@ -15,8 +15,11 @@ class KnowledgeIndexTool(BaseTool):
     }
 
     async def execute(self, path: str, recursive: bool = True) -> ToolResult:
-        engine = get_rag_engine()
-        result = engine.index_file(path, recursive=recursive)
+        try:
+            engine = get_rag_engine()
+            result = engine.index_file(path, recursive=recursive)
+        except Exception as exc:
+            return ToolResult(error=f"Knowledge index unavailable: {exc}")
         if "error" in result:
             return ToolResult(error=result["error"])
         return ToolResult(
@@ -40,8 +43,11 @@ class KnowledgeSearchTool(BaseTool):
     }
 
     async def execute(self, query: str, top_k: int = 5, source_filter: str = "", min_score: float = 0.3) -> ToolResult:
-        engine = get_rag_engine()
-        results = engine.search(query, top_k=top_k, source_filter=source_filter or None)
+        try:
+            engine = get_rag_engine()
+            results = engine.search(query, top_k=top_k, source_filter=source_filter or None)
+        except Exception as exc:
+            return ToolResult(error=f"Knowledge search unavailable: {exc}")
         if min_score > 0:
             results = [r for r in results if r.score >= min_score]
         if not results:
@@ -61,8 +67,11 @@ class KnowledgeListTool(BaseTool):
     }
 
     async def execute(self) -> ToolResult:
-        engine = get_rag_engine()
-        docs = engine.list_docs()
+        try:
+            engine = get_rag_engine()
+            docs = engine.list_docs()
+        except Exception as exc:
+            return ToolResult(error=f"Knowledge list unavailable: {exc}")
         if not docs:
             return ToolResult(output="知识库为空，尚未索引任何文档。")
         lines = [f"共 {len(docs)} 个源文件："]
@@ -80,8 +89,11 @@ class KnowledgeClearTool(BaseTool):
     }
 
     async def execute(self) -> ToolResult:
-        engine = get_rag_engine()
-        result = engine.clear_all()
+        try:
+            engine = get_rag_engine()
+            result = engine.clear_all()
+        except Exception as exc:
+            return ToolResult(error=f"Knowledge clear unavailable: {exc}")
         if result.get("cleared"):
             return ToolResult(output="知识库已清空。")
         return ToolResult(error="清空知识库失败")

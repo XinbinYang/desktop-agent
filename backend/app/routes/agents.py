@@ -182,6 +182,15 @@ async def reset_bootstrap():
     return {"status": "ok", "message": "BOOTSTRAP.md re-created. Agent will re-enter onboarding on next session."}
 
 
+@router.post("/personal/bootstrap/complete")
+async def complete_bootstrap():
+    """Mark bootstrap onboarding as complete by archiving BOOTSTRAP.md."""
+    ok = AgentManager.complete_bootstrap()
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to complete bootstrap")
+    return {"status": "ok", "bootstrapped": AgentManager.is_bootstrapped()}
+
+
 @router.get("/personal/bootstrap/status")
 async def bootstrap_status():
     """Check if bootstrap onboarding is complete."""

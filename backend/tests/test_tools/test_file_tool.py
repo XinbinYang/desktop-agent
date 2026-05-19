@@ -4,7 +4,22 @@ import pytest
 from app.tools.file_tool import FileReadTool, FileWriteTool, FileListTool, FileSearchTool, FileDeleteTool
 
 
-class TestFileReadTool:
+class _UnrestrictedFileToolTests:
+    @pytest.fixture(autouse=True)
+    def _force_unrestricted_mode(self, monkeypatch):
+        import app.config as config_mod
+
+        orig = config_mod.load_config
+
+        def wrapped():
+            c = orig()
+            c.settings.sandbox_mode = "unrestricted"
+            return c
+
+        monkeypatch.setattr(config_mod, "load_config", wrapped)
+
+
+class TestFileReadTool(_UnrestrictedFileToolTests):
     @pytest.fixture
     def tool(self):
         return FileReadTool()
@@ -60,7 +75,7 @@ class TestFileReadTool:
         assert "alias-ok" in result.output
 
 
-class TestFileWriteTool:
+class TestFileWriteTool(_UnrestrictedFileToolTests):
     @pytest.fixture
     def tool(self):
         return FileWriteTool()
@@ -106,7 +121,7 @@ class TestFileWriteTool:
         assert "new_text" not in edit
 
 
-class TestFileListTool:
+class TestFileListTool(_UnrestrictedFileToolTests):
     @pytest.fixture
     def tool(self):
         return FileListTool()
@@ -138,7 +153,7 @@ class TestFileListTool:
         assert "not found" in result.error
 
 
-class TestFileSearchTool:
+class TestFileSearchTool(_UnrestrictedFileToolTests):
     @pytest.fixture
     def tool(self):
         return FileSearchTool()
@@ -158,7 +173,7 @@ class TestFileSearchTool:
         assert "No matching" in result.output
 
 
-class TestFileDeleteTool:
+class TestFileDeleteTool(_UnrestrictedFileToolTests):
     @pytest.fixture
     def tool(self):
         return FileDeleteTool()

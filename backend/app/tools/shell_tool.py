@@ -9,7 +9,7 @@ from app.tools.base import BaseTool, ToolResult
 _DANGEROUS_COMMAND_PATTERNS = [
     r"rm\s+-rf\s+[/~]",
     r"del\s+/[fq]",
-    r"format\s+",
+    r"(^|[;&|]\s*)format\s+[a-z]:",
     r"dd\s+if=",
     r">\s*/dev/sda",
     r"mkfs\.",
@@ -46,7 +46,7 @@ def _is_dangerous_command(cmd: str) -> bool:
     return False
 
 
-def _default_work_dir() -> str:
+def _default_work_dir(agent_type: str = "") -> str:
     try:
         from app.coding_runs import get_run_context
         ctx = get_run_context()
@@ -54,6 +54,15 @@ def _default_work_dir() -> str:
             return ctx.active_path
     except Exception:
         pass
+
+    if agent_type == "personal":
+        try:
+            from app.runtime_paths import agents_dir
+            home = agents_dir() / "personal"
+            home.mkdir(parents=True, exist_ok=True)
+            return str(home)
+        except Exception:
+            pass
 
     try:
         from app.coding_runs import effective_project_path
@@ -82,11 +91,11 @@ class ShellExecuteTool(BaseTool):
         "required": ["command"]
     }
 
-    async def execute(self, command: str, cwd: str = "", timeout: int = 60) -> ToolResult:
+    async def execute(self, command: str, cwd: str = "", timeout: int = 60, agent_type: str = "") -> ToolResult:
         if _is_dangerous_command(command):
             return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
         
-        work_dir = cwd if cwd else _default_work_dir()
+        work_dir = cwd if cwd else _default_work_dir(agent_type)
         
         # 根据系统选择 shell
         if os.name == "nt":
@@ -136,10 +145,10 @@ class ShellStartTool(BaseTool):
         "required": ["command"]
     }
     
-    async def execute(self, command: str, cwd: str = "") -> ToolResult:
+    async def execute(self, command: str, cwd: str = "", agent_type: str = "") -> ToolResult:
         if _is_dangerous_command(command):
             return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
-        work_dir = cwd if cwd else _default_work_dir()
+        work_dir = cwd if cwd else _default_work_dir(agent_type)
         try:
             if os.name == "nt":
                 subprocess = await asyncio.create_subprocess_shell(

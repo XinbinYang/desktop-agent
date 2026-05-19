@@ -76,6 +76,13 @@ describe('ChatPanel', () => {
     expect(within(welcome).getAllByText(/desktop-agent/).length).toBeGreaterThan(0)
   })
 
+  it('does not show current project state for Personal Agent', () => {
+    render(<ChatPanel {...defaultProps} agentType="personal" projectName="desktop-agent" />)
+    const welcome = screen.getByTestId('empty-chat-welcome')
+    expect(within(welcome).getByText('Personal Agent')).toBeInTheDocument()
+    expect(within(welcome).queryByText(/desktop-agent/)).not.toBeInTheDocument()
+  })
+
   it('uses the coding event timeline for Coding Agent sessions', () => {
     const messages: ChatMessage[] = [
       { id: '1', role: 'user', content: 'Inspect the app', isTool: false },

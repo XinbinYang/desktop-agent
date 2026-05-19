@@ -79,8 +79,8 @@ class TestHallucinationGuard:
         assert "[INTENT_BLOCKED]" not in tool_events[0]["data"]["result"]
 
     @pytest.mark.asyncio
-    async def test_browser_navigate_external_blocked_without_intent(self, session):
-        """User asks about local files; model hallucinates browsing external site -> blocked."""
+    async def test_browser_navigate_external_allowed_without_intent_filter(self, session):
+        """Browser navigation is allowed; prompts steer it, but hard intent filtering is for clone."""
         mock_response = {
             "choices": [{
                 "message": {
@@ -108,7 +108,7 @@ class TestHallucinationGuard:
         tool_events = [e for e in events if e["type"] == "tool_call"]
         assert len(tool_events) >= 1
         assert tool_events[0]["data"]["name"] == "browser_navigate"
-        assert "[INTENT_BLOCKED]" in tool_events[0]["data"]["result"]
+        assert "[INTENT_BLOCKED]" not in tool_events[0]["data"]["result"]
 
     @pytest.mark.asyncio
     async def test_browser_navigate_localhost_always_allowed(self, session):
@@ -142,15 +142,15 @@ class TestHallucinationGuard:
         assert tool_events[0]["data"]["name"] == "browser_navigate"
         assert "[INTENT_BLOCKED]" not in tool_events[0]["data"]["result"]
 
-    def test_web_search_blocked_without_external_intent(self, session):
+    def test_web_search_allowed_without_external_intent(self, session):
         ok, reason = session._check_tool_intent_consistency(
             "web_search",
             {"query": "latest docs"},
             "inspect local project files",
         )
 
-        assert ok is False
-        assert "[INTENT_BLOCKED]" in reason
+        assert ok is True
+        assert reason == ""
 
     def test_web_search_allowed_with_search_intent(self, session):
         ok, reason = session._check_tool_intent_consistency(
@@ -167,6 +167,16 @@ class TestHallucinationGuard:
             "web_fetch",
             {"url": "http://localhost:5173"},
             "check local app",
+        )
+
+        assert ok is True
+        assert reason == ""
+
+    def test_web_fetch_external_allowed_without_intent_filter(self, session):
+        ok, reason = session._check_tool_intent_consistency(
+            "web_fetch",
+            {"url": "https://example.com/docs"},
+            "inspect local project files",
         )
 
         assert ok is True

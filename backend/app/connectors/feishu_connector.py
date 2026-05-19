@@ -60,6 +60,17 @@ class FeishuConnector(PlatformConnector):
                     "sensitive": True,
                 },
                 "target_agent": target_agent_config_schema(),
+                "notifications_enabled": {
+                    "type": "boolean",
+                    "label": "Enable Notifications",
+                    "description": "Allow Desktop Agent to send proactive Feishu notifications",
+                    "default": False,
+                },
+                "notification_chat_id": {
+                    "type": "string",
+                    "label": "Notification Chat ID",
+                    "description": "Feishu chat_id used by the test-message endpoint",
+                },
             },
             "required": ["app_id", "app_secret"],
         }
@@ -79,6 +90,18 @@ class FeishuConnector(PlatformConnector):
             }
         except Exception as e:
             return {"healthy": False, "latency_ms": None, "details": str(e)}
+
+    async def send_notification(self, message: str) -> Dict[str, Any]:
+        chat_id = str(self._config.config.get("notification_chat_id", "")).strip()
+        if not chat_id:
+            raise ValueError("notification_chat_id is required")
+        if self._status != "running" or not self._api_client:
+            raise RuntimeError("Feishu connector is not running")
+
+        message_id = self._send_text_message(chat_id, "", message)
+        if not message_id:
+            raise RuntimeError("Feishu message send failed")
+        return {"chat_id": chat_id, "message_id": message_id}
 
     async def start(self) -> None:
         app_id = self._config.config.get("app_id", "").strip()

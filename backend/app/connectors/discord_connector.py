@@ -40,6 +40,17 @@ class DiscordConnector(PlatformConnector):
                     "sensitive": True,
                 },
                 "target_agent": target_agent_config_schema(),
+                "notifications_enabled": {
+                    "type": "boolean",
+                    "label": "Enable Notifications",
+                    "description": "Allow Desktop Agent to send proactive Discord notifications",
+                    "default": False,
+                },
+                "notification_channel_id": {
+                    "type": "string",
+                    "label": "Notification Channel ID",
+                    "description": "Discord channel or DM ID used by the test-message endpoint",
+                },
             },
             "required": ["bot_token"],
         }
@@ -55,6 +66,30 @@ class DiscordConnector(PlatformConnector):
         if self._client and hasattr(self._client, "is_ready"):
             healthy = healthy and self._client.is_ready()
         return {"healthy": healthy, "latency_ms": latency, "details": details}
+
+    async def send_notification(self, message: str) -> Dict[str, Any]:
+        channel_id = str(self._config.config.get("notification_channel_id", "")).strip()
+        if not channel_id:
+            raise ValueError("notification_channel_id is required")
+        if self._status != "running" or not self._client:
+            raise RuntimeError("Discord connector is not running")
+
+        try:
+            channel_id_int = int(channel_id)
+        except ValueError as exc:
+            raise ValueError("notification_channel_id must be a numeric Discord channel ID") from exc
+
+        channel = self._client.get_channel(channel_id_int)
+        if channel is None and hasattr(self._client, "fetch_channel"):
+            channel = await self._client.fetch_channel(channel_id_int)
+        if channel is None or not hasattr(channel, "send"):
+            raise RuntimeError(f"Discord channel not found: {channel_id}")
+
+        sent = await channel.send(message)
+        return {
+            "channel_id": channel_id,
+            "message_id": str(getattr(sent, "id", "") or ""),
+        }
 
     async def start(self) -> None:
         bot_token = self._config.config.get("bot_token", "").strip()

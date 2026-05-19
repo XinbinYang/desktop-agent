@@ -99,12 +99,19 @@ def test_collaboration_rest_run_lifecycle(isolated_collaboration_db, client):
 
 
 @pytest.mark.asyncio
-async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypatch, isolated_collaboration_db):
+async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
     from app import agent as agent_module
     from app.agent import AgentSession
     from app.config import load_config
+    from app.project_manager import ProjectManager
 
-    async def fake_consult_worker(packet, *, run_id, task_id):
+    project = tmp_path / "opened-project"
+    project.mkdir()
+    ProjectManager._current_project = {"path": str(project), "name": "opened-project"}
+    seen = {}
+
+    async def fake_consult_worker(packet, *, run_id, task_id, project_path=""):
+        seen["project_path"] = project_path
         return ResultPacket(status="pass", summary="Mock diagnosis.\nACCEPTANCE: PASS"), []
 
     monkeypatch.setattr(agent_module, "run_consult_worker", fake_consult_worker)
@@ -122,5 +129,32 @@ async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypat
     assert any(event["type"] == "collaboration_run_completed" for event in events)
     assert any(
         event["type"] == "content" and "Mock diagnosis" in event["data"].get("text", "")
+        for event in events
+    )
+    assert seen["project_path"] == str(project)
+
+
+@pytest.mark.asyncio
+async def test_personal_explicit_coding_mention_without_project_blocks(monkeypatch, isolated_collaboration_db, isolate_projects):
+    from app import agent as agent_module
+    from app.agent import AgentSession
+    from app.config import load_config
+
+    async def fake_consult_worker(*args, **kwargs):
+        raise AssertionError("Coding worker should not run without a project path")
+
+    monkeypatch.setattr(agent_module, "run_consult_worker", fake_consult_worker)
+    session = AgentSession(
+        model_id=load_config().settings.default_model,
+        session_id="test_collab_no_project",
+        agent_type="personal",
+    )
+    session._save = lambda: None  # type: ignore[method-assign]
+
+    events = [event async for event in session.run("@coding agent inspect this error")]
+
+    assert not any(event["type"] == "collaboration_run_created" for event in events)
+    assert any(
+        event["type"] == "content" and "需要先打开一个项目" in event["data"].get("text", "")
         for event in events
     )

@@ -1,5 +1,4 @@
 import json
-import os
 import sqlite3
 from typing import Any, Dict, Optional
 
@@ -9,6 +8,7 @@ from app.backtest_engine import generate_report, run_backtest
 from app.runtime_paths import runtime_dir
 from app.strategies import get_strategy_info, list_strategies
 from app.tools.base import BaseTool, ToolResult
+from app.tools.wind_runtime import get_wind_client
 
 _BACKTEST_CACHE_DIR = runtime_dir("sessions") / "backtest"
 _BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,13 +146,7 @@ def _get_data_from_market_db(code: str, start_date: str, end_date: str) -> Optio
 
 def _get_wind_data(codes: str, start_date: str, end_date: str) -> pd.DataFrame:
     """通过 WIND 获取历史数据，构造 backtrader 可用的 DataFrame。"""
-    import sys
-    windpy_path = os.environ.get("WINDPY_PATH", r"C:\Wind\Wind.NET.Client\WindNET\x64")
-    if windpy_path not in sys.path:
-        sys.path.insert(0, windpy_path)
-    from WindPy import w
-    if not w.isconnected():
-        w.start()
+    w = get_wind_client()
 
     fields = "open,high,low,close,volume"
     result = w.wsd(codes, fields, start_date, end_date, "PriceAdj=F")

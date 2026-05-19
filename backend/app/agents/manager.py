@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.runtime_paths import agents_dir, workspace_root
+from app.runtime_paths import agents_dir
 
 logger = logging.getLogger(__name__)
 
@@ -74,19 +74,24 @@ class AgentManager:
         """Personal Agent: full OpenClaw cognitive system with bootstrap detection."""
         parts: List[str] = []
 
-        ws_root = str(workspace_root()).replace("\\", "/")
         agent_root = str(cls._agents_root()).replace("\\", "/")
+        personal_home = str(cls._personal_dir()).replace("\\", "/")
+        shared_home = str((cls._agents_root() / "_shared")).replace("\\", "/")
         parts.append(
             "## Runtime Context\n"
-            "- Workspace root: " + ws_root + ".\n"
-            "- Agent runtime workspace: " + agent_root + ". "
-            "你的身份与记忆文件统一位于这个 runtime AGENTS 目录的 personal/ 子目录，"
-            "共享文件在 _shared/。\n"
+            "- Personal home: " + personal_home + ". "
+            "你的身份、记忆、日记、心情、技能和 handoff 文件统一位于这里。\n"
+            "- Shared Agent workspace: " + shared_home + ". "
+            "跨 Agent 偏好和共享记忆位于这里。\n"
+            "- Agent runtime workspace root: " + agent_root + ".\n"
+            "- 当前打开的代码项目不会注入到 Personal Agent 的系统提示中；"
+            "它只是用户可能正在处理的工作目标，不是你的身份、家或源码位置。\n"
             "- The host has already loaded the Personal Agent workspace files into this system prompt. "
             "Do not call file or shell tools merely to locate or re-read personal/SOUL.md, "
             "USER.md, MEMORY.md, BOOTSTRAP.md, or related identity files.\n"
             "- 读写身份、记忆、日记、技能等 Agent 文件时，"
-            "使用上面的 Agent runtime workspace 绝对路径，不要写回仓库 AGENTS/ 模板目录。\n"
+            "使用上面的 Personal home 绝对路径，或 `AGENTS/personal/...` / `AGENTS/_shared/...` 路径；"
+            "不要写回仓库 AGENTS/ 模板目录。\n"
             "- For greetings, identity questions, model questions, and ordinary conversation, answer directly.\n"
             "- Use tools only when the user's task requires observation, file changes, external lookup, "
             "or desktop/browser control. This is a Windows desktop app; if shell commands are needed, "
@@ -657,6 +662,28 @@ class AgentManager:
         return not (cls._personal_dir() / "BOOTSTRAP.md").exists()
 
     @classmethod
+    def complete_bootstrap(cls) -> bool:
+        """Mark bootstrap onboarding complete by archiving BOOTSTRAP.md."""
+        bootstrap_path = cls._personal_dir() / "BOOTSTRAP.md"
+        if not bootstrap_path.exists():
+            return True
+        try:
+            archive_dir = cls._personal_dir() / ".archive" / "bootstrap"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            archive_path = archive_dir / f"BOOTSTRAP.completed.{timestamp}.md"
+            suffix = 1
+            while archive_path.exists():
+                archive_path = archive_dir / f"BOOTSTRAP.completed.{timestamp}-{suffix}.md"
+                suffix += 1
+            archive_path.write_text(bootstrap_path.read_text(encoding="utf-8"), encoding="utf-8")
+            bootstrap_path.unlink()
+            return True
+        except OSError as e:
+            logger.warning("Failed to complete bootstrap: %s", e)
+            return False
+
+    @classmethod
     def reset_bootstrap(cls) -> bool:
         """Re-create BOOTSTRAP.md to trigger the onboarding flow again.
 
@@ -676,6 +703,15 @@ class AgentManager:
 - **不要审问。不要机械化。** 这是一场对话。
 - 如果用户说"你自己选"，你就自己选。
 - 如果用户跳过一个话题，就跳过去。
+
+---
+
+> ⚠️ **工作区约定（不可修改）**
+> - Personal home = 运行时 `AGENTS/personal/`；这是你的身份、记忆、日记、心情、技能和 handoff 的家。
+> - 当前打开的代码项目只是用户可能正在处理的工作目标，不是你的身份、家或源码位置。
+> - 使用 `file_write` 写入身份文档时，**保持默认 `project_relative=false`**。
+>   相对路径如 `AGENTS/personal/USER.md` 会被解析到 runtime AGENTS workspace。
+> - 不要在任何其他位置（如 `backend/AGENTS/`）创建身份文件。
 
 ---
 

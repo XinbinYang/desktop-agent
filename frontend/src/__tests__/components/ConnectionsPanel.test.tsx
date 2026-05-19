@@ -12,7 +12,12 @@ const connectorResponse = {
       status_message: '',
       enabled: false,
       uptime_seconds: 0,
-      config: { bot_token: 'masked', target_agent: 'personal' },
+      config: {
+        bot_token: 'masked',
+        target_agent: 'personal',
+        notifications_enabled: false,
+        notification_channel_id: '123',
+      },
       config_schema: {
         type: 'object',
         properties: {
@@ -30,6 +35,15 @@ const connectorResponse = {
               coding: 'Coding Agent',
             },
             default: 'personal',
+          },
+          notifications_enabled: {
+            type: 'boolean',
+            label: 'Enable Notifications',
+            default: false,
+          },
+          notification_channel_id: {
+            type: 'string',
+            label: 'Notification Channel ID',
           },
         },
         required: ['bot_token'],
@@ -51,7 +65,10 @@ describe('ConnectionsPanel', () => {
 
   beforeEach(() => {
     fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (String(url).endsWith('/api/connectors') && init?.method === 'PUT') {
+      if (String(url).endsWith('/test-message') && init?.method === 'POST') {
+        return mockFetchResponse({ status: 'sent' });
+      }
+      if (String(url).includes('/api/connectors') && init?.method === 'PUT') {
         return mockFetchResponse({ status: 'updated' });
       }
       if (String(url).includes('/api/connectors')) {
@@ -66,14 +83,14 @@ describe('ConnectionsPanel', () => {
     const { container } = render(<ConnectionsPanel />);
 
     expect(await screen.findByText('Discord')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('配置凭据'));
+    fireEvent.click(screen.getByTitle('Configure connector'));
 
     const select = container.querySelector('select');
     expect(select).not.toBeNull();
     expect(select?.value).toBe('personal');
 
     fireEvent.change(select!, { target: { value: 'coding' } });
-    fireEvent.click(screen.getByText('保存'));
+    fireEvent.click(screen.getByTitle('Save connector config'));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -87,6 +104,21 @@ describe('ConnectionsPanel', () => {
       config: {
         target_agent: 'coding',
       },
+    });
+  });
+
+  it('sends a connector test message from the edit form', async () => {
+    render(<ConnectionsPanel />);
+
+    expect(await screen.findByText('Discord')).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('Configure connector'));
+    fireEvent.click(screen.getByText('Test message'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/api/connectors/discord/test-message'),
+        expect.objectContaining({ method: 'POST' }),
+      );
     });
   });
 });

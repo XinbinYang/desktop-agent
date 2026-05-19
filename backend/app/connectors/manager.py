@@ -190,6 +190,12 @@ class ConnectorManager:
                 results[n] = {"healthy": False, "details": str(e)}
         return results
 
+    async def send_test_message(self, name: str, message: str) -> Dict[str, Any]:
+        connector = self._connectors.get(name)
+        if not connector:
+            raise KeyError(name)
+        return await connector.send_notification(message)
+
     async def shutdown(self) -> None:
         for name in list(self._connectors.keys()):
             try:

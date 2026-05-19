@@ -52,6 +52,8 @@ class HeartbeatEngine:
             "todos_found": 0,
             "mood_updated": False,
             "dream_triggered": False,
+            "dream_result": None,
+            "dream_error": "",
         }
 
         # 1. Extract key info from conversation and write diary
@@ -77,7 +79,15 @@ class HeartbeatEngine:
 
         # 4. Decide whether to trigger DREAM
         should_dream = cls._should_trigger_dream()
-        result["dream_triggered"] = should_dream
+        if should_dream:
+            try:
+                from app.agents.dream import DreamEngine
+
+                result["dream_result"] = await DreamEngine.run()
+                result["dream_triggered"] = True
+            except Exception as e:
+                logger.warning("Heartbeat: DREAM failed: %s", e)
+                result["dream_error"] = str(e)
 
         # 5. Clean expired memories (entries older than 30 days with no recent references)
         cls._clean_expired_memories()
@@ -187,10 +197,20 @@ class HeartbeatEngine:
             return False
 
         # Check diary size
+        dreams_path = AgentManager._personal_dir() / "DREAMS.md"
+        last_dream_mtime = 0.0
+        if dreams_path.exists():
+            try:
+                last_dream_mtime = dreams_path.stat().st_mtime
+            except OSError:
+                last_dream_mtime = 0.0
+
         total_size = 0
         diary_count = 0
         for f in mem_dir.glob("*.md"):
             try:
+                if f.stat().st_mtime <= last_dream_mtime:
+                    continue
                 total_size += f.stat().st_size
                 diary_count += 1
             except OSError:

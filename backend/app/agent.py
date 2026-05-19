@@ -582,9 +582,13 @@ class AgentSession:
             pass
         system_msg = f"You are powered by the model {model_name}.\n\n" + system_msg
 
-        # Prefer the project this session is bound to (per-session isolation);
-        # fall back to the global UI-selected project for unbound sessions.
-        project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
+        project = None
+        if self._agent_type == "coding":
+            # Coding sessions are project-bound. Prefer the per-session project
+            # binding; fall back to the global UI-selected project only for
+            # legacy/unbound Coding sessions.
+            project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
+
         if project:
             project_ctx = "\n\n## Current Project\n"
             project_ctx += f"- Name: {project['name']}\n"
@@ -594,6 +598,11 @@ class AgentSession:
             if project.get("git_remote"):
                 project_ctx += f"- Git remote: {project['git_remote']}\n"
             system_msg += project_ctx
+
+            try:
+                AgentManager.update_project_context(project)
+            except Exception as e:
+                logger.warning("Project context update failed: %s", e)
 
             # Inject project-level and user-level agent rules (.desktop-agent.md / AGENTS.md)
             branch = project.get("git_branch", "") if project else ""
@@ -606,58 +615,49 @@ class AgentSession:
             if memory_text:
                 system_msg += "\n\n" + memory_text
 
-            # Coding Agent: inject repo map and operating rules
-            if self._agent_type == "coding":
-                try:
-                    cfg = load_config()
-                    coding_cfg = cfg.coding_agent
-                    max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
-                    if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
-                        if self._repo_map_cache is None:
-                            self._repo_map_cache = build_repo_map(project["path"])
-                        repo_map = self._repo_map_cache
-                        system_msg += "\n\n## Coding Agent Context\n"
-                        system_msg += format_repo_map_summary(repo_map, max_chars=4500)
-                        system_msg += (
-                            "\n\n## Coding Agent Operating Rules\n"
-                            "- USER IS NON-PROGRAMMER: Treat the user's words as product intent, not an implementation spec. "
-                            "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
-                            "or destructive/security-sensitive choices.\n"
-                            "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
-                            f"use `dispatch_parallel` to launch at most {max_parallel_agents} `explorer` workers simultaneously — one per "
-                            "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
-                            "and reports back. Synthesize their reports before dispatching an architect. "
-                            f"Never request more than {max_parallel_agents} workers in a single `dispatch_parallel` call.\n"
-                            "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
-                            "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
-                            "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "
-                            "acceptance criteria, verification plan, recovery policy, and reporting target explicit. "
-                            "If any field is unclear, infer conservatively or ask.\n"
-                            "- GREEN CONTRACT: Treat completion as evidence, not prose. `verify_project` produces the "
-                            "current green level (`targeted_tests`, `workspace`, `lint`, `typecheck`, or `build`); "
-                            "do not merge/apply/close out broad changes on stale or partial evidence.\n"
-                            "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
-                            "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
-                            "- AUTONOMOUS CLOSEOUT: Complete the engineering loop yourself: implement, verify, review, fix failures, "
-                            "and re-run verification. Do not ask the user to choose test commands, files, branch strategy, or code structure.\n"
-                            "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
-                            "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
-                            "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
-                            "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
-                            "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks.\n"
-                            "- Windows: avoid Unix-only helpers (tail, head, grep, sed, awk); use PowerShell or `rg`.\n"
-                            "- Use project-relative paths. In worktree mode, tools operate inside the worktree.\n"
-                            "- Worker roles: explorer=parallel read-only area scan, architect=read-only plan, editor=minimal edits+verify, verifier=run tests+report, reviewer=diff review.\n"
-                        )
-                except Exception as e:
-                    logger.warning("Coding repo map injection failed: %s", e)
-
-            # Personal Agent: update PROJECT.md for Coding Agent reference
-            if self._agent_type == "personal":
-                try:
-                    AgentManager.update_project_context(project)
-                except Exception as e:
-                    logger.warning("Project context update failed: %s", e)
+            try:
+                cfg = load_config()
+                coding_cfg = cfg.coding_agent
+                max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
+                if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
+                    if self._repo_map_cache is None:
+                        self._repo_map_cache = build_repo_map(project["path"])
+                    repo_map = self._repo_map_cache
+                    system_msg += "\n\n## Coding Agent Context\n"
+                    system_msg += format_repo_map_summary(repo_map, max_chars=4500)
+                    system_msg += (
+                        "\n\n## Coding Agent Operating Rules\n"
+                        "- USER IS NON-PROGRAMMER: Treat the user's words as product intent, not an implementation spec. "
+                        "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
+                        "or destructive/security-sensitive choices.\n"
+                        "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
+                        f"use `dispatch_parallel` to launch at most {max_parallel_agents} `explorer` workers simultaneously — one per "
+                        "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
+                        "and reports back. Synthesize their reports before dispatching an architect. "
+                        f"Never request more than {max_parallel_agents} workers in a single `dispatch_parallel` call.\n"
+                        "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
+                        "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
+                        "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "
+                        "acceptance criteria, verification plan, recovery policy, and reporting target explicit. "
+                        "If any field is unclear, infer conservatively or ask.\n"
+                        "- GREEN CONTRACT: Treat completion as evidence, not prose. `verify_project` produces the "
+                        "current green level (`targeted_tests`, `workspace`, `lint`, `typecheck`, or `build`); "
+                        "do not merge/apply/close out broad changes on stale or partial evidence.\n"
+                        "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
+                        "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
+                        "- AUTONOMOUS CLOSEOUT: Complete the engineering loop yourself: implement, verify, review, fix failures, "
+                        "and re-run verification. Do not ask the user to choose test commands, files, branch strategy, or code structure.\n"
+                        "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
+                        "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
+                        "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
+                        "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
+                        "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks.\n"
+                        "- Windows: avoid Unix-only helpers (tail, head, grep, sed, awk); use PowerShell or `rg`.\n"
+                        "- Use project-relative paths. In worktree mode, tools operate inside the worktree.\n"
+                        "- Worker roles: explorer=parallel read-only area scan, architect=read-only plan, editor=minimal edits+verify, verifier=run tests+report, reviewer=diff review.\n"
+                    )
+            except Exception as e:
+                logger.warning("Coding repo map injection failed: %s", e)
 
         if self.chat_mode == "plan" and not self.plan_state.approved:
             try:
@@ -670,7 +670,10 @@ class AgentSession:
 
         if self._last_user_message:
             matched_skills = SkillManager.match_skills(
-                self._last_user_message, self.role_id, project is not None, agent_type=self._agent_type
+                self._last_user_message,
+                self.role_id,
+                self._agent_type == "coding" and project is not None,
+                agent_type=self._agent_type,
             )
             if matched_skills:
                 skill_prompt = SkillManager.build_skill_prompt(matched_skills)
@@ -693,13 +696,13 @@ class AgentSession:
             r"^(切换|switch|change)\s+(role|角色|model|模型)",
         ]
         try:
-            from app.rag.engine import get_rag_engine
+            from app.rag.engine import get_rag_engine, has_indexed_docs
             import re
             should_skip = any(
                 re.match(p, self._last_user_message.strip(), re.IGNORECASE)
                 for p in _RAG_SKIP_PATTERNS
             )
-            if not should_skip:
+            if not should_skip and has_indexed_docs():
                 rag = get_rag_engine()
                 docs = rag.list_docs()
                 if docs and self._last_user_message:
@@ -942,9 +945,9 @@ class AgentSession:
         *,
         original_input: str,
         resolved_input: str,
+        project_path: str,
         image_base64: Optional[str] = None,
     ) -> TaskPacket:
-        project_path = effective_project_path()
         task = mention.task.strip() or "Open or create a Coding Agent session."
         mode = "execute" if mention.mode == "execute" else "consult"
         context: Dict[str, Any] = {
@@ -1055,10 +1058,27 @@ class AgentSession:
             return
 
         project_path = effective_project_path()
+        if not project_path:
+            text = "需要先打开一个项目，或在任务里提供明确项目路径，然后我才能把项目代码任务交给 Coding Agent。"
+            assistant_msg = {"role": "assistant", "content": text}
+            self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+            self.messages.append(assistant_msg)
+            yield self._event("content", {"text": text}, outer_run_id)
+            yield self._event("status", {"status": "completed"}, outer_run_id)
+            yield self._event("run_completed", {
+                "status": "completed",
+                "summary": text,
+                "verification_passed": None,
+                "review_passed": None,
+            }, outer_run_id)
+            self._save()
+            return
+
         packet = self._collaboration_packet(
             mention,
             original_input=original_input,
             resolved_input=resolved_input,
+            project_path=project_path,
             image_base64=image_base64,
         )
         collab_run = collab_create_run(
@@ -1100,7 +1120,12 @@ class AgentSession:
         child_events: List[Dict[str, Any]] = []
         started_at = time.time()
         if packet.mode == "consult":
-            result, child_events = await run_consult_worker(packet, run_id=collab_run.run_id, task_id=task.task_id)
+            result, child_events = await run_consult_worker(
+                packet,
+                run_id=collab_run.run_id,
+                task_id=task.task_id,
+                project_path=project_path,
+            )
             for event in child_events:
                 yield event
         else:
@@ -1108,6 +1133,7 @@ class AgentSession:
                 packet,
                 session_id=self.session_id,
                 run_id=collab_run.run_id,
+                project_path=project_path,
             ):
                 child_events.append(event)
                 yield event
@@ -1663,7 +1689,7 @@ class AgentSession:
         return True
 
     # Tools that can break out of the current project context.
-    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone", "browser_navigate", "web_search", "web_fetch"})
+    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone"})
     _EXTERNAL_RESOURCE_KEYWORDS = [
         "clone", "github", "gitlab", "gitee", "bitbucket",
         "repo", "repository", "template", "模板",
@@ -1689,12 +1715,6 @@ class AgentSession:
             return True, ""
 
         user_lower = (user_input or "").lower()
-        # Localhost navigations are always allowed (common dev workflow)
-        if tool_name in {"browser_navigate", "web_fetch"}:
-            url = str(tool_args.get("url") or "").lower()
-            if "localhost" in url or "127.0.0.1" in url:
-                return True, ""
-
         # Check if user explicitly mentioned external resources
         has_external_intent = any(kw in user_lower for kw in self._EXTERNAL_RESOURCE_KEYWORDS)
         if not has_external_intent:
@@ -2914,6 +2934,7 @@ class AgentSession:
                     tool_name, tool_args, allowed_names, self.session_id,
                     run_id=run_id,
                     tool_call_id=tool_id,
+                    agent_type=self._agent_type,
                     get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
                 )
 

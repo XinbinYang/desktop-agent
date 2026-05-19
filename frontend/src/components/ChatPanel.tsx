@@ -232,11 +232,12 @@ const EmptyChatWelcome: React.FC<{
 }> = ({ agentType, chatMode, projectName }) => {
   const { t } = useTranslation();
   const isCoding = agentType === 'coding';
+  const visibleProjectName = isCoding ? projectName : undefined;
   const AgentIcon = isCoding ? Code2 : Bot;
   const agentLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
   const modeLabel = chatMode === 'plan' ? t('chat.empty.planMode') : t('chat.empty.agentMode');
-  const title = projectName
-    ? t('chat.empty.projectReady', { projectName })
+  const title = visibleProjectName
+    ? t('chat.empty.projectReady', { projectName: visibleProjectName })
     : t('chat.empty.ready');
 
   return (
@@ -259,11 +260,11 @@ const EmptyChatWelcome: React.FC<{
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
           <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
           <EmptyStatusChip tone={chatMode === 'plan' ? 'accent' : 'neutral'}>{modeLabel}</EmptyStatusChip>
-          {projectName && (
-            <EmptyStatusChip title={projectName}>
+          {visibleProjectName && (
+            <EmptyStatusChip title={visibleProjectName}>
               <span className="inline-flex min-w-0 items-center gap-1.5">
                 <FolderOpen className="h-3 w-3 shrink-0" />
-                <span className="truncate">{projectName}</span>
+                <span className="truncate">{visibleProjectName}</span>
               </span>
             </EmptyStatusChip>
           )}
