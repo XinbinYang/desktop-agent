@@ -226,7 +226,7 @@ def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> st
 
 
 def _history_project_key(path: Optional[str]) -> str:
-    return str(path or "").replace("\\", "/").rstrip("/").lower()
+    return ProjectManager.history_key(path)
 
 
 def _history_project_name(path: str) -> str:
@@ -303,7 +303,8 @@ def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
     ) -> Optional[Dict[str, Any]]:
         if not path:
             return None
-        key = _history_project_key(path)
+        canonical_path = ProjectManager.canonical_project_path(path)
+        key = _history_project_key(canonical_path)
         if not key:
             return None
         metadata = metadata_by_key.get(key) or {}
@@ -312,12 +313,14 @@ def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
         if (is_archived or is_removed) and key != current_key and not include_archived:
             return None
         if key not in projects_by_key:
-            project_path = source.get("path") if source and source.get("path") else path
+            project_path = ProjectManager.canonical_project_path(source.get("path") if source and source.get("path") else canonical_path)
             folder_name = _history_project_name(project_path)
             display_name = str(metadata.get("display_name") or "").strip()
             source_name = source.get("name") if source and source.get("name") else ""
             projects_by_key[key] = {
                 "path": project_path,
+                "canonical_path": project_path,
+                "project_key": key,
                 "name": display_name or source_name or folder_name,
                 "display_name": display_name or None,
                 "folder_name": folder_name,

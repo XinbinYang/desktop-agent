@@ -1,13 +1,13 @@
 import React from 'react';
 import {
   Sparkles,
-  FolderOpen,
-  MessageSquare,
+  LayoutPanelLeft,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
   User,
   Code,
+  Loader2,
   type LucideIcon,
 } from 'lucide-react';
 import { type SidebarSection, type AgentType } from '../types';
@@ -21,6 +21,8 @@ interface ActivityBarProps {
   onSectionChange: (section: SidebarSection) => void;
   onAgentChange: (agent: AgentType) => void;
   onToggleSidebar: () => void;
+  personalRunning?: boolean;
+  codingRunning?: boolean;
 }
 
 interface ActivityItem {
@@ -37,8 +39,7 @@ const AGENT_ITEMS: ActivityItem[] = [
 
 const SECTION_ITEMS: ActivityItem[] = [
   { id: 'skills', icon: Sparkles, label: 'Skills' },
-  { id: 'project', icon: FolderOpen, label: 'Project' },
-  { id: 'sessions', icon: MessageSquare, label: 'Sessions' },
+  { id: 'workspace', icon: LayoutPanelLeft, label: 'Workspace' },
   { id: 'settings', icon: Settings, label: 'Settings' },
 ];
 
@@ -49,7 +50,13 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
   onSectionChange,
   onAgentChange,
   onToggleSidebar,
+  personalRunning = false,
+  codingRunning = false,
 }) => {
+  const agentRunning: Record<AgentType, boolean> = {
+    personal: personalRunning,
+    coding: codingRunning,
+  };
   const handleAgentClick = (agentType: AgentType) => {
     if (!sidebarCollapsed && activeAgent === agentType) {
       onToggleSidebar();
@@ -58,8 +65,8 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
       onToggleSidebar();
     } else {
       onAgentChange(agentType);
-      // Auto-switch section: personal → personal, coding → project
-      onSectionChange(agentType === 'personal' ? 'personal' : 'project');
+      // Auto-switch section: personal → personal, coding → workspace
+      onSectionChange(agentType === 'personal' ? 'personal' : 'workspace');
     }
   };
 
@@ -96,6 +103,12 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
                 aria-label={`${item.label} Agent`}
               >
                 <item.icon className="w-5 h-5" />
+                {agentRunning[item.id as AgentType] && (
+                  <Loader2
+                    className="absolute -top-0.5 -right-0.5 w-3 h-3 animate-spin text-success"
+                    aria-label={`${item.label} Agent running`}
+                  />
+                )}
               </button>
             </Tooltip>
           );

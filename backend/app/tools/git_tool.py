@@ -4,7 +4,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from app.tools.base import BaseTool, ToolResult
-from app.project_manager import ProjectManager
 from app.credential_manager import CredentialManager
 from app.security import redact_sensitive_text
 
@@ -70,9 +69,13 @@ def _get_project_cwd() -> Optional[str]:
             return ctx.active_path
     except Exception:
         pass
-    project = ProjectManager.get_current()
-    if project:
-        return project.get("path")
+    try:
+        from app.coding_runs import effective_project_path
+        bound = effective_project_path()
+        if bound:
+            return bound
+    except Exception:
+        pass
     return None
 
 
@@ -122,9 +125,10 @@ class GitCloneTool(BaseTool):
         else:
             # 从 URL 提取 repo 名
             repo_name = url.rstrip("/").split("/")[-1].replace(".git", "")
-            project = ProjectManager.get_current()
-            if project:
-                target = Path(project["path"]).parent / repo_name
+            from app.coding_runs import effective_project_path
+            bound = effective_project_path()
+            if bound:
+                target = Path(bound).parent / repo_name
             else:
                 target = Path.cwd() / repo_name
 

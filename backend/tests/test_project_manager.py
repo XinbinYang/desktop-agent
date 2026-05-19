@@ -1,5 +1,6 @@
 import pytest
 import json
+import subprocess
 from pathlib import Path
 from app.project_manager import ProjectManager, RECENT_FILE
 
@@ -117,6 +118,40 @@ class TestProjectManager:
         ProjectManager.open_project(str(p))
         recent = ProjectManager.list_recent()
         assert len(recent) == 1
+
+    def test_git_subdirectory_opens_as_repo_root(self, temp_dir):
+        """Opening a directory inside a Git repo uses the repo root as the project."""
+        if subprocess.run(["git", "--version"], capture_output=True, text=True).returncode != 0:
+            pytest.skip("git is not available")
+        repo = temp_dir / "repo"
+        subdir = repo / "nested"
+        subdir.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
+
+        project = ProjectManager.open_project(str(subdir))
+
+        assert project["path"] == str(repo.resolve())
+        recent = ProjectManager.list_recent()
+        assert len(recent) == 1
+        assert recent[0]["path"] == str(repo.resolve())
+
+    def test_open_project_without_touching_recent_keeps_order(self, temp_dir):
+        """UI focus sync can switch current project without reordering recent projects."""
+        p1 = temp_dir / "proj1"
+        p2 = temp_dir / "proj2"
+        p1.mkdir()
+        p2.mkdir()
+        ProjectManager.open_project(str(p1))
+        ProjectManager.open_project(str(p2))
+
+        project = ProjectManager.open_project(str(p1), touch_recent=False)
+
+        assert project["path"] == str(p1.resolve())
+        assert ProjectManager.get_current()["path"] == str(p1.resolve())
+        assert [item["path"] for item in ProjectManager.list_recent()] == [
+            str(p2.resolve()),
+            str(p1.resolve()),
+        ]
 
     def test_get_tree_empty_no_project(self):
         """get_tree returns empty when no project open"""

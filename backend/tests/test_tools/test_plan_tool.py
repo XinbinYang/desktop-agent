@@ -1,6 +1,6 @@
 import pytest
 
-from app.tools.plan_tool import PlanWriteDraftTool, PlanUpdateTodosTool
+from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool, PlanUpdateTodosTool
 
 
 @pytest.fixture
@@ -11,6 +11,38 @@ def tool():
 @pytest.fixture
 def update_tool():
     return PlanUpdateTodosTool()
+
+
+@pytest.fixture
+def ask_tool():
+    return PlanAskQuestionsTool()
+
+
+@pytest.mark.asyncio
+async def test_ask_questions_accepts_multiple_blocking_questions(ask_tool):
+    result = await ask_tool.execute(questions=[
+        {
+            "id": "focus",
+            "prompt": "Which area should this plan focus on?",
+            "options": [
+                {"id": "performance", "label": "Performance"},
+                {"id": "errors", "label": "Error handling"},
+            ],
+        },
+        {
+            "id": "depth",
+            "prompt": "How deep should the change go?",
+            "options": [
+                {"id": "targeted", "label": "Targeted fix"},
+                {"id": "hardening", "label": "Test-backed hardening"},
+            ],
+        },
+    ])
+
+    assert not result.error
+    assert result.output == "Questions submitted (2). Waiting for user response."
+    assert result.metadata["plan_action"] == "questions_submitted"
+    assert [q["id"] for q in result.metadata["questions"]] == ["focus", "depth"]
 
 
 @pytest.mark.asyncio

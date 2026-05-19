@@ -15,9 +15,12 @@ from app.coding_context import build_repo_map, format_repo_map_summary
 from app.coding_runs import (
     complete_run,
     create_coding_run,
+    effective_project_path,
     record_event,
     reset_run_context,
+    reset_session_project,
     set_run_context,
+    set_session_project,
 )
 from app.collaboration.executor import result_from_execute_events, run_consult_worker, run_execute_agent_events
 from app.collaboration.manager import (
@@ -117,6 +120,19 @@ _VERIFICATION_COMMAND_HINTS: tuple[str, ...] = (
 )
 
 
+def _project_key_for_path(project_path: str | None) -> str:
+    if not project_path or project_path == GLOBAL_PROJECT_KEY:
+        return GLOBAL_PROJECT_KEY
+    return ProjectManager.history_key(project_path) or GLOBAL_PROJECT_KEY
+
+
+def _canonical_project_path(project_path: str | None) -> str | None:
+    if not project_path:
+        return None
+    canonical = ProjectManager.canonical_project_path(project_path)
+    return canonical or None
+
+
 def _normalize_project_key(project_path: str | None = None) -> str:
     if not project_path:
         try:
@@ -125,9 +141,7 @@ def _normalize_project_key(project_path: str | None = None) -> str:
                 project_path = project.get("path")
         except Exception:
             project_path = None
-    if not project_path:
-        return GLOBAL_PROJECT_KEY
-    return str(project_path).replace("\\", "/").rstrip("/").lower()
+    return _project_key_for_path(project_path)
 
 
 def _load_session_registry() -> Dict[str, Any]:
@@ -148,6 +162,20 @@ def _load_session_registry() -> Dict[str, Any]:
         data["coding"] = coding
     if not isinstance(coding.get("last_session_by_project"), dict):
         coding["last_session_by_project"] = {}
+    else:
+        last_by_project = coding["last_session_by_project"]
+        normalized_last: Dict[str, Any] = {}
+        changed = False
+        for key, value in list(last_by_project.items()):
+            normalized_key = GLOBAL_PROJECT_KEY if key == GLOBAL_PROJECT_KEY else ProjectManager.history_key(key)
+            if not normalized_key:
+                changed = True
+                continue
+            normalized_last[normalized_key] = value
+            if normalized_key != key:
+                changed = True
+        if changed or len(normalized_last) != len(last_by_project):
+            coding["last_session_by_project"] = normalized_last
     return data
 
 
@@ -279,14 +307,14 @@ def _session_record_matches(
 ) -> bool:
     live = _sessions.get(session_id)
     if live and live.agent_type == agent_type:
-        return True if not project_path else _normalize_project_key(project_path) == _normalize_project_key(None)
+        return True if not project_path else _project_key_for_path(live.project_path) == _project_key_for_path(project_path)
 
     data = _load_session_data(session_id)
     if not data or _resolve_stored_agent_type(data) != agent_type:
         return False
     if project_path:
         stored = data.get("project_path")
-        if _normalize_project_key(stored) != _normalize_project_key(project_path):
+        if _project_key_for_path(stored) != _project_key_for_path(project_path):
             return False
     return True
 
@@ -302,8 +330,8 @@ def list_session_records(project_path: str = "", agent_type: str = "") -> List[D
             stored_agent_type = _resolve_stored_agent_type(data)
             if agent_type and stored_agent_type != agent_type:
                 continue
-            sp = data.get("project_path")
-            if project_path and _normalize_project_key(sp) != _normalize_project_key(project_path):
+            sp = _canonical_project_path(data.get("project_path"))
+            if project_path and _project_key_for_path(sp) != _project_key_for_path(project_path):
                 continue
             session_id = data.get("session_id", path.stem)
             is_primary = stored_agent_type == "personal" and session_id == primary_id
@@ -328,7 +356,7 @@ def list_session_records(project_path: str = "", agent_type: str = "") -> List[D
 
 
 def archive_session_records_for_project(project_path: str, agent_type: str = "coding") -> int:
-    project_key = _normalize_project_key(project_path)
+    project_key = _project_key_for_path(project_path)
     if not project_key:
         return 0
 
@@ -341,7 +369,7 @@ def archive_session_records_for_project(project_path: str, agent_type: str = "co
                 continue
             if _resolve_stored_agent_type(data) != agent_type:
                 continue
-            if _normalize_project_key(data.get("project_path")) != project_key:
+            if _project_key_for_path(data.get("project_path")) != project_key:
                 continue
             if data.get("archived_at"):
                 continue
@@ -462,6 +490,10 @@ class AgentSession:
         self._last_context_usage: Dict[str, Any] = {}
         self.team_id: str | None = None
         self.team_name: str = ""
+        # Project this session is bound to. Set at resolve time and persisted.
+        # Authoritative for this session's execution — independent of the
+        # global ProjectManager.get_current() (which is now UI-only).
+        self.project_path: str | None = None
         self._setup_system_prompt()
 
     @property
@@ -507,7 +539,9 @@ class AgentSession:
             pass
         system_msg = f"You are powered by the model {model_name}.\n\n" + system_msg
 
-        project = ProjectManager.get_current()
+        # Prefer the project this session is bound to (per-session isolation);
+        # fall back to the global UI-selected project for unbound sessions.
+        project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
         if project:
             project_ctx = "\n\n## Current Project\n"
             project_ctx += f"- Name: {project['name']}\n"
@@ -867,8 +901,7 @@ class AgentSession:
         resolved_input: str,
         image_base64: Optional[str] = None,
     ) -> TaskPacket:
-        project = ProjectManager.get_current()
-        project_path = str(project.get("path") or "") if project else ""
+        project_path = effective_project_path()
         task = mention.task.strip() or "Open or create a Coding Agent session."
         mode = "execute" if mention.mode == "execute" else "consult"
         context: Dict[str, Any] = {
@@ -978,8 +1011,7 @@ class AgentSession:
             self._save()
             return
 
-        project = ProjectManager.get_current()
-        project_path = str(project.get("path") or "") if project else ""
+        project_path = effective_project_path()
         packet = self._collaboration_packet(
             mention,
             original_input=original_input,
@@ -2062,6 +2094,10 @@ class AgentSession:
         coding_run = None
         run_context_token = None
         coding_run_closed = False
+        # Bind this session's project for the whole turn. run() executes inside
+        # SessionRuntime's per-session asyncio.Task, so this ContextVar is
+        # isolated from other concurrently-running sessions.
+        session_project_token = set_session_project(self.project_path)
 
         is_plan_continue = user_input == PLAN_CONTINUE_MARKER
 
@@ -2072,6 +2108,7 @@ class AgentSession:
                     session_id=self.session_id,
                     run_id=run_id,
                     prompt=self._last_user_message if is_plan_continue else user_input,
+                    project_path=self.project_path,
                 )
             if coding_run:
                 run_context_token = set_run_context(coding_run)
@@ -2103,13 +2140,16 @@ class AgentSession:
             logger.warning("Coding run initialization failed: %s", e)
 
         def close_coding_run(status: str, summary: str = "", details: Optional[Dict[str, Any]] = None) -> None:
-            nonlocal coding_run_closed, run_context_token
+            nonlocal coding_run_closed, run_context_token, session_project_token
             if coding_run and not coding_run_closed:
                 complete_run(run_id, status, summary, details=details)
                 coding_run_closed = True
             if run_context_token is not None:
                 reset_run_context(run_context_token)
                 run_context_token = None
+            if session_project_token is not None:
+                reset_session_project(session_project_token)
+                session_project_token = None
 
         if self._repair_incomplete_tool_call_history():
             self._save()
@@ -2133,8 +2173,7 @@ class AgentSession:
                 return
 
             # Resolve @mentions in user input (file/folder/git/knowledge context)
-            project = ProjectManager.get_current()
-            project_path = project["path"] if project else ""
+            project_path = effective_project_path()
             resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
 
             # Explicit delegation has priority over Personal's normal reasoning turn.
@@ -2159,7 +2198,7 @@ class AgentSession:
                 return
 
             # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
-            if self._agent_type == "personal" and project and self.chat_mode != "plan":
+            if self._agent_type == "personal" and project_path and self.chat_mode != "plan":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
                         inferred_mode = classify_coding_intent(user_input)
@@ -2260,11 +2299,10 @@ class AgentSession:
         active_skills: List[str] = []
         skills_trace = {"skills": [], "disabled_matches": []}
         if self._last_user_message:
-            project = ProjectManager.get_current()
             skills_trace = SkillManager.explain_match_skills(
                 self._last_user_message,
                 self.role_id,
-                project is not None,
+                bool(effective_project_path()),
                 agent_type=self._agent_type,
             )
             active_skills = [skill["id"] for skill in skills_trace["skills"]]
@@ -2577,9 +2615,8 @@ class AgentSession:
                         break
 
                 # Auto-verification gate: block completion if files were edited without verify
-                _proj = ProjectManager.get_current()
                 if (
-                    _proj
+                    effective_project_path()
                     and _files_modified
                     and not _verify_called
                     and not _verify_gate_fired
@@ -3276,20 +3313,16 @@ class AgentSession:
                 break
         if not title and self.plan_state.goal:
             title = self.plan_state.goal[:80]
-        # Get current project path
-        project_path = None
-        try:
-            proj = ProjectManager.get_current()
-            if proj:
-                project_path = proj.get("path")
-        except Exception:
-            pass
+
+        stored_project_path = _canonical_project_path(self.project_path)
+        self.project_path = stored_project_path
 
         data = {
             "session_id": self.session_id,
             "model_id": self.model_id,
             "role_id": self.role_id,
             "agent_type": self._agent_type,
+            "project_path": self.project_path,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
             "messages": self.messages,
@@ -3302,7 +3335,7 @@ class AgentSession:
             "last_usage": self._last_usage,
             "last_context_usage": self._last_context_usage,
             "title": title,
-            "project_path": project_path,
+            "project_path": stored_project_path,
         }
         try:
             tmp = path.with_suffix(".tmp")
@@ -3338,6 +3371,8 @@ class AgentSession:
             session._last_usage = last_usage if isinstance(last_usage, dict) else {}
             last_context_usage = data.get("last_context_usage")
             session._last_context_usage = last_context_usage if isinstance(last_context_usage, dict) else {}
+            stored_project_path = data.get("project_path")
+            session.project_path = _canonical_project_path(stored_project_path) if isinstance(stored_project_path, str) and stored_project_path else None
 
             # Restore per-agent model and thinking intensity from persisted data
             stored_agent_models = data.get("agent_models")
@@ -3533,18 +3568,13 @@ def _new_session_summary(
     created: bool,
     is_primary: bool,
 ) -> Dict[str, Any]:
-    try:
-        project = ProjectManager.get_current()
-        project_path = project.get("path") if project else None
-    except Exception:
-        project_path = None
     return {
         "session_id": session.session_id,
         "agent_type": session.agent_type,
         "role_id": session.role_id,
         "model_id": session.model_id,
         "title": _session_title_from_messages(session.messages, session.plan_state),
-        "project_path": project_path,
+        "project_path": session.project_path,
         "created": created,
         "is_primary": is_primary,
     }
@@ -3565,6 +3595,7 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
     registry = _load_session_registry()
     role_id = AgentManager.get_default_role(agent_type)
     model_id = get_model_for_agent(agent_type)
+    canonical_project_path = _canonical_project_path(project_path)
 
     if agent_type == "personal":
         personal = registry.setdefault("personal", {})
@@ -3583,22 +3614,26 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
 
     coding = registry.setdefault("coding", {})
     last_by_project = coding.setdefault("last_session_by_project", {})
-    project_key = _normalize_project_key(project_path)
+    project_key = _normalize_project_key(canonical_project_path)
 
     session_id = ""
     if policy != "new":
         candidate = last_by_project.get(project_key)
-        if candidate and _session_record_matches(candidate, agent_type="coding", project_path=project_path):
+        if candidate and _session_record_matches(candidate, agent_type="coding", project_path=canonical_project_path):
             session_id = candidate
         else:
-            session_id = _newest_matching_session_id("coding", project_path)
+            session_id = _newest_matching_session_id("coding", canonical_project_path)
 
     if not session_id:
         session_id = _new_coding_session_id()
 
     created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
     session = get_or_create_session(session_id, model_id, role_id=role_id, agent_type="coding")
-    if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
+    bound_path = canonical_project_path or None
+    binding_changed = bound_path is not None and session.project_path != bound_path
+    if binding_changed:
+        session.project_path = bound_path
+    if created or binding_changed or not (SESSIONS_DIR / f"{session_id}.json").exists():
         session._save()
 
     last_by_project[project_key] = session.session_id

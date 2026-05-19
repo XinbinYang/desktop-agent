@@ -5,6 +5,7 @@ import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGro
 
 export interface SessionSnapshot {
   sessionId: string;
+  projectPath?: string | null;
   agentType: AgentType;
   isRunning: boolean;
   isConnected: boolean;

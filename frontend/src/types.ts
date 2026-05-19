@@ -471,7 +471,7 @@ export interface EditorGroup {
 }
 
 export type AgentType = 'personal' | 'coding';
-export type SidebarSection = 'personal' | 'coding' | 'skills' | 'project' | 'sessions' | 'settings';
+export type SidebarSection = 'personal' | 'coding' | 'skills' | 'workspace' | 'settings';
 
 export interface SessionHistoryItem {
   id: string;
@@ -490,6 +490,8 @@ export interface SessionHistoryItem {
 
 export interface SessionHistoryProject {
   path: string;
+  canonical_path?: string;
+  project_key?: string;
   name: string;
   display_name?: string | null;
   folder_name?: string;

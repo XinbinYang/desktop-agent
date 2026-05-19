@@ -49,7 +49,8 @@ class ProjectManager:
 
     @classmethod
     def history_key(cls, path: str | Path | None) -> str:
-        return str(path or "").replace("\\", "/").rstrip("/").lower()
+        canonical = cls.canonical_project_path(path)
+        return str(canonical or "").replace("\\", "/").rstrip("/").lower()
 
     @classmethod
     def _now_iso(cls) -> str:
@@ -61,6 +62,82 @@ class ProjectManager:
             return str(Path(path).expanduser().resolve())
         except (OSError, RuntimeError, ValueError):
             return str(path)
+
+    @classmethod
+    def _git_root_for(cls, path: Path) -> Optional[Path]:
+        if not path.exists() or not path.is_dir():
+            return None
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        root = (result.stdout or "").strip()
+        if not root:
+            return None
+        try:
+            resolved = Path(root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return resolved if resolved.exists() and resolved.is_dir() else None
+
+    @classmethod
+    def canonical_project_path(cls, path: str | Path | None) -> str:
+        if not path:
+            return ""
+        normalized = cls._normalized_path(path)
+        try:
+            candidate = Path(normalized)
+        except (OSError, RuntimeError, ValueError):
+            return str(normalized)
+        git_root = cls._git_root_for(candidate)
+        return str(git_root) if git_root else str(candidate)
+
+    @classmethod
+    def _history_entry_sort_value(cls, entry: Dict[str, Any], field: str) -> str:
+        value = entry.get(field)
+        return str(value or "")
+
+    @classmethod
+    def _merge_history_entries(cls, older: Dict[str, Any], newer: Dict[str, Any]) -> Dict[str, Any]:
+        older_updated = cls._history_entry_sort_value(older, "updated_at")
+        newer_updated = cls._history_entry_sort_value(newer, "updated_at")
+        base, other = (older, newer) if older_updated >= newer_updated else (newer, older)
+        merged = dict(base)
+        canonical_path = cls.canonical_project_path(base.get("path") or other.get("path"))
+        if canonical_path:
+            merged["path"] = canonical_path
+
+        display_name = str(base.get("display_name") or other.get("display_name") or "").strip()
+        if display_name:
+            merged["display_name"] = display_name
+        else:
+            merged.pop("display_name", None)
+
+        pinned_values = [str(item.get("pinned_at") or "") for item in (older, newer) if item.get("pinned_at")]
+        if pinned_values:
+            merged["pinned_at"] = max(pinned_values)
+        else:
+            merged.pop("pinned_at", None)
+
+        for field in ("removed_at", "archived_at"):
+            if older.get(field) and newer.get(field):
+                merged[field] = max(str(older[field]), str(newer[field]))
+            else:
+                merged.pop(field, None)
+
+        updated_values = [str(item.get("updated_at") or "") for item in (older, newer) if item.get("updated_at")]
+        if updated_values:
+            merged["updated_at"] = max(updated_values)
+        return merged
 
     @classmethod
     def _load_history(cls) -> Dict[str, Dict[str, Any]]:
@@ -75,14 +152,27 @@ class ProjectManager:
         if not isinstance(projects, dict):
             return {}
         normalized: Dict[str, Dict[str, Any]] = {}
+        changed = False
         for key, entry in projects.items():
             if not isinstance(entry, dict):
+                changed = True
                 continue
             entry_path = str(entry.get("path") or "")
-            item_key = cls.history_key(entry_path) or str(key)
+            canonical_path = cls.canonical_project_path(entry_path or str(key))
+            item_key = cls.history_key(canonical_path) or str(key)
             if not item_key:
+                changed = True
                 continue
-            normalized[item_key] = dict(entry, path=entry_path or str(key))
+            candidate = dict(entry, path=canonical_path or entry_path or str(key))
+            if item_key in normalized:
+                normalized[item_key] = cls._merge_history_entries(normalized[item_key], candidate)
+                changed = True
+            else:
+                normalized[item_key] = candidate
+            if item_key != str(key) or candidate.get("path") != entry.get("path"):
+                changed = True
+        if changed:
+            cls._save_history(normalized)
         return normalized
 
     @classmethod
@@ -98,7 +188,7 @@ class ProjectManager:
 
     @classmethod
     def _update_history_entry(cls, path: str | Path, updates: Dict[str, Any]) -> Dict[str, Any]:
-        normalized_path = cls._normalized_path(path)
+        normalized_path = cls.canonical_project_path(path)
         key = cls.history_key(normalized_path)
         if not key:
             raise ValueError("Project path is required")
@@ -138,6 +228,10 @@ class ProjectManager:
         return cls._update_history_entry(path, {"display_name": display_name})
 
     @classmethod
+    def archive_project_history(cls, path: str | Path) -> Dict[str, Any]:
+        return cls._update_history_entry(path, {"archived_at": cls._now_iso()})
+
+    @classmethod
     def remove_project_from_history(cls, path: str | Path) -> Dict[str, Any]:
         now = cls._now_iso()
         return cls._update_history_entry(path, {"removed_at": now, "archived_at": now})
@@ -164,13 +258,47 @@ class ProjectManager:
 
     @classmethod
     def _load_recent(cls) -> List[Dict[str, Any]]:
-        if RECENT_FILE.exists():
+        if not RECENT_FILE.exists():
+            return []
+        try:
+            with open(RECENT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        changed = False
+        for item in data:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            canonical_path = cls.canonical_project_path(item.get("path"))
+            key = cls.history_key(canonical_path)
+            if not canonical_path or not key:
+                changed = True
+                continue
+            if key in seen:
+                changed = True
+                continue
+            seen.add(key)
             try:
-                with open(RECENT_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-        return []
+                project_path = Path(canonical_path)
+                if project_path.exists() and project_path.is_dir():
+                    project = cls._build_project_info(project_path, item.get("last_opened"))
+                else:
+                    project = dict(item, path=canonical_path, name=Path(canonical_path).name)
+            except (OSError, RuntimeError, ValueError):
+                project = dict(item, path=canonical_path)
+            normalized.append(project)
+            if project.get("path") != item.get("path") or project.get("name") != item.get("name"):
+                changed = True
+        normalized = normalized[:20]
+        if changed:
+            cls._save_recent(normalized)
+        return normalized
 
     @classmethod
     def _save_recent(cls, projects: List[Dict[str, Any]]) -> None:
@@ -254,15 +382,31 @@ class ProjectManager:
         return info
 
     @classmethod
-    def open_project(cls, path: str) -> Dict[str, Any]:
+    def _recent_last_opened(cls, path: str | Path) -> Optional[str]:
+        key = cls.history_key(path)
+        for project in cls._load_recent():
+            if cls.history_key(project.get("path")) == key:
+                value = project.get("last_opened")
+                return str(value) if value else None
+        return None
+
+    @classmethod
+    def open_project(cls, path: str, touch_recent: bool = True) -> Dict[str, Any]:
         """打开项目，验证路径，持久化到最近列表"""
-        project_path = Path(path).resolve()
-        if not project_path.exists():
+        requested_path = Path(path).expanduser().resolve()
+        if not requested_path.exists():
             raise ValueError(f"路径不存在: {path}")
-        if not project_path.is_dir():
+        if not requested_path.is_dir():
             raise ValueError(f"路径不是目录: {path}")
 
-        project = cls._build_project_info(project_path)
+        project_path = Path(cls.canonical_project_path(requested_path)).resolve()
+        if not project_path.exists():
+            raise ValueError(f"Path does not exist: {project_path}")
+        if not project_path.is_dir():
+            raise ValueError(f"Path is not a directory: {project_path}")
+
+        last_opened = None if touch_recent else cls._recent_last_opened(project_path)
+        project = cls._build_project_info(project_path, last_opened)
 
         cls._lock.acquire()
         try:
@@ -270,16 +414,36 @@ class ProjectManager:
         finally:
             cls._lock.release()
 
+        if not touch_recent:
+            return project
+
         # 更新最近列表
         recent = cls._load_recent()
         # 去重并移到顶部
-        recent = [p for p in recent if p.get("path") != str(project_path)]
+        key = cls.history_key(project_path)
+        recent = [p for p in recent if cls.history_key(p.get("path")) != key]
         recent.insert(0, project)
         recent = recent[:20]  # 最多保留 20 个
         cls._save_recent(recent)
         cls.restore_project_to_history(project_path)
 
         return project
+
+    @classmethod
+    def project_info_for(cls, path: str | Path | None) -> Optional[Dict[str, Any]]:
+        """Build project metadata for an arbitrary path WITHOUT mutating the
+        global current project. Used for per-session project context so a
+        session bound to project A is described correctly even while the UI
+        (global current project) points at project B."""
+        if not path:
+            return None
+        try:
+            project_path = Path(cls.canonical_project_path(path)).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not project_path.exists() or not project_path.is_dir():
+            return None
+        return cls._build_project_info(project_path)
 
     @classmethod
     def close_project(cls) -> None:
@@ -301,7 +465,7 @@ class ProjectManager:
         if not current:
             return None
 
-        project_path = Path(current["path"]).resolve()
+        project_path = Path(cls.canonical_project_path(current["path"])).resolve()
         if not project_path.exists():
             raise ValueError(f"Path does not exist: {project_path}")
         if not project_path.is_dir():

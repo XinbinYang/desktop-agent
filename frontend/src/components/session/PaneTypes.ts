@@ -10,6 +10,10 @@ export interface SessionPane {
   title?: string;
   isPrimary?: boolean;
   teamId?: string;
+  // Project this pane's session is bound to. Drives the Workspace file-tree
+  // zone when this pane is focused. null/undefined for project-less sessions
+  // (e.g. Personal Agent).
+  projectPath?: string | null;
 }
 
 export interface LeafNode {

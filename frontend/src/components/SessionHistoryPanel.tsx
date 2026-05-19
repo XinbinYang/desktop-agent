@@ -11,6 +11,7 @@ import {
   MoreHorizontal,
   Pencil,
   Pin,
+  SquarePen,
   X,
 } from 'lucide-react';
 import type { AgentType, SessionHistoryItem, SessionHistoryProject, SessionHistoryResponse } from '../types';
@@ -29,10 +30,15 @@ interface SessionHistoryPanelProps {
   onOpenProject?: (path: string) => void;
   onOpenProjectModal?: () => void;
   onProjectAction?: (action: ProjectHistoryAction, project: SessionHistoryProject) => void;
+  onNewProjectSession?: (project: SessionHistoryProject) => void;
 }
 
 function projectKey(path?: string | null): string {
   return (path || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+function projectIdentity(project: SessionHistoryProject): string {
+  return project.project_key || projectKey(project.canonical_path || project.path);
 }
 
 function formatSessionLabel(session: SessionHistoryItem): string {
@@ -76,6 +82,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   onOpenProject,
   onOpenProjectModal,
   onProjectAction,
+  onNewProjectSession,
 }) => {
   const projects = history?.projects || [];
   const standaloneSessions = history?.standalone_sessions || fallbackSessions;
@@ -88,7 +95,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
       let changed = false;
       for (const project of projects) {
         if (project.is_current || project.has_running || projectKey(project.path) === projectKey(currentProjectPath)) {
-          const key = projectKey(project.path);
+          const key = projectIdentity(project);
           if (key && !next.has(key)) {
             next.add(key);
             changed = true;
@@ -122,6 +129,12 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   const handleProjectAction = (action: ProjectHistoryAction, project: SessionHistoryProject) => {
     setOpenProjectMenu(null);
     onProjectAction?.(action, project);
+  };
+
+  const startProjectSession = (project: SessionHistoryProject) => {
+    const key = projectIdentity(project);
+    setExpandedProjects((prev) => new Set(prev).add(key));
+    onNewProjectSession?.(project);
   };
 
   const renderProjectMenu = (project: SessionHistoryProject, key: string) => (
@@ -163,7 +176,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => handleProjectAction('archive', project)}>
           <Archive className="h-3.5 w-3.5" />
-          <span>归档对话</span>
+          <span>归档项目</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem destructive onSelect={() => handleProjectAction('remove', project)}>
@@ -246,10 +259,10 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
           <span className="truncate">New project</span>
         </button>
         {projects.map((project) => {
-          const key = projectKey(project.path);
+          const key = projectIdentity(project);
           const expanded = expandedProjects.has(key);
           return (
-            <div key={project.path} className="space-y-0.5">
+            <div key={key || project.path} className="space-y-0.5">
               <div
                 className={cn(
                   'group flex items-center gap-1 rounded px-1 py-1 text-xs transition-colors',
@@ -279,10 +292,27 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
                   <Folder className="h-3.5 w-3.5 shrink-0" />
                   <span className="truncate">{project.name}</span>
                 </button>
-                {project.has_running && (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Project running" />
-                )}
-                {renderProjectMenu(project, key)}
+                <div className="flex shrink-0 items-center gap-0.5">
+                  {project.has_running && (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Project running" />
+                  )}
+                  {renderProjectMenu(project, key)}
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      startProjectSession(project);
+                    }}
+                    className={cn(
+                      'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100',
+                      project.is_current && 'opacity-100',
+                    )}
+                    aria-label={`Start new session in ${project.name}`}
+                    title={`在 ${project.name} 中开始新对话`}
+                  >
+                    <SquarePen className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
               {expanded && project.sessions.length > 0 && (
                 <div className="ml-5 space-y-0.5">

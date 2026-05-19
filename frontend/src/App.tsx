@@ -44,6 +44,8 @@ import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
 import { ProjectModal } from './components/ProjectModal';
+import { ProjectRenameDialog } from './components/ProjectRenameDialog';
+import { ProjectHistoryConfirmDialog } from './components/ProjectHistoryConfirmDialog';
 import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
@@ -304,6 +306,15 @@ export default function App() {
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [showProjectModal, setShowProjectModal] = useState(false);
+  const [renameProjectTarget, setRenameProjectTarget] = useState<SessionHistoryProject | null>(null);
+  const [renameProjectError, setRenameProjectError] = useState('');
+  const [isRenamingProject, setIsRenamingProject] = useState(false);
+  const [confirmProjectAction, setConfirmProjectAction] = useState<{
+    action: 'archive' | 'remove';
+    project: SessionHistoryProject;
+  } | null>(null);
+  const [confirmProjectError, setConfirmProjectError] = useState('');
+  const [isConfirmingProjectAction, setIsConfirmingProjectAction] = useState(false);
   const [isRefreshingProject, setIsRefreshingProject] = useState(false);
 
   const layout = useLayoutState();
@@ -329,6 +340,23 @@ export default function App() {
 
   const [focusedSnapshot, setFocusedSnapshot] = useState<SessionSnapshot | null>(null);
   const [focusedActions, setFocusedActions] = useState<SessionActions>(NOOP_ACTIONS);
+  // Per-agent "is any session running" — drives the persistent spinner on the
+  // ActivityBar agent buttons so a backgrounded agent's work stays visible.
+  // Server truth (session-history poll) plus the focused pane's live snapshot.
+  const agentRunningState = React.useMemo(() => {
+    let personal = false;
+    let coding = false;
+    for (const s of sessions) {
+      if (!s.is_running) continue;
+      if ((s.agent_type || 'personal') === 'coding') coding = true;
+      else personal = true;
+    }
+    if (focusedSnapshot?.isRunning) {
+      if (focusedAgentType === 'coding') coding = true;
+      else personal = true;
+    }
+    return { personal, coding };
+  }, [sessions, focusedSnapshot?.isRunning, focusedAgentType]);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('editor');
 
   const previewUrl = React.useMemo(() => {
@@ -350,6 +378,7 @@ export default function App() {
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
   const projectRefreshTimerRef = useRef<number | null>(null);
   const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
+  const manualProjectLockLeafRef = useRef<string | null>(null);
 
   useEffect(() => {
     const panel = rightPanelRef.current;
@@ -394,13 +423,15 @@ export default function App() {
           role: meta.role_id || roleForAgent(agentType),
           title: meta.title || pane.title,
           isPrimary: !!meta.is_primary,
+          projectPath: meta.project_path ?? pane.projectPath ?? null,
         };
         if (
           updated.model !== pane.model ||
           updated.agentType !== pane.agentType ||
           updated.role !== pane.role ||
           updated.title !== pane.title ||
-          updated.isPrimary !== pane.isPrimary
+          updated.isPrimary !== pane.isPrimary ||
+          updated.projectPath !== pane.projectPath
         ) {
           changed = true;
         }
@@ -438,12 +469,16 @@ export default function App() {
   }, [sessionHistory]);
 
   useEffect(() => {
-    if (layout.activeSection !== 'sessions' && !sessionHistoryHasRunning) return;
+    // Also poll in the parallel scenario (≥2 panes) so a backgrounded agent's
+    // running indicator stays fresh even when the user is on a non-workspace
+    // section (e.g. Personal) and no run was known when the poll last gated.
+    const hasMultiplePanes = collectLeafNodes(paneRoot).length > 1;
+    if (layout.activeSection !== 'workspace' && !sessionHistoryHasRunning && !hasMultiplePanes) return;
     const timer = window.setInterval(() => {
       loadSessions(currentProject?.path ?? null);
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [currentProject?.path, layout.activeSection, loadSessions, sessionHistoryHasRunning]);
+  }, [currentProject?.path, layout.activeSection, loadSessions, sessionHistoryHasRunning, paneRoot]);
 
   // Slash command handler — delegates to focused session actions
   const handleSlashCommand = useCallback(async (command: string, args: string) => {
@@ -528,7 +563,7 @@ export default function App() {
         }
         const targetAgent = agentForRole(arg);
         layout.setActiveAgent(targetAgent);
-        layout.setActiveSection(targetAgent === 'personal' ? 'personal' : 'project');
+        layout.setActiveSection(targetAgent === 'personal' ? 'personal' : 'workspace');
         setPaneRoot((prev) => {
           const leaf = findLeafById(prev, focusedLeafId);
           if (!leaf) return prev;
@@ -549,7 +584,7 @@ export default function App() {
       }
       case 'project': {
         layout.setSidebarCollapsed(false);
-        layout.setActiveSection('project');
+        layout.setActiveSection('workspace');
         if (!arg) {
           setShowProjectModal(true);
           addTerminalLog('[Project] Choose a folder or create a project');
@@ -671,7 +706,7 @@ export default function App() {
   const handleAgentChange = useCallback((agentType: AgentType) => {
     layout.setActiveAgent(agentType);
     // Switch section to match agent
-    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'workspace');
     // Update session pane role and model to match agent
     const defaultRole = roleForAgent(agentType);
     const newModel = agentModels[agentType] || '';
@@ -687,14 +722,16 @@ export default function App() {
   const resolveAgentSessionClient = useCallback(async (
     agentType: AgentType,
     policy: 'canonical' | 'last_or_create' | 'new',
+    projectPathOverride?: string | null,
   ): Promise<ResolvedSession> => {
+    const projectPath = projectPathOverride ?? currentProject?.path;
     const res = await fetch(`${API_BASE}/api/sessions/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         agent_type: agentType,
         policy,
-        project_path: currentProject?.path || undefined,
+        project_path: projectPath || undefined,
       }),
     });
     if (!res.ok) {
@@ -707,7 +744,7 @@ export default function App() {
   const applyResolvedSessionToFocusedPane = useCallback((resolved: ResolvedSession) => {
     const agentType = normalizeAgentType(resolved.agent_type, resolved.role_id);
     layout.setActiveAgent(agentType);
-    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'workspace');
     lastFocusedLeafByAgent.current[agentType] = focusedLeafId;
     setPaneRoot((prev) => {
       const leaf = findLeafById(prev, focusedLeafId);
@@ -720,14 +757,23 @@ export default function App() {
         role: resolved.role_id || roleForAgent(agentType),
         title: resolved.title || undefined,
         isPrimary: !!resolved.is_primary,
+        projectPath: resolved.project_path ?? null,
       };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
   }, [agentModels, focusedLeafId, layout]);
 
-  const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
+  // Switch to an agent without ever interrupting a running session: focus an
+  // existing pane for that agent if one exists, otherwise open the resolved
+  // session in a NEW split pane beside the focused one. The currently focused
+  // (possibly running) pane is never replaced/unmounted — its WebSocket and
+  // task keep going. Returns the agent's session id (existing or resolved).
+  const openAgentSessionInPane = useCallback(async (
+    agentType: AgentType,
+    policy: 'canonical' | 'last_or_create' | 'new',
+  ): Promise<string | null> => {
     layout.setActiveAgent(agentType);
-    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'project');
+    layout.setActiveSection(agentType === 'personal' ? 'personal' : 'workspace');
 
     const leaves = collectLeafNodes(paneRoot);
     const rememberedLeafId = lastFocusedLeafByAgent.current[agentType];
@@ -739,22 +785,49 @@ export default function App() {
     if (openLeaf) {
       setFocusedLeafId(openLeaf.id);
       lastFocusedLeafByAgent.current[agentType] = openLeaf.id;
-      return;
+      return openLeaf.pane.sessionId;
     }
 
+    let resolved: ResolvedSession;
     try {
-      const resolved = await resolveAgentSessionClient(
-        agentType,
-        agentType === 'personal' ? 'canonical' : 'last_or_create',
-      );
-      applyResolvedSessionToFocusedPane(resolved);
-      loadSessions(currentProject?.path ?? null);
-      addTerminalLog(`[系统] 已切换到 ${AGENT_LABEL[agentType]}`);
+      resolved = await resolveAgentSessionClient(agentType, policy);
     } catch (err) {
-      console.error('[App] Failed to navigate agent:', err);
+      console.error('[App] Failed to resolve agent session:', err);
       addTerminalLog(`[系统] Agent 切换失败: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
     }
-  }, [addTerminalLog, applyResolvedSessionToFocusedPane, currentProject?.path, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+
+    const model = resolved.model_id || agentModels[agentType] || agentModel;
+    const newLeaf = createLeaf(agentType, model, resolved.session_id);
+    newLeaf.pane.role = resolved.role_id || roleForAgent(agentType);
+    newLeaf.pane.title = resolved.title || undefined;
+    newLeaf.pane.isPrimary = !!resolved.is_primary;
+    newLeaf.pane.projectPath = resolved.project_path ?? null;
+
+    setPaneRoot((prev) => {
+      const targetLeafId = findLeafById(prev, focusedLeafId)?.id ?? findFirstLeafId(prev);
+      if (!targetLeafId) return newLeaf;
+      const existingNode = findLeafById(prev, targetLeafId);
+      if (!existingNode) return prev;
+      const split: SplitNode = {
+        type: 'split',
+        id: nextNodeId(),
+        direction: 'horizontal',
+        children: [existingNode, newLeaf],
+        sizes: [50, 50],
+      };
+      return replaceNode(prev, targetLeafId, split);
+    });
+    setFocusedLeafId(newLeaf.id);
+    lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
+    loadSessions(currentProject?.path ?? null);
+    addTerminalLog(`[系统] 已切换到 ${AGENT_LABEL[agentType]}`);
+    return resolved.session_id;
+  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+
+  const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
+    await openAgentSessionInPane(agentType, agentType === 'personal' ? 'canonical' : 'last_or_create');
+  }, [openAgentSessionInPane]);
 
   const handleFocusLeaf = useCallback((leafId: string) => {
     setFocusedLeafId(leafId);
@@ -903,13 +976,20 @@ export default function App() {
     }
   }, [fetchProjectTreePath, loadSessions, addTerminalLog]);
 
-  const handleOpenProjectPath = useCallback(async (path: string): Promise<ProjectInfo | null> => {
+  const handleOpenProjectPath = useCallback(async (
+    path: string,
+    options: { touchRecent?: boolean; source?: 'manual' | 'focus-sync' } = {},
+  ): Promise<ProjectInfo | null> => {
     if (!path) return null;
+    const touchRecent = options.touchRecent ?? true;
+    if ((options.source ?? 'manual') === 'manual') {
+      manualProjectLockLeafRef.current = focusedLeafId;
+    }
     try {
       const res = await fetch(`${API_BASE}/api/projects/open`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify({ path, touch_recent: touchRecent }),
       });
       const project = await res.json();
       if (project.error) {
@@ -921,13 +1001,47 @@ export default function App() {
       setLoadingPaths(new Set());
       setFileTree(await fetchProjectTreePath());
       loadSessions(project.path);
-      addTerminalLog(`[Project] Opened ${project.name || project.path}`);
+      if (touchRecent) addTerminalLog(`[Project] Opened ${project.name || project.path}`);
       return project as ProjectInfo;
     } catch (err) {
       addTerminalLog(`[Project] Open error: ${err}`);
       return null;
     }
-  }, [addTerminalLog, fetchProjectTreePath, loadSessions]);
+  }, [addTerminalLog, fetchProjectTreePath, focusedLeafId, loadSessions]);
+
+  // File-tree zone follows the focused pane's project. Safe to flip the global
+  // project here: backend execution is bound per-session, so this no longer
+  // affects any running session — it is purely a UI/file-tree concern.
+  const focusProjectSyncRef = useRef<string>('');
+  useEffect(() => {
+    const leaf = findLeafById(paneRoot, focusedLeafId);
+    const paneProject = leaf?.pane.projectPath || '';
+    if (!paneProject) return;
+    if (manualProjectLockLeafRef.current && manualProjectLockLeafRef.current !== focusedLeafId) {
+      manualProjectLockLeafRef.current = null;
+    }
+    if (manualProjectLockLeafRef.current === focusedLeafId) return;
+    const paneKey = normalizeProjectPath(paneProject).toLowerCase();
+    const currentKey = currentProject?.path ? normalizeProjectPath(currentProject.path).toLowerCase() : '';
+    if (paneKey === currentKey || focusProjectSyncRef.current === paneKey) return;
+    focusProjectSyncRef.current = paneKey;
+    const targetLeafId = leaf.id;
+    void handleOpenProjectPath(paneProject, { touchRecent: false, source: 'focus-sync' })
+      .then((project) => {
+        if (!project?.path) return;
+        setPaneRoot((prev) => {
+          const target = findLeafById(prev, targetLeafId);
+          if (!target || target.pane.projectPath === project.path) return prev;
+          return replaceNode(prev, targetLeafId, {
+            ...target,
+            pane: { ...target.pane, projectPath: project.path },
+          });
+        });
+      })
+      .finally(() => {
+        if (focusProjectSyncRef.current === paneKey) focusProjectSyncRef.current = '';
+      });
+  }, [paneRoot, focusedLeafId, currentProject?.path, handleOpenProjectPath]);
 
   const handleProjectHistoryAction = useCallback(async (
     action: ProjectHistoryAction,
@@ -1002,37 +1116,18 @@ export default function App() {
           return;
         }
         case 'rename': {
-          const nextName = window.prompt('重命名项目', project.display_name || project.name)?.trim();
-          if (!nextName || nextName === (project.display_name || project.name)) return;
-          const data = await postJson('/api/projects/history/rename', { path: projectPath, name: nextName });
-          if (data.error) {
-            addTerminalLog(`[Project] Rename failed: ${apiErrorMessage(data.error)}`);
-            return;
-          }
-          refreshHistory();
-          addTerminalLog(`[Project] Renamed project to ${nextName}`);
+          setRenameProjectTarget(project);
+          setRenameProjectError('');
           return;
         }
         case 'archive': {
-          if (!window.confirm(`归档 ${project.name} 的对话？`)) return;
-          const data = await postJson('/api/projects/history/archive-sessions', { path: projectPath });
-          if (data.error) {
-            addTerminalLog(`[Project] Archive failed: ${apiErrorMessage(data.error)}`);
-            return;
-          }
-          refreshHistory();
-          addTerminalLog(`[Project] Archived ${data.archived_sessions ?? 0} sessions for ${project.name}`);
+          setConfirmProjectAction({ action: 'archive', project });
+          setConfirmProjectError('');
           return;
         }
         case 'remove': {
-          if (!window.confirm(`从历史中移除 ${project.name}？对话会被归档，项目文件不会删除。`)) return;
-          const data = await postJson('/api/projects/history/remove', { path: projectPath });
-          if (data.error) {
-            addTerminalLog(`[Project] Remove failed: ${apiErrorMessage(data.error)}`);
-            return;
-          }
-          refreshHistory();
-          addTerminalLog(`[Project] Removed ${project.name} from history`);
+          setConfirmProjectAction({ action: 'remove', project });
+          setConfirmProjectError('');
           return;
         }
         default:
@@ -1042,6 +1137,95 @@ export default function App() {
       addTerminalLog(`[Project] Action failed: ${err}`);
     }
   }, [addTerminalLog, currentProject?.path, fetchProjectTreePath, loadSessions]);
+
+  const closeProjectRenameDialog = useCallback(() => {
+    if (isRenamingProject) return;
+    setRenameProjectTarget(null);
+    setRenameProjectError('');
+  }, [isRenamingProject]);
+
+  const submitProjectRename = useCallback(async (name: string) => {
+    if (!renameProjectTarget) return;
+    setIsRenamingProject(true);
+    setRenameProjectError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/history/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: renameProjectTarget.path, name }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setRenameProjectError(apiErrorMessage(data.error));
+        return;
+      }
+      setRenameProjectTarget(null);
+      loadSessions(currentProject?.path ?? null);
+      addTerminalLog(`[Project] Renamed project to ${name}`);
+    } catch (err) {
+      setRenameProjectError(String(err));
+    } finally {
+      setIsRenamingProject(false);
+    }
+  }, [addTerminalLog, currentProject?.path, loadSessions, renameProjectTarget]);
+
+  const closeProjectHistoryConfirm = useCallback(() => {
+    if (isConfirmingProjectAction) return;
+    setConfirmProjectAction(null);
+    setConfirmProjectError('');
+  }, [isConfirmingProjectAction]);
+
+  const submitProjectHistoryConfirm = useCallback(async () => {
+    if (!confirmProjectAction) return;
+    setIsConfirmingProjectAction(true);
+    setConfirmProjectError('');
+    const { action, project } = confirmProjectAction;
+    const url = action === 'archive'
+      ? '/api/projects/history/archive-sessions'
+      : '/api/projects/history/remove';
+
+    try {
+      const res = await fetch(`${API_BASE}${url}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: project.path }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setConfirmProjectError(apiErrorMessage(data.error));
+        return;
+      }
+      setConfirmProjectAction(null);
+      const isCurrentProjectAction = Boolean(
+        currentProject?.path &&
+        project.path &&
+        normalizeProjectPath(currentProject.path).toLowerCase() === normalizeProjectPath(project.path).toLowerCase(),
+      );
+      if (isCurrentProjectAction) {
+        try {
+          await fetch(`${API_BASE}/api/projects/close`, { method: 'POST' });
+        } catch (closeErr) {
+          addTerminalLog(`[Project] Close after ${action} failed: ${closeErr}`);
+        }
+        setCurrentProject(null);
+        setFileTree([]);
+        setExpandedPaths(new Set());
+        setLoadingPaths(new Set());
+        loadSessions();
+      } else {
+        loadSessions(currentProject?.path ?? null);
+      }
+      if (action === 'archive') {
+        addTerminalLog(`[Project] Archived ${data.archived_sessions ?? 0} sessions for ${project.name}`);
+      } else {
+        addTerminalLog(`[Project] Removed ${project.name} from history`);
+      }
+    } catch (err) {
+      setConfirmProjectError(String(err));
+    } finally {
+      setIsConfirmingProjectAction(false);
+    }
+  }, [addTerminalLog, confirmProjectAction, currentProject?.path, loadSessions]);
 
   const handleCloseProject = useCallback(() => {
     fetch(`${API_BASE}/api/projects/close`, { method: 'POST' })
@@ -1108,38 +1292,11 @@ export default function App() {
     if (focusedAgentType === 'coding') {
       return focusedSessionId;
     }
-
-    const leaves = collectLeafNodes(paneRoot);
-    const rememberedLeafId = lastFocusedLeafByAgent.current.coding;
-    const rememberedLeaf = rememberedLeafId ? findLeafById(paneRoot, rememberedLeafId) : null;
-    const codingLeaf = rememberedLeaf?.pane.agentType === 'coding'
-      ? rememberedLeaf
-      : leaves.find((entry) => entry.pane.agentType === 'coding')?.node || null;
-
-    layout.setActiveAgent('coding');
-    layout.setActiveSection('project');
-    if (codingLeaf) {
-      setFocusedLeafId(codingLeaf.id);
-      lastFocusedLeafByAgent.current.coding = codingLeaf.id;
-      return codingLeaf.pane.sessionId;
-    }
-
-    const resolved = await resolveAgentSessionClient('coding', 'last_or_create');
-    applyResolvedSessionToFocusedPane(resolved);
-    loadSessions(currentProject?.path ?? null);
-    addTerminalLog(`[ç³»ç»Ÿ] å·²åˆ‡æ¢åˆ° ${AGENT_LABEL.coding}`);
-    return resolved.session_id;
-  }, [
-    addTerminalLog,
-    applyResolvedSessionToFocusedPane,
-    currentProject?.path,
-    focusedAgentType,
-    focusedSessionId,
-    layout,
-    loadSessions,
-    paneRoot,
-    resolveAgentSessionClient,
-  ]);
+    // Focus an existing Coding pane, or open one in a new split pane — never
+    // replaces the focused (possibly running Personal) pane.
+    const sid = await openAgentSessionInPane('coding', 'last_or_create');
+    return sid || focusedSessionId;
+  }, [focusedAgentType, focusedSessionId, openAgentSessionInPane]);
 
   const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir', options: { openToSide?: boolean } = {}) => {
     if (type !== 'file' || !currentProject) return;
@@ -1424,41 +1581,51 @@ export default function App() {
 
   // ---- Session pane management (tree-based) ----
 
+  // Open a session from the Workspace panel. Never replaces a running pane:
+  // if the session is already shown, just focus it; otherwise open it in a NEW
+  // split pane next to the focused one. No global current-project flip — the
+  // backend binds the project per-session, and the focus effect syncs the
+  // file-tree zone.
   const switchSession = useCallback(async (newSessionId: string, projectPath?: string | null) => {
     const target = sessions.find((s) => s.id === newSessionId);
     const targetAgent = target ? normalizeAgentType(target.agent_type, target.role_id) : layout.activeAgent;
-    const targetProjectPath = projectPath || target?.project_path || '';
-    const currentProjectKey = currentProject?.path ? normalizeProjectPath(currentProject.path).toLowerCase() : '';
-    const targetProjectKey = targetProjectPath ? normalizeProjectPath(targetProjectPath).toLowerCase() : '';
+    const targetProjectPath = projectPath || target?.project_path || null;
 
-    if (targetAgent === 'coding' && targetProjectPath && targetProjectKey !== currentProjectKey) {
-      await handleOpenProjectPath(targetProjectPath);
+    const existing = collectLeafNodes(paneRoot).find((entry) => entry.pane.sessionId === newSessionId);
+    if (existing) {
+      setFocusedLeafId(existing.leafId);
+      lastFocusedLeafByAgent.current[existing.pane.agentType] = existing.leafId;
+      layout.setActiveAgent(existing.pane.agentType);
+      layout.setActiveSection(existing.pane.agentType === 'personal' ? 'personal' : 'workspace');
+      return;
     }
 
-    layout.setActiveAgent(targetAgent);
-    if (targetAgent === 'personal') {
-      const existingPersonal = collectLeafNodes(paneRoot).find((entry) => entry.pane.agentType === 'personal');
-      if (existingPersonal) {
-        setFocusedLeafId(existingPersonal.leafId);
-        lastFocusedLeafByAgent.current.personal = existingPersonal.leafId;
-        return;
-      }
-    }
+    const model = target?.model_id || agentModels[targetAgent] || agentModel;
+    const newLeaf = createLeaf(targetAgent, model, newSessionId);
+    newLeaf.pane.role = target?.role_id || roleForAgent(targetAgent);
+    newLeaf.pane.title = target?.title || undefined;
+    newLeaf.pane.isPrimary = !!target?.is_primary;
+    newLeaf.pane.projectPath = targetProjectPath;
+
     setPaneRoot((prev) => {
-      const leaf = findLeafById(prev, focusedLeafId);
-      if (!leaf) return prev;
-      const newPane: SessionPane = {
-        ...leaf.pane,
-        sessionId: newSessionId,
-        model: target?.model_id || agentModels[targetAgent] || agentModel,
-        agentType: targetAgent,
-        role: target?.role_id || roleForAgent(targetAgent),
-        title: target?.title || undefined,
-        isPrimary: !!target?.is_primary,
+      const targetLeafId = findLeafById(prev, focusedLeafId)?.id ?? findFirstLeafId(prev);
+      if (!targetLeafId) return newLeaf;
+      const existingNode = findLeafById(prev, targetLeafId);
+      if (!existingNode) return prev;
+      const split: SplitNode = {
+        type: 'split',
+        id: nextNodeId(),
+        direction: 'horizontal',
+        children: [existingNode, newLeaf],
+        sizes: [50, 50],
       };
-      return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
+      return replaceNode(prev, targetLeafId, split);
     });
-  }, [agentModel, agentModels, currentProject?.path, focusedLeafId, handleOpenProjectPath, layout, paneRoot, sessions]);
+    setFocusedLeafId(newLeaf.id);
+    lastFocusedLeafByAgent.current[targetAgent] = newLeaf.id;
+    layout.setActiveAgent(targetAgent);
+    layout.setActiveSection(targetAgent === 'personal' ? 'personal' : 'workspace');
+  }, [agentModel, agentModels, focusedLeafId, layout, paneRoot, sessions]);
 
   const stopSessionById = useCallback((sessionId: string) => {
     if (!sessionId) return;
@@ -1493,20 +1660,21 @@ export default function App() {
     }
   }, [addTerminalLog, agentModel, agentModels.coding, applyResolvedSessionToFocusedPane, currentProject?.path, focusedLeafId, loadSessions, resolveAgentSessionClient]);
 
-  const openNewSessionPane = useCallback(async () => {
+  const openNewSessionPane = useCallback(async (projectPathOverride?: string | null) => {
     const agentType: AgentType = 'coding';
     let sessionId = createDefaultSessionId(agentType);
     let model = agentModels.coding || agentModel;
     let role = roleForAgent(agentType);
     let title: string | undefined;
+    const projectPath = projectPathOverride ?? currentProject?.path ?? null;
 
     try {
-      const resolved = await resolveAgentSessionClient(agentType, 'new');
+      const resolved = await resolveAgentSessionClient(agentType, 'new', projectPath);
       sessionId = resolved.session_id;
       model = resolved.model_id || model;
       role = resolved.role_id || role;
       title = resolved.title || undefined;
-      loadSessions(currentProject?.path ?? null);
+      loadSessions(projectPath);
       addTerminalLog('[System] Created Coding Agent session');
     } catch (err) {
       console.error('[App] Failed to create coding session:', err);
@@ -1516,6 +1684,7 @@ export default function App() {
     newLeaf.pane.role = role;
     newLeaf.pane.title = title;
     newLeaf.pane.isPrimary = false;
+    newLeaf.pane.projectPath = projectPath ?? null;
 
     setPaneRoot((prev) => {
       const targetLeafId = findLeafById(prev, focusedLeafId)?.id ?? findFirstLeafId(prev);
@@ -1534,7 +1703,7 @@ export default function App() {
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current.coding = newLeaf.id;
     layout.setActiveAgent(agentType);
-    layout.setActiveSection('project');
+    layout.setActiveSection('workspace');
   }, [
     addTerminalLog,
     agentModel,
@@ -1545,6 +1714,13 @@ export default function App() {
     loadSessions,
     resolveAgentSessionClient,
   ]);
+
+  const handleNewProjectSession = useCallback(async (project: SessionHistoryProject) => {
+    if (!project.path) return;
+    // Resolve the new session bound to this project; the new pane becomes
+    // focused and the focus effect syncs the file-tree zone. No pre-flip.
+    await openNewSessionPane(project.path);
+  }, [openNewSessionPane]);
 
   useEffect(() => {
     newSessionRef.current = openNewSessionPane;
@@ -1907,6 +2083,8 @@ export default function App() {
           onSectionChange={layout.setActiveSection}
           onAgentChange={handleAgentNavigate}
           onToggleSidebar={layout.toggleSidebar}
+          personalRunning={agentRunningState.personal}
+          codingRunning={agentRunningState.coding}
         />
 
         {/* Left sidebar */}
@@ -1934,8 +2112,9 @@ export default function App() {
               onRewindSession={openFocusedRewind}
               onSwitchSession={switchSession}
               onDeleteSession={deleteSession}
-              onOpenProject={handleOpenProjectPath}
+              onOpenProject={(path) => { void handleOpenProjectPath(path, { touchRecent: false }); }}
               onProjectAction={handleProjectHistoryAction}
+              onNewProjectSession={handleNewProjectSession}
               currentProjectPath={currentProject?.path ?? null}
               currentProject={currentProject}
               fileTree={fileTree}
@@ -1962,6 +2141,24 @@ export default function App() {
                 setShowProjectModal(false);
                 addTerminalLog(`[系统] 已创建项目: ${project.name}`);
               }}
+            />
+            <ProjectRenameDialog
+              isOpen={!!renameProjectTarget}
+              initialName={renameProjectTarget?.display_name || renameProjectTarget?.name || ''}
+              projectPath={renameProjectTarget?.path}
+              loading={isRenamingProject}
+              error={renameProjectError}
+              onClose={closeProjectRenameDialog}
+              onSubmit={submitProjectRename}
+            />
+            <ProjectHistoryConfirmDialog
+              isOpen={!!confirmProjectAction}
+              action={confirmProjectAction?.action || 'archive'}
+              project={confirmProjectAction?.project || null}
+              loading={isConfirmingProjectAction}
+              error={confirmProjectError}
+              onClose={closeProjectHistoryConfirm}
+              onConfirm={submitProjectHistoryConfirm}
             />
           </>
         )}

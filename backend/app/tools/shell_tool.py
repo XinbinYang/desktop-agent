@@ -56,10 +56,10 @@ def _default_work_dir() -> str:
         pass
 
     try:
-        from app.project_manager import ProjectManager
-        project = ProjectManager.get_current()
-        if project and project.get("path"):
-            return project["path"]
+        from app.coding_runs import effective_project_path
+        bound = effective_project_path()
+        if bound:
+            return bound
     except Exception:
         pass
 

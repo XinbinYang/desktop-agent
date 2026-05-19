@@ -2,17 +2,17 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Trash2, Zap,
-  Globe, Plus, MessageSquare, X, Archive, RotateCcw,
+  Globe,
   UserCog, Settings, BookOpen, Sun, Moon, Laptop,
-  Brain, Activity, Moon as MoonIcon, Sparkles, FolderOpen
+  Brain, Activity, Moon as MoonIcon, Sparkles
 } from 'lucide-react';
 import { ProjectInfo, FileNode, SidebarSection, type AgentType, type SessionHistoryItem, type SessionHistoryResponse } from '../types';
-import { ProjectPanel } from './ProjectPanel';
 import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
 import { AGENT_LABEL } from '../lib/agentProfiles';
-import { SessionHistoryPanel, type ProjectHistoryAction } from './SessionHistoryPanel';
+import { type ProjectHistoryAction } from './SessionHistoryPanel';
+import { WorkspacePanel } from './WorkspacePanel';
 
 interface SidebarProps {
   activeSection: SidebarSection;
@@ -35,6 +35,7 @@ interface SidebarProps {
   onDeleteSession?: (id: string) => void;
   onOpenProject?: (path: string) => void;
   onProjectAction?: (action: ProjectHistoryAction, project: SessionHistoryResponse['projects'][number]) => void;
+  onNewProjectSession?: (project: SessionHistoryResponse['projects'][number]) => void;
   currentProjectPath?: string | null;
   // 项目相关
   currentProject?: ProjectInfo | null;
@@ -51,19 +52,6 @@ interface SidebarProps {
   isRefreshingProject?: boolean;
 }
 
-type SessionItem = {id: string; title?: string; project_path?: string; model_id: string; role_id?: string; agent_type?: AgentType; message_count: number; updated_at?: number; is_primary?: boolean};
-
-function formatSessionLabel(s: SessionItem): string {
-  if (s.title) return s.title.length > 40 ? s.title.slice(0, 40) + '…' : s.title;
-  // Fallback: parse timestamp from session ID
-  const ts = parseInt(s.id.replace('session_', ''), 10);
-  if (ts > 0) {
-    return new Date(ts).toLocaleDateString(undefined, {
-      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-    });
-  }
-  return s.id.replace('session_', '');
-}
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
@@ -85,6 +73,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onDeleteSession,
   onOpenProject,
   onProjectAction,
+  onNewProjectSession,
   currentProjectPath,
   // 项目
   currentProject,
@@ -185,148 +174,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
 
-        {activeSection === 'coding' && (
-          <div className="space-y-3">
-            <div className="text-xs font-medium text-fg-muted">Coding Agent</div>
-            {currentProject ? (
-              <div className="h-full flex flex-col">
-                <ProjectPanel
-                  currentProject={currentProject}
-                  fileTree={fileTree}
-                  expandedPaths={expandedPaths}
-                  loadingPaths={loadingPaths}
-                  onTogglePath={onTogglePath || (() => {})}
-                  onSelectFile={onSelectFile || (() => {})}
-                  onFileAction={onFileAction}
-                  onOpenFolder={onOpenFolder || (() => {})}
-                  onOpenModal={onOpenProjectModal || (() => {})}
-                  onCloseProject={onCloseProject || (() => {})}
-                  onRefreshTree={onRefreshTree || (() => {})}
-                  isRefreshing={isRefreshingProject}
-                />
-              </div>
-            ) : (
-              <div className="text-xs text-fg-muted text-center py-4">
-                <FolderOpen className="w-5 h-5 mx-auto mb-2 opacity-30" />
-                <p>No project open.</p>
-                <button
-                  type="button"
-                  onClick={onOpenFolder}
-                  className="mt-2 text-accent hover:underline text-[11px]"
-                >
-                  Open a folder
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeSection === 'skills' && (
-          <SkillsPanel activeAgent={activeAgent} />
-        )}
-
-        {activeSection === 'project' && (
-          <div className="h-full flex flex-col">
-            <ProjectPanel
-              currentProject={currentProject || null}
-              fileTree={fileTree}
-              expandedPaths={expandedPaths}
-              loadingPaths={loadingPaths}
-              onTogglePath={onTogglePath || (() => {})}
-              onSelectFile={onSelectFile || (() => {})}
-              onFileAction={onFileAction}
-              onOpenFolder={onOpenFolder || (() => {})}
-              onOpenModal={onOpenProjectModal || (() => {})}
-              onCloseProject={onCloseProject || (() => {})}
-              onRefreshTree={onRefreshTree || (() => {})}
-              isRefreshing={isRefreshingProject}
-            />
-          </div>
-        )}
-
-        {activeSection === 'sessions' && (
-          <div className="space-y-2">
-            <button
-              onClick={onNewSession}
-              className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              /new
-            </button>
-            <div className="grid grid-cols-2 gap-1.5">
-              <button
-                type="button"
-                onClick={onCompactSession}
-                className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-surface-alt text-fg-secondary hover:bg-surface-hover hover:text-fg transition-colors"
-                title="Compact current session context"
-              >
-                <Archive className="w-3.5 h-3.5" />
-                /compact
-              </button>
-              <button
-                type="button"
-                onClick={onRewindSession}
-                className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-surface-alt text-fg-secondary hover:bg-surface-hover hover:text-fg transition-colors"
-                title="Rewind to a previous checkpoint"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                /rewind
-              </button>
-            </div>
-            <div className="flex items-center justify-between mt-2">
-              <span className="text-xs font-medium text-fg-muted">History</span>
-              {currentProjectPath && (
-                <span className="text-[10px] text-accent/80 bg-accent/10 px-1.5 py-0.5 rounded" title={`Filtered: ${currentProjectPath}`}>
-                  Project
-                </span>
-              )}
-            </div>
-            <SessionHistoryPanel
-              history={sessionHistory}
-              fallbackSessions={sessions}
+        {(activeSection === 'workspace' || activeSection === 'coding') && (
+          <div className="h-full">
+            <WorkspacePanel
+              sessionHistory={sessionHistory}
+              sessions={sessions}
               currentSession={currentSession}
               currentProjectPath={currentProjectPath}
+              onNewSession={onNewSession}
+              onCompactSession={onCompactSession}
+              onRewindSession={onRewindSession}
               onSwitchSession={onSwitchSession}
               onDeleteSession={onDeleteSession}
               onOpenProject={onOpenProject}
               onOpenProjectModal={onOpenProjectModal}
               onProjectAction={onProjectAction}
+              onNewProjectSession={onNewProjectSession}
+              currentProject={currentProject}
+              fileTree={fileTree}
+              expandedPaths={expandedPaths}
+              loadingPaths={loadingPaths}
+              onTogglePath={onTogglePath}
+              onSelectFile={onSelectFile}
+              onFileAction={onFileAction}
+              onOpenFolder={onOpenFolder}
+              onCloseProject={onCloseProject}
+              onRefreshTree={onRefreshTree}
+              isRefreshingProject={isRefreshingProject}
             />
-            {false && sessions.length === 0 && (
-              <div className="text-xs text-fg-muted text-center py-4">No sessions yet</div>
-            )}
-            {false && sessions.map(s => (
-              <div
-                key={s.id}
-                className={`flex items-center justify-between px-2 py-1.5 rounded text-xs cursor-pointer ${
-                  s.id === currentSession ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:bg-surface-hover'
-                }`}
-              >
-                <div className="flex items-center gap-2 flex-1 min-w-0" onClick={() => onSwitchSession?.(s.id)}>
-                  <MessageSquare className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{s.is_primary ? 'Personal Agent · Main' : formatSessionLabel(s)}</span>
-                  <span className={`text-[9px] px-1 py-0.5 rounded shrink-0 ${
-                    (s.agent_type || 'personal') === 'coding'
-                      ? 'bg-success/10 text-success'
-                      : 'bg-accent/10 text-accent'
-                  }`}>
-                    {(s.agent_type || 'personal') === 'coding' ? 'Coding' : 'Personal'}
-                  </span>
-                </div>
-                {!s.is_primary && (
-                  <button
-                    type="button"
-                    onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id); }}
-                    className="text-fg-muted hover:text-danger ml-1"
-                    aria-label="Delete session"
-                    title="Delete session"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                )}
-              </div>
-            ))}
           </div>
+        )}
+
+        {activeSection === 'skills' && (
+          <SkillsPanel activeAgent={activeAgent} />
         )}
 
         {activeSection === 'settings' && (

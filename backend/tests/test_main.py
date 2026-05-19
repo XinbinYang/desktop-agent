@@ -278,6 +278,48 @@ class TestAPIRoutes:
         standalone_ids = {session["id"] for session in data["standalone_sessions"]}
         assert {"personal_project", "personal_free"}.issubset(standalone_ids)
 
+    def test_session_history_canonicalizes_git_subdirectory_sessions(self, client, monkeypatch, tmp_path, isolate_projects):
+        if subprocess.run(["git", "--version"], capture_output=True, text=True).returncode != 0:
+            pytest.skip("git is not available")
+        import app.agent as agent_module
+        from app.project_manager import ProjectManager
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        repo = tmp_path / "repo"
+        subdir = repo / ".superpowers"
+        subdir.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
+        ProjectManager.open_project(str(subdir))
+        self._write_session_record(sessions_dir, "coding_subdir", project_path=str(subdir), updated_at=3000)
+
+        data = client.get("/api/session-history").json()
+
+        assert data["current_project_path"] == str(repo.resolve())
+        projects = {project["path"]: project for project in data["projects"]}
+        assert set(projects) == {str(repo.resolve())}
+        assert projects[str(repo.resolve())]["project_key"] == str(repo.resolve()).replace("\\", "/").lower()
+        assert projects[str(repo.resolve())]["sessions"][0]["project_path"] == str(repo.resolve())
+
+    def test_open_project_touch_recent_false_keeps_recent_order(self, client, tmp_path, isolate_projects):
+        p1 = tmp_path / "proj1"
+        p2 = tmp_path / "proj2"
+        p1.mkdir()
+        p2.mkdir()
+        client.post("/api/projects/open", json={"path": str(p1)})
+        client.post("/api/projects/open", json={"path": str(p2)})
+
+        response = client.post("/api/projects/open", json={"path": str(p1), "touch_recent": False})
+        recent = client.get("/api/projects").json()["projects"]
+
+        assert response.status_code == 200
+        assert response.json()["path"] == str(p1.resolve())
+        assert [item["path"] for item in recent] == [str(p2.resolve()), str(p1.resolve())]
+
     def test_session_history_marks_running_connection_and_needs_input(self, client, monkeypatch, tmp_path):
         import asyncio
         import app.agent as agent_module
@@ -353,16 +395,17 @@ class TestAPIRoutes:
         archive = client.post("/api/projects/history/archive-sessions", json={"path": str(project_b)})
         assert archive.status_code == 200
         assert archive.json()["archived_sessions"] == 1
+        assert archive.json()["project"]["archived_at"]
         archived_record = json.loads((sessions_dir / "coding_b.json").read_text(encoding="utf-8"))
         assert archived_record["archived_at"]
 
         data = client.get("/api/session-history").json()
-        project_b_item = next(project for project in data["projects"] if project["path"] == str(project_b))
-        assert project_b_item["sessions"] == []
-        assert project_b_item["archived_sessions_count"] == 1
+        assert str(project_b) not in {project["path"] for project in data["projects"]}
 
         data_with_archived = client.get("/api/session-history?include_archived=true").json()
         project_b_archived = next(project for project in data_with_archived["projects"] if project["path"] == str(project_b))
+        assert project_b_archived["is_archived"] is True
+        assert project_b_archived["archived_sessions_count"] == 1
         assert project_b_archived["sessions"][0]["id"] == "coding_b"
 
     def test_remove_project_hides_history_without_deleting_and_reopen_restores_project(self, client, monkeypatch, tmp_path, isolate_projects):

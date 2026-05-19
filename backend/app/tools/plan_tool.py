@@ -23,7 +23,10 @@ _ASK_QUESTIONS_SCHEMA: Dict[str, Any] = {
             "type": "array",
             "minItems": 1,
             "maxItems": 5,
-            "description": "Clarifying questions the user must answer.",
+            "description": (
+                "One to five focused clarifying questions the user must answer. "
+                "Ask enough to understand the request; avoid filler."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
@@ -65,9 +68,10 @@ _ASK_QUESTIONS_SCHEMA: Dict[str, Any] = {
 class PlanAskQuestionsTool(BaseTool):
     name = "plan_ask_questions"
     description = (
-        "Present structured decision questions to the user. "
+        "Present one or more structured decision questions to the user. "
         "Use when the user's request is ambiguous or has multiple valid approaches. "
         "Questions should be derived from codebase exploration — never generic. "
+        "Batch related blocking decisions when multiple answers are needed to draft a sound plan. "
         "Only call when you genuinely need user input; skip for clear, specific requests."
     )
     parameters = _ASK_QUESTIONS_SCHEMA

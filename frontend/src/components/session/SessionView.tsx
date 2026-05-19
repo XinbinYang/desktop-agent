@@ -424,6 +424,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     if (!isFocused) return null;
     return {
       sessionId,
+      projectPath: currentProject?.path ?? null,
       agentType,
       isRunning,
       isConnected,
@@ -441,7 +442,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       toolCalls,
       runEvents,
     };
-  }, [isFocused, sessionId, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
+  }, [isFocused, sessionId, currentProject?.path, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
       contextUsage, checkpoints, suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents]);
 
   const actions: SessionActions = useMemo(() => ({

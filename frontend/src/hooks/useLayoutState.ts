@@ -11,7 +11,7 @@ const REQUIRED_MAIN_KEYS = Object.keys(DEFAULT_MAIN_LAYOUT);
 const REQUIRED_TERMINAL_KEYS = Object.keys(DEFAULT_TERMINAL_LAYOUT);
 const DEFAULT_SIDEBAR_SECTION: SidebarSection = 'skills';
 const SIDEBAR_SECTIONS: SidebarSection[] = [
-  'personal', 'coding', 'skills', 'project', 'sessions', 'settings',
+  'personal', 'coding', 'skills', 'workspace', 'settings',
 ];
 
 // Legacy 11-tab values, kept only to migrate persisted layout state.

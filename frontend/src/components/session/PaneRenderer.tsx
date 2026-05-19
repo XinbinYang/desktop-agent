@@ -1,6 +1,6 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { Panel, Group, Separator } from 'react-resizable-panels';
-import { X, Plus, GripVertical, Users, UserPlus } from 'lucide-react';
+import { X, Plus, GripVertical, Users, UserPlus, Loader2 } from 'lucide-react';
 import { SessionView, type SessionViewHandle } from './SessionView';
 import type { PaneNode, SessionPane, SplitNode } from './PaneTypes';
 import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSessionContext';
@@ -26,6 +26,7 @@ interface SessionMeta {
   role_id?: string;
   agent_type?: AgentType;
   is_primary?: boolean;
+  is_running?: boolean;
 }
 
 interface DragPayload {
@@ -463,6 +464,12 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           <span className="text-[10px] text-fg-secondary truncate px-0.5 select-none pointer-events-none">
             {paneTitle}
           </span>
+          {meta?.is_running && (
+            <Loader2
+              className="w-3 h-3 animate-spin text-success shrink-0 pointer-events-none"
+              aria-label="Session running"
+            />
+          )}
         </div>
         <select
           value={modelLabel}

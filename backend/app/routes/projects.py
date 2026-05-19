@@ -30,6 +30,7 @@ router = APIRouter()
 class OpenProjectRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     path: str
+    touch_recent: bool = True
 
 
 class CreateProjectRequest(BaseModel):
@@ -265,9 +266,10 @@ def get_project_repomap(max_files: int = 220):
 def open_project(req: OpenProjectRequest):
     """打开一个项目目录"""
     try:
-        project = ProjectManager.open_project(req.path)
+        project = ProjectManager.open_project(req.path, touch_recent=req.touch_recent)
         # 配置 GCM
-        CredentialManager.configure_gcm(req.path)
+        if req.touch_recent:
+            CredentialManager.configure_gcm(project["path"])
         return project
     except ValueError as e:
         return {"error": str(e)}
@@ -328,9 +330,12 @@ def rename_project_display(req: ProjectDisplayNameRequest):
 def archive_project_sessions(req: ProjectPathRequest):
     from app.agent import archive_session_records_for_project
 
-    archived_count = archive_session_records_for_project(req.path, agent_type="coding")
-    metadata = ProjectManager.get_project_history(req.path)
-    return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
+    try:
+        archived_count = archive_session_records_for_project(req.path, agent_type="coding")
+        metadata = ProjectManager.archive_project_history(req.path)
+        return {"status": "ok", "archived_sessions": archived_count, "project": metadata}
+    except ValueError as e:
+        return {"error": str(e)}
 
 
 @router.post("/api/projects/history/remove")

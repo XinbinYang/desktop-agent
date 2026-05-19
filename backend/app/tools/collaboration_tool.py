@@ -7,15 +7,14 @@ from app.collaboration.executor import (
     run_consult_worker,
     run_execute_agent_events,
 )
+from app.coding_runs import effective_project_path
 from app.collaboration.manager import add_task, complete_run, create_run, list_events, update_task
 from app.collaboration.models import TaskPacket
-from app.project_manager import ProjectManager
 from app.tools.base import BaseTool, ToolResult
 
 
 def _project_path() -> str:
-    project = ProjectManager.get_current()
-    return str(project.get("path") or "") if project else ""
+    return effective_project_path()
 
 
 def _event_payloads(run_id: str) -> List[Dict[str, Any]]:
@@ -162,7 +161,8 @@ class RequestPersonalContextTool(BaseTool):
 
         prefs = AgentManager.load_workspace_file("_shared", "user_preferences.md")[:3000]
         cross = AgentManager.load_workspace_file("_shared", "cross_agent_memory.md")[:3000]
-        project = ProjectManager.get_current() or {}
+        from app.project_manager import ProjectManager
+        project = ProjectManager.project_info_for(effective_project_path()) or {}
         output = (
             f"Topic: {topic}\n\n"
             f"Project: {project.get('name', '')} {project.get('path', '')}\n\n"

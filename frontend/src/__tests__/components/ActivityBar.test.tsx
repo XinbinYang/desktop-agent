@@ -21,8 +21,7 @@ describe('ActivityBar', () => {
   it('renders all section icons', () => {
     render(<ActivityBar {...defaultProps} />)
     expect(screen.getByLabelText('Skills')).toBeInTheDocument()
-    expect(screen.getByLabelText('Project')).toBeInTheDocument()
-    expect(screen.getByLabelText('Sessions')).toBeInTheDocument()
+    expect(screen.getByLabelText('Workspace')).toBeInTheDocument()
     expect(screen.getByLabelText('Settings')).toBeInTheDocument()
   })
 
@@ -66,8 +65,8 @@ describe('ActivityBar', () => {
       <ActivityBar {...defaultProps} activeSection="skills" sidebarCollapsed={false}
         onSectionChange={onSectionChange} onToggleSidebar={onToggleSidebar} />
     )
-    fireEvent.click(screen.getByLabelText('Sessions'))
-    expect(onSectionChange).toHaveBeenCalledWith('sessions')
+    fireEvent.click(screen.getByLabelText('Workspace'))
+    expect(onSectionChange).toHaveBeenCalledWith('workspace')
     expect(onToggleSidebar).not.toHaveBeenCalled()
   })
 

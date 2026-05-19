@@ -84,6 +84,7 @@ describe('SessionHistoryPanel', () => {
     const onDeleteSession = vi.fn();
     const onOpenProject = vi.fn();
     const onOpenProjectModal = vi.fn();
+    const onNewProjectSession = vi.fn();
 
     render(
       <SessionHistoryPanel
@@ -94,6 +95,7 @@ describe('SessionHistoryPanel', () => {
         onDeleteSession={onDeleteSession}
         onOpenProject={onOpenProject}
         onOpenProjectModal={onOpenProjectModal}
+        onNewProjectSession={onNewProjectSession}
       />,
     );
 
@@ -107,6 +109,9 @@ describe('SessionHistoryPanel', () => {
 
     fireEvent.click(screen.getByLabelText('Open project repo'));
     expect(onOpenProject).toHaveBeenCalledWith('C:/repo');
+
+    fireEvent.click(screen.getByLabelText('Start new session in repo'));
+    expect(onNewProjectSession).toHaveBeenCalledWith(expect.objectContaining({ path: 'C:/repo' }));
 
     fireEvent.click(screen.getByLabelText('Open session Idle task'));
     expect(onSwitchSession).toHaveBeenCalledWith('session_idle', 'C:/repo');
@@ -126,6 +131,29 @@ describe('SessionHistoryPanel', () => {
     expect(screen.getByText('Implement agent history')).toBeInTheDocument();
   });
 
+  it('keeps expansion state on backend canonical project identity', () => {
+    const history = historyFixture();
+    history.current_project_path = null;
+    history.projects[0].is_current = false;
+    history.projects[0].has_running = false;
+    history.projects[0].project_key = 'c:/repo';
+    const { rerender } = render(<SessionHistoryPanel history={history} currentProjectPath={null} />);
+
+    fireEvent.click(screen.getByLabelText('Expand project repo'));
+    expect(screen.getByText('Implement agent history')).toBeInTheDocument();
+
+    const refreshed = historyFixture();
+    refreshed.current_project_path = null;
+    refreshed.projects[0].is_current = false;
+    refreshed.projects[0].has_running = false;
+    refreshed.projects[0].path = 'C:/repo/nested';
+    refreshed.projects[0].canonical_path = 'C:/repo';
+    refreshed.projects[0].project_key = 'c:/repo';
+    rerender(<SessionHistoryPanel history={refreshed} currentProjectPath={null} />);
+
+    expect(screen.getByText('Implement agent history')).toBeInTheDocument();
+  });
+
   it('opens project action menu and emits menu actions', () => {
     const onProjectAction = vi.fn();
     render(
@@ -142,7 +170,7 @@ describe('SessionHistoryPanel', () => {
     expect(screen.getByText('在资源管理器中打开')).toBeInTheDocument();
     expect(screen.getByText('创建永久工作树')).toBeInTheDocument();
     expect(screen.getByText('重命名项目')).toBeInTheDocument();
-    expect(screen.getByText('归档对话')).toBeInTheDocument();
+    expect(screen.getByText('归档项目')).toBeInTheDocument();
     expect(screen.getByText('移除')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('置顶项目'));

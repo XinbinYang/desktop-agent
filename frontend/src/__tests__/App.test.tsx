@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
 vi.mock('react-virtuoso', () => {
   const Virtuoso = ({ data, itemContent, components, totalCount }: any) => {
@@ -107,7 +107,7 @@ describe('App', () => {
   })
 
   const collapsedProjectLayout = () => ({
-    activeSection: 'project',
+    activeSection: 'workspace',
     activeAgent: 'personal',
     showTerminal: true,
     rightZone: 'activity',
@@ -268,6 +268,60 @@ describe('App', () => {
     expect(await screen.findByTitle('Coding Agent · Implement tabs')).toBeInTheDocument()
   })
 
+  it('does not unmount the current pane when switching to another agent', async () => {
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: 'session_coding_parallel',
+            agent_type: 'coding',
+            role_id: 'code-expert',
+            model_id: 'gpt-4o',
+            title: 'Parallel task',
+            project_path: null,
+            created: true,
+            is_primary: false,
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          models: [
+            { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+          ],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByTestId('session-session_personal_main')
+
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+
+    // The new Coding pane opens in a split...
+    expect(await screen.findByTestId('session-session_coding_parallel')).toBeInTheDocument()
+    // ...and the original Personal pane is still present — the old bug
+    // replaced (and thus destroyed) the focused pane's session here.
+    expect(screen.getByTestId('session-session_personal_main')).toBeInTheDocument()
+  })
+
   it('creates a new coding session in a split pane without replacing the current pane', async () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/api/sessions/resolve')) {
@@ -312,7 +366,7 @@ describe('App', () => {
 
     render(<App />)
     await screen.findByTestId('session-session_personal_main')
-    fireEvent.click(screen.getByLabelText('Sessions'))
+    fireEvent.click(screen.getByLabelText('Workspace'))
     fireEvent.click(screen.getByRole('button', { name: '/new' }))
 
     expect(await screen.findByTestId('session-session_coding_new')).toBeInTheDocument()
@@ -394,7 +448,7 @@ describe('App', () => {
         return Promise.resolve({ json: () => Promise.resolve(history) }) as any
       }
       if (url.endsWith('/api/projects/open')) {
-        expect(JSON.parse(String(init?.body))).toEqual({ path: projectB.path })
+        expect(JSON.parse(String(init?.body))).toEqual({ path: projectB.path, touch_recent: false })
         return Promise.resolve({ json: () => Promise.resolve(projectB) }) as any
       }
       if (url.endsWith('/api/projects/tree')) {
@@ -406,7 +460,7 @@ describe('App', () => {
 
     render(<App />)
     await screen.findByText('Desktop Agent')
-    fireEvent.click(screen.getByLabelText('Sessions'))
+    fireEvent.click(screen.getByLabelText('Workspace'))
     fireEvent.click(await screen.findByLabelText('Expand project repo-b'))
     fireEvent.click(await screen.findByLabelText('Open session Fix bug'))
 
@@ -414,6 +468,188 @@ describe('App', () => {
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/open'))).toBe(true)
     })
     expect(await screen.findByTestId('session-session_b')).toBeInTheDocument()
+  })
+
+  it('starts a new coding session inside a selected project from the project row', async () => {
+    const projectA = {
+      path: 'C:/repo-a',
+      name: 'repo-a',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const projectB = {
+      path: 'C:/repo-b',
+      name: 'repo-b',
+      git_branch: 'main',
+      last_opened: '2026-05-18T01:00:00Z',
+    }
+    const history = {
+      current_project_path: projectA.path,
+      projects: [
+        { ...projectA, is_current: true, has_running: false, sessions: [] },
+        { ...projectB, is_current: false, has_running: false, sessions: [] },
+      ],
+      standalone_sessions: [],
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(projectA) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project: projectA, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/projects/open')) {
+        return Promise.resolve({ json: () => Promise.resolve(projectB) }) as any
+      }
+      if (url.endsWith('/api/projects/tree')) {
+        return Promise.resolve({ json: () => Promise.resolve({ nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: 'session_project_new',
+            agent_type: 'coding',
+            role_id: 'code-expert',
+            model_id: 'gpt-4o',
+            title: 'New project chat',
+            project_path: projectB.path,
+            created: true,
+            is_primary: false,
+          }),
+        }) as any
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Workspace'))
+    fireEvent.click(await screen.findByLabelText('Start new session in repo-b'))
+
+    await waitFor(() => {
+      const openCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/open'))
+      expect(JSON.parse(String(openCall?.[1]?.body))).toMatchObject({ path: projectB.path, touch_recent: false })
+      const resolveCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/sessions/resolve'))
+      expect(JSON.parse(String(resolveCall?.[1]?.body))).toMatchObject({
+        agent_type: 'coding',
+        policy: 'new',
+        project_path: projectB.path,
+      })
+    })
+    expect(await screen.findByTestId('session-session_project_new')).toBeInTheDocument()
+  })
+
+  it('keeps a manually selected project instead of syncing back to the focused session project', async () => {
+    const projectA = {
+      path: 'C:/repo-a',
+      name: 'repo-a',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const projectB = {
+      path: 'C:/repo-b',
+      name: 'repo-b',
+      git_branch: 'main',
+      last_opened: '2026-05-18T01:00:00Z',
+    }
+    const history = {
+      current_project_path: projectA.path,
+      projects: [
+        { ...projectA, is_current: true, has_running: false, sessions: [] },
+        { ...projectB, is_current: false, has_running: false, sessions: [] },
+      ],
+      standalone_sessions: [{
+        id: 'session_personal_main',
+        title: '',
+        project_path: projectA.path,
+        model_id: 'gpt-4o',
+        role_id: 'desktop-agent',
+        agent_type: 'personal',
+        message_count: 1,
+        updated_at: 1779116000,
+        is_primary: true,
+        is_running: false,
+        active_connections: 0,
+        activity_state: 'idle',
+      }],
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(projectA) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project: projectA, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/projects/open')) {
+        const body = JSON.parse(String(init?.body))
+        return Promise.resolve({ json: () => Promise.resolve(body.path === projectB.path ? projectB : projectA) }) as any
+      }
+      if (url.endsWith('/api/projects/tree')) {
+        return Promise.resolve({ json: () => Promise.resolve({ nodes: [] }) }) as any
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Workspace'))
+    fireEvent.click(await screen.findByLabelText('Open project repo-b'))
+
+    await waitFor(() => {
+      const openBodies = fetchMock.mock.calls
+        .filter(([url]) => String(url).endsWith('/api/projects/open'))
+        .map(([, init]) => JSON.parse(String((init as RequestInit | undefined)?.body)))
+      expect(openBodies).toEqual([{ path: projectB.path, touch_recent: false }])
+    })
   })
 
   it('handles project action menu through App handlers', async () => {
@@ -505,8 +741,8 @@ describe('App', () => {
 
     render(<App />)
     await screen.findByText('Desktop Agent')
-    fireEvent.click(screen.getByLabelText('Sessions'))
-    await screen.findByText('repo')
+    fireEvent.click(screen.getByLabelText('Workspace'))
+    await screen.findByLabelText('Project actions for repo')
 
     fireEvent.click(screen.getByLabelText('Project actions for repo'))
     fireEvent.click(await screen.findByText('在资源管理器中打开'))
@@ -522,26 +758,40 @@ describe('App', () => {
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: project.path, pinned: true })
     })
 
-    promptSpy.mockReturnValueOnce('Repo Alias')
     fireEvent.click(screen.getByLabelText('Project actions for repo'))
     fireEvent.click(await screen.findByText('重命名项目'))
+    const renameInput = await screen.findByLabelText('项目名称')
+    expect(renameInput).toHaveValue('repo')
+    fireEvent.change(renameInput, { target: { value: 'Repo Alias' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/projects/history/rename'))
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({ path: project.path, name: 'Repo Alias' })
     })
+    expect(promptSpy).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByLabelText('Project actions for repo'))
-    fireEvent.click(await screen.findByText('归档对话'))
+    fireEvent.click(await screen.findByText('归档项目'))
+    const archiveDialog = await screen.findByRole('dialog')
+    const archiveButtons = within(archiveDialog).getAllByRole('button')
+    fireEvent.click(archiveButtons[archiveButtons.length - 1])
     await waitFor(() => {
-      expect(confirmSpy).toHaveBeenCalled()
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/history/archive-sessions'))).toBe(true)
     })
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/close'))).toBe(true)
+    })
+    expect(confirmSpy).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByLabelText('Project actions for repo'))
     fireEvent.click(await screen.findByText('移除'))
+    const removeDialog = await screen.findByRole('dialog')
+    const removeButtons = within(removeDialog).getAllByRole('button')
+    fireEvent.click(removeButtons[removeButtons.length - 1])
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/history/remove'))).toBe(true)
     })
+    expect(confirmSpy).not.toHaveBeenCalled()
 
     promptSpy.mockReturnValueOnce('repo-worktree')
     fireEvent.click(screen.getByLabelText('Project actions for repo'))

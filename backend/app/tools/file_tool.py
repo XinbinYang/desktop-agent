@@ -4,7 +4,6 @@ import aiofiles
 from pathlib import Path
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
-from app.project_manager import ProjectManager
 from app.runtime_paths import agents_dir, workspace_root
 from app.security import is_relative_to, resolve_under_base
 
@@ -81,9 +80,19 @@ def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]
                 return Path(ctx.active_path).resolve(), None
         except Exception:
             pass
-        project = ProjectManager.get_current()
-        if project:
-            return Path(project["path"]).resolve(), None
+        # No coding run context (personal agent, or pre-run). Use the running
+        # session's bound project; effective_project_path() falls back to the
+        # global UI project for legacy / unbound sessions.
+        try:
+            from app.coding_runs import effective_project_path
+            bound = effective_project_path()
+        except Exception:
+            bound = ""
+        if bound:
+            try:
+                return Path(bound).resolve(), None
+            except (OSError, RuntimeError, ValueError):
+                pass
         return _PROJECT_ROOT, "No project is currently open. Use project_relative=false or open a project first via the sidebar."
     return _PROJECT_ROOT, None
 

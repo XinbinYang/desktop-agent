@@ -167,9 +167,7 @@ def _make_stream_mock(mock_response: dict):
 
 @pytest.fixture
 def temp_dir():
-    """Provide a temporary directory inside the project root for file tool tests"""
-    test_dir = BACKEND_ROOT / "tests" / "tmp"
-    test_dir.mkdir(parents=True, exist_ok=True)
+    """Provide a temporary directory outside the repo working tree."""
     import tempfile
-    with tempfile.TemporaryDirectory(dir=str(test_dir)) as d:
+    with tempfile.TemporaryDirectory() as d:
         yield Path(d)
