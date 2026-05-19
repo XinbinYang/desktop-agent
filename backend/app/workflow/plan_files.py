@@ -10,7 +10,7 @@ from typing import Optional
 
 from app.runtime_paths import runtime_dir
 
-from .models import PlanDraft, PlanTodo
+from .models import PlanDraft
 
 _PLANS_ROOT_NAME = "plans"
 
@@ -31,62 +31,82 @@ def _slug(text: str) -> str:
     return s[:64] or "plan"
 
 
-def _render_markdown(draft: PlanDraft, session_id: str) -> str:
+def _render_markdown(draft: PlanDraft, session_id: str, research_notes: str = "") -> str:
+    """Render a plan as the four-block Claude-Code-style template:
+    任务目标 / 任务方案 (PART 1..N) / 关键文件清单 / 验证.
+    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    hr = "\n".join(f"- {a}" for a in draft.assumptions) if draft.assumptions else "- _none_"
-    ac_lines = draft.acceptance_criteria or []
 
-    # Steps section
-    steps_text = "_no steps defined_"
-    if draft.steps:
-        steps_lines = []
-        for s in draft.steps:
-            deps = f" (depends: {', '.join(s.depends_on)})" if s.depends_on else ""
-            pg = f" [{s.parallel_group}]" if s.parallel_group else ""
-            details = f"\n  {s.details}" if s.details else ""
-            steps_lines.append(f"1. **{s.title}**{deps}{pg}{details}")
-        steps_text = "\n".join(steps_lines)
+    # ── 任务目标 / Goal: why + outcome, with assumptions/risks/research as light sub-notes ──
+    goal_block = (draft.context.strip() or draft.goal.strip() or "_no goal set_")
+    note_lines: list[str] = []
+    for a in draft.assumptions:
+        note_lines.append(f"> 假设 / Assumption: {a}")
+    for r in draft.risks:
+        note_lines.append(f"> 风险 / Risk: {r}")
+    rn = research_notes.strip()
+    if rn:
+        note_lines.append(f"> 调研 / Research: {rn}")
+    goal_section = goal_block + ("\n\n" + "\n".join(note_lines) if note_lines else "")
 
-    # Todos section
-    todos_text = "_no todos defined_"
+    # ── 任务方案 / Approach: each todo (or step) is a numbered PART ──
+    part_lines: list[str] = []
     if draft.todos:
-        todos_lines = []
-        for t in draft.todos:
-            deps = f" (depends: {', '.join(t.depends_on)})" if t.depends_on else ""
-            ac = f"  → *AC*: {t.acceptance_criteria}" if t.acceptance_criteria else ""
-            todos_lines.append(f"- [ ] **{t.title}**{deps}{ac}")
-        todos_text = "\n".join(todos_lines)
+        for i, todo in enumerate(draft.todos, 1):
+            deps = f" (depends: {', '.join(todo.depends_on)})" if todo.depends_on else ""
+            group = f" [{todo.parallel_group}]" if todo.parallel_group else ""
+            part_lines.append(f"### PART {i} — {todo.title}{deps}{group}")
+            if todo.acceptance_criteria:
+                part_lines.append(f"- 验收 / Acceptance: {todo.acceptance_criteria}")
+            part_lines.append("")
+    elif draft.steps:
+        for i, step in enumerate(draft.steps, 1):
+            deps = f" (depends: {', '.join(step.depends_on)})" if step.depends_on else ""
+            group = f" [{step.parallel_group}]" if step.parallel_group else ""
+            part_lines.append(f"### PART {i} — {step.title}{deps}{group}")
+            if step.details:
+                part_lines.append(f"- {step.details}")
+            part_lines.append("")
+    approach_section = "\n".join(part_lines).strip() or "_no tasks defined_"
 
-    risks_text = "\n".join(f"- {r}" for r in draft.risks) if draft.risks else "- _none_"
-    verify_text = "\n".join(f"- {v}" for v in ac_lines) if ac_lines else "- _see acceptance criteria_"
+    # ── 关键文件清单 / Critical Files ──
+    if draft.critical_files:
+        cf_lines = ["| 文件 / File | 改动 / Change |", "|---|---|"]
+        for cf in draft.critical_files:
+            path = str(cf.get("path", "")).strip()
+            if not path:
+                continue
+            change = str(cf.get("change", "")).strip() or "—"
+            cf_lines.append(f"| `{path}` | {change} |")
+        critical_section = "\n".join(cf_lines) if len(cf_lines) > 2 else "_探索阶段确认 / determined during exploration_"
+    else:
+        critical_section = "_探索阶段确认 / determined during exploration_"
+
+    # ── 验证 / Verification ──
+    verification = (
+        "\n".join(f"- {v}" for v in draft.acceptance_criteria)
+        if draft.acceptance_criteria
+        else "- _见各 PART 的验收标准 / see each PART's acceptance criteria_"
+    )
 
     return (
-        f"# Plan: {draft.goal or 'Untitled Plan'}\n"
-        f"\n"
-        f"**Session**: `{session_id}` · **Created**: {now}\n"
-        f"\n"
-        f"---\n"
-        f"\n"
-        f"## Goal\n"
-        f"{draft.goal or '_no goal set_'}\n"
-        f"\n"
-        f"## Assumptions\n"
-        f"{hr}\n"
-        f"\n"
-        f"## Research Notes\n"
-        f"_gathered during exploration_\n"
-        f"\n"
-        f"## Steps\n"
-        f"{steps_text}\n"
-        f"\n"
-        f"## Todos\n"
-        f"{todos_text}\n"
-        f"\n"
-        f"## Risks\n"
-        f"{risks_text}\n"
-        f"\n"
-        f"## Verification\n"
-        f"{verify_text}\n"
+        f"# {draft.goal or 'Untitled Plan'}\n"
+        "\n"
+        f"**Session**: `{session_id}` | **Created**: {now}\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## 任务目标 / Goal\n"
+        f"{goal_section}\n"
+        "\n"
+        "## 任务方案 / Approach\n"
+        f"{approach_section}\n"
+        "\n"
+        "## 关键文件清单 / Critical Files\n"
+        f"{critical_section}\n"
+        "\n"
+        "## 验证 / Verification\n"
+        f"{verification}\n"
     )
 
 
@@ -94,9 +114,11 @@ def write_plan_file(
     session_id: str,
     draft: PlanDraft,
     raw_markdown: str = "",
+    research_notes: str = "",
 ) -> Path:
     """Render *draft* to markdown, persist to a timestamped file, and return the path."""
-    md = raw_markdown if raw_markdown.strip() else _render_markdown(draft, session_id)
+    del raw_markdown  # Kept for API compatibility; user-visible plans are task-first.
+    md = _render_markdown(draft, session_id, research_notes=research_notes)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     slug = _slug(draft.goal or "plan")
     filename = f"{ts}-{slug}.md"
@@ -116,9 +138,9 @@ def read_plan_file(session_id: str, filename: str) -> str:
 @dataclass
 class PlanFileMeta:
     filename: str
-    path: str   # absolute path
+    path: str
     size_bytes: int
-    created_at: str  # ISO 8601
+    created_at: str
 
 
 def list_plan_files(session_id: str) -> list[PlanFileMeta]:

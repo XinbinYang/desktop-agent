@@ -1,11 +1,14 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import Editor from '@monaco-editor/react';
+import { useTheme } from '../../hooks/useTheme';
 import { getLangFromFilename } from '../../lib/language';
+import { ensureMonacoTheme, ensureMonacoThemes, getMonacoThemeName } from '../../lib/monacoTheme';
 
 interface CodeEditorProps {
   content: string;
   filename: string;
   isModified?: boolean;
+  readOnly?: boolean;
   onChange?: (value: string) => void;
   onSave?: (value: string) => void;
 }
@@ -18,74 +21,97 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   content,
   filename,
   isModified,
+  readOnly = false,
   onChange,
   onSave,
 }) => {
   const editorRef = useRef<any>(null);
+  const monacoRef = useRef<any>(null);
   const [hasChanged, setHasChanged] = useState(false);
   const currentValueRef = useRef(content);
+  const { resolved } = useTheme();
+  const monacoTheme = getMonacoThemeName(resolved);
 
   useEffect(() => {
     currentValueRef.current = content;
     setHasChanged(false);
   }, [content, filename]);
 
-  const handleEditorDidMount = useCallback((editor: any) => {
+  useEffect(() => {
+    if (monacoRef.current) {
+      ensureMonacoTheme(monacoRef.current, resolved);
+    }
+  }, [resolved]);
+
+  const handleEditorWillMount = useCallback((monaco: any) => {
+    monacoRef.current = monaco;
+    ensureMonacoThemes(monaco);
+  }, []);
+
+  const handleEditorDidMount = useCallback((editor: any, monaco: any) => {
     editorRef.current = editor;
-    
-    // 绑定 Ctrl+S / Cmd+S 保存快捷键
-    editor.addCommand((window as any).monaco?.KeyMod?.CtrlCmd | (window as any).monaco?.KeyCode?.KeyS, () => {
+    monacoRef.current = monaco;
+    ensureMonacoThemes(monaco);
+
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      if (readOnly) return;
       if (onSave && currentValueRef.current !== undefined) {
         onSave(currentValueRef.current);
         setHasChanged(false);
       }
     });
-  }, [onSave]);
+  }, [onSave, readOnly]);
 
   const handleChange = useCallback((value: string | undefined) => {
+    if (readOnly) return;
     if (value === undefined) return;
     currentValueRef.current = value;
     setHasChanged(true);
     onChange?.(value);
-  }, [onChange]);
+  }, [onChange, readOnly]);
 
-  const showModified = isModified || hasChanged;
+  const showModified = !readOnly && (isModified || hasChanged);
 
   return (
-    <div className="h-full flex flex-col bg-gray-950">
-      {/* Header */}
-      <div className="flex items-center justify-between bg-gray-800 px-3 py-1 text-[10px] text-gray-400 border-b border-gray-700 z-10 shrink-0">
+    <div className="h-full flex flex-col bg-app">
+      <div className="flex items-center justify-between bg-surface px-3 py-1 text-[10px] text-fg-secondary border-b border-border z-10 shrink-0">
         <div className="flex items-center gap-2">
           <span>{filename}</span>
+          {readOnly && (
+            <span className="rounded border border-border-subtle px-1.5 py-0.5 text-[10px] text-fg-muted">
+              Read-only
+            </span>
+          )}
           {showModified && (
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-400" title="已修改" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent" title="已修改" />
           )}
         </div>
         <div className="flex items-center gap-2">
           {showModified && (
             <button
               onClick={() => {
+                if (readOnly) return;
                 if (onSave && currentValueRef.current !== undefined) {
                   onSave(currentValueRef.current);
                   setHasChanged(false);
                 }
               }}
-              className="px-2 py-0.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-[10px] transition-colors"
+              className="px-2 py-0.5 bg-accent/85 hover:bg-accent text-fg-on-accent rounded text-[10px] transition-colors"
             >
               保存
             </button>
           )}
         </div>
       </div>
-      
-      {/* Editor */}
+
       <div className="flex-1 min-h-0">
         <Editor
           height="100%"
           language={getLang(filename)}
           value={content}
-          theme="vs-dark"
+          theme={monacoTheme}
           onChange={handleChange}
+          beforeMount={handleEditorWillMount}
           onMount={handleEditorDidMount}
           options={{
             fontSize: 13,
@@ -100,10 +126,10 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             renderWhitespace: 'selection',
             folding: true,
             bracketPairColorization: { enabled: true },
-            readOnly: false,
+            readOnly,
           }}
           loading={
-            <div className="h-full flex items-center justify-center text-gray-500 text-xs">
+            <div className="h-full flex items-center justify-center text-fg-muted text-xs">
               加载编辑器...
             </div>
           }

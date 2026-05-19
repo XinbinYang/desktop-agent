@@ -30,15 +30,15 @@ export class ErrorBoundary extends Component<Props, State> {
         return this.props.fallback;
       }
       return (
-        <div className="h-screen flex items-center justify-center bg-gray-900 text-gray-100">
+        <div className="h-screen flex items-center justify-center bg-app text-fg">
           <div className="text-center">
-            <h2 className="text-xl font-bold mb-2 text-red-400">出错了</h2>
-            <p className="text-sm text-gray-400 mb-4">
+            <h2 className="text-xl font-bold mb-2 text-danger">出错了</h2>
+            <p className="text-sm text-fg-secondary mb-4">
               {this.state.error?.message || '未知错误'}
             </p>
             <button
               onClick={() => this.setState({ hasError: false })}
-              className="px-4 py-2 bg-agent-600 hover:bg-agent-500 text-white rounded-lg text-sm"
+              className="px-4 py-2 bg-accent/85 hover:bg-accent text-fg-on-accent rounded-lg text-sm"
             >
               重试
             </button>

@@ -1,6 +1,7 @@
 ﻿# Desktop Agent 一键安装脚本
 # 双击 install.bat 即可安装；也可在 PowerShell 中直接运行 .\install.ps1。
 
+# NOTE: This script is for development/source mode. Customer installs should use the Windows installer.
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
@@ -32,7 +33,7 @@ function Run-Step {
 }
 
 Write-Host '=========================================' -ForegroundColor Cyan
-Write-Host '  Desktop Agent 一键安装' -ForegroundColor Cyan
+Write-Host '  Desktop Agent - Dev Dependency Install' -ForegroundColor Cyan
 Write-Host '=========================================' -ForegroundColor Cyan
 
 # ===== 前置检查 =====
@@ -106,7 +107,7 @@ if (Test-Path $configPath) {
 Write-Host "`n=========================================" -ForegroundColor Cyan
 if ($failures.Count -eq 0) {
     Write-Host '  ✅ 安装完成！' -ForegroundColor Green
-    Write-Host '  双击 start-all.bat 启动应用' -ForegroundColor Green
+    Write-Host '  开发模式可双击 start-all.bat 启动；客户交付请使用 Windows 安装器。' -ForegroundColor Green
 } else {
     Write-Host '  ⚠ 部分步骤失败:' -ForegroundColor Yellow
     foreach ($f in $failures) { Write-Host "    - $f" -ForegroundColor Yellow }

@@ -8,6 +8,103 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+DEFAULT_INTERRUPTED_TOOL_RESULT = (
+    "[ERROR] Tool call interrupted before returning a result. "
+    "The previous agent run was cancelled, disconnected, or superseded."
+)
+
+
+def _tool_call_name(tool_call: Dict[str, Any]) -> str:
+    function = tool_call.get("function") or {}
+    return str(function.get("name") or "")
+
+
+def _tool_call_ids(tool_calls: Any) -> List[str]:
+    if not isinstance(tool_calls, list):
+        return []
+    ids: List[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = str(tool_call.get("id") or "")
+        if tool_call_id and tool_call_id not in ids:
+            ids.append(tool_call_id)
+    return ids
+
+
+def repair_tool_call_messages(
+    messages: List[Dict[str, Any]],
+    missing_tool_content: str = DEFAULT_INTERRUPTED_TOOL_RESULT,
+) -> List[Dict[str, Any]]:
+    """Return a provider-safe copy with complete assistant/tool groupings.
+
+    OpenAI-compatible providers require every assistant message containing
+    tool_calls to be followed immediately by one tool message for each
+    tool_call_id. A run can be interrupted after the assistant tool_calls were
+    persisted but before tool results were appended, leaving history that the
+    next provider call rejects. This helper inserts synthetic interrupted tool
+    results for missing ids and drops orphan tool messages.
+    """
+    repaired: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role")
+
+        if role == "tool":
+            i += 1
+            continue
+
+        tool_calls = msg.get("tool_calls")
+        if role != "assistant" or not tool_calls:
+            repaired.append(dict(msg))
+            i += 1
+            continue
+
+        expected_ids = _tool_call_ids(tool_calls)
+        assistant_msg = dict(msg)
+        if not expected_ids:
+            assistant_msg.pop("tool_calls", None)
+            if str(assistant_msg.get("content") or "").strip() or str(assistant_msg.get("reasoning_content") or "").strip():
+                repaired.append(assistant_msg)
+            i += 1
+            while i < len(messages) and messages[i].get("role") == "tool":
+                i += 1
+            continue
+
+        repaired.append(assistant_msg)
+        i += 1
+
+        seen_ids: set[str] = set()
+        tool_messages_by_id: Dict[str, Dict[str, Any]] = {}
+        while i < len(messages) and messages[i].get("role") == "tool":
+            tool_msg = dict(messages[i])
+            tool_call_id = str(tool_msg.get("tool_call_id") or "")
+            if tool_call_id in expected_ids and tool_call_id not in seen_ids:
+                tool_messages_by_id[tool_call_id] = tool_msg
+                seen_ids.add(tool_call_id)
+            i += 1
+
+        calls_by_id = {
+            str(tool_call.get("id") or ""): tool_call
+            for tool_call in tool_calls
+            if isinstance(tool_call, dict) and tool_call.get("id")
+        }
+        for tool_call_id in expected_ids:
+            if tool_call_id in tool_messages_by_id:
+                repaired.append(tool_messages_by_id[tool_call_id])
+                continue
+            tool_call = calls_by_id.get(tool_call_id, {})
+            repaired.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": _tool_call_name(tool_call),
+                "content": missing_tool_content,
+            })
+
+    return repaired
+
+
 def trim_messages(
     messages: List[Dict[str, Any]],
     max_messages: int,
@@ -83,13 +180,43 @@ def trim_messages(
         groups.append([msg])
         i += 1
 
+    turns: List[List[Dict[str, Any]]] = []
+    current_turn: List[Dict[str, Any]] = []
+    current_checkpoint = object()
+
+    for group in groups:
+        first_msg = group[0] if group else {}
+        role = first_msg.get("role")
+        checkpoint = first_msg.get("checkpoint_id")
+
+        if role == "user":
+            starts_new_turn = (
+                current_turn
+                and any(m.get("role") == "user" for m in current_turn)
+                and (checkpoint is None or checkpoint != current_checkpoint)
+            )
+            if starts_new_turn:
+                turns.append(current_turn)
+                current_turn = []
+            current_turn.extend(group)
+            current_checkpoint = checkpoint
+            continue
+
+        if current_turn:
+            current_turn.extend(group)
+        else:
+            turns.append(group)
+
+    if current_turn:
+        turns.append(current_turn)
+
     selected: List[List[Dict[str, Any]]] = []
     count = 0
-    for group in reversed(groups):
-        if selected and count + len(group) > max_messages:
+    for turn in reversed(turns):
+        if selected and count + len(turn) > max_messages:
             break
-        selected.insert(0, group)
-        count += len(group)
+        selected.insert(0, turn)
+        count += len(turn)
 
     if has_system:
         return [system_msg] + [msg for group in selected for msg in group]
@@ -284,6 +411,7 @@ async def execute_tool(
             tool_call_id=tool_call_id,
             result_text=result.to_text(),
             duration_ms=duration_ms,
+            error=result.error or None,
             base64_image=result.base64_image,
             metadata=metadata,
         )
@@ -360,6 +488,7 @@ def resolve_mentions(user_text: str, project_path: str = "") -> str:
                     ["git", "status", "--short"],
                     cwd=project_path,
                     capture_output=True, text=True, timeout=10,
+                    encoding="utf-8", errors="replace",
                 )
                 if r.returncode == 0:
                     context_parts.append(f"## @git status\n```\n{r.stdout.strip()[:2000]}\n```")

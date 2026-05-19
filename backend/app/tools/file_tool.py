@@ -4,11 +4,11 @@ import aiofiles
 from pathlib import Path
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
-from app.project_manager import ProjectManager
-from app.security import resolve_under_base
+from app.runtime_paths import agents_dir, workspace_root
+from app.security import is_relative_to, resolve_under_base
 
 # File operations are sandboxed under the project root or current project directory
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_PROJECT_ROOT = workspace_root()
 DIFF_TEXT_LIMIT = 1_000_000
 
 
@@ -73,19 +73,73 @@ def build_file_edit_metadata(path: Path, old_content: str, new_content: str, exi
 def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]:
     """Return (base_path, error_message). When error_message is set, base_path is the fallback."""
     if project_relative:
-        project = ProjectManager.get_current()
-        if project:
-            return Path(project["path"]).resolve(), None
+        try:
+            from app.coding_runs import get_run_context
+            ctx = get_run_context()
+            if ctx and ctx.active_path:
+                return Path(ctx.active_path).resolve(), None
+        except Exception:
+            pass
+        # No coding run context (personal agent, or pre-run). Use the running
+        # session's bound project; effective_project_path() falls back to the
+        # global UI project for legacy / unbound sessions.
+        try:
+            from app.coding_runs import effective_project_path
+            bound = effective_project_path()
+        except Exception:
+            bound = ""
+        if bound:
+            try:
+                return Path(bound).resolve(), None
+            except (OSError, RuntimeError, ValueError):
+                pass
         return _PROJECT_ROOT, "No project is currently open. Use project_relative=false or open a project first via the sidebar."
     return _PROJECT_ROOT, None
+
+
+def _resolve_agent_workspace_path(path: str) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve AGENTS/* paths to the mutable runtime Agent workspace."""
+    try:
+        raw = Path(path)
+        root = agents_dir().resolve()
+        if raw.is_absolute():
+            resolved = raw.resolve()
+            if is_relative_to(resolved, root):
+                return resolved, None
+            return None, None
+
+        parts = raw.parts
+        if not parts or parts[0].lower() != "agents":
+            return None, None
+        rel = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+        resolved, err = resolve_under_base(str(rel), root, allow_relative=True)
+        if err:
+            return resolved, err
+        return resolved, None
+    except (OSError, ValueError) as e:
+        return Path(path), f"Invalid path: {path} ({e})"
 
 
 def _validate_path(path: str, project_relative: bool = False) -> tuple[Path, Optional[str]]:
     """Validate that a path is within the sandbox. Returns (resolved_path, error_message)."""
     from app.config import load_config
+
+    if not project_relative:
+        agent_path, agent_err = _resolve_agent_workspace_path(path)
+        if agent_path is not None or agent_err:
+            return agent_path or Path(path), agent_err
+
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
-            return Path(path).resolve(), None
+            candidate = Path(path)
+            if candidate.is_absolute():
+                return candidate.resolve(), None
+            if project_relative:
+                base, base_err = _get_base_path(project_relative=True)
+                if base_err:
+                    return base, base_err
+                return (base / candidate).resolve(), None
+            return (_PROJECT_ROOT / candidate).resolve(), None
         except (OSError, ValueError) as e:
             return Path(path), f"Invalid path: {path} ({e})"
     base, base_err = _get_base_path(project_relative)
@@ -112,7 +166,18 @@ class FileReadTool(BaseTool):
         "required": ["path"]
     }
 
-    async def execute(self, path: str, offset: int = 0, limit: int = 200, project_relative: bool = False) -> ToolResult:
+    async def execute(
+        self,
+        path: str = "",
+        offset: int = 0,
+        limit: int = 200,
+        project_relative: bool = False,
+        file_path: str = "",
+    ) -> ToolResult:
+        if not path:
+            path = file_path
+        if not path:
+            return ToolResult(error="Missing required argument: path")
         p, err = _validate_path(path, project_relative)
         if err:
             return ToolResult(error=err)

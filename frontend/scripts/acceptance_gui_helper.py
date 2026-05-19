@@ -63,6 +63,23 @@ def matching_process_ids(exe_path: Path) -> list[int]:
     return sorted(matches)
 
 
+def check_icon_resource(target: Path, key: str, report: dict[str, Any]) -> None:
+    large_icons: list[int] = []
+    small_icons: list[int] = []
+    try:
+        large_icons, small_icons = win32gui.ExtractIconEx(str(target), 0)
+        icon_count = len(large_icons) + len(small_icons)
+        report["checks"][f"{key}_icon_count"] = icon_count
+        if icon_count <= 0:
+            raise AcceptanceError(f"No icon resource could be extracted from {target}")
+    finally:
+        for icon_handle in [*large_icons, *small_icons]:
+            try:
+                win32gui.DestroyIcon(icon_handle)
+            except Exception:
+                pass
+
+
 def wait_for_health(base_url: str, user_data_dir: Path, timeout_seconds: int) -> tuple[str, dict[str, Any]]:
     deadline = time.monotonic() + timeout_seconds
     last_error = "backend did not respond"
@@ -118,12 +135,26 @@ async def check_websocket(ws_url: str, token: str, report: dict[str, Any]) -> No
     if not no_token_failed:
         raise AcceptanceError("Expected unauthenticated WebSocket connection to fail")
 
-    async with websockets.connect(f"{ws_url}/ws/gui-acceptance?token={token}", open_timeout=5) as ws:
+    async with websockets.connect(
+        f"{ws_url}/ws/gui-acceptance?token={token}",
+        open_timeout=5,
+        origin="file://",
+    ) as ws:
         await ws.send(json.dumps({"type": "clear"}))
-        message = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-        report["checks"]["ws_clear_response"] = message.get("type")
-        if message.get("type") != "cleared":
-            raise AcceptanceError(f"Expected WebSocket clear response, got {message}")
+        seen_types: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 10
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise AcceptanceError(f"Timed out waiting for WebSocket cleared response; saw {seen_types}")
+            message = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+            message_type = message.get("type")
+            if isinstance(message_type, str):
+                seen_types.append(message_type)
+            if message_type == "cleared":
+                report["checks"]["ws_clear_response"] = message_type
+                report["checks"]["ws_events_before_clear"] = seen_types
+                return
 
 
 def check_project_file_api(base_url: str, token: str, report: dict[str, Any]) -> None:
@@ -266,6 +297,7 @@ def capture_window(window: dict[str, Any], screenshot_path: Path) -> dict[str, A
 def run(args: argparse.Namespace) -> dict[str, Any]:
     exe_path = Path(args.exe).resolve()
     backend_exe = Path(args.backend_exe).resolve()
+    installer_path = Path(args.installer).resolve()
     user_data_dir = Path(args.user_data_dir).resolve()
     screenshot_path = Path(args.screenshot).resolve()
 
@@ -275,10 +307,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "release_dir": str(Path(args.release_dir).resolve()),
         "electron_exe": str(exe_path),
         "backend_exe": str(backend_exe),
+        "installer": str(installer_path),
         "user_data_dir": str(user_data_dir),
         "checks": {},
         "artifacts": {"screenshot": str(screenshot_path)},
     }
+
+    if not installer_path.exists():
+        raise AcceptanceError(f"Packaged installer is missing: {installer_path}")
+    check_icon_resource(exe_path, "electron_exe", report)
+    check_icon_resource(installer_path, "installer", report)
 
     token, health = wait_for_health(args.base_url, user_data_dir, args.timeout_seconds)
     report["checks"]["health_status"] = health.get("status")
@@ -306,6 +344,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release-dir", required=True)
     parser.add_argument("--exe", required=True)
     parser.add_argument("--backend-exe", required=True)
+    parser.add_argument("--installer", required=True)
     parser.add_argument("--user-data-dir", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--screenshot", required=True)

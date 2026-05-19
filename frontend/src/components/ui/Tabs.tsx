@@ -27,7 +27,7 @@ export const Tabs: React.FC<TabsProps> = ({
           type="button"
           onClick={() => onTabChange(tab.id)}
           className={cn(
-            'flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wider transition-colors',
+            'flex-1 px-3 py-2 text-xs font-medium transition-colors',
             activeTab === tab.id
               ? 'bg-surface text-fg'
               : 'text-fg-muted hover:text-fg-secondary'

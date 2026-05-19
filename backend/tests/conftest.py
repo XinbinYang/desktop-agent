@@ -1,6 +1,8 @@
 import pytest
 import pytest_asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 BACKEND_ROOT = Path(__file__).parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
+
+TEST_USER_DATA_DIR = Path(tempfile.gettempdir()) / "desktop-agent-pytest-user-data"
+os.environ.setdefault("DESKTOP_AGENT_USER_DATA_DIR", str(TEST_USER_DATA_DIR))
 
 from fastapi.testclient import TestClient
 from httpx import AsyncClient, ASGITransport
@@ -102,7 +107,7 @@ def reset_config_cache(monkeypatch, tmp_path):
 def reset_local_auth(monkeypatch):
     """Local API auth is opt-in per test."""
     monkeypatch.delenv("DESKTOP_AGENT_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("DESKTOP_AGENT_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("DESKTOP_AGENT_USER_DATA_DIR", str(TEST_USER_DATA_DIR))
 
 
 @pytest.fixture(autouse=True)
@@ -143,11 +148,26 @@ def isolate_projects(tmp_path, monkeypatch):
     CredentialManager._credentials_cache = None
 
 
+def _make_stream_mock(mock_response: dict):
+    """Create an async generator callable to replace chat_completion_stream in tests.
+
+    Converts legacy non-streaming mock_response dicts into a streaming-compatible
+    replacement. Yields text_delta events for content (split into a few chunks),
+    then a 'done' event wrapping the full response.
+    """
+    async def _stream(*args, **kwargs):
+        msg = mock_response.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content", "")
+        if content:
+            chunk_size = max(1, len(content) // 4)
+            for i in range(0, len(content), chunk_size):
+                yield {"type": "text_delta", "text": content[i:i + chunk_size]}
+        yield {"type": "done", "response": mock_response}
+    return _stream
+
 @pytest.fixture
 def temp_dir():
-    """Provide a temporary directory inside the project root for file tool tests"""
-    test_dir = BACKEND_ROOT / "tests" / "tmp"
-    test_dir.mkdir(parents=True, exist_ok=True)
+    """Provide a temporary directory outside the repo working tree."""
     import tempfile
-    with tempfile.TemporaryDirectory(dir=str(test_dir)) as d:
+    with tempfile.TemporaryDirectory() as d:
         yield Path(d)

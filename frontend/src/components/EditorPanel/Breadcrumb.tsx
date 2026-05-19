@@ -8,7 +8,7 @@ interface BreadcrumbProps {
 export const Breadcrumb: React.FC<BreadcrumbProps> = ({ projectName, filePath }) => {
   if (!filePath) {
     return (
-      <div className="h-7 bg-gray-800 border-b border-gray-700 flex items-center px-3 text-[11px] text-gray-500">
+      <div className="h-7 bg-surface border-b border-border flex items-center px-3 text-[11px] text-fg-muted">
         <span>{projectName}</span>
       </div>
     );
@@ -17,13 +17,13 @@ export const Breadcrumb: React.FC<BreadcrumbProps> = ({ projectName, filePath })
   const parts = filePath.split('/');
 
   return (
-    <div className="h-7 bg-gray-800 border-b border-gray-700 flex items-center px-3 text-[11px] text-gray-400 overflow-hidden">
-      <span className="text-gray-300 font-medium shrink-0">{projectName}</span>
+    <div className="h-7 bg-surface border-b border-border flex items-center px-3 text-[11px] text-fg-secondary overflow-hidden">
+      <span className="text-fg-secondary font-medium shrink-0">{projectName}</span>
       {parts.map((part, idx) => (
         <React.Fragment key={idx}>
-          <span className="mx-1.5 text-gray-600 shrink-0">/</span>
+          <span className="mx-1.5 text-fg-muted shrink-0">/</span>
           <span
-            className={`shrink-0 ${idx === parts.length - 1 ? 'text-gray-200 font-medium' : ''}`}
+            className={`shrink-0 ${idx === parts.length - 1 ? 'text-fg font-medium' : ''}`}
             title={part}
           >
             {part}

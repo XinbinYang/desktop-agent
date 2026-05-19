@@ -1,8 +1,70 @@
 import asyncio
 import os
+import re
 import shutil
 from typing import Optional
 from app.tools.base import BaseTool, ToolResult
+
+# 危险命令检测（模块级共享，供所有 shell 工具使用）
+_DANGEROUS_COMMAND_PATTERNS = [
+    r"rm\s+-rf\s+[/~]",
+    r"del\s+/[fq]",
+    r"format\s+",
+    r"dd\s+if=",
+    r">\s*/dev/sda",
+    r"mkfs\.",
+    r":\(\)\{\s*:\|:&\s*\};:",  # fork bomb
+    r"shutdown\s+-[hrt]",
+    r"rd\s+/s\s+/q",
+    r"git\s+push\s+(--force|-f)\b",
+    r"git\s+push\s+.*\s+(--force|-f)\b",
+    r"git\s+reset\s+--hard\b",
+    r"git\s+checkout\s+\.\s*$",
+    r"git\s+checkout\s+--\s+\.",
+    r"git\s+clean\s+-[fdx]+",
+    r"git\s+branch\s+-[dD]\b",
+]
+_DANGEROUS_COMMAND_LITERALS = [
+    "rm -rf /", "rm -rf ~", "rm -rf /*",
+    "del /q /s /f c:\\", "format c:",
+    "> /dev/sda", "dd if=/dev/zero of=/dev/sda",
+    "git push --force", "git push -f",
+    "git reset --hard",
+    "git clean -fd", "git clean -fdx",
+    "git branch -D",
+]
+
+
+def _is_dangerous_command(cmd: str) -> bool:
+    """检查 shell 命令是否匹配已知的不可逆/危险模式"""
+    lower = cmd.lower()
+    if any(p.lower() in lower for p in _DANGEROUS_COMMAND_LITERALS):
+        return True
+    for pattern in _DANGEROUS_COMMAND_PATTERNS:
+        if re.search(pattern, lower):
+            return True
+    return False
+
+
+def _default_work_dir() -> str:
+    try:
+        from app.coding_runs import get_run_context
+        ctx = get_run_context()
+        if ctx and ctx.active_path:
+            return ctx.active_path
+    except Exception:
+        pass
+
+    try:
+        from app.coding_runs import effective_project_path
+        bound = effective_project_path()
+        if bound:
+            return bound
+    except Exception:
+        pass
+
+    return os.getcwd()
+
 
 class ShellExecuteTool(BaseTool):
     name = "shell_execute"
@@ -19,51 +81,12 @@ class ShellExecuteTool(BaseTool):
         },
         "required": ["command"]
     }
-    
-    # 危险命令关键字（正则模式 + 固定字符串）
-    DANGEROUS_PATTERNS = [
-        r"rm\s+-rf\s+[/~]",
-        r"del\s+/[fq]",
-        r"format\s+",
-        r"dd\s+if=",
-        r">\s*/dev/sda",
-        r"mkfs\.",
-        r":\(\)\{\s*:\|:&\s*\};:",  # fork bomb
-        r"shutdown\s+-[hrt]",
-        r"rd\s+/s\s+/q",
-        r"git\s+push\s+(--force|-f)\b",
-        r"git\s+push\s+.*\s+(--force|-f)\b",
-        r"git\s+reset\s+--hard\b",
-        r"git\s+checkout\s+\.\s*$",
-        r"git\s+checkout\s+--\s+\.",
-        r"git\s+clean\s+-[fdx]+",
-        r"git\s+branch\s+-[dD]\b",
-    ]
-    DANGEROUS_LITERALS = [
-        "rm -rf /", "rm -rf ~", "rm -rf /*",
-        "del /q /s /f c:\\", "format c:",
-        "> /dev/sda", "dd if=/dev/zero of=/dev/sda",
-        "git push --force", "git push -f",
-        "git reset --hard",
-        "git clean -fd", "git clean -fdx",
-        "git branch -D",
-    ]
 
-    def _is_dangerous(self, cmd: str) -> bool:
-        import re
-        lower = cmd.lower()
-        if any(p.lower() in lower for p in self.DANGEROUS_LITERALS):
-            return True
-        for pattern in self.DANGEROUS_PATTERNS:
-            if re.search(pattern, lower):
-                return True
-        return False
-    
     async def execute(self, command: str, cwd: str = "", timeout: int = 60) -> ToolResult:
-        if self._is_dangerous(command):
+        if _is_dangerous_command(command):
             return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
         
-        work_dir = cwd if cwd else os.getcwd()
+        work_dir = cwd if cwd else _default_work_dir()
         
         # 根据系统选择 shell
         if os.name == "nt":
@@ -114,7 +137,9 @@ class ShellStartTool(BaseTool):
     }
     
     async def execute(self, command: str, cwd: str = "") -> ToolResult:
-        work_dir = cwd if cwd else os.getcwd()
+        if _is_dangerous_command(command):
+            return ToolResult(error=f"不可逆操作需用户确认: {command}。请在确认后重试，或让用户手动执行此命令。")
+        work_dir = cwd if cwd else _default_work_dir()
         try:
             if os.name == "nt":
                 subprocess = await asyncio.create_subprocess_shell(

@@ -59,7 +59,15 @@
     "send": "发送",
     "stop": "停止",
     "regenerate": "重新生成",
-    "scrollToBottom": "滚动到底部"
+    "scrollToBottom": "滚动到底部",
+    "empty": {
+      "ready": "准备好了",
+      "projectReady": "{{projectName}} 已就绪",
+      "personalAgent": "Personal Agent",
+      "codingAgent": "Coding Agent",
+      "agentMode": "Agent",
+      "planMode": "Plan"
+    }
   },
   "terminal": {
     "title": "执行日志",
@@ -113,6 +121,26 @@
     "cancel": "取消",
     "newRole": "新建自定义角色",
     "noRoles": "暂无自定义角色"
+  },
+  "connections": {
+    "title": "平台连接",
+    "addConnection": "添加连接",
+    "noConnections": "暂无连接的平台",
+    "start": "启动",
+    "stop": "停止",
+    "running": "运行中",
+    "stopped": "已停止",
+    "error": "错误",
+    "botToken": "Bot Token",
+    "discord": "Discord",
+    "discordDesc": "通过 Discord Bot 远程与 Agent 对话，支持 DM 和 @提及触发。",
+    "feishu": "飞书",
+    "feishuDesc": "通过飞书 Bot 远程与 Agent 对话，支持单聊和群聊 @提及（WebSocket 模式）。",
+    "save": "保存",
+    "cancel": "取消",
+    "remove": "移除",
+    "confirmRemove": "确定要移除此连接配置吗？",
+    "configCredentials": "配置凭据"
   },
   "errors": {
     "title": "出错了",

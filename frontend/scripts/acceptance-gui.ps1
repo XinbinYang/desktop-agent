@@ -69,16 +69,74 @@ function Stop-MatchingProcesses {
     }
 }
 
+function Test-IsDesktopAgentProcess {
+    param($Process)
+
+    $name = $Process.ProcessName
+    if ($name -in @("Desktop Agent", "desktop-agent-backend")) {
+        return $true
+    }
+
+    try {
+        return $Process.Path -like "*\Desktop Agent\*"
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DesktopAgentPortOwners {
+    param([int]$Port)
+
+    $connections = @(Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    $connections |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        ForEach-Object {
+            Get-Process -Id $_ -ErrorAction SilentlyContinue
+        }
+}
+
+function Stop-DesktopAgentPortOwners {
+    param([int]$Port)
+
+    $owners = @(Get-DesktopAgentPortOwners -Port $Port)
+    if ($owners.Count -eq 0) {
+        return
+    }
+
+    $nonAgentOwners = @($owners | Where-Object { !(Test-IsDesktopAgentProcess -Process $_) })
+    if ($nonAgentOwners.Count -gt 0) {
+        $details = ($nonAgentOwners | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ", "
+        throw "Port $Port is already in use by a non-Desktop-Agent process ($details). Stop that process before running GUI acceptance."
+    }
+
+    if (!$ForceStop) {
+        $details = ($owners | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ", "
+        throw "Port $Port is already in use by Desktop Agent ($details). Re-run with -ForceStop to stop Desktop Agent-owned processes for acceptance."
+    }
+
+    foreach ($proc in $owners) {
+        Write-Host "[acceptance-gui] Stopping port $Port owner $($proc.ProcessName) PID $($proc.Id)"
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+}
+
 $ResolvedReleaseDir = Resolve-ReleaseDir -Candidate $ReleaseDir
 $WinUnpackedDir = Join-Path $ResolvedReleaseDir "win-unpacked"
 $ExePath = Join-Path $WinUnpackedDir "Desktop Agent.exe"
 $BackendExePath = Join-Path $WinUnpackedDir "resources\backend\desktop-agent-backend.exe"
+$PackageJson = Get-Content -LiteralPath (Join-Path $FrontendDir "package.json") -Raw | ConvertFrom-Json
+$InstallerPath = Join-Path $ResolvedReleaseDir ("Desktop-Agent-Setup-{0}.exe" -f $PackageJson.version)
 
 if (!(Test-Path $ExePath)) {
     throw "Packaged Desktop Agent executable is missing: $ExePath"
 }
 if (!(Test-Path $BackendExePath)) {
     throw "Packaged backend executable is missing: $BackendExePath. Run npm run build:backend before packaging."
+}
+if (!(Test-Path $InstallerPath)) {
+    throw "Packaged Desktop Agent installer is missing: $InstallerPath"
 }
 if (!(Test-Path $HelperPath)) {
     throw "Acceptance helper is missing: $HelperPath"
@@ -93,6 +151,7 @@ if ($existing.Count -gt 0) {
     }
     Stop-MatchingProcesses -Paths $targetPaths
 }
+Stop-DesktopAgentPortOwners -Port 8765
 
 New-Item -ItemType Directory -Force -Path $AcceptanceDir | Out-Null
 $FreshUserData = Join-Path $env:TEMP ("desktop-agent-acceptance-userdata-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
@@ -103,7 +162,10 @@ Write-Host "[acceptance-gui] User data: $FreshUserData"
 Write-Host "[acceptance-gui] Starting packaged GUI"
 
 $started = $null
+$PreviousUserDataEnv = $env:DESKTOP_AGENT_USER_DATA_DIR
 try {
+    $env:DESKTOP_AGENT_USER_DATA_DIR = $FreshUserData
+
     $started = Start-Process `
         -FilePath $ExePath `
         -WorkingDirectory $WinUnpackedDir `
@@ -116,6 +178,7 @@ try {
         --release-dir $ResolvedReleaseDir `
         --exe $ExePath `
         --backend-exe $BackendExePath `
+        --installer $InstallerPath `
         --user-data-dir $FreshUserData `
         --report $ReportPath `
         --screenshot $ScreenshotPath `
@@ -131,6 +194,13 @@ try {
     Write-Host "[acceptance-gui] Screenshot: $ScreenshotPath"
 }
 finally {
+    if ($null -eq $PreviousUserDataEnv) {
+        Remove-Item Env:DESKTOP_AGENT_USER_DATA_DIR -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:DESKTOP_AGENT_USER_DATA_DIR = $PreviousUserDataEnv
+    }
+
     Stop-MatchingProcesses -Paths $targetPaths
     if (!$KeepUserData -and (Test-Path $FreshUserData)) {
         Remove-Item -LiteralPath $FreshUserData -Recurse -Force -ErrorAction SilentlyContinue

@@ -8,6 +8,20 @@ global.ResizeObserver = class MockResizeObserver {
   disconnect() {}
 } as any
 
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  }),
+})
+
 // Mock WebSocket for tests
 global.WebSocket = class MockWebSocket {
   static CONNECTING = 0

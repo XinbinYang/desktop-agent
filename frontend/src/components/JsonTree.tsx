@@ -10,8 +10,8 @@ const PRIMITIVE_COLORS: Record<string, string> = {
   string: 'text-green-400',
   number: 'text-yellow-400',
   boolean: 'text-purple-400',
-  null: 'text-gray-500',
-  undefined: 'text-gray-500',
+  null: 'text-fg-muted',
+  undefined: 'text-fg-muted',
 };
 
 function getType(value: any): string {
@@ -22,7 +22,7 @@ function getType(value: any): string {
 
 function PrimitiveView({ value }: { value: any }) {
   const type = getType(value);
-  const color = PRIMITIVE_COLORS[type] || 'text-gray-300';
+  const color = PRIMITIVE_COLORS[type] || 'text-fg-secondary';
   let display = String(value);
   if (type === 'string') display = `"${display}"`;
   if (type === 'null' || type === 'undefined') display = String(value);
@@ -45,9 +45,9 @@ export const JsonTree: React.FC<JsonTreeProps> = ({ data, level = 0 }) => {
   const closeBrace = isArray ? ']' : '}';
 
   return (
-    <span className="text-gray-300">
+    <span className="text-fg-secondary">
       {isEmpty ? (
-        <span className="text-gray-500">
+        <span className="text-fg-muted">
           {openBrace}
           {closeBrace}
         </span>
@@ -55,31 +55,31 @@ export const JsonTree: React.FC<JsonTreeProps> = ({ data, level = 0 }) => {
         <>
           <button
             onClick={() => setExpanded((v) => !v)}
-            className="inline-flex items-center hover:text-white transition-colors"
+            className="inline-flex items-center hover:text-fg transition-colors"
             aria-label={expanded ? '折叠' : '展开'}
           >
             {expanded ? (
-              <ChevronDown className="w-3 h-3 mr-0.5 text-gray-500" />
+              <ChevronDown className="w-3 h-3 mr-0.5 text-fg-muted" />
             ) : (
-              <ChevronRight className="w-3 h-3 mr-0.5 text-gray-500" />
+              <ChevronRight className="w-3 h-3 mr-0.5 text-fg-muted" />
             )}
-            <span className="text-gray-500">{openBrace}</span>
+            <span className="text-fg-muted">{openBrace}</span>
             {!expanded && (
-              <span className="text-gray-500 ml-1">...{closeBrace}</span>
+              <span className="text-fg-muted ml-1">...{closeBrace}</span>
             )}
           </button>
           {expanded && (
-            <div className="pl-3 border-l border-gray-700/50 ml-1">
+            <div className="pl-3 border-l border-border-subtle/50 ml-1">
               {keys.map((key, i) => (
                 <div key={key} className="my-0.5">
                   {!isArray && (
                     <span className="text-blue-400 mr-1.5">{key}:</span>
                   )}
                   <JsonTree data={data[key]} level={level + 1} />
-                  {i < keys.length - 1 && <span className="text-gray-600">,</span>}
+                  {i < keys.length - 1 && <span className="text-fg-muted">,</span>}
                 </div>
               ))}
-              <span className="text-gray-500">{closeBrace}</span>
+              <span className="text-fg-muted">{closeBrace}</span>
             </div>
           )}
         </>

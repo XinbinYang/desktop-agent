@@ -1,31 +1,37 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { FolderOpen, FolderX, GitBranch, GitCommit, Plus, X, FileText, Save, Loader } from 'lucide-react';
+import { FolderOpen, FolderX, GitBranch, Plus, FileText, Save, Loader, RefreshCw } from 'lucide-react';
 import { ProjectInfo, FileNode } from '../types';
-import { FileTree } from './FileTree';
+import { FileTree, type FileTreeAction } from './FileTree';
 import { API_BASE, withAuthQuery } from '../config';
 
 interface ProjectPanelProps {
   currentProject: ProjectInfo | null;
   fileTree: FileNode[];
   expandedPaths: Set<string>;
+  loadingPaths?: Set<string>;
   onTogglePath: (path: string) => void;
   onSelectFile: (path: string, type: 'file' | 'dir') => void;
+  onFileAction?: (action: FileTreeAction, node: FileNode) => void;
   onOpenFolder: () => void;
   onOpenModal: () => void;
   onCloseProject: () => void;
-  onRefreshTree: () => void;
+  onRefreshTree: () => void | Promise<void>;
+  isRefreshing?: boolean;
 }
 
 export const ProjectPanel: React.FC<ProjectPanelProps> = ({
   currentProject,
   fileTree,
   expandedPaths,
+  loadingPaths = new Set(),
   onTogglePath,
   onSelectFile,
+  onFileAction,
   onOpenFolder,
   onOpenModal,
   onCloseProject,
   onRefreshTree,
+  isRefreshing = false,
 }) => {
   const [showRules, setShowRules] = useState(false);
   const [rulesContent, setRulesContent] = useState('');
@@ -72,6 +78,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
           没有打开的项目
         </div>
         <button
+          type="button"
           onClick={onOpenFolder}
           className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors"
         >
@@ -79,6 +86,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
           打开文件夹
         </button>
         <button
+          type="button"
           onClick={onOpenModal}
           className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-surface-alt text-fg-secondary hover:bg-surface-hover transition-colors"
         >
@@ -91,19 +99,32 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
 
   return (
     <div className="flex flex-col h-full space-y-3">
-      {/* 项目信息卡片 */}
       <div className="bg-surface-alt/50 rounded p-2.5 space-y-1.5">
         <div className="flex items-center justify-between">
-          <div className="text-xs font-medium text-white truncate flex-1" title={currentProject.name}>
+          <div className="text-xs font-medium text-fg truncate flex-1" title={currentProject.name}>
             {currentProject.name}
           </div>
-          <button
-            onClick={onCloseProject}
-            className="text-fg-muted hover:text-red-400 ml-1 shrink-0"
-            title="关闭项目"
-          >
-            <FolderX className="w-3 h-3" />
-          </button>
+          <div className="flex items-center gap-1 ml-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => { void onRefreshTree(); }}
+              disabled={isRefreshing}
+              className="text-fg-muted hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
+              title="刷新项目文件"
+              aria-label="刷新项目文件"
+            >
+              <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={onCloseProject}
+              className="text-fg-muted hover:text-danger"
+              title="关闭项目"
+              aria-label="关闭项目"
+            >
+              <FolderX className="w-3 h-3" />
+            </button>
+          </div>
         </div>
         <div className="text-[10px] text-fg-muted truncate" title={currentProject.path}>
           {currentProject.path}
@@ -128,9 +149,9 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
         )}
       </div>
 
-      {/* 操作按钮 */}
       <div className="flex gap-1">
         <button
+          type="button"
           onClick={onOpenFolder}
           className="flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] bg-surface-alt text-fg-secondary hover:bg-surface-hover transition-colors"
         >
@@ -138,23 +159,17 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
           打开
         </button>
         <button
+          type="button"
           onClick={onOpenModal}
           className="flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] bg-surface-alt text-fg-secondary hover:bg-surface-hover transition-colors"
         >
           <Plus className="w-3 h-3" />
           新建
         </button>
-        <button
-          onClick={onRefreshTree}
-          className="px-2 py-1 rounded text-[10px] bg-surface-alt text-fg-secondary hover:bg-surface-hover transition-colors"
-          title="刷新"
-        >
-          <GitCommit className="w-3 h-3" />
-        </button>
       </div>
 
-      {/* 规则文件按钮 */}
       <button
+        type="button"
         onClick={() => { setShowRules(!showRules); setRulesLoaded(false); }}
         className={`w-full flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] transition-colors ${
           showRules ? 'bg-accent/10 text-accent' : 'bg-surface-alt text-fg-secondary hover:bg-surface-hover'
@@ -165,11 +180,10 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
         {showRules ? '隐藏规则' : '编辑规则'}
       </button>
 
-      {/* 规则编辑器 */}
       {showRules && (
         <div className="space-y-2 border-t border-border pt-2">
           <div className="text-[10px] text-fg-muted">
-            项目规则（.desktop-agent.md）— 类似 CLAUDE.md，Agent 会自动读取并遵守
+            项目规则（.desktop-agent.md）会被 Agent 自动读取并遵守
           </div>
           <textarea
             value={rulesContent}
@@ -179,6 +193,7 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
             spellCheck={false}
           />
           <button
+            type="button"
             onClick={saveRules}
             disabled={saving}
             className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors disabled:opacity-50"
@@ -189,14 +204,15 @@ export const ProjectPanel: React.FC<ProjectPanelProps> = ({
         </div>
       )}
 
-      {/* 文件树 */}
-      <div className="text-xs text-fg-muted uppercase tracking-wider">文件</div>
+      <div className="text-xs font-medium text-fg-muted">文件</div>
       <div className="flex-1 overflow-y-auto min-h-0">
         <FileTree
           nodes={fileTree}
           onSelect={onSelectFile}
           expandedPaths={expandedPaths}
           onToggle={onTogglePath}
+          loadingPaths={loadingPaths}
+          onAction={onFileAction}
         />
       </div>
     </div>

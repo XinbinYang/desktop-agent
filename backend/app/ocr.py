@@ -168,6 +168,7 @@ def _ocr_tesseract(image_bytes: bytes, language: str = "chi_sim+eng") -> List[OC
             subprocess.run(
                 [tesseract_bin, img_path, out_base, "-l", language, "--psm", "6", "tsv"],
                 capture_output=True, text=True, timeout=15, check=True,
+                encoding="utf-8", errors="replace",
             )
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
             logger.debug("Tesseract execution failed")

@@ -4,7 +4,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from app.tools.base import BaseTool, ToolResult
-from app.project_manager import ProjectManager
 from app.credential_manager import CredentialManager
 from app.security import redact_sensitive_text
 
@@ -19,7 +18,9 @@ def _run_git(args: List[str], cwd: Optional[str] = None, env: Optional[Dict[str,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=env
+            env=env,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.returncode, redact_sensitive_text(result.stdout), redact_sensitive_text(result.stderr)
     except subprocess.TimeoutExpired:
@@ -61,9 +62,20 @@ def _auth_env_for_remote(remote_url: str) -> Dict[str, str]:
 
 def _get_project_cwd() -> Optional[str]:
     """获取当前项目的目录路径"""
-    project = ProjectManager.get_current()
-    if project:
-        return project.get("path")
+    try:
+        from app.coding_runs import get_run_context
+        ctx = get_run_context()
+        if ctx and ctx.active_path:
+            return ctx.active_path
+    except Exception:
+        pass
+    try:
+        from app.coding_runs import effective_project_path
+        bound = effective_project_path()
+        if bound:
+            return bound
+    except Exception:
+        pass
     return None
 
 
@@ -73,6 +85,25 @@ def _ensure_project() -> Tuple[Optional[str], Optional[str]]:
     if not cwd:
         return None, "No project is currently open. Use 'open_project' first."
     return cwd, None
+
+
+def _ensure_git_project() -> Tuple[Optional[str], Optional[str]]:
+    cwd, err = _ensure_project()
+    if err or not cwd:
+        return cwd, err
+    code, root, stderr = _run_git(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if code == 0:
+        return root.strip() or cwd, None
+    nested = []
+    try:
+        for dotgit in Path(cwd).rglob(".git"):
+            if len(nested) >= 3:
+                break
+            nested.append(str(dotgit.parent))
+    except OSError:
+        pass
+    hint = f" Nested Git repos found: {', '.join(nested)}. Open the actual repo root." if nested else ""
+    return None, f"Current project is not a Git repository: {cwd}. {stderr.strip()}{hint}"
 
 
 class GitCloneTool(BaseTool):
@@ -94,9 +125,10 @@ class GitCloneTool(BaseTool):
         else:
             # 从 URL 提取 repo 名
             repo_name = url.rstrip("/").split("/")[-1].replace(".git", "")
-            project = ProjectManager.get_current()
-            if project:
-                target = Path(project["path"]).parent / repo_name
+            from app.coding_runs import effective_project_path
+            bound = effective_project_path()
+            if bound:
+                target = Path(bound).parent / repo_name
             else:
                 target = Path.cwd() / repo_name
 
@@ -128,7 +160,7 @@ class GitStatusTool(BaseTool):
     }
 
     async def execute(self) -> ToolResult:
-        cwd, err = _ensure_project()
+        cwd, err = _ensure_git_project()
         if err:
             return ToolResult(error=err)
 
@@ -197,7 +229,7 @@ class GitDiffTool(BaseTool):
         staged: bool = False,
         include_untracked: bool = True,
     ) -> ToolResult:
-        cwd, err = _ensure_project()
+        cwd, err = _ensure_git_project()
         if err:
             return ToolResult(error=err)
 

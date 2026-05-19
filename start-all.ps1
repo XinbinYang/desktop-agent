@@ -1,6 +1,7 @@
 ﻿# Desktop Agent - One-click launcher.
 # Double-click start-all.bat or run from PowerShell: .\start-all.ps1
 
+# NOTE: This launcher is for development/source mode. Customer installs should use the Windows installer.
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
@@ -10,7 +11,7 @@ $userDataDir = Join-Path $env:APPDATA 'Desktop Agent'
 $venvPython  = Join-Path $backendDir 'venv\Scripts\python.exe'
 
 Write-Host '=========================================' -ForegroundColor Cyan
-Write-Host '  Desktop Agent - One-click Start' -ForegroundColor Cyan
+Write-Host '  Desktop Agent - Dev Source Start' -ForegroundColor Cyan
 Write-Host '=========================================' -ForegroundColor Cyan
 
 # ------------------------------------------------------------------

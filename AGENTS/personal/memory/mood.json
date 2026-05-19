@@ -1,0 +1,74 @@
+{
+  "current": "negative",
+  "updated_at": "2026-05-18T22:32:40.533845",
+  "history": [
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:08:55.478615"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:09:23.669521"
+    },
+    {
+      "mood": "neutral",
+      "timestamp": "2026-05-18T22:09:23.677913"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:20:01.265111"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:20:22.589310"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:23.335800"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:24.337630"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:30.323656"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:22:35.982812"
+    },
+    {
+      "mood": "neutral",
+      "timestamp": "2026-05-18T22:22:35.991629"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:23:37.618907"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:31:51.612469"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:37.566810"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:38.518471"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:39.319982"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:39.995374"
+    },
+    {
+      "mood": "negative",
+      "timestamp": "2026-05-18T22:32:40.533845"
+    }
+  ]
+}

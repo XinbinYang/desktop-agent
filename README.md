@@ -1,214 +1,275 @@
-# Desktop Agent — 桌面个人 Agent
+# Desktop Agent
 
-一个带 GUI 的桌面级个人 Agent，支持**多模型切换**、**文件操控**、**终端执行**、**浏览器自动化**、**桌面键鼠控制**和**跨应用交互**。
+Desktop Agent 是一个运行在本机的桌面级个人 Agent：Electron + React 提供图形界面，Python + FastAPI 提供 Agent 后端，二者通过 WebSocket 和 REST API 通信。
 
-架构：**Electron + React（前端）+ Python FastAPI（后端）**
+当前仓库已完成第一阶段质量清理：产品代码、测试、文档和模板保留在仓库中；会话、计划、工作流、截图、Personal Agent 记忆等运行时数据写入用户数据目录，不再污染 git worktree。
 
----
+## 核心能力
 
-## 功能特性
+| 能力 | 说明 |
+| --- | --- |
+| 多模型路由 | 通过 LiteLLM 接入 OpenAI、Anthropic、Kimi、Ollama 及兼容 OpenAI API 的端点 |
+| ReAct Agent | 自动推理、选择工具、执行、观察并继续迭代 |
+| 文件与终端 | 本地文件读写、搜索、删除，以及受保护的 shell 命令执行 |
+| 浏览器自动化 | Playwright 驱动的页面导航、点击、输入、截图和脚本执行 |
+| 桌面与应用控制 | PyAutoGUI、pynput、pywinauto、pywin32 支持键鼠、窗口和应用操作 |
+| 本地知识库 | sentence-transformers + sqlite-vec 提供文档索引和语义搜索 |
+| 工作流与计划 | 录制、回放工作流，并把结构化计划保存到运行时目录 |
+| MCP 扩展 | 作为 MCP 客户端动态接入外部工具服务器 |
+| Personal / Coding Agent | 通过 `AGENTS/` 种子模板初始化不同 Agent 的身份、规则和技能 |
 
-| 能力 | 工具名 | 说明 |
-|------|--------|------|
-| 📁 文件操作 | `file_read/write/list/search/delete` | 读写本地文件、目录浏览、搜索 |
-| 🖥️ 终端控制 | `shell_execute/start` | 执行命令并流式回显，支持超时控制 |
-| 🌐 浏览器 | `browser_navigate/click/type/screenshot/evaluate` | Playwright 驱动，可视化浏览器自动化 |
-| 🖱️ 桌面操控 | `screenshot/mouse_click/move/type/press_key/scroll` | PyAutoGUI 键鼠控制 + 屏幕截图 |
-| 🪟 应用控制 | `app_open/list_windows/find_window/click/type` | 启动程序、操作窗口 UI（Windows） |
+## 仓库结构
 
-**模型支持**：OpenAI (GPT-4o)、Anthropic (Claude 3.7)、本地 Ollama、任何兼容 OpenAI API 的端点。
-
----
-
-## 项目结构
-
-```
+```text
 desktop-agent/
-├── backend/                 # Python Agent 后端
+├── AGENTS/                 # Agent 种子模板；运行时会复制到用户数据目录
+├── backend/                # Python FastAPI 后端
 │   ├── app/
-│   │   ├── main.py         # FastAPI + WebSocket 服务
-│   │   ├── agent.py        # ReAct Agent 循环核心
-│   │   ├── models.py       # 多模型路由（LiteLLM）
-│   │   ├── config.py       # 配置管理
-│   │   └── tools/          # 工具实现
+│   │   ├── main.py         # FastAPI 入口、WebSocket、REST API
+│   │   ├── agent.py        # AgentSession 与 ReAct 循环
+│   │   ├── runtime_paths.py # 仓库路径、用户数据目录和运行时目录解析
+│   │   ├── agents/         # Personal/Coding Agent 管理
+│   │   ├── routes/         # REST 路由
+│   │   ├── tools/          # 文件、终端、浏览器、桌面、Git、RAG、MCP 等工具
+│   │   ├── rag/            # 本地知识库引擎
+│   │   └── workflow/       # 计划和工作流存储
+│   ├── tests/              # pytest 测试
 │   ├── requirements.txt
+│   ├── pytest.ini
 │   └── start.py
-├── frontend/               # Electron + React 前端
-│   ├── src-main/           # Electron 主进程 + Preload
-│   ├── src/                # React 组件
+├── config/
+│   ├── models.yaml         # 模型配置模板，使用环境变量占位
+│   └── mcp.yaml            # MCP server 配置模板
+├── docs/
+│   └── QUALITY_REVIEW.md   # 第一阶段质量审查记录
+├── frontend/               # Electron + React + Vite 前端
+│   ├── src/                # React 渲染进程
+│   ├── src-main/           # Electron 主进程和 preload
+│   ├── e2e/                # Playwright E2E 测试
 │   ├── package.json
 │   └── vite.config.ts
-└── config/
-    └── models.yaml         # 模型配置文件
+├── install.ps1 / install.bat
+├── start-all.ps1 / start-all.bat
+└── README.md
 ```
 
----
+根目录不再保留 npm 包配置；前端相关 npm 命令统一在 `frontend/` 下执行。
 
-## 环境准备
+## 运行时目录
 
-### 1. 后端环境
+`backend/app/runtime_paths.py` 统一管理运行时路径。
 
-```bash
-# 进入后端目录
-cd desktop-agent/backend
-
-# 创建虚拟环境（推荐）
-python -m venv venv
-venv\Scripts\activate
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 安装 Playwright 浏览器（浏览器自动化必需）
-playwright install chromium
-```
-
-### 2. 配置模型
-
-首次启动后，打开左侧“设置”面板，添加或编辑 Provider：
-
-- OpenAI: `https://api.openai.com/v1`，填入自己的 `OPENAI_API_KEY` 或直接粘贴 API Key。
-- Anthropic: `https://api.anthropic.com/v1`，填入自己的 `ANTHROPIC_API_KEY` 或直接粘贴 API Key。
-- Kimi: `https://api.kimi.com/coding/v1`，填入自己的 `KIMI_API_KEY` 或直接粘贴 API Key。
-- Ollama: `http://localhost:11434/v1`，API Key 可填 `ollama`。
-
-设置页保存后会写入本机用户数据目录下的用户配置文件，不会修改仓库内的 `config/models.yaml` 模板。编辑 Provider 时 API Key 输入框留空表示保留原 key；保存后界面只显示脱敏值。
-
-高级用户仍可使用环境变量，例如 PowerShell：
+优先级最高的是环境变量：
 
 ```powershell
-$env:OPENAI_API_KEY="<your-api-key>"
+$env:DESKTOP_AGENT_USER_DATA_DIR="D:\DesktopAgentData"
 ```
 
-> 发布说明：历史版本中若曾暴露真实 API Key，请立即在对应平台轮换旧 key。当前仓库模板只保留 `${ENV_VAR}` 占位。
+未设置时默认使用系统用户数据目录：
 
-### 3. 前端环境
+| 平台 | 默认目录 |
+| --- | --- |
+| Windows | `%APPDATA%\Desktop Agent` |
+| macOS | `~/Library/Application Support/Desktop Agent` |
+| Linux | `$XDG_CONFIG_HOME/Desktop Agent` 或 `~/.config/Desktop Agent` |
 
-```bash
-# 进入前端目录（使用 PowerShell）
-cd desktop-agent/frontend
+后端运行时根目录为：
 
-# 安装依赖（需要 Node.js 18+）
+```text
+<user-data-dir>/backend/
+```
+
+主要运行时数据包括：
+
+```text
+<user-data-dir>/backend/AGENTS/      # Agent 身份、记忆、日记、技能等可变数据
+<user-data-dir>/backend/config/      # 用户模型配置副本
+<user-data-dir>/backend/sessions/    # 会话 JSON
+<user-data-dir>/backend/plans/       # 计划 markdown
+<user-data-dir>/backend/workflows/   # 工作流 JSON
+<user-data-dir>/backend/preview/     # 回测报告、预览文件等
+<user-data-dir>/backend/data/        # 本地知识库等数据文件
+```
+
+首次启动会从仓库中的 `AGENTS/` 和 `config/models.yaml` 复制缺失模板到运行时目录；已存在的用户文件不会被覆盖。
+
+## 环境要求
+
+- 客户安装包：Windows 10/11；不需要客户预装 Python、Node.js 或前端依赖。
+- 开发/源码模式：Windows 是主要目标平台；需要 Python 3.11+、Node.js 18+、npm、Playwright Chromium。
+- 桌面和应用控制能力依赖 Windows API；其他平台只作为代码结构兼容目标。
+
+## 客户安装
+
+客户只需要下载生产安装器并双击安装：
+
+```text
+Desktop-Agent-Setup-<version>.exe
+```
+
+安装后从桌面快捷方式或开始菜单打开 `Desktop Agent`。Electron 主应用会静默启动内置 Python 后端，运行时数据写入 `%APPDATA%\Desktop Agent`，后端日志写入：
+
+```text
+%APPDATA%\Desktop Agent\logs\backend.log
+```
+
+关闭窗口会隐藏到托盘；从托盘可重新打开主界面、打开日志目录或退出应用。退出应用时会停止由主进程托管的后端进程。
+
+## 开发/源码安装
+
+`install.ps1` 和 `start-all.ps1` 只用于开发者从源码运行，不是客户交付入口。
+
+一键安装开发依赖：
+
+```powershell
+.\install.ps1
+```
+
+手动安装：
+
+```powershell
+cd backend
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+
+cd ..\frontend
 npm install
-
-# 或如果使用 bun/yarn/pnpm 也可以
 ```
 
----
+## 开发启动
 
-## 启动方式
+一键启动开发环境：
 
-### 开发模式（推荐）
-
-**步骤 1：启动后端**
-```bash
-cd desktop-agent/backend
-venv\Scripts\activate
-python start.py
+```powershell
+.\start-all.ps1
 ```
-后端将运行在 `http://127.0.0.1:8765`
 
-**步骤 2：启动前端（新终端）**
-```bash
-cd desktop-agent/frontend
+手动启动后端：
+
+```powershell
+cd backend
+.\venv\Scripts\python.exe start.py
+```
+
+后端默认监听 `http://127.0.0.1:8765`。
+
+手动启动前端：
+
+```powershell
+cd frontend
 npm run dev
 ```
-这将同时启动 Vite 开发服务器（:5173）和 Electron 窗口。
 
-### 生产构建
+开发模式会启动 Vite 并打开 Electron 窗口。
 
-```bash
-cd desktop-agent/frontend
+## 配置 API Key
+
+仓库内的 `config/models.yaml` 是模板，使用环境变量占位：
+
+```yaml
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+  kimi:
+    base_url: https://api.kimi.com/coding
+    api_key: ${KIMI_API_KEY}
+```
+
+推荐在 PowerShell 中设置环境变量：
+
+```powershell
+$env:OPENAI_API_KEY="<your-openai-key>"
+$env:ANTHROPIC_API_KEY="<your-anthropic-key>"
+$env:KIMI_API_KEY="<your-kimi-key>"
+```
+
+也可以在应用设置页编辑 Provider。保存后的用户配置写入运行时目录下的 `backend/config/models.yaml`，不会修改仓库模板。
+
+不要把真实 API Key 提交到仓库。如果历史版本曾经包含真实密钥，请在对应平台轮换旧密钥。
+
+## 测试与构建
+
+后端：
+
+```powershell
+cd backend
+.\venv\Scripts\python.exe -m pytest -q
+```
+
+后端测试会把 `DESKTOP_AGENT_USER_DATA_DIR` 指向系统临时目录，避免向仓库写入 plan、session、workflow 或 Personal Agent 记忆。
+
+前端：
+
+```powershell
+cd frontend
+npx vitest run
 npm run build
 ```
-输出在 `frontend/dist/`，Electron 将加载打包后的静态文件。
 
----
+收尾检查：
 
-## 使用指南
-
-### GUI 界面
-
-- **顶部栏**：显示连接状态、当前模型下拉切换
-- **左侧边栏**：快捷工具（截图、浏览器、列出窗口等）、模型设置
-- **中间区域**：聊天对话，支持 Markdown、代码高亮、图片显示
-- **底部面板**：终端执行日志（可折叠）
-- **右侧栏**：工具调用历史记录（可展开查看参数和结果）
-
-### 核心工作流
-
-1. **选择模型**：顶部下拉框或左栏设置中切换 GPT/Claude/本地模型
-2. **输入指令**：支持文字、图片上传、粘贴截图
-3. **Agent 执行**：AI 自动分析任务 → 调用工具 → 观察结果 → 循环直到完成
-4. **人工干预**：危险命令已内置拦截规则，关键操作可随时中断
-
-### 指令示例
-
-```
-"帮我截图当前屏幕，然后打开浏览器访问百度，搜索'FastAPI 教程'"
-"在 D:\\workspace 下创建一个 hello.py，写入打印当前时间的代码，然后运行它"
-"列出当前所有打开的窗口，点击记事本的'文件'菜单"
-"读取 C:\\Users\\admin\\Desktop\\test.txt 的内容并总结"
+```powershell
+git diff --check
+git status --short
 ```
 
----
+## 生产构建
 
-## 进阶：添加自定义工具
-
-在 `backend/app/tools/` 下新建文件，继承 `BaseTool`：
-
-```python
-from app.tools.base import BaseTool, ToolResult
-
-class MyTool(BaseTool):
-    name = "my_tool"
-    description = "我的自定义工具"
-    parameters = {
-        "type": "object",
-        "properties": {"arg1": {"type": "string"}},
-        "required": ["arg1"]
-    }
-    
-    async def execute(self, arg1: str) -> ToolResult:
-        return ToolResult(output=f"结果: {arg1}")
+```powershell
+cd frontend
+npm run dist
 ```
 
-然后在 `backend/app/tools/__init__.py` 的 `ALL_TOOLS` 列表中注册即可。**无需修改前端**，Agent 会自动识别并使用。
+`npm run dist` 会先用 PyInstaller 构建 `backend/desktop-agent-backend.exe`，再构建 Vite renderer，最后调用 electron-builder 输出 Windows 安装器和 `win-unpacked` 验收目录。产物位于：
 
----
+```text
+frontend/release-packaged/<stamp>/Desktop-Agent-Setup-<version>.exe
+frontend/release-packaged/<stamp>/win-unpacked/
+```
+
+完整 GUI 验收：
+
+```powershell
+npm run dist:verify
+```
+
+## WebSocket 协议概览
+
+前端通过 `/ws/{session_id}` 与后端建立 WebSocket。
+
+前端发送：
+
+- `chat`: 用户消息，支持 `text`、`model_id`、`image_base64`
+- `clear`: 清空会话
+- `stop`: 中断当前 Agent 循环
+- `retry`: 重试最后一次回复
+- `tool_direct`: 调用白名单内的安全直连工具
+
+后端发送：
+
+- `content`: 助手文本流
+- `reasoning`: 模型 reasoning/thinking 文本
+- `tool_call`: 工具调用记录
+- `image`: 图片数据
+- `status`: `thinking`、`executing`、`completed` 等状态
+- `error`: 错误信息
+- `done`: 单次交互结束
+
+## 开发提示
+
+- 新工具放在 `backend/app/tools/`，继承 `BaseTool` 并在 `backend/app/tools/__init__.py` 注册。
+- 普通文件工具的工作区根是仓库根目录。
+- `AGENTS/...` 相对路径会被解析到运行时 `backend/AGENTS/`，用于 Personal/Coding Agent 的身份和记忆文件。
+- 会话、计划、工作流、预览、知识库和模型缓存都是运行时数据，不应提交到 git。
+- 修改公共协议、工具 schema 或 REST 响应前，请同步更新测试和文档。
 
 ## 安全提示
 
-- `shell_execute` 已内置危险命令拦截（`rm -rf /`, `format` 等）
-- 桌面键鼠操作依赖 PyAutoGUI 的 FAILSAFE（将鼠标移到屏幕左上角可紧急中断）
-- 建议不要在高权限账户下长期运行 Agent
-- 浏览器自动化使用非 headless 模式，可实时观察操作过程
-
----
-
-## 后续可扩展方向
-
-1. **向量记忆**：接入 ChromaDB，支持长期记忆和代码库 RAG
-2. **MCP 协议**：集成 Model Context Protocol，复用社区工具生态
-3. **语音输入**：加入 Whisper 本地语音识别
-4. **视觉 Agent**：接入更强的多模态模型，实现真正的"看屏操作"
-5. **任务计划器**：支持定时任务、复杂工作流编排
-6. **远程模式**：后端可部署到服务器，前端作为纯客户端连接
-
----
-
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| 前端 GUI | Electron 33 + React 18 + Vite + TailwindCSS |
-| 前后通信 | WebSocket + REST API |
-| Agent 后端 | Python 3.11 + FastAPI + LiteLLM |
-| 模型路由 | LiteLLM（统一 OpenAI/Anthropic/Ollama） |
-| 浏览器 | Playwright |
-| 桌面操控 | PyAutoGUI + pynput + Pillow |
-| 应用控制 | pywinauto + pywin32 |
-
----
-
-**当前状态**：MVP 框架已搭建完成，核心链路（聊天 → 模型路由 → 工具调用 → GUI 回显）已跑通。下一步可根据你的具体使用场景继续深化。
+- `shell_execute` 内置危险命令拦截，但仍不建议在高权限账号下长期运行。
+- PyAutoGUI 的 FAILSAFE 可通过把鼠标移动到屏幕左上角触发。
+- Electron 当前为本地资源加载关闭了部分 web security，打包前需继续审查安全边界。
+- 真实 API Key 只应放在环境变量或本机运行时配置中。

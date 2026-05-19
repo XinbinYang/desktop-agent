@@ -1,7 +1,8 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, nativeTheme, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const crypto = require('crypto');
 const { spawn, exec } = require('child_process');
 
@@ -18,19 +19,117 @@ function resolveAppDataDir() {
   if (process.platform === 'darwin') return path.join(process.env.HOME || '', 'Library', 'Application Support');
   return process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '', '.config');
 }
-const STABLE_USER_DATA_DIR = path.join(resolveAppDataDir(), 'Desktop Agent');
-app.setPath('userData', STABLE_USER_DATA_DIR);
+
+function resolveUserDataOverride() {
+  const arg = process.argv.find((value) => value.startsWith('--user-data-dir='));
+  if (!arg) return null;
+  const value = arg.slice('--user-data-dir='.length).trim();
+  return value ? path.resolve(value) : null;
+}
+
+const DEFAULT_USER_DATA_DIR = path.join(resolveAppDataDir(), 'Desktop Agent');
+const APP_USER_DATA_DIR = path.resolve(
+  process.env.DESKTOP_AGENT_USER_DATA_DIR || resolveUserDataOverride() || DEFAULT_USER_DATA_DIR
+);
+app.setPath('userData', APP_USER_DATA_DIR);
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.desktop.agent');
+}
 
 function getStorePath() {
   return path.join(app.getPath('userData'), 'window-state.json');
 }
+
+function getLogDir() {
+  return path.join(app.getPath('userData'), 'logs');
+}
+
+function getBackendLogPath() {
+  return path.join(getLogDir(), 'backend.log');
+}
+
+function ensureLogDir() {
+  fs.mkdirSync(getLogDir(), { recursive: true });
+}
+
+function getIconPath(name) {
+  return path.join(__dirname, '..', 'assets', 'icons', name);
+}
+
+function createNativeIcon(name) {
+  const iconPath = getIconPath(name);
+  const icon = nativeImage.createFromPath(iconPath);
+  if (icon.isEmpty()) {
+    console.warn('[Electron] Icon failed to load:', iconPath);
+  }
+  return icon;
+}
+
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function openLogsFolder() {
+  try {
+    ensureLogDir();
+    shell.openPath(getLogDir());
+  } catch (error) {
+    console.error('[Electron] Failed to open logs folder:', error);
+  }
+}
 let mainWindow;
 let tray = null;
 let backendProcess = null;
+let backendLogStream = null;
 
 const isDev = process.argv.includes('--dev');
 const isPackaged = app.isPackaged;
+const shouldOpenDevTools = process.env.DESKTOP_AGENT_OPEN_DEVTOOLS === '1';
 let authToken = null;
+let lastRendererCrashReloadAt = 0;
+
+const WINDOW_THEMES = {
+  dark: {
+    background: '#0d1117',
+    titleBar: '#161b22',
+    symbol: '#e6edf3',
+  },
+  light: {
+    background: '#ffffff',
+    titleBar: '#f3f3f3',
+    symbol: '#1e1e1e',
+  },
+};
+
+function normalizeTheme(theme) {
+  return theme === 'light' ? 'light' : 'dark';
+}
+
+function getTitleBarOverlay(theme) {
+  const colors = WINDOW_THEMES[normalizeTheme(theme)];
+  return {
+    color: colors.titleBar,
+    symbolColor: colors.symbol,
+    height: 40,
+  };
+}
+
+function applyWindowTheme(theme) {
+  const resolvedTheme = normalizeTheme(theme);
+  const colors = WINDOW_THEMES[resolvedTheme];
+
+  nativeTheme.themeSource = resolvedTheme;
+
+  if (!mainWindow) return;
+  mainWindow.setBackgroundColor(colors.background);
+  if (process.platform !== 'darwin' && typeof mainWindow.setTitleBarOverlay === 'function') {
+    mainWindow.setTitleBarOverlay(getTitleBarOverlay(resolvedTheme));
+  }
+}
 
 function getAuthStorePath() {
   return path.join(app.getPath('userData'), 'local-auth.json');
@@ -74,53 +173,93 @@ if (!gotTheLock) {
 }
 
 app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-  }
+  showMainWindow();
 });
 
 // ========== 后端进程管理 ==========
-function waitForBackendHealth(timeoutMs = isPackaged ? 90000 : 15000) {
-  const started = Date.now();
+function requestBackendHealth(timeoutMs = 2000) {
   const token = getAuthToken();
 
+  return new Promise((resolve) => {
+    const options = token ? { headers: { 'X-Desktop-Agent-Token': token } } : undefined;
+    const req = http.get('http://127.0.0.1:8765/api/health', options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        let body = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        } catch {
+          body = null;
+        }
+        resolve({ ok: res.statusCode === 200, statusCode: res.statusCode, body });
+      });
+    });
+
+    req.on('error', (error) => resolve({ ok: false, error }));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error('Backend health request timed out'));
+    });
+  });
+}
+
+function isBackendPortListening(timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: 8765 });
+    const finish = (listening) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(timeoutMs, () => finish(false));
+  });
+}
+
+function waitForBackendHealth(timeoutMs = isPackaged ? 90000 : 15000) {
+  const started = Date.now();
+
   return new Promise((resolve, reject) => {
-    const retry = () => {
+    const check = async () => {
+      const result = await requestBackendHealth();
+      if (result.ok) {
+        resolve(true);
+        return;
+      }
       if (Date.now() - started > timeoutMs) {
-        reject(new Error('Backend health check timed out at http://127.0.0.1:8765/api/health'));
+        reject(new Error(`Backend health check timed out at http://127.0.0.1:8765/api/health. Log: ${getBackendLogPath()}`));
         return;
       }
       setTimeout(check, 500);
-    };
-
-    const check = () => {
-      const options = token ? { headers: { 'X-Desktop-Agent-Token': token } } : undefined;
-      const req = http.get('http://127.0.0.1:8765/api/health', options, (res) => {
-        if (res.statusCode === 200) {
-          res.resume();
-          resolve(true);
-          return;
-        }
-        res.resume();
-        retry();
-      });
-
-      req.on('error', retry);
-      req.setTimeout(2000, () => {
-        req.destroy();
-        retry();
-      });
     };
 
     check();
   });
 }
 
-function startBackend() {
+function openBackendLogStream() {
+  ensureLogDir();
+  if (backendLogStream && !backendLogStream.destroyed) {
+    return backendLogStream;
+  }
+  backendLogStream = fs.createWriteStream(getBackendLogPath(), { flags: 'a' });
+  backendLogStream.write(`\n[${new Date().toISOString()}] [electron] Starting backend\n`);
+  return backendLogStream;
+}
+
+function writeBackendLog(channel, data) {
+  const stream = openBackendLogStream();
+  const text = data.toString();
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    stream.write(`[${new Date().toISOString()}] [${channel}] ${line}\n`);
+  }
+}
+
+async function startBackend() {
   if (isDev) {
-    return Promise.resolve();
+    return;
   }
 
   const backendExe = isPackaged
@@ -143,14 +282,28 @@ function startBackend() {
     backendEnv.DESKTOP_AGENT_AUTH_TOKEN = token;
   }
 
+  const existing = await requestBackendHealth();
+  if (existing.ok) {
+    console.log('[Electron] Reusing existing Desktop Agent backend on port 8765');
+    return;
+  }
+
+  if (await isBackendPortListening()) {
+    throw new Error(
+      `Port 8765 is already in use, but it is not this Desktop Agent backend session. ` +
+      `Close the other process using 127.0.0.1:8765 and try again. Backend log: ${getBackendLogPath()}`
+    );
+  }
+
   console.log('[Electron] Starting backend:', backendExe, backendArgs);
 
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(backendExe)) {
-      reject(new Error(`Backend executable not found: ${backendExe}. Run "npm run build:backend" before packaging.`));
+      reject(new Error(`Backend executable not found: ${backendExe}. Run "npm run build:backend" before packaging. Log: ${getBackendLogPath()}`));
       return;
     }
 
+    openBackendLogStream();
     backendProcess = spawn(backendExe, backendArgs, {
       cwd: backendCwd,
       windowsHide: true,
@@ -161,6 +314,7 @@ function startBackend() {
     backendProcess.stdout.on('data', (data) => {
       const str = data.toString();
       console.log('[Backend]', str);
+      writeBackendLog('stdout', data);
       if (str.includes('Uvicorn running')) {
         waitForBackendHealth().then(resolve).catch(reject);
       }
@@ -168,11 +322,17 @@ function startBackend() {
 
     backendProcess.stderr.on('data', (data) => {
       console.error('[Backend Error]', data.toString());
+      writeBackendLog('stderr', data);
     });
 
     backendProcess.on('error', (err) => {
       console.error('[Backend Failed]', err);
+      writeBackendLog('error', String(err));
       reject(err);
+    });
+
+    backendProcess.on('exit', (code, signal) => {
+      writeBackendLog('exit', `Backend process exited with code=${code} signal=${signal}`);
     });
 
     setTimeout(() => {
@@ -197,6 +357,12 @@ function stopBackend() {
     setTimeout(() => {
       if (!backendProcess.killed) backendProcess.kill('SIGKILL');
     }, 2000);
+  }
+
+  if (backendLogStream && !backendLogStream.destroyed) {
+    const stream = backendLogStream;
+    backendLogStream = null;
+    stream.end(`[${new Date().toISOString()}] [electron] Stopping backend\n`);
   }
 }
 
@@ -229,12 +395,8 @@ function saveWindowState() {
 
 // ========== 托盘 ==========
 function createTray() {
-  // 使用一个极简的 16x16 内联图标（1px 透明占位，可被替换）
-  const iconData = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAABpJREFUeNpi/P//PwMlgImBQjBqwKgBwAADAA7XA/5l9V8AAAAASUVORK5CYII=',
-    'base64'
-  );
-  const icon = nativeImage.createFromBuffer(iconData);
+  // Use the packaged brand icon so the tray entry stays visible after hiding the window.
+  const icon = createNativeIcon(process.platform === 'win32' ? 'tray.ico' : 'tray.png');
   tray = new Tray(icon);
   tray.setToolTip('Desktop Agent');
 
@@ -242,10 +404,7 @@ function createTray() {
     {
       label: '显示主窗口',
       click: () => {
-        if (mainWindow) {
-          mainWindow.show();
-          mainWindow.focus();
-        }
+        showMainWindow();
       },
     },
     {
@@ -253,6 +412,10 @@ function createTray() {
       click: () => {
         if (mainWindow) mainWindow.hide();
       },
+    },
+    {
+      label: '打开日志',
+      click: openLogsFolder,
     },
     { type: 'separator' },
     {
@@ -269,8 +432,7 @@ function createTray() {
       if (mainWindow.isVisible()) {
         mainWindow.hide();
       } else {
-        mainWindow.show();
-        mainWindow.focus();
+        showMainWindow();
       }
     }
   });
@@ -287,7 +449,11 @@ function createWindow() {
     y: state.y,
     minWidth: 1000,
     minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'darwin' ? {} : { titleBarOverlay: getTitleBarOverlay('dark') }),
+    icon: getIconPath('app.ico'),
+    backgroundColor: WINDOW_THEMES.dark.background,
+    autoHideMenuBar: true,
     show: false, // 先隐藏，等加载完成再显示，避免闪烁
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -296,14 +462,49 @@ function createWindow() {
       webSecurity: false,
     },
   });
+  applyWindowTheme('dark');
 
   if (state.maximized) {
     mainWindow.maximize();
   }
 
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[Electron] Renderer process gone:', details);
+    const now = Date.now();
+    if (now - lastRendererCrashReloadAt > 10000 && mainWindow && !mainWindow.isDestroyed()) {
+      lastRendererCrashReloadAt = now;
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          console.error('[Electron] Reloading renderer after crash');
+          mainWindow.reload();
+        }
+      }, 500);
+    }
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error('[Electron] Renderer failed to load:', { errorCode, errorDescription, validatedURL });
+  });
+
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      console.error(`[Renderer:${level}] ${message} (${sourceId}:${line})`);
+    }
+  });
+
+  mainWindow.on('unresponsive', () => {
+    console.error('[Electron] Window became unresponsive');
+  });
+
+  mainWindow.on('responsive', () => {
+    console.error('[Electron] Window became responsive again');
+  });
+
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
+    if (shouldOpenDevTools) {
+      mainWindow.webContents.openDevTools();
+    }
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
@@ -411,6 +612,7 @@ app.whenReady().then(async () => {
     createTray();
     buildMenu();
   } catch (e) {
+    e.message = `${e.message}\n\nLog file:\n${getBackendLogPath()}`;
     dialog.showErrorBox('启动失败', '后端服务启动失败: ' + e.message);
     app.quit();
   }
@@ -430,7 +632,7 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   } else if (mainWindow) {
-    mainWindow.show();
+    showMainWindow();
   }
 });
 
@@ -448,6 +650,93 @@ ipcMain.handle('select-file', async () => {
   return result.filePaths[0] || null;
 });
 
+function resolveUserPath(value) {
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  return path.resolve(value);
+}
+
+function openExplorerFallback(resolved, isDirectory) {
+  if (process.platform !== 'win32') return null;
+  const args = isDirectory ? [resolved] : ['/select,', resolved];
+  const child = spawn('explorer.exe', args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  return null;
+}
+
+ipcMain.handle('reveal-path', async (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    if (!fs.existsSync(resolved)) return 'Path does not exist';
+    const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) {
+      const error = await shell.openPath(resolved);
+      if (!error) return null;
+      return openExplorerFallback(resolved, true) || error;
+    }
+    if (process.platform === 'win32') {
+      return openExplorerFallback(resolved, false);
+    }
+    shell.showItemInFolder(resolved);
+    return null;
+  } catch (err) {
+    return String(err);
+  }
+});
+
+ipcMain.handle('open-path', async (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    const error = await shell.openPath(resolved);
+    return error || null;
+  } catch (err) {
+    return String(err);
+  }
+});
+
+ipcMain.handle('open-terminal', (_event, targetPath) => {
+  const resolved = resolveUserPath(targetPath);
+  if (!resolved) return 'Invalid path';
+  try {
+    if (!fs.existsSync(resolved)) return 'Path does not exist';
+    const stat = fs.statSync(resolved);
+    const cwd = stat.isDirectory() ? resolved : path.dirname(resolved);
+    const command = process.platform === 'win32'
+      ? 'powershell.exe'
+      : (process.env.SHELL || '/bin/sh');
+    const args = process.platform === 'win32' ? ['-NoExit'] : [];
+    const child = spawn(command, args, {
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    return null;
+  } catch (err) {
+    return String(err);
+  }
+});
+
 ipcMain.handle('get-app-version', () => app.getVersion());
 
 ipcMain.handle('get-auth-token', () => getAuthToken());
+
+ipcMain.handle('set-theme', (_event, theme) => {
+  const resolvedTheme = normalizeTheme(theme);
+  applyWindowTheme(resolvedTheme);
+  return resolvedTheme;
+});
+
+ipcMain.handle('capture-region', async (_event, rect) => {
+  try {
+    const img = await mainWindow.webContents.capturePage(rect);
+    return img.toDataURL();
+  } catch (err) {
+    console.error('[capture-region] failed:', err);
+    return null;
+  }
+});

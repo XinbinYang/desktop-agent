@@ -1,9 +1,26 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   X, Plus, Trash2, Edit3, Save, Eye, EyeOff, Settings, Wifi, Download,
+  Database, Workflow, Server, Plug, Globe2,
 } from 'lucide-react';
-import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel } from '../types';
+import { ModelInfo, ProviderSettings, AppSettings, SettingsResponse, SuggestedModel, PersonalAgentSettings, CodingAgentSettings, ThinkingIntensity, WebSearchProvider, WebSearchSettings } from '../types';
 import { API_BASE } from '../config';
+import { KnowledgePanel } from './KnowledgePanel';
+import { WorkflowPanel } from './WorkflowPanel';
+import { McpPanel } from './McpPanel';
+import { ConnectionsPanel } from './ConnectionsPanel';
+
+type SettingsTab = 'general' | 'providers' | 'web' | 'knowledge' | 'workflows' | 'mcp' | 'connections';
+
+const SETTINGS_NAV: { key: SettingsTab; label: string; icon: React.FC<{ className?: string }> }[] = [
+  { key: 'general', label: '通用', icon: Settings },
+  { key: 'providers', label: 'Providers', icon: Server },
+  { key: 'web', label: 'Web Search', icon: Globe2 },
+  { key: 'knowledge', label: '知识库', icon: Database },
+  { key: 'workflows', label: '工作流', icon: Workflow },
+  { key: 'mcp', label: 'MCP', icon: Wifi },
+  { key: 'connections', label: '连接', icon: Plug },
+];
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -14,14 +31,14 @@ interface SettingsModalProps {
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
-  openai: 'bg-green-600',
-  anthropic: 'bg-purple-600',
-  kimi: 'bg-blue-600',
-  local: 'bg-orange-500',
+  openai: 'bg-success/10 text-success border-success/25',
+  anthropic: 'bg-info/10 text-info border-info/25',
+  kimi: 'bg-accent/10 text-accent border-accent/25',
+  local: 'bg-warning/10 text-warning border-warning/25',
 };
 
 function providerColor(name: string): string {
-  return PROVIDER_COLORS[name] || 'bg-surface-hover';
+  return PROVIDER_COLORS[name] || 'bg-surface-alt text-fg-secondary border-border';
 }
 
 function providerInitial(name: string): string {
@@ -32,7 +49,7 @@ function getProviderIcon(name: string): React.ReactNode {
   const color = providerColor(name);
   const initial = providerInitial(name);
   return (
-    <div className={`w-7 h-7 rounded-full ${color} flex items-center justify-center text-white text-xs font-bold shrink-0`}>
+    <div className={`w-7 h-7 rounded-full border ${color} flex items-center justify-center text-xs font-bold shrink-0`}>
       {initial}
     </div>
   );
@@ -56,6 +73,37 @@ interface ProviderTestResult {
   model_count?: number;
 }
 
+interface GeneralFormState extends AppSettings {
+  personal_agent?: PersonalAgentSettings;
+  coding_agent?: CodingAgentSettings;
+}
+
+type WebSearchKeyField = 'brave_api_key' | 'tavily_api_key' | 'serpapi_api_key';
+
+function clampParallelAgentCount(value: string | number): number {
+  const parsed = typeof value === 'number' ? value : parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 3;
+  return Math.max(1, Math.min(16, parsed));
+}
+
+interface WebSearchFormState {
+  provider: WebSearchProvider;
+  brave_api_key: string;
+  tavily_api_key: string;
+  serpapi_api_key: string;
+  fallback_enabled: boolean;
+  allow_private_network: boolean;
+  showKeys: Record<WebSearchKeyField, boolean>;
+  keyDirty: Record<WebSearchKeyField, boolean>;
+}
+
+interface WebSearchTestResult {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  result_count?: number;
+}
+
 function providerToEditable(p: ProviderSettings): EditableProvider {
   return {
     name: p.name,
@@ -68,11 +116,37 @@ function providerToEditable(p: ProviderSettings): EditableProvider {
   };
 }
 
+function webSearchToForm(web?: WebSearchSettings): WebSearchFormState {
+  return {
+    provider: web?.provider || 'auto',
+    brave_api_key: web?.providers?.brave?.api_key_masked || '',
+    tavily_api_key: web?.providers?.tavily?.api_key_masked || '',
+    serpapi_api_key: web?.providers?.serpapi?.api_key_masked || '',
+    fallback_enabled: web?.fallback_enabled ?? true,
+    allow_private_network: web?.allow_private_network ?? false,
+    showKeys: {
+      brave_api_key: false,
+      tavily_api_key: false,
+      serpapi_api_key: false,
+    },
+    keyDirty: {
+      brave_api_key: false,
+      tavily_api_key: false,
+      serpapi_api_key: false,
+    },
+  };
+}
+
+function generalSettingsPayload(form: GeneralFormState): Omit<GeneralFormState, 'default_model' | 'default_provider'> {
+  const { default_model: _legacyDefaultModel, default_provider: _legacyDefaultProvider, ...payload } = form;
+  return payload;
+}
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen, onClose, models, currentModel, onSettingsChanged,
 }) => {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
-  const [generalForm, setGeneralForm] = useState<AppSettings | null>(null);
+  const [generalForm, setGeneralForm] = useState<GeneralFormState | null>(null);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [providerForm, setProviderForm] = useState<EditableProvider | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -86,6 +160,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [fetchedModels, setFetchedModels] = useState<SuggestedModel[]>([]);
   const [pickerSelection, setPickerSelection] = useState<Record<string, boolean>>({});
   const [pickerSearch, setPickerSearch] = useState('');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const [webSearchForm, setWebSearchForm] = useState<WebSearchFormState | null>(null);
+  const [testingWebSearch, setTestingWebSearch] = useState(false);
+  const [webSearchTestResult, setWebSearchTestResult] = useState<WebSearchTestResult | null>(null);
 
   useEffect(() => {
     if (isOpen) fetchSettings();
@@ -139,11 +217,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
       const ok = data as SettingsResponse;
       setSettings(ok);
-      setGeneralForm({ ...ok.settings });
+      setGeneralForm({
+        ...ok.settings,
+        personal_agent: ok.personal_agent || { model: '', thinking_intensity: 'medium' },
+        coding_agent: ok.coding_agent || { model: '', thinking_intensity: 'medium', enabled: true, default_execution_mode: 'worktree', max_fix_rounds: 2, max_parallel_workers: 3, require_verification: true, require_review: true, auto_generate_repo_map: true },
+      });
+      setWebSearchForm(webSearchToForm(ok.web_search));
       setEditingProvider(null);
       setProviderForm(null);
       setIsCreating(false);
       setTestResult(null);
+      setWebSearchTestResult(null);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       const looksLikeNetwork =
@@ -323,7 +407,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await fetch(`${API_BASE}/api/settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(generalForm),
+        body: JSON.stringify(generalSettingsPayload(generalForm)),
       });
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
       onSettingsChanged();
@@ -332,6 +416,80 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     } finally {
       setSaving(false);
     }
+  };
+
+  const webSearchRequestBody = () => {
+    if (!webSearchForm) return {};
+    return {
+      provider: webSearchForm.provider,
+      fallback_enabled: webSearchForm.fallback_enabled,
+      allow_private_network: webSearchForm.allow_private_network,
+      brave_api_key: webSearchForm.keyDirty.brave_api_key ? webSearchForm.brave_api_key.trim() : '',
+      tavily_api_key: webSearchForm.keyDirty.tavily_api_key ? webSearchForm.tavily_api_key.trim() : '',
+      serpapi_api_key: webSearchForm.keyDirty.serpapi_api_key ? webSearchForm.serpapi_api_key.trim() : '',
+    };
+  };
+
+  const saveWebSearchForm = async () => {
+    if (!webSearchForm) return;
+    const res = await fetch(`${API_BASE}/api/web-search/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(webSearchRequestBody()),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || 'Web Search settings save failed');
+    }
+  };
+
+  const handleSaveWebSearch = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      await saveWebSearchForm();
+      await fetchSettings();
+      onSettingsChanged();
+    } catch (e: any) {
+      setError(e.message || 'Web Search settings save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestWebSearch = async () => {
+    if (!webSearchForm) return;
+    setTestingWebSearch(true);
+    setError('');
+    setWebSearchTestResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/web-search/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...webSearchRequestBody(),
+          query: 'OpenAI API documentation',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || 'Web Search test failed');
+      }
+      setWebSearchTestResult(data);
+    } catch (e: any) {
+      setWebSearchTestResult({ ok: false, message: e.message || 'Web Search test failed' });
+    } finally {
+      setTestingWebSearch(false);
+    }
+  };
+
+  const updateWebSearchKey = (field: WebSearchKeyField, value: string) => {
+    if (!webSearchForm) return;
+    setWebSearchForm({
+      ...webSearchForm,
+      [field]: value,
+      keyDirty: { ...webSearchForm.keyDirty, [field]: true },
+    });
   };
 
   const handleSaveAll = async () => {
@@ -346,8 +504,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         await fetch(`${API_BASE}/api/settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(generalForm),
+          body: JSON.stringify(generalSettingsPayload(generalForm)),
         });
+      }
+      if (webSearchForm) {
+        await saveWebSearchForm();
       }
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
       onSettingsChanged();
@@ -461,7 +622,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     settings && typeof settings.providers === 'object' && settings.providers !== null
       ? Object.keys(settings.providers)
       : [];
-  const defaultProvider = settings?.settings.default_provider || '';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
@@ -478,44 +638,40 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          {error && (
-            <div className="px-3 py-2 rounded text-xs bg-red-900/30 border border-red-800 text-red-300">
-              {error}
-            </div>
-          )}
+        <div className="flex-1 flex min-h-0 overflow-hidden">
+          {/* Left nav */}
+          <div className="w-36 shrink-0 border-r border-border bg-surface-alt/40 p-2 space-y-0.5">
+            {SETTINGS_NAV.map(({ key, label, icon: Icon }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setSettingsTab(key)}
+                className={`flex items-center gap-2 w-full px-2 py-1.5 rounded text-xs font-medium transition-colors ${
+                  settingsTab === key
+                    ? 'bg-surface text-fg'
+                    : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Right content */}
+          <div className="flex-1 overflow-y-auto p-4">
+            {error && (
+              <div className="px-3 py-2 rounded text-xs bg-danger/10 border border-danger/30 text-danger mb-4">
+                {error}
+              </div>
+            )}
 
-          {/* 全局设置 */}
-          {generalForm && (
+            {settingsTab === 'general' && generalForm && (
+            <>
             <section>
-              <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3">
                 全局设置
               </h3>
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs text-fg-secondary block mb-1">默认模型</label>
-                  <select
-                    value={generalForm.default_model}
-                    onChange={(e) => setGeneralForm({ ...generalForm, default_model: e.target.value })}
-                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
-                  >
-                    {models.map(m => (
-                      <option key={m.id} value={m.id}>{m.name} ({m.provider})</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-fg-secondary block mb-1">默认 Provider</label>
-                  <select
-                    value={generalForm.default_provider}
-                    onChange={(e) => setGeneralForm({ ...generalForm, default_provider: e.target.value })}
-                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
-                  >
-                    {allProviderNames.map(p => (
-                      <option key={p} value={p}>{p}</option>
-                    ))}
-                  </select>
-                </div>
                 <div>
                   <label className="text-xs text-fg-secondary block mb-1">最大迭代次数</label>
                   <input
@@ -580,6 +736,95 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     统一抽象：在支持的模型上影响推理预算或采样温度；不支持的提供商会自动降级。
                   </div>
                 </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3 mt-4">
+                Personal Agent 模型
+              </h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">模型</label>
+                  <select
+                    value={generalForm.personal_agent?.model || ''}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      personal_agent: { ...generalForm.personal_agent, model: e.target.value, thinking_intensity: generalForm.personal_agent?.thinking_intensity || 'medium' },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    {!generalForm.personal_agent?.model && <option value="" disabled>请选择模型</option>}
+                    {models.map(m => (
+                      <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
+                    ))}
+                  </select>
+                  <div className="text-[10px] text-fg-muted mt-1">
+                    Personal/Main Agent 会使用这里选择的模型；推荐多模态模型以获得视觉能力。
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Thinking 强度</label>
+                  <select
+                    value={generalForm.personal_agent?.thinking_intensity || 'medium'}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      personal_agent: { model: generalForm.personal_agent?.model || '', thinking_intensity: e.target.value as ThinkingIntensity },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-xs font-semibold text-fg-secondary mb-3 mt-4">
+                Coding Agent 模型
+              </h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">模型</label>
+                  <select
+                    value={generalForm.coding_agent?.model || ''}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      coding_agent: { ...generalForm.coding_agent, model: e.target.value, thinking_intensity: generalForm.coding_agent?.thinking_intensity || 'medium', enabled: generalForm.coding_agent?.enabled ?? true, default_execution_mode: generalForm.coding_agent?.default_execution_mode || 'worktree', max_fix_rounds: generalForm.coding_agent?.max_fix_rounds ?? 2, max_parallel_workers: generalForm.coding_agent?.max_parallel_workers ?? 3, require_verification: generalForm.coding_agent?.require_verification ?? true, require_review: generalForm.coding_agent?.require_review ?? true, auto_generate_repo_map: generalForm.coding_agent?.auto_generate_repo_map ?? true },
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    {!generalForm.coding_agent?.model && <option value="" disabled>请选择模型</option>}
+                    {models.map(m => (
+                      <option key={m.id} value={m.id}>{m.name} ({m.provider}){m.vision ? ' 👁' : ''}</option>
+                    ))}
+                  </select>
+                  <div className="text-[10px] text-fg-muted mt-1">
+                    Coding Agent 会使用这里选择的模型；推荐推理能力强的模型以获得更好的代码生成质量。
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Thinking 强度</label>
+                  <select
+                    value={generalForm.coding_agent?.thinking_intensity || 'medium'}
+                    onChange={(e) => setGeneralForm({
+                      ...generalForm,
+                      coding_agent: { ...generalForm.coding_agent, thinking_intensity: e.target.value as ThinkingIntensity } as CodingAgentSettings,
+                    })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs text-fg-secondary block mb-1">多 Agent 协同</label>
                   <select
@@ -606,7 +851,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) =>
                       setGeneralForm({
                         ...generalForm,
-                        max_parallel_agents: parseInt(e.target.value, 10) || 3,
+                        max_parallel_agents: clampParallelAgentCount(e.target.value),
                       })}
                     className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
                   />
@@ -635,12 +880,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
             </section>
+          </>
           )}
 
-          {/* Provider 设置 */}
+          {settingsTab === 'providers' && (
           <section>
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider">
+              <h3 className="text-xs font-semibold text-fg-secondary">
                 Providers
               </h3>
               <button
@@ -797,7 +1043,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         </label>
                         <button
                           onClick={() => removeModel(i)}
-                          className="p-0.5 text-fg-muted hover:text-red-400"
+                          className="p-0.5 text-fg-muted hover:text-danger"
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -886,7 +1132,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                     <button
                       onClick={handleAddSelectedModels}
-                      className="w-full py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-white transition-colors"
+                      className="w-full py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-fg-on-accent transition-colors"
                     >
                       添加 {Object.entries(pickerSelection).filter(([, v]) => v).length} 个模型
                     </button>
@@ -897,8 +1143,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div
                     className={`px-3 py-2 rounded text-xs border ${
                       testResult.ok
-                        ? 'bg-green-900/20 border-green-800 text-green-300'
-                        : 'bg-red-900/30 border-red-800 text-red-300'
+                        ? 'bg-success/10 border-success/30 text-success'
+                        : 'bg-danger/10 border-danger/30 text-danger'
                     }`}
                   >
                     {testResult.message}
@@ -942,7 +1188,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 {allProviderNames.map((pname) => {
                   const p = settings.providers[pname];
                   if (!p) return null;
-                  const isDefault = defaultProvider === pname;
+                  const isPersonalProvider = p.models.some((m) => m.id === generalForm?.personal_agent?.model);
+                  const isCodingProvider = p.models.some((m) => m.id === generalForm?.coding_agent?.model);
+                  const providerInUse = isPersonalProvider || isCodingProvider;
                   const isDeleting = deletingProvider === pname;
                   return (
                     <div
@@ -953,9 +1201,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="text-xs font-medium text-fg">{pname}</span>
-                          {isDefault && (
-                            <span className="text-[10px] bg-accent/12 text-accent px-1 py-0.5 rounded border border-accent/25">
-                              默认
+                          {isPersonalProvider && (
+                            <span className="text-[10px] bg-accent/10 text-accent px-1 py-0.5 rounded border border-accent/25">
+                              Personal
+                            </span>
+                          )}
+                          {isCodingProvider && (
+                            <span className="text-[10px] bg-success/10 text-success px-1 py-0.5 rounded border border-success/25">
+                              Coding
                             </span>
                           )}
                         </div>
@@ -976,9 +1229,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </button>
                       <button
                         onClick={() => handleDeleteProvider(pname)}
-                        disabled={isDefault || isDeleting}
-                        className="p-1 text-fg-secondary hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed"
-                        title={isDefault ? '不能删除默认 Provider' : '删除'}
+                        disabled={providerInUse || isDeleting}
+                        className="p-1 text-fg-secondary hover:text-danger disabled:opacity-30 disabled:cursor-not-allowed"
+                        title={providerInUse ? 'Provider is used by an Agent model' : '删除'}
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>
@@ -988,6 +1241,135 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
           </section>
+          )}
+
+          {settingsTab === 'web' && webSearchForm && (
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-fg-secondary">Web Search</h3>
+              <span className="text-[10px] text-fg-muted">Used by Personal, Coding, and worker agents</span>
+            </div>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Provider</label>
+                  <select
+                    value={webSearchForm.provider}
+                    onChange={(e) => setWebSearchForm({ ...webSearchForm, provider: e.target.value as WebSearchProvider })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="brave">Brave Search</option>
+                    <option value="tavily">Tavily</option>
+                    <option value="serpapi">SerpAPI</option>
+                    <option value="duckduckgo">DuckDuckGo fallback</option>
+                  </select>
+                </div>
+                <div className="flex items-end gap-3">
+                  <label className="flex items-center gap-2 text-xs text-fg-secondary cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={webSearchForm.fallback_enabled}
+                      onChange={(e) => setWebSearchForm({ ...webSearchForm, fallback_enabled: e.target.checked })}
+                      className="w-3 h-3"
+                    />
+                    Enable fallback
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-fg-secondary cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={webSearchForm.allow_private_network}
+                      onChange={(e) => setWebSearchForm({ ...webSearchForm, allow_private_network: e.target.checked })}
+                      className="w-3 h-3"
+                    />
+                    Allow private URLs
+                  </label>
+                </div>
+              </div>
+
+              {([
+                ['brave_api_key', 'Brave Search API Key', settings?.web_search?.providers?.brave?.api_key_configured],
+                ['tavily_api_key', 'Tavily API Key', settings?.web_search?.providers?.tavily?.api_key_configured],
+                ['serpapi_api_key', 'SerpAPI Key', settings?.web_search?.providers?.serpapi?.api_key_configured],
+              ] as Array<[WebSearchKeyField, string, boolean | undefined]>).map(([field, label, configured]) => (
+                <div key={field}>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs text-fg-secondary">{label}</label>
+                    <span className={`text-[10px] ${configured ? 'text-success' : 'text-fg-muted'}`}>
+                      {configured ? 'Configured' : 'Not configured'}
+                    </span>
+                  </div>
+                  <div className="flex gap-1">
+                    <input
+                      type={webSearchForm.showKeys[field] ? 'text' : 'password'}
+                      value={webSearchForm[field]}
+                      onChange={(e) => updateWebSearchKey(field, e.target.value)}
+                      onFocus={() => {
+                        if (!webSearchForm.keyDirty[field]) {
+                          updateWebSearchKey(field, '');
+                        }
+                      }}
+                      placeholder="Leave blank to keep unchanged; ${ENV_VAR} is supported"
+                      className="flex-1 text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setWebSearchForm({
+                        ...webSearchForm,
+                        showKeys: { ...webSearchForm.showKeys, [field]: !webSearchForm.showKeys[field] },
+                      })}
+                      className="px-2 text-fg-secondary hover:text-fg bg-surface-alt border border-border-subtle rounded"
+                      title={webSearchForm.showKeys[field] ? 'Hide' : 'Show'}
+                    >
+                      {webSearchForm.showKeys[field] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {webSearchTestResult && (
+                <div
+                  className={`px-3 py-2 rounded text-xs border ${
+                    webSearchTestResult.ok
+                      ? 'bg-success/10 border-success/30 text-success'
+                      : 'bg-danger/10 border-danger/30 text-danger'
+                  }`}
+                >
+                  {webSearchTestResult.message}
+                  {typeof webSearchTestResult.result_count === 'number' && (
+                    <span className="ml-2 text-fg-secondary">({webSearchTestResult.result_count} results)</span>
+                  )}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleTestWebSearch}
+                  disabled={testingWebSearch || saving}
+                  className="flex items-center justify-center gap-1 px-3 py-1.5 rounded text-xs bg-surface-alt text-fg hover:bg-surface-hover transition-colors disabled:opacity-50"
+                >
+                  <Wifi className="w-3 h-3" />
+                  {testingWebSearch ? 'Testing...' : 'Test search'}
+                </button>
+                <button
+                  onClick={handleSaveWebSearch}
+                  disabled={saving}
+                  className="flex-1 flex items-center justify-center gap-1 px-3 py-1.5 rounded text-xs bg-accent/10 text-accent hover:bg-accent/15 transition-colors disabled:opacity-50"
+                >
+                  <Save className="w-3 h-3" />
+                  {saving ? 'Saving...' : 'Save Web Search'}
+                </button>
+              </div>
+            </div>
+          </section>
+          )}
+
+          {settingsTab === 'knowledge' && <KnowledgePanel />}
+          {settingsTab === 'workflows' && <WorkflowPanel />}
+          {settingsTab === 'mcp' && <McpPanel />}
+          {settingsTab === 'connections' && <ConnectionsPanel />}
+          </div>
         </div>
 
         {/* Footer */}
@@ -1005,7 +1387,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               onClick={handleSaveAll}
               disabled={saving}
-              className="flex items-center gap-1 px-4 py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-white transition-colors disabled:opacity-50"
+              className="flex items-center gap-1 px-4 py-1.5 rounded text-xs bg-accent/85 hover:bg-accent text-fg-on-accent transition-colors disabled:opacity-50"
             >
               {saving ? '保存中...' : '保存并关闭'}
             </button>

@@ -13,6 +13,36 @@ export interface ModelInfo {
   context: number;
 }
 
+export interface ContextUsage {
+  session_id: string;
+  model_id: string;
+  model_context: number;
+  estimated_tokens: number;
+  used_tokens: number;
+  output_tokens?: number;
+  remaining_tokens: number;
+  used_percent: number;
+  exact: boolean;
+  source: 'provider' | 'estimate' | string;
+  status: 'ok' | 'warning' | 'critical' | string;
+  breakdown: Record<string, number>;
+  transcript_message_count?: number;
+  context_message_count?: number;
+  transcript_estimated_tokens?: number;
+  context_estimated_tokens?: number;
+  context_truncated?: boolean;
+}
+
+export interface ConversationCheckpoint {
+  id: string;
+  message_id?: string;
+  turn_id?: string;
+  index: number;
+  role: 'user';
+  preview: string;
+  created_at: number;
+}
+
 export interface RoleInfo {
   id: string;
   name: string;
@@ -30,8 +60,8 @@ export interface ProviderSettings {
 }
 
 export interface AppSettings {
-  default_model: string;
-  default_provider: string;
+  default_model?: string;
+  default_provider?: string;
   max_iterations: number;
   auto_approve: boolean;
   screenshot_on_step: boolean;
@@ -42,6 +72,11 @@ export interface AppSettings {
   review_gate_enabled?: boolean;
 }
 
+export interface PersonalAgentSettings {
+  model: string;
+  thinking_intensity: ThinkingIntensity;
+}
+
 export interface CodingAgentSettings {
   enabled: boolean;
   default_execution_mode: "worktree" | "current_dir" | string;
@@ -50,12 +85,34 @@ export interface CodingAgentSettings {
   require_verification: boolean;
   require_review: boolean;
   auto_generate_repo_map: boolean;
+  model: string;
+  thinking_intensity: ThinkingIntensity;
+}
+
+export type WebSearchProvider = "auto" | "brave" | "tavily" | "serpapi" | "duckduckgo";
+
+export interface WebSearchKeyStatus {
+  api_key_masked: string;
+  api_key_configured: boolean;
+}
+
+export interface WebSearchSettings {
+  provider: WebSearchProvider;
+  fallback_enabled: boolean;
+  allow_private_network: boolean;
+  providers: {
+    brave: WebSearchKeyStatus;
+    tavily: WebSearchKeyStatus;
+    serpapi: WebSearchKeyStatus;
+  };
 }
 
 export interface SettingsResponse {
   providers: Record<string, ProviderSettings>;
   settings: AppSettings;
   coding_agent?: CodingAgentSettings;
+  personal_agent?: PersonalAgentSettings;
+  web_search?: WebSearchSettings;
 }
 
 export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video';
@@ -127,20 +184,99 @@ export interface ToolSummary {
   toolBuckets: Array<{ label: string; count: number }>;
 }
 
+export interface KnowledgeContextSource {
+  source_path: string;
+  score: number;
+  preview?: string;
+}
+
 export interface RunEvent {
   id: string;
   type:
     | 'run_created'
     | 'context_pack'
+    | 'skills_matched'
+    | 'skill_draft_ready'
     | 'guardrail_decision'
     | 'approval_required'
     | 'verification_start'
     | 'verification_result'
     | 'review_finding'
+    | 'collaboration_run_created'
+    | 'collaboration_task_update'
+    | 'agent_message'
+    | 'artifact_ready'
+    | 'decision_required'
+    | 'collaboration_run_completed'
     | 'run_completed';
   runId?: string;
   timestamp: number;
   data: Record<string, any>;
+}
+
+export interface ArtifactRef {
+  id: string;
+  type: string;
+  title: string;
+  url?: string;
+  path?: string;
+  content?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface ResultPacket {
+  status: 'pass' | 'fail' | 'blocked';
+  summary: string;
+  details?: string;
+  changed_files?: string[];
+  tests_run?: string[];
+  verification_passed?: boolean | null;
+  review_passed?: boolean | null;
+  assumptions?: string[];
+  blockers?: string[];
+  artifacts?: ArtifactRef[];
+}
+
+export interface CollaborationTask {
+  task_id: string;
+  run_id: string;
+  owner: 'personal' | 'coding' | 'worker';
+  mode: 'consult' | 'execute' | 'handoff';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'cancelled';
+  packet: Record<string, any>;
+  result?: ResultPacket | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CollaborationRun {
+  run_id: string;
+  session_id: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  source_agent: 'personal' | 'coding' | 'worker';
+  target_agent: 'personal' | 'coding' | 'worker';
+  mode: 'consult' | 'execute' | 'handoff';
+  goal: string;
+  project_path?: string;
+  task_ids: string[];
+  artifacts: ArtifactRef[];
+  summary?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentMention {
+  id: string;
+  label: string;
+  agent_type: AgentType;
+}
+
+export interface AgentMessage {
+  agent_type: AgentType;
+  text: string;
+  status?: string;
+  run_id?: string;
+  task_id?: string;
 }
 
 export type ClientChatMode = "agent" | "plan";
@@ -157,6 +293,13 @@ export interface PlanQuestion {
   allow_multiple?: boolean;
   options: PlanQuestionOption[];
   selected?: string[];
+}
+
+export interface PlanDecisionAnswer {
+  question_id: string;
+  selected: string[];
+  other_text?: string;
+  skipped?: boolean;
 }
 
 export type PlanTodoStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
@@ -179,13 +322,20 @@ export interface StructuredPlanStep {
   parallel_group?: string;
 }
 
+export interface CriticalFile {
+  path: string;
+  change?: string;
+}
+
 export interface StructuredPlanDraft {
   goal: string;
+  context?: string;
   assumptions: string[];
   steps: StructuredPlanStep[];
   todos: PlanTodo[];
   risks: string[];
   acceptance_criteria: string[];
+  critical_files?: CriticalFile[];
 }
 
 export interface PlanState {
@@ -197,6 +347,7 @@ export interface PlanState {
   questions: PlanQuestion[];
   todos: PlanTodo[];
   decisions: Record<string, string[]>;
+  decision_notes?: Record<string, string>;
   approved: boolean;
   /** Server: full todos withheld until user answers clarification questions */
   pending_clarification?: boolean;
@@ -206,9 +357,33 @@ export interface PlanState {
   research_notes?: string;
 }
 
+export type TaskGuidanceStatus = "queued" | "applied" | "consumed" | "stale";
+
+export interface TaskGuidanceItem {
+  id: string;
+  text: string;
+  image_base64?: string | null;
+  status: TaskGuidanceStatus;
+  created_at: number;
+  applied_at?: number | null;
+  consumed_at?: number | null;
+  truncated?: boolean;
+}
+
 export type AssistantBlock =
-  | { type: 'thinking'; text: string; timestamp: number }
+  | {
+      type: 'thinking';
+      text: string;
+      timestamp: number;
+      /** When the first reasoning token of this block arrived (frontend clock). */
+      startedAt?: number;
+      /** When this thinking block was sealed (a non-thinking block / turn end). */
+      endedAt?: number;
+      /** True once the thinking step has finished streaming. */
+      complete?: boolean;
+    }
   | { type: 'text'; text: string; timestamp: number }
+  | { type: 'knowledge_context'; sources: KnowledgeContextSource[]; timestamp: number }
   | { type: 'file_edit'; edit: FileEdit; timestamp: number }
   | {
       type: 'tool_call';
@@ -221,16 +396,34 @@ export type AssistantBlock =
       workerEvents?: WorkerEvent[];
       timestamp: number;
     }
-  | { type: 'image'; base64: string; timestamp: number };
+  | { type: 'image'; base64: string; timestamp: number }
+  | { type: 'plan_questions'; questions: PlanQuestion[]; timestamp: number }
+  | { type: 'plan_answers'; questions: PlanQuestion[]; answers: PlanDecisionAnswer[]; timestamp: number }
+  | { type: 'plan_execution'; goal: string; todos: PlanTodo[]; timestamp: number }
+  | {
+      type: 'plan_draft';
+      goal: string;
+      draft: string;
+      todos: PlanTodo[];
+      structured_plan?: StructuredPlanDraft | null;
+      timestamp: number;
+    };
 
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  messageId?: string;
+  turnId?: string;
+  checkpointId?: string;
+  createdAt?: number;
   imageBase64?: string;
+  rawContent?: unknown;
+  attachmentCount?: number;
   isTool: boolean;
   reasoning?: string;
   skill?: string;
+  agentType?: AgentType;
   blocks?: AssistantBlock[];
   toolSummary?: ToolSummary;
   turnComplete?: boolean;
@@ -254,6 +447,7 @@ export interface FileNode {
   type: 'file' | 'dir';
   path: string;
   extension?: string;
+  has_children?: boolean;
   children?: FileNode[];
 }
 
@@ -266,6 +460,8 @@ export interface OpenFile {
   isModified?: boolean;
   hasConflict?: boolean;
   isPinned?: boolean;
+  readOnly?: boolean;
+  source?: 'project' | 'plan' | 'artifact';
 }
 
 export interface EditorGroup {
@@ -274,7 +470,128 @@ export interface EditorGroup {
   openFiles: OpenFile[];
 }
 
-export type SidebarSection = 'tools' | 'project' | 'sessions' | 'knowledge' | 'settings';
+export type AgentType = 'personal' | 'coding';
+export type SidebarSection = 'personal' | 'coding' | 'skills' | 'workspace' | 'settings';
+
+export interface SessionHistoryItem {
+  id: string;
+  title?: string;
+  project_path?: string | null;
+  model_id: string;
+  role_id?: string;
+  agent_type?: AgentType;
+  message_count: number;
+  updated_at?: number;
+  is_primary?: boolean;
+  archived_at?: string | null;
+  is_running: boolean;
+  active_connections: number;
+  activity_state: 'idle' | 'running' | 'needs_input';
+}
+
+export interface SessionHistoryProject {
+  path: string;
+  canonical_path?: string;
+  project_key?: string;
+  name: string;
+  display_name?: string | null;
+  folder_name?: string;
+  last_opened?: string | null;
+  is_current: boolean;
+  has_running: boolean;
+  is_pinned?: boolean;
+  is_archived?: boolean;
+  archived_sessions_count?: number;
+  source?: 'recent' | 'session' | 'current' | 'metadata';
+  sessions: SessionHistoryItem[];
+}
+
+export interface SessionHistoryResponse {
+  current_project_path: string | null;
+  projects: SessionHistoryProject[];
+  standalone_sessions: SessionHistoryItem[];
+}
+
+export interface SkillPreferences {
+  personal: Record<string, boolean>;
+  coding: Record<string, boolean>;
+}
+
+export interface SkillCatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  source: 'superpowers' | 'personal' | 'mcp' | 'a2a' | string;
+  enabledByAgent: Record<AgentType, boolean>;
+  recommendedFor: AgentType[];
+  category: string;
+  trustLevel: 'local' | 'trusted' | 'external' | string;
+  status?: 'draft' | 'published' | 'archived' | string;
+  scopes?: AgentType[];
+  version?: string;
+  validation?: SkillValidationSummary;
+}
+
+export interface SkillValidationIssue {
+  level: 'error' | 'warning' | 'risk' | string;
+  code: string;
+  message: string;
+}
+
+export interface SkillValidationSummary {
+  passed?: boolean;
+  issues?: SkillValidationIssue[];
+  warnings?: SkillValidationIssue[];
+  risks?: SkillValidationIssue[];
+  name?: string;
+  description?: string;
+}
+
+export interface SkillDraftItem {
+  id: string;
+  draft_id: string;
+  skill_id: string;
+  name: string;
+  description: string;
+  status: 'draft' | string;
+  source: string;
+  scopes: AgentType[];
+  enabledByAgent: Record<AgentType, boolean>;
+  path: string;
+  created_at?: string;
+  updated_at?: string;
+  validation?: SkillValidationSummary;
+}
+
+export interface SkillPreset {
+  id: string;
+  name: string;
+  description: string;
+  agentTypes: AgentType[];
+  skillIds: string[];
+}
+
+export interface MatchedSkillTrace {
+  id: string;
+  name: string;
+  category: string;
+  source: string;
+  reason: string;
+}
+
+export interface SkillCatalogResponse {
+  skills: SkillCatalogItem[];
+  preferences: SkillPreferences;
+  defaults: SkillPreferences;
+  presets: SkillPreset[];
+  ignored?: string[];
+}
+
+export interface AgentInfo {
+  type: AgentType;
+  name: string;
+  description: string;
+}
 
 export interface KnowledgeDoc {
   source_path: string;
@@ -306,7 +623,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'run_created' | 'context_pack' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'run_completed' | 'chat_mode' | 'compacted' | 'model_switched';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 
@@ -327,14 +644,14 @@ export function errorCategory(data: any): string {
   return data?.category || 'unknown';
 }
 
-declare global {
-  interface Window {
-    electronAPI: {
-      selectFolder: () => Promise<string | undefined>;
-      selectFile: () => Promise<string | undefined>;
-      getAppVersion: () => Promise<string>;
-      getAuthToken: () => Promise<string>;
-      onNewSession: (cb: () => void) => () => void;
-    };
-  }
+export interface ConnectorInfo {
+  name: string;
+  display_name: string;
+  description: string;
+  status: 'stopped' | 'running' | 'error';
+  status_message: string;
+  enabled: boolean;
+  uptime_seconds: number;
+  config: Record<string, any>;
+  config_schema: Record<string, any>;
 }

@@ -20,7 +20,7 @@ providers:
       context: 200000
       vision: true
   kimi:
-    base_url: https://api.kimi.com/coding/v1
+    base_url: https://api.kimi.com/coding
     api_key: ${KIMI_API_KEY}
     models:
     - id: kimi-for-coding
@@ -29,7 +29,7 @@ providers:
       vision: true
   local:
     base_url: http://localhost:11434/v1
-    api_key: ollama
+    api_key: ${OLLAMA_API_KEY}
     models:
     - id: gemma3:4b
       name: Gemma 3 (4B)
@@ -51,12 +51,16 @@ rag:
   top_k: 5
 
 settings:
-  default_model: kimi-for-coding
-  default_provider: kimi
+  default_model: ""
+  default_provider: ""
   max_iterations: 10000
   auto_approve: false
   screenshot_on_step: true
   sandbox_mode: sandbox
+  collaboration_enabled: true
+  default_collaboration_mode: hybrid
+  auto_delegate_coding: suggest
+  max_parallel_agents: 3
 
 coding_agent:
   enabled: true
@@ -66,3 +70,7 @@ coding_agent:
   require_verification: true
   require_review: true
   auto_generate_repo_map: true
+  model: kimi-for-coding
+
+personal_agent:
+  model: kimi-for-coding

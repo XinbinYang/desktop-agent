@@ -14,6 +14,8 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
 @dataclass
 class TestResult:
+    __test__ = False
+
     name: str
     status: str  # passed, failed, skipped, error
     duration_ms: float = 0
@@ -23,6 +25,8 @@ class TestResult:
 
 @dataclass
 class TestRun:
+    __test__ = False
+
     run_id: str
     total: int = 0
     passed: int = 0

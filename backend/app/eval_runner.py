@@ -160,12 +160,17 @@ async def _execute_single_task(
 
         # 2. Run agent
         from app.agent import AgentSession
-        from app.config import load_config
+        from app.agents.manager import AgentManager
+        from app.config import get_model_for_agent
 
-        cfg = load_config()
-        model_id = cfg.settings.default_model
+        model_id = get_model_for_agent("coding")
 
-        session = AgentSession(model_id=model_id, session_id=session_id)
+        session = AgentSession(
+            model_id=model_id,
+            session_id=session_id,
+            role_id=AgentManager.get_default_role("coding"),
+            agent_type="coding",
+        )
         session.max_iterations = 30  # Limit iterations for eval
 
         try:

@@ -2,7 +2,7 @@ import asyncio
 import base64
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,18 +12,22 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.agent import (
     AgentSession,
     SESSIONS_DIR,
     _sessions,
+    _load_session_data,
+    archive_session_record,
     clear_session,
     get_or_create_session,
+    list_session_records,
     refresh_all_sessions_mcp_tools,
+    resolve_agent_session,
     PLAN_CONTINUE_MARKER,
 )
-from app.config import list_all_models, load_config
+from app.config import get_model_for_agent, list_all_models, load_config
 from app.credential_manager import CredentialManager
 from app.errors import (
     ErrorCategory,
@@ -31,6 +35,7 @@ from app.errors import (
     categorize_exception,
     error_response,
     not_found_error,
+    sandbox_error,
     tool_failure_error,
     tool_not_found_error,
     validation_error,
@@ -38,19 +43,51 @@ from app.errors import (
 from app.mcp.manager import MCP_CONFIG_PATH, get_mcp_manager
 from app.project_manager import ProjectManager
 from app.roles import RoleManager
+from app.agents.manager import AgentManager
+from app.agents.heartbeat import HeartbeatEngine
 from app.runtime_paths import runtime_dir
 from app.commands import get_commands
+from app.collaboration.manager import cancel_run as cancel_collaboration_run, list_events as list_collaboration_events
 from app.security import AUTH_HEADER, is_auth_enabled, is_valid_auth_token, resolve_current_project_file
+from app.skill_authoring import (
+    SkillAuthoringError,
+    archive_skill as archive_user_skill,
+    list_drafts as list_skill_drafts,
+    publish_draft as publish_skill_draft,
+    read_skill as read_user_skill,
+    save_draft as save_skill_draft,
+    update_draft as update_skill_draft,
+    validate_skill as validate_user_skill,
+)
 from app.skills import SkillManager
+from app.session_runtime import (
+    cancel_session_runtime,
+    get_session_runtime,
+    session_runtime_status,
+    terminate_session_runtime,
+)
 from app.tools import ALL_TOOLS, SAFE_DIRECT_TOOLS, get_tool, list_tool_names
+from app.tools.browser_tool import close_browser_session
 from app.tools.file_tool import build_file_edit_metadata
-from app.tools.worker_tool import reset_worker_event_callback, set_worker_event_callback
+from app.tools.worker_tool import cancel_workers_for_session
+from app.tools.workflow_tool import clear_recorder
 from app.transcribe import get_model_info, transcribe_audio
+from app.ws_connections import (
+    SESSION_DELETED_CLOSE_CODE,
+    SESSION_DELETED_REASON,
+    allow_session_recreate,
+    close_session_websockets,
+    is_session_deleted,
+    mark_session_deleted,
+    register_session_websocket,
+    session_websocket_snapshot,
+    unregister_session_websocket,
+)
 
-# 生命周期管理
+# ç”Ÿå‘½å‘¨æœŸç®¡ç†
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时检查
+    # å¯åŠ¨æ—¶æ£€æŸ¥
     print("[Desktop Agent] Backend starting...")
     print(f"[Desktop Agent] Available tools: {list_tool_names()}")
     whisper_info = get_model_info()
@@ -62,17 +99,29 @@ async def lifespan(app: FastAPI):
     if n > 0:
         print(f"[Desktop Agent] Loaded {n} plugin(s)")
 
+    # Register platform connectors
+    from app.connectors import get_connector_manager
+    from app.connectors.discord_connector import DiscordConnector
+    from app.connectors.feishu_connector import FeishuConnector
+    connector_manager = get_connector_manager()
+    connector_manager.register(DiscordConnector())
+    connector_manager.register(FeishuConnector())
+    print(f"[Desktop Agent] Registered connectors: {[c['name'] for c in connector_manager.list_connectors()]}")
+    # Restore enabled connectors from saved config
+    await connector_manager.start_enabled()
+
     yield
     print("[Desktop Agent] Backend shutting down...")
     get_plugin_manager().unload_all()
+    await connector_manager.shutdown()
     await get_mcp_manager().disconnect_all()
 
 app = FastAPI(title="Desktop Agent API", lifespan=lifespan)
 
-# CORS：允许前端访问
+# CORSï¼šå…è®¸å‰ç«¯è®¿é—®
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null", "file://"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,13 +129,26 @@ app.add_middleware(
 
 _LOCAL_ORIGINS = frozenset({
     "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174",
-    "http://localhost:5175", "null",  # null = file:// (Electron renderer)
+    "http://localhost:5175", "null", "file://",  # packaged Electron renderer
 })
 
 
 def _is_local_origin(origin: str) -> bool:
     """Only allow WebSocket upgrades from known local origins."""
     return origin.lower() in _LOCAL_ORIGINS
+
+
+def _collaboration_ws_event(event: Any) -> Dict[str, Any]:
+    data = dict(getattr(event, "data", {}) or {})
+    collab_run_id = getattr(event, "run_id", "")
+    task_id = getattr(event, "task_id", "") or ""
+    data.setdefault("run_id", collab_run_id)
+    data.setdefault("collaboration_run_id", collab_run_id)
+    if task_id:
+        data.setdefault("task_id", task_id)
+        data.setdefault("collaboration_task_id", task_id)
+    data.setdefault("timestamp", getattr(event, "timestamp", None))
+    return {"type": getattr(event, "type", "collaboration_task_update"), "data": data}
 
 
 @app.middleware("http")
@@ -105,7 +167,7 @@ async def local_auth_middleware(request: Request, call_next):
 
     return await call_next(request)
 
-# Preview 目录静态文件服务（用于 Codex 代码预览）
+# Preview ç›®å½•é™æ€æ–‡ä»¶æœåŠ¡ï¼ˆç”¨äºŽ Codex ä»£ç é¢„è§ˆï¼‰
 PREVIEW_DIR = runtime_dir("preview")
 app.mount("/preview", StaticFiles(directory=str(PREVIEW_DIR)), name="preview")
 
@@ -115,12 +177,18 @@ from app.routes.projects import router as projects_router
 from app.routes.knowledge import router as knowledge_router
 from app.routes.workflows import router as workflows_router
 from app.routes.runs import router as runs_router
+from app.routes.agents import router as agents_router
+from app.routes.connectors import router as connectors_router
+from app.routes.collaboration import router as collaboration_router
 
 app.include_router(settings_router)
 app.include_router(projects_router)
 app.include_router(knowledge_router)
 app.include_router(workflows_router)
 app.include_router(runs_router)
+app.include_router(agents_router)
+app.include_router(connectors_router)
+app.include_router(collaboration_router)
 
 
 # ====== REST API ======
@@ -132,7 +200,206 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     model_id: Optional[str] = None
     role_id: Optional[str] = None
+    agent_type: Optional[str] = None
     image_base64: Optional[str] = None
+
+
+class SessionResolveRequest(BaseModel):
+    agent_type: str
+    policy: str = "last_or_create"
+    project_path: Optional[str] = None
+
+
+class CompactSessionRequest(BaseModel):
+    focus: Optional[str] = ""
+    force: bool = False
+
+
+class RewindSessionRequest(BaseModel):
+    checkpoint_id: str
+    retry: bool = False
+
+
+def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> str:
+    if agent_type in ("personal", "coding"):
+        return agent_type
+    return AgentManager.get_agent_type_for_role(role_id or "desktop-agent")
+
+
+def _history_project_key(path: Optional[str]) -> str:
+    return ProjectManager.history_key(path)
+
+
+def _history_project_name(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/").rstrip("/")
+    if not normalized:
+        return "Untitled project"
+    return Path(normalized).name or normalized
+
+
+def _session_activity_state(session_id: str, is_running: bool) -> str:
+    if is_running:
+        return "running"
+
+    phase = ""
+    live = _sessions.get(session_id)
+    if live is not None:
+        phase = getattr(getattr(live, "plan_state", None), "phase", "") or ""
+    else:
+        data = _load_session_data(session_id)
+        plan_state = data.get("plan_state") if isinstance(data, dict) else None
+        if isinstance(plan_state, dict):
+            phase = str(plan_state.get("phase") or "")
+
+    if phase in {"awaiting_decision", "awaiting_approval", "approved_waiting_build"}:
+        return "needs_input"
+    return "idle"
+
+
+def _session_history_item(record: Dict[str, Any], connection_counts: Dict[str, int]) -> Dict[str, Any]:
+    session_id = str(record.get("id") or "")
+    runtime = session_runtime_status(session_id)
+    is_running = bool(runtime.get("is_running"))
+    item = dict(record)
+    item["is_running"] = is_running
+    item["active_connections"] = int(connection_counts.get(session_id, 0))
+    item["activity_state"] = _session_activity_state(session_id, is_running)
+    return item
+
+
+def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
+    current_project = ProjectManager.get_current()
+    current_project_path = current_project.get("path") if current_project else None
+    current_key = _history_project_key(current_project_path)
+    metadata_entries = ProjectManager.list_project_history()
+    metadata_by_key = {
+        _history_project_key(item.get("path")): item
+        for item in metadata_entries
+        if _history_project_key(item.get("path"))
+    }
+
+    connection_counts = {
+        str(item.get("session_id")): int(item.get("connections") or 0)
+        for item in session_websocket_snapshot()
+    }
+    session_items: List[Dict[str, Any]] = []
+    archived_counts: Dict[str, int] = {}
+    for record in list_session_records():
+        item = _session_history_item(record, connection_counts)
+        project_path = item.get("project_path")
+        if item.get("archived_at"):
+            if item.get("agent_type") == "coding" and project_path:
+                key = _history_project_key(str(project_path))
+                archived_counts[key] = archived_counts.get(key, 0) + 1
+            if not include_archived:
+                continue
+        session_items.append(item)
+
+    projects_by_key: Dict[str, Dict[str, Any]] = {}
+    project_order: List[str] = []
+
+    def ensure_project(
+        path: Optional[str],
+        source: Optional[Dict[str, Any]] = None,
+        source_type: str = "session",
+    ) -> Optional[Dict[str, Any]]:
+        if not path:
+            return None
+        canonical_path = ProjectManager.canonical_project_path(path)
+        key = _history_project_key(canonical_path)
+        if not key:
+            return None
+        metadata = metadata_by_key.get(key) or {}
+        is_archived = bool(metadata.get("archived_at"))
+        is_removed = bool(metadata.get("removed_at"))
+        if (is_archived or is_removed) and key != current_key and not include_archived:
+            return None
+        if key not in projects_by_key:
+            project_path = ProjectManager.canonical_project_path(source.get("path") if source and source.get("path") else canonical_path)
+            folder_name = _history_project_name(project_path)
+            display_name = str(metadata.get("display_name") or "").strip()
+            source_name = source.get("name") if source and source.get("name") else ""
+            projects_by_key[key] = {
+                "path": project_path,
+                "canonical_path": project_path,
+                "project_key": key,
+                "name": display_name or source_name or folder_name,
+                "display_name": display_name or None,
+                "folder_name": folder_name,
+                "last_opened": source.get("last_opened") if source else None,
+                "is_current": key == current_key,
+                "has_running": False,
+                "is_pinned": bool(metadata.get("pinned_at")),
+                "is_archived": is_archived,
+                "archived_sessions_count": archived_counts.get(key, 0),
+                "source": source_type,
+                "_order": len(project_order),
+                "_pinned_at": metadata.get("pinned_at") or "",
+                "sessions": [],
+            }
+            project_order.append(key)
+        elif source:
+            project = projects_by_key[key]
+            display_name = str(metadata.get("display_name") or "").strip()
+            project["name"] = display_name or source.get("name") or project["name"]
+            project["display_name"] = display_name or None
+            project["folder_name"] = project.get("folder_name") or _history_project_name(project.get("path") or path)
+            project["last_opened"] = source.get("last_opened") or project.get("last_opened")
+            project["is_current"] = project["is_current"] or key == current_key
+            project["is_pinned"] = bool(metadata.get("pinned_at"))
+            project["is_archived"] = is_archived
+            project["archived_sessions_count"] = archived_counts.get(key, 0)
+        return projects_by_key[key]
+
+    for project in ProjectManager.list_recent():
+        ensure_project(project.get("path"), project, "recent")
+    if current_project_path:
+        ensure_project(current_project_path, current_project, "current")
+    for metadata in metadata_entries:
+        if metadata.get("pinned_at"):
+            ensure_project(metadata.get("path"), metadata, "metadata")
+
+    standalone_sessions: List[Dict[str, Any]] = []
+    for item in session_items:
+        project_path = item.get("project_path")
+        if item.get("agent_type") == "coding" and project_path:
+            project = ensure_project(str(project_path), source_type="session")
+            if project is not None:
+                project["sessions"].append(item)
+                project["has_running"] = bool(project["has_running"] or item.get("is_running"))
+            continue
+        standalone_sessions.append(item)
+
+    def session_sort_key(session: Dict[str, Any]) -> float:
+        try:
+            return -float(session.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for project in projects_by_key.values():
+        project["sessions"] = sorted(project["sessions"], key=session_sort_key)
+        project["archived_sessions_count"] = archived_counts.get(_history_project_key(project.get("path")), 0)
+
+    pinned_projects = sorted(
+        (project for project in projects_by_key.values() if project.get("is_pinned")),
+        key=lambda project: str(project.get("_pinned_at") or ""),
+        reverse=True,
+    )
+    regular_projects = sorted(
+        (project for project in projects_by_key.values() if not project.get("is_pinned")),
+        key=lambda project: int(project.get("_order") or 0),
+    )
+    projects = pinned_projects + regular_projects
+    for project in projects:
+        project.pop("_order", None)
+        project.pop("_pinned_at", None)
+
+    return {
+        "current_project_path": current_project_path,
+        "projects": projects,
+        "standalone_sessions": standalone_sessions,
+    }
+
 
 class StoreCredentialRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -142,13 +409,13 @@ class StoreCredentialRequest(BaseModel):
 
 @app.get("/api/models")
 def get_models():
-    """获取所有可用模型列表"""
+    """èŽ·å–æ‰€æœ‰å¯ç”¨æ¨¡åž‹åˆ—è¡¨"""
     try:
-        return {"models": list_all_models(), "default": load_config().settings.default_model}
+        return {"models": list_all_models(), "default": get_model_for_agent("personal")}
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"无法读取模型配置文件（models.yaml）：{e}",
+            detail=f"æ— æ³•è¯»å–æ¨¡åž‹é…ç½®æ–‡ä»¶ï¼ˆmodels.yamlï¼‰ï¼š{e}",
         ) from e
 
 @app.get("/api/health")
@@ -162,20 +429,24 @@ def health_check():
 
 @app.get("/api/tools")
 def get_tools():
-    """获取所有可用工具列表"""
+    """èŽ·å–æ‰€æœ‰å¯ç”¨å·¥å…·åˆ—è¡¨"""
     return {"tools": [{"name": t.name, "description": t.description} for t in ALL_TOOLS]}
 
 @app.get("/api/roles")
 def get_roles():
-    """获取所有内置角色列表"""
+    """èŽ·å–æ‰€æœ‰å†…ç½®è§’è‰²åˆ—è¡¨"""
     return {"roles": RoleManager.list_roles()}
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """非流式聊天（测试用）"""
-    model_id = req.model_id or load_config().settings.default_model
-    role_id = req.role_id or "desktop-agent"
-    session = get_or_create_session(req.session_id, model_id, role_id)
+    """éžæµå¼èŠå¤©ï¼ˆæµ‹è¯•ç”¨ï¼‰"""
+    agent_type = _resolve_agent_type(req.agent_type, req.role_id)
+    model_id = req.model_id or get_model_for_agent(agent_type)
+    role_id = req.role_id or AgentManager.get_default_role(agent_type)
+    try:
+        session = get_or_create_session(req.session_id, model_id, role_id, agent_type=agent_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     results = []
     async for event in session.run(req.message, req.image_base64):
@@ -183,29 +454,40 @@ async def chat(req: ChatRequest):
 
     return {"events": results}
 
+
+@app.get("/api/session-history")
+def get_session_history(include_archived: bool = False):
+    """Return project-grouped session history with live per-session activity."""
+    return _build_session_history(include_archived=include_archived)
+
+
 @app.get("/api/sessions")
-def list_sessions(project_path: str = ""):
-    """获取所有保存的会话列表，可按项目路径过滤"""
-    sessions = []
-    for path in SESSIONS_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            sp = data.get("project_path")
-            if project_path and sp != project_path:
-                continue
-            sessions.append({
-                "id": data.get("session_id", path.stem),
-                "title": data.get("title", ""),
-                "project_path": sp,
-                "model_id": data.get("model_id", ""),
-                "role_id": data.get("role_id", "desktop-agent"),
-                "message_count": len(data.get("messages", [])),
-                "updated_at": path.stat().st_mtime,
-            })
-        except Exception:
-            pass
-    return {"sessions": sorted(sessions, key=lambda s: s.get("updated_at", 0), reverse=True)}
+def list_sessions(project_path: str = "", agent_type: str = ""):
+    """èŽ·å–æ‰€æœ‰ä¿å­˜çš„ä¼šè¯åˆ—è¡¨ï¼Œå¯æŒ‰é¡¹ç›®è·¯å¾„è¿‡æ»¤"""
+    if agent_type and agent_type not in ("personal", "coding"):
+        raise HTTPException(status_code=400, detail=f"Unknown agent_type: {agent_type}")
+    return {"sessions": list_session_records(project_path=project_path, agent_type=agent_type)}
+
+
+@app.get("/api/sessions/connections")
+def list_session_connections():
+    """Return currently accepted WebSocket connections grouped by session."""
+    connections = session_websocket_snapshot()
+    return {
+        "connections": connections,
+        "total": sum(item["connections"] for item in connections),
+    }
+
+
+@app.post("/api/sessions/resolve")
+def resolve_session(req: SessionResolveRequest):
+    """Resolve the concrete session that should back an agent navigation action."""
+    try:
+        resolved = resolve_agent_session(req.agent_type, req.policy, req.project_path)
+        allow_session_recreate(resolved["session_id"])
+        return resolved
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.get("/api/sessions/{session_id}")
 def get_session_snapshot(session_id: str):
@@ -216,13 +498,109 @@ def get_session_snapshot(session_id: str):
     return session.to_snapshot()
 
 @app.post("/api/sessions/{session_id}/clear")
-def clear_chat(session_id: str):
+async def clear_chat(session_id: str):
+    session = _sessions.get(session_id)
+    await terminate_session_runtime(session_id, session)
+    cancel_workers_for_session(session_id)
+    clear_recorder(session_id)
     clear_session(session_id)
     return {"status": "ok", "message": f"Session {session_id} cleared"}
 
+
+@app.get("/api/sessions/{session_id}/context")
+def get_session_context(session_id: str):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session.context_usage()
+
+
+@app.get("/api/sessions/{session_id}/runtime")
+def get_session_runtime_status(session_id: str):
+    """Return live runtime state for one session without touching other sessions."""
+    return session_runtime_status(session_id)
+
+
+@app.post("/api/sessions/{session_id}/stop")
+async def stop_session_runtime(session_id: str):
+    """Stop only the live run owned by this session."""
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    was_running = await cancel_session_runtime(session_id, session, broadcast=True)
+    cancel_workers_for_session(session_id)
+    paused_plan = False
+    if session is not None:
+        paused_plan = session.pause_plan_build()
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "was_running": was_running,
+        "paused_plan": paused_plan,
+        **session_runtime_status(session_id),
+    }
+
+
+@app.get("/api/sessions/{session_id}/checkpoints")
+def get_session_checkpoints(session_id: str):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"checkpoints": session.build_checkpoints()}
+
+
+@app.post("/api/sessions/{session_id}/compact")
+async def compact_session(session_id: str, req: CompactSessionRequest):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = await session.compact_context(req.focus or "", force=req.force)
+    if result is None:
+        raise HTTPException(status_code=500, detail="Context compaction failed")
+    return {**result, "snapshot": session.to_snapshot()}
+
+
+@app.post("/api/sessions/{session_id}/rewind")
+def rewind_session(session_id: str, req: RewindSessionRequest):
+    session = _sessions.get(session_id) or AgentSession.load(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = session.rewind_to_checkpoint(req.checkpoint_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    return {**result, "retry": False, "snapshot": session.to_snapshot()}
+
+
+@app.post("/api/sessions/{session_id}/archive")
+def archive_session(session_id: str):
+    """Archive a saved session without deleting its transcript."""
+    runtime = session_runtime_status(session_id)
+    if runtime.get("is_running"):
+        raise HTTPException(status_code=409, detail="Cannot archive a running session")
+    try:
+        archived = archive_session_record(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not archived:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "ok", "session": archived}
+
+
 @app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str):
-    """删除会话"""
+async def delete_session(session_id: str):
+    """åˆ é™¤ä¼šè¯"""
+    mark_session_deleted(session_id)
+    closed_connections = await close_session_websockets(
+        session_id,
+        code=SESSION_DELETED_CLOSE_CODE,
+        reason=SESSION_DELETED_REASON,
+    )
+    session = _sessions.get(session_id)
+    runtime_terminated = await terminate_session_runtime(session_id, session)
+    cancel_workers_for_session(session_id)
+    clear_recorder(session_id)
+    try:
+        await close_browser_session(session_id)
+    except Exception as exc:
+        print(f"[Session] Browser cleanup failed for {session_id}: {exc}")
     if session_id in _sessions:
         del _sessions[session_id]
     path = SESSIONS_DIR / f"{session_id}.json"
@@ -231,24 +609,54 @@ def delete_session(session_id: str):
             path.unlink()
         except OSError:
             pass
-    return {"status": "ok", "message": f"Session {session_id} deleted"}
+    return {
+        "status": "ok",
+        "message": f"Session {session_id} deleted",
+        "runtime_terminated": runtime_terminated,
+        "closed_connections": closed_connections,
+    }
+
+# ---- Team shared context ----
+
+@app.get("/api/teams/{team_id}/context")
+def get_team_context(team_id: str):
+    from app.teams import read_team_context
+    content = read_team_context(team_id)
+    return {"team_id": team_id, "content": content}
+
+@app.post("/api/teams/{team_id}/context")
+def post_team_context(team_id: str, request: Request):
+    from app.teams import append_team_context
+    import asyncio
+    body = asyncio.run(_read_json_body(request))
+    content = (body or {}).get("content", "")
+    if not content:
+        raise validation_error("content is required")
+    append_team_context(team_id, content)
+    return {"status": "ok", "team_id": team_id}
+
+async def _read_json_body(request: Request) -> dict | None:
+    try:
+        return await request.json()
+    except Exception:
+        return None
 
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
-    """上传图片并返回 base64"""
+    """ä¸Šä¼ å›¾ç‰‡å¹¶è¿”å›ž base64"""
     content = await file.read()
     b64 = base64.b64encode(content).decode("utf-8")
     return {"filename": file.filename, "base64": b64}
 
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    """上传音频文件，返回 Whisper 语音转录文本。"""
+    """ä¸Šä¼ éŸ³é¢‘æ–‡ä»¶ï¼Œè¿”å›ž Whisper è¯­éŸ³è½¬å½•æ–‡æœ¬ã€‚"""
     try:
         content = await file.read()
         if not content:
-            return {"text": "", "error": "空音频文件"}
+            return {"text": "", "error": "ç©ºéŸ³é¢‘æ–‡ä»¶"}
 
-        # 根据文件名推断后缀
+        # æ ¹æ®æ–‡ä»¶åæŽ¨æ–­åŽç¼€
         suffix = Path(file.filename).suffix if file.filename else ".webm"
         if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac"}:
             suffix = ".webm"
@@ -256,42 +664,42 @@ async def transcribe(file: UploadFile = File(...)):
         text = await transcribe_audio(content, language="zh", suffix=suffix)
         return {"text": text, "filename": file.filename}
     except Exception as e:
-        return {"text": "", "error": f"转录失败: {e}"}
+        return {"text": "", "error": f"è½¬å½•å¤±è´¥: {e}"}
 
 @app.get("/api/transcribe/info")
 def transcribe_info():
-    """获取 Whisper 模型状态。"""
+    """èŽ·å– Whisper æ¨¡åž‹çŠ¶æ€ã€‚"""
     return get_model_info()
 
-# ====== 文件读取 API ======
+# ====== æ–‡ä»¶è¯»å– API ======
 
 @app.get("/api/file/read")
 async def read_file_api(path: str):
-    """读取文件内容，用于编辑器预览。path 为绝对路径。"""
+    """è¯»å–æ–‡ä»¶å†…å®¹ï¼Œç”¨äºŽç¼–è¾‘å™¨é¢„è§ˆã€‚path ä¸ºç»å¯¹è·¯å¾„ã€‚"""
     p, err = resolve_current_project_file(path)
     if err:
         return {"error": err}
     assert p is not None  # resolve_current_project_file returns Path when err is None
 
     if not p.exists():
-        return {"error": f"文件不存在: {path}"}
+        return {"error": f"æ–‡ä»¶ä¸å­˜åœ¨: {path}"}
     if not p.is_file():
-        return {"error": f"路径不是文件: {path}"}
+        return {"error": f"è·¯å¾„ä¸æ˜¯æ–‡ä»¶: {path}"}
 
-    # 安全限制：避免读取超大文件
+    # å®‰å…¨é™åˆ¶ï¼šé¿å…è¯»å–è¶…å¤§æ–‡ä»¶
     size = p.stat().st_size
     if size > 10 * 1024 * 1024:  # 10MB
-        return {"error": f"文件过大 ({size} bytes)，拒绝读取"}
+        return {"error": f"æ–‡ä»¶è¿‡å¤§ ({size} bytes)ï¼Œæ‹’ç»è¯»å–"}
 
     try:
         async with aiofiles.open(p, "r", encoding="utf-8", errors="ignore") as f:
             content = await f.read()
         return {"content": content, "path": str(p)}
     except OSError as e:
-        return {"error": f"文件读取错误: {e}"}
+        return {"error": f"æ–‡ä»¶è¯»å–é”™è¯¯: {e}"}
 
 
-# ====== 文件保存 API ======
+# ====== æ–‡ä»¶ä¿å­˜ API ======
 
 class WriteFileRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -300,7 +708,7 @@ class WriteFileRequest(BaseModel):
 
 @app.post("/api/file/write")
 async def write_file_api(req: WriteFileRequest):
-    """写入文件内容，用于编辑器保存。path 为绝对路径。"""
+    """å†™å…¥æ–‡ä»¶å†…å®¹ï¼Œç”¨äºŽç¼–è¾‘å™¨ä¿å­˜ã€‚path ä¸ºç»å¯¹è·¯å¾„ã€‚"""
     p, err = resolve_current_project_file(req.path)
     if err:
         return {"error": err}
@@ -308,7 +716,7 @@ async def write_file_api(req: WriteFileRequest):
     if p.exists() and not p.is_file():
         return {"error": f"Path is not a file: {req.path}"}
     if not p.parent.exists():
-        return {"error": f"父目录不存在: {p.parent}"}
+        return {"error": f"çˆ¶ç›®å½•ä¸å­˜åœ¨: {p.parent}"}
 
     try:
         existed = p.exists()
@@ -323,7 +731,7 @@ async def write_file_api(req: WriteFileRequest):
         file_edit = build_file_edit_metadata(p, old_content, req.content, existed)
         return {"status": "ok", "path": str(p), "file_edit": file_edit}
     except OSError as e:
-        return {"error": f"文件写入错误: {e}"}
+        return {"error": f"æ–‡ä»¶å†™å…¥é”™è¯¯: {e}"}
 
 
 class RevertFileRequest(BaseModel):
@@ -334,7 +742,7 @@ class RevertFileRequest(BaseModel):
 
 @app.post("/api/file/revert")
 async def revert_file_api(req: RevertFileRequest):
-    """回退文件到指定内容（用于 Apply/Diff 审批的 Reject 操作）。"""
+    """å›žé€€æ–‡ä»¶åˆ°æŒ‡å®šå†…å®¹ï¼ˆç”¨äºŽ Apply/Diff å®¡æ‰¹çš„ Reject æ“ä½œï¼‰ã€‚"""
     p, err = resolve_current_project_file(req.path)
     if err:
         return {"error": err}
@@ -344,14 +752,14 @@ async def revert_file_api(req: RevertFileRequest):
             await f.write(req.old_content)
         return {"status": "ok", "path": str(p)}
     except OSError as e:
-        return {"error": {"category": "internal", "message": f"文件回退失败: {e}"}}
+        return {"error": {"category": "internal", "message": f"æ–‡ä»¶å›žé€€å¤±è´¥: {e}"}}
 
 
 # ====== Plugins API ======
 
 @app.get("/api/plugins")
 def list_plugins():
-    """列出所有已加载的插件。"""
+    """åˆ—å‡ºæ‰€æœ‰å·²åŠ è½½çš„æ’ä»¶ã€‚"""
     from app.plugins import get_plugin_manager
     plugins = get_plugin_manager().plugins
     return {
@@ -365,7 +773,7 @@ def list_plugins():
 
 @app.post("/api/plugins/reload")
 def reload_plugins():
-    """重新加载所有插件。"""
+    """é‡æ–°åŠ è½½æ‰€æœ‰æ’ä»¶ã€‚"""
     from app.plugins import get_plugin_manager
     manager = get_plugin_manager()
     manager.unload_all()
@@ -377,13 +785,13 @@ def reload_plugins():
 
 @app.post("/api/diagnostics/run")
 async def run_diagnostics_api(source: str = ""):
-    """运行项目诊断（linter/typechecker），返回结果。"""
+    """è¿è¡Œé¡¹ç›®è¯Šæ–­ï¼ˆlinter/typecheckerï¼‰ï¼Œè¿”å›žç»“æžœã€‚"""
     from app.diagnostics import run_diagnostics as run_diag, detect_linters
     from app.project_manager import ProjectManager
 
     project = ProjectManager.get_current()
     if not project:
-        return {"error": {"category": "validation", "message": "没有打开的项目"}}
+        return {"error": {"category": "validation", "message": "æ²¡æœ‰æ‰“å¼€çš„é¡¹ç›®"}}
 
     sources = [source] if source else None
     results = await run_diag(project["path"], sources)
@@ -407,7 +815,7 @@ async def run_diagnostics_api(source: str = ""):
 
 @app.get("/api/diagnostics/last")
 def get_last_diagnostics():
-    """获取最近一次诊断结果。"""
+    """èŽ·å–æœ€è¿‘ä¸€æ¬¡è¯Šæ–­ç»“æžœã€‚"""
     from app.diagnostics import get_last_result
     r = get_last_result()
     if not r:
@@ -427,7 +835,7 @@ def get_last_diagnostics():
 
 @app.get("/api/diagnostics/linters")
 def list_available_linters():
-    """列出当前项目可用的 linter/typechecker。"""
+    """åˆ—å‡ºå½“å‰é¡¹ç›®å¯ç”¨çš„ linter/typecheckerã€‚"""
     from app.diagnostics import detect_linters
     from app.project_manager import ProjectManager
     project = ProjectManager.get_current()
@@ -440,13 +848,13 @@ def list_available_linters():
 
 @app.post("/api/tests/run")
 async def run_tests_api(framework: str = "", filter: str = ""):
-    """运行项目测试，返回结果。"""
+    """è¿è¡Œé¡¹ç›®æµ‹è¯•ï¼Œè¿”å›žç»“æžœã€‚"""
     from app.test_runner import run_and_store, detect_framework
     from app.project_manager import ProjectManager
 
     project = ProjectManager.get_current()
     if not project:
-        return {"error": {"category": "validation", "message": "没有打开的项目"}}
+        return {"error": {"category": "validation", "message": "æ²¡æœ‰æ‰“å¼€çš„é¡¹ç›®"}}
 
     run = await run_and_store(project["path"], framework or None, filter)
     return {
@@ -468,7 +876,7 @@ async def run_tests_api(framework: str = "", filter: str = ""):
 
 @app.get("/api/tests/last")
 def get_last_test_run():
-    """获取最近一次测试运行结果。"""
+    """èŽ·å–æœ€è¿‘ä¸€æ¬¡æµ‹è¯•è¿è¡Œç»“æžœã€‚"""
     from app.test_runner import get_last_run
     run = get_last_run()
     if not run:
@@ -490,7 +898,7 @@ def get_last_test_run():
 
 @app.get("/api/tests/framework")
 def detect_test_framework():
-    """检测当前项目的测试框架。"""
+    """æ£€æµ‹å½“å‰é¡¹ç›®çš„æµ‹è¯•æ¡†æž¶ã€‚"""
     from app.test_runner import detect_framework as detect
     from app.project_manager import ProjectManager
     project = ProjectManager.get_current()
@@ -501,17 +909,154 @@ def detect_test_framework():
 
 # ====== Skills API ======
 
+class SkillPreferencesRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    personal: Dict[str, bool] = Field(default_factory=dict)
+    coding: Dict[str, bool] = Field(default_factory=dict)
+
+
+class SkillDraftRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    name: str
+    description: str
+    body: str
+    scopes: List[str] = Field(default_factory=lambda: ["personal"])
+    resources: List[Dict[str, Any]] = Field(default_factory=list)
+    compatibility: str = ""
+    allowed_tools: str = ""
+
+
+class SkillDraftUpdateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    name: Optional[str] = None
+    description: Optional[str] = None
+    body: Optional[str] = None
+    scopes: Optional[List[str]] = None
+    resources: List[Dict[str, Any]] = Field(default_factory=list)
+    compatibility: str = ""
+    allowed_tools: str = ""
+
+
+class SkillPublishRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    enable_for: List[str] = Field(default_factory=lambda: ["personal"])
+    allow_risky: bool = False
+
+
 @app.get("/api/skills")
 def list_skills():
-    """获取所有可用的 Superpowers skills"""
-    return {"skills": SkillManager.list_skills()}
+    """èŽ·å–æ‰€æœ‰å¯ç”¨çš„ Superpowers skills"""
+    return SkillManager.list_skill_catalog()
+
+
+@app.get("/api/skills/drafts")
+def get_skill_drafts():
+    """List user-created skill drafts awaiting review."""
+    return {"drafts": list_skill_drafts()}
+
+
+@app.post("/api/skills/drafts")
+def create_skill_draft(req: SkillDraftRequest):
+    """Create a user Skill draft. Drafts are inert until published."""
+    try:
+        draft = save_skill_draft(
+            name=req.name,
+            description=req.description,
+            body=req.body,
+            scopes=req.scopes,
+            resources=req.resources,
+            compatibility=req.compatibility,
+            allowed_tools=req.allowed_tools,
+            created_from="api",
+        )
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"draft": draft}
+
+
+@app.put("/api/skills/drafts/{draft_id}")
+def update_skill_draft_api(draft_id: str, req: SkillDraftUpdateRequest):
+    """Update a user Skill draft."""
+    try:
+        draft = update_skill_draft(
+            draft_id,
+            name=req.name,
+            description=req.description,
+            body=req.body,
+            scopes=req.scopes,
+            resources=req.resources,
+            compatibility=req.compatibility,
+            allowed_tools=req.allowed_tools,
+        )
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"draft": draft}
+
+
+@app.post("/api/skills/drafts/{draft_id}/validate")
+def validate_skill_draft_api(draft_id: str):
+    """Validate a user Skill draft."""
+    try:
+        validation = validate_user_skill(draft_id)
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"validation": validation}
+
+
+@app.post("/api/skills/drafts/{draft_id}/publish")
+def publish_skill_draft_api(draft_id: str, req: SkillPublishRequest):
+    """Publish a validated user Skill draft and refresh the catalog."""
+    try:
+        skill = publish_skill_draft(draft_id, enable_for=req.enable_for, allow_risky=req.allow_risky)
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    catalog = SkillManager.list_skill_catalog()
+    return {"skill": skill, **catalog}
+
+
+@app.get("/api/skills/{skill_id:path}")
+def read_skill_api(skill_id: str):
+    """Read an Agent Skill by id, including bundled, personal, user, or draft Skills."""
+    try:
+        return {"skill": read_user_skill(skill_id)}
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/skills/{skill_id:path}/archive")
+def archive_skill_api(skill_id: str):
+    """Archive a published user Skill."""
+    try:
+        skill = archive_user_skill(skill_id)
+    except SkillAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    catalog = SkillManager.list_skill_catalog()
+    return {"skill": skill, **catalog}
+
+
+@app.put("/api/skills/preferences")
+def update_skill_preferences(req: SkillPreferencesRequest):
+    """Persist per-agent skill enablement preferences."""
+    try:
+        result = SkillManager.update_preferences(req.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    catalog = SkillManager.list_skill_catalog()
+    return {
+        **catalog,
+        "ignored": result["ignored"],
+    }
 
 
 # ====== Commands API ======
 
 @app.get("/api/commands")
 def list_commands():
-    """获取所有可用的 slash commands"""
+    """èŽ·å–æ‰€æœ‰å¯ç”¨çš„ slash commands"""
     return {"commands": get_commands()}
 
 
@@ -597,66 +1142,103 @@ async def mcp_health_check():
     return result
 
 
-# ====== 凭据管理 API ======
+# ====== å‡­æ®ç®¡ç† API ======
 
 @app.get("/api/credentials")
 def list_credentials():
-    """获取已存储的 Git 凭据 host 列表"""
+    """èŽ·å–å·²å­˜å‚¨çš„ Git å‡­æ® host åˆ—è¡¨"""
     return {"hosts": CredentialManager.list_hosts(), "gcm_available": CredentialManager.has_gcm()}
 
 @app.post("/api/credentials")
 def store_credential(req: StoreCredentialRequest):
-    """存储 Git 凭据"""
+    """å­˜å‚¨ Git å‡­æ®"""
     CredentialManager.store_token(req.host, req.username, req.token)
     return {"status": "stored", "host": req.host}
 
 @app.delete("/api/credentials/{host}")
 def delete_credential(host: str):
-    """删除指定 host 的凭据"""
+    """åˆ é™¤æŒ‡å®š host çš„å‡­æ®"""
     CredentialManager.delete_token(host)
     return {"status": "deleted", "host": host}
 
 
-# ====== WebSocket（核心实时通信） ======
+# ====== WebSocketï¼ˆæ ¸å¿ƒå®žæ—¶é€šä¿¡ï¼‰ ======
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     if is_auth_enabled():
         token = websocket.headers.get(AUTH_HEADER) or websocket.query_params.get("token")
         if not is_valid_auth_token(token):
-            await websocket.close(code=1008)
+            print(f"[WS] 403 — auth token rejected for session={session_id}: "
+                  f"header={'set' if websocket.headers.get(AUTH_HEADER) else 'missing'}, "
+                  f"query={'set' if websocket.query_params.get('token') else 'missing'}")
+            await websocket.close(code=1008, reason="Unauthorized")
             return
 
     # Defense in depth: only allow local origins for WS upgrade.
     origin = websocket.headers.get("origin", "")
     if origin and not _is_local_origin(origin):
+        print(f"[WS] 403 — origin rejected for session={session_id}: origin={origin}")
         await websocket.close(code=1008, reason="Origin not allowed")
         return
 
+    if is_session_deleted(session_id):
+        await websocket.accept()
+        await websocket.close(code=SESSION_DELETED_CLOSE_CODE, reason=SESSION_DELETED_REASON)
+        return
+
     await websocket.accept()
-    current_model = load_config().settings.default_model
+    register_session_websocket(session_id, websocket)
+    current_model = get_model_for_agent("personal")
+    current_role_id = "desktop-agent"
+    current_agent_type = "personal"
 
-    # 发送历史会话消息（如果有）
-    session = get_or_create_session(session_id, current_model)
-    current_model = session.model_id  # 恢复已保存的 model
-    if any(m.get("role") != "system" for m in session.messages):
-        await websocket.send_json({"type": "history_snapshot", "data": session.to_snapshot()})
-        await websocket.send_json({
-            "type": "status",
-            "data": {
-                "status": "history_loaded",
-                "count": len([m for m in session.messages if m.get("role") != "system"]),
-            },
-        })
+    # å‘é€åŽ†å²ä¼šè¯æ¶ˆæ¯ï¼ˆå¦‚æžœæœ‰ï¼‰
+    session = get_or_create_session(session_id, current_model, preserve_existing_model=True)
+    current_model = session.model_id  # æ¢å¤å·²ä¿å­˜çš„ model
+    current_role_id = session.role_id  # æ¢å¤å·²ä¿å­˜çš„ role
+    current_agent_type = session.agent_type  # æ¢å¤å·²ä¿å­˜çš„ agent_type
 
-    if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
-        await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
+    runtime = get_session_runtime(session_id)
+    runtime_queue = runtime.subscribe()
+    runtime_forward_task: "asyncio.Task | None" = None
+    send_lock = asyncio.Lock()
+
+    async def send_event(event: Dict[str, Any]) -> None:
+        async with send_lock:
+            await websocket.send_json(event)
+
+    async def forward_runtime_events() -> None:
+        while True:
+            event = await runtime_queue.get()
+            await send_event(event)
 
     try:
-        run_task: "asyncio.Task | None" = None
+        # Send initial state inside the disconnect guard. In dev React StrictMode
+        # can open and immediately close a probe connection before the real one.
+        if any(m.get("role") != "system" for m in session.messages):
+            await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
+            await send_event({
+                "type": "status",
+                "data": {
+                    "status": "history_loaded",
+                    "count": len([m for m in session.messages if m.get("role") != "system"]),
+                },
+            })
+
+        if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
+            await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+
+        await send_event({"type": "context_usage", "data": session.context_usage()})
+        if runtime.is_running:
+            await send_event({
+                "type": "status",
+                "data": {"status": "thinking", "message": "Reconnected to running session"},
+            })
+        runtime_forward_task = asyncio.create_task(forward_runtime_events())
 
         while True:
-            # 接收前端消息
+            # æŽ¥æ”¶å‰ç«¯æ¶ˆæ¯
             data = await websocket.receive_text()
             msg = json.loads(data)
 
@@ -665,174 +1247,431 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if msg_type == "chat":
                 user_text = msg.get("text", "")
                 model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", "desktop-agent")
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 image_b64 = msg.get("image_base64")
-                chat_mode = msg.get("chat_mode") or "agent"
+                requested_chat_mode = msg.get("chat_mode")
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
+                current_role_id = role_id
+                current_agent_type = agent_type
 
-                session = get_or_create_session(session_id, model_id, role_id)
-
-                # Cancel any in-progress run before starting a new one
-                if run_task and not run_task.done():
-                    session.cancel()
-                    run_task.cancel()
-
-                async def _run_agent():
-                    token = set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                chat_mode = (
+                    requested_chat_mode
+                    if requested_chat_mode in ("agent", "plan")
+                    else session.chat_mode
+                )
+                if runtime.is_running:
                     try:
-                        async for event in session.run(
+                        item = session.queue_task_guidance(
                             user_text,
                             image_b64,
+                            item_id=msg.get("guidance_id") or msg.get("id"),
+                        )
+                        applied = session.apply_task_guidance()
+                    except ValueError as exc:
+                        await send_event({"type": "error", "data": validation_error(str(exc))})
+                        continue
+                    await send_event({
+                        "type": "task_guidance_queued",
+                        "data": {
+                            "item": item.model_dump(),
+                            "items": session.active_task_guidance_items(),
+                        },
+                    })
+                    if applied:
+                        await send_event({
+                            "type": "task_guidance_applied",
+                            "data": {
+                                "items": [i.model_dump() for i in applied],
+                                "all_items": session.active_task_guidance_items(),
+                                "auto": True,
+                            },
+                        })
+                    continue
+
+                async def _run_agent_events(
+                    session=session,
+                    user_text=user_text,
+                    image_b64=image_b64,
+                    chat_mode=chat_mode,
+                    thinking_intensity=thinking_intensity,
+                ):
+                    async for event in session.run(
+                        user_text,
+                        image_b64,
+                        chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
+                        thinking_intensity=thinking_intensity
+                        if thinking_intensity in ("low", "medium", "high")
+                        else None,
+                    ):
+                        yield event
+
+                await runtime.start(session, _run_agent_events)
+
+            elif msg_type == "queue_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                try:
+                    item = session.queue_task_guidance(
+                        str(msg.get("text") or ""),
+                        msg.get("image_base64"),
+                        item_id=msg.get("guidance_id") or msg.get("id"),
+                    )
+                    applied = session.apply_task_guidance() if runtime.is_running else []
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                await send_event({
+                    "type": "task_guidance_queued",
+                    "data": {
+                        "item": item.model_dump(),
+                        "items": session.active_task_guidance_items(),
+                    },
+                })
+                if applied:
+                    await send_event({
+                        "type": "task_guidance_applied",
+                        "data": {
+                            "items": [i.model_dump() for i in applied],
+                            "all_items": session.active_task_guidance_items(),
+                            "auto": True,
+                        },
+                    })
+
+            elif msg_type == "apply_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                applied = session.apply_task_guidance()
+                await send_event({
+                    "type": "task_guidance_applied",
+                    "data": {
+                        "items": [item.model_dump() for item in applied],
+                        "all_items": session.active_task_guidance_items(),
+                    },
+                })
+                if applied and not runtime.is_running:
+                    stale = session.mark_applied_task_guidance_stale()
+                    await send_event({
+                        "type": "task_guidance_stale",
+                        "data": {
+                            "items": [item.model_dump() for item in stale],
+                            "all_items": session.active_task_guidance_items(),
+                        },
+                    })
+
+            elif msg_type == "delete_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                item_id = str(msg.get("id") or msg.get("guidance_id") or "")
+                if not item_id:
+                    await send_event({"type": "error", "data": validation_error("delete_task_guidance requires id")})
+                    continue
+                deleted = session.delete_task_guidance(item_id)
+                await send_event({
+                    "type": "task_guidance_deleted",
+                    "data": {"id": item_id, "deleted": deleted, "items": session.active_task_guidance_items()},
+                })
+
+            elif msg_type == "clear_task_guidance":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                removed = session.clear_task_guidance()
+                await send_event({
+                    "type": "task_guidance_cleared",
+                    "data": {
+                        "items": [item.model_dump() for item in removed],
+                        "all_items": session.active_task_guidance_items(),
+                    },
+                })
+
+            elif msg_type == "collaborate":
+                goal = str(msg.get("goal") or msg.get("text") or "").strip()
+                mode = str(msg.get("mode") or "consult").strip().lower()
+                if not goal:
+                    await send_event({"type": "error", "data": validation_error("collaborate requires a goal")})
+                    continue
+                prefix = "implement" if mode == "execute" else "inspect"
+                user_text = f"@coding agent {prefix}: {goal}"
+                model_id = msg.get("model_id", current_model)
+                role_id = AgentManager.get_default_role("personal")
+                current_model = model_id
+                current_role_id = role_id
+                current_agent_type = "personal"
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type="personal")
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+
+                async def _collaborate_agent_events(session=session, user_text=user_text):
+                    async for event in session.run(user_text, None, chat_mode="agent"):
+                        yield event
+
+                await runtime.start(session, _collaborate_agent_events)
+
+            elif msg_type == "collaboration_cancel":
+                collab_run_id = str(msg.get("run_id") or msg.get("collaboration_run_id") or "").strip()
+                if not collab_run_id:
+                    await send_event({"type": "error", "data": validation_error("collaboration_cancel requires run_id")})
+                    continue
+                run = cancel_collaboration_run(collab_run_id)
+                if not run:
+                    await send_event({"type": "error", "data": not_found_error(f"Collaboration run not found: {collab_run_id}")})
+                    continue
+                for event in list_collaboration_events(collab_run_id):
+                    await send_event(_collaboration_ws_event(event))
+
+            elif msg_type == "handoff_agent":
+                target_agent = str(msg.get("agent_type") or msg.get("to") or "coding").strip().lower()
+                if target_agent not in ("personal", "coding"):
+                    await send_event({"type": "error", "data": validation_error(f"Unknown agent_type: {target_agent}")})
+                    continue
+                project = ProjectManager.get_current()
+                project_path = str(project.get("path") or "") if project else ""
+                try:
+                    resolved = resolve_agent_session(target_agent, "last_or_create", project_path)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                await send_event({
+                    "type": "agent_switched",
+                    "data": {
+                        "agent_type": target_agent,
+                        "name": "Personal Agent" if target_agent == "personal" else "Coding Agent",
+                        "session_id": resolved.get("id"),
+                        "model_id": resolved.get("model_id"),
+                        "created": resolved.get("created"),
+                    },
+                })
+
+            elif msg_type == "clear":
+                await runtime.cancel(_sessions.get(session_id), broadcast=False)
+                cancel_workers_for_session(session_id)
+                clear_recorder(session_id)
+                clear_session(session_id)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await send_event({"type": "cleared"})
+                await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
+                await send_event({"type": "context_usage", "data": session.context_usage()})
+
+            elif msg_type == "set_chat_mode":
+                mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                if isinstance(mode, str) and session.set_session_chat_mode(mode):
+                    await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
+                    await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                else:
+                    await send_event({"type": "error", "data": validation_error("Invalid chat_mode")})
+
+            elif msg_type == "set_thinking_intensity":
+                intensity = msg.get("thinking_intensity") or msg.get("thinkingIntensity") or ""
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                if isinstance(intensity, str) and session.set_session_thinking_intensity(intensity):
+                    await send_event({
+                        "type": "thinking_intensity",
+                        "data": {"thinking_intensity": session.thinking_intensity},
+                    })
+                else:
+                    await send_event({"type": "error", "data": validation_error("Invalid thinking_intensity")})
+
+            elif msg_type == "stop":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await runtime.cancel(session, broadcast=False)
+                if session.pause_plan_build():
+                    await send_event({"type": "build_paused", "data": session.plan_event_payload()})
+                    await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                    await send_event({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
+                    await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
+                await send_event({"type": "interrupted", "data": {"message": "å·²æ”¶åˆ°åœæ­¢è¯·æ±‚"}})
+
+            elif msg_type == "retry":
+                model_id = msg.get("model_id", current_model)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
+                chat_mode = msg.get("chat_mode")
+                thinking_intensity = msg.get("thinking_intensity")
+                current_model = model_id
+                current_role_id = role_id
+                current_agent_type = agent_type
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                if session.retry_last():
+                    async def _retry_agent_events(
+                        session=session,
+                        chat_mode=chat_mode,
+                        thinking_intensity=thinking_intensity,
+                    ):
+                        async for event in session.run(
+                            "",
+                            None,
                             chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
                             thinking_intensity=thinking_intensity
                             if thinking_intensity in ("low", "medium", "high")
                             else None,
                         ):
-                            await websocket.send_json(event)
-                        await websocket.send_json({"type": "done"})
-                    except asyncio.CancelledError:
-                        pass
-                    finally:
-                        reset_worker_event_callback(token)
+                            yield event
 
-                run_task = asyncio.create_task(_run_agent())
-
-            elif msg_type == "clear":
-                clear_session(session_id)
-                await websocket.send_json({"type": "cleared"})
-
-            elif msg_type == "set_chat_mode":
-                mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
-                session = get_or_create_session(session_id, current_model)
-                if isinstance(mode, str) and session.set_session_chat_mode(mode):
-                    await websocket.send_json({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
-                    if session.chat_mode == "plan" and session.plan_state.phase not in ("idle",):
-                        await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
+                    await runtime.start(session, _retry_agent_events)
                 else:
-                    await websocket.send_json({"type": "error", "data": validation_error("Invalid chat_mode")})
-
-            elif msg_type == "stop":
-                session = get_or_create_session(session_id, current_model)
-                session.cancel()
-                if run_task and not run_task.done():
-                    run_task.cancel()
-                await websocket.send_json({"type": "interrupted", "data": {"message": "已收到停止请求"}})
-
-            elif msg_type == "retry":
-                model_id = msg.get("model_id", current_model)
-                role_id = msg.get("role_id", "desktop-agent")
-                chat_mode = msg.get("chat_mode")
-                thinking_intensity = msg.get("thinking_intensity")
-                current_model = model_id
-                session = get_or_create_session(session_id, model_id, role_id)
-                if session.retry_last():
-                    # Cancel any in-progress run before retrying
-                    if run_task and not run_task.done():
-                        session.cancel()
-                        run_task.cancel()
-
-                    async def _retry_agent():
-                        token = set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
-                        try:
-                            async for event in session.run(
-                                "",
-                                None,
-                                chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
-                                thinking_intensity=thinking_intensity
-                                if thinking_intensity in ("low", "medium", "high")
-                                else None,
-                            ):
-                                await websocket.send_json(event)
-                            await websocket.send_json({"type": "done"})
-                        except asyncio.CancelledError:
-                            pass
-                        finally:
-                            reset_worker_event_callback(token)
-
-                    run_task = asyncio.create_task(_retry_agent())
-                else:
-                    await websocket.send_json({"type": "error", "data": validation_error("没有可重试的消息")})
+                    await send_event({"type": "error", "data": validation_error("æ²¡æœ‰å¯é‡è¯•çš„æ¶ˆæ¯")})
 
             elif msg_type == "approve_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 session.approve_plan()
-                await websocket.send_json({"type": "plan_approved_waiting_build", "data": {}})
-                await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "plan_approved_waiting_build", "data": {}})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
 
             elif msg_type == "switch_model":
                 model_id = msg.get("model_id", current_model)
                 if model_id and model_id != current_model:
                     current_model = model_id
-                    session = get_or_create_session(session_id, model_id)
+                    session = get_or_create_session(session_id, model_id, current_role_id, agent_type=current_agent_type)
                     session.router = type(session.router)(model_id)  # Rebuild ModelRouter
                     session.model_id = model_id
+                    session._agent_models[current_agent_type] = model_id
                     session._refresh_system_prompt()
-                    await websocket.send_json({
+                    session._save()
+                    await send_event({
                         "type": "model_switched",
-                        "data": {"model_id": model_id},
+                        "data": {"model_id": model_id, "agent_type": current_agent_type},
                     })
 
             elif msg_type == "reject_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 session.reject_plan()
-                await websocket.send_json({"type": "plan_rejected", "data": {}})
-                await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "plan_rejected", "data": {}})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
 
             elif msg_type == "compact":
-                session = get_or_create_session(session_id, current_model)
-                summary = await session.compact_context()
-                if summary:
-                    await websocket.send_json({
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                result = await session.compact_context(
+                    focus=str(msg.get("focus") or ""),
+                    force=bool(msg.get("force", False)),
+                )
+                if result:
+                    await send_event({
                         "type": "compacted",
-                        "data": {"summary": summary, "message_count": len(session.messages)},
+                        "data": {
+                            **result,
+                            "message_count": len(session.messages),
+                            "source": msg.get("source") or "websocket",
+                        },
                     })
+                    await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
+                    await send_event({"type": "context_usage", "data": session.context_usage()})
                 else:
-                    await websocket.send_json({
+                    await send_event({
                         "type": "error",
-                        "data": validation_error("对话消息不足，无需压缩（至少需要 15 条消息）"),
+                        "data": validation_error("å¯¹è¯æ¶ˆæ¯ä¸è¶³ï¼Œæ— éœ€åŽ‹ç¼©ï¼ˆè‡³å°‘éœ€è¦ 15 æ¡æ¶ˆæ¯ï¼‰"),
                     })
+
+            elif msg_type == "context":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await send_event({"type": "context_usage", "data": session.context_usage()})
+
+            elif msg_type == "rewind":
+                model_id = msg.get("model_id", current_model)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
+                chat_mode = msg.get("chat_mode")
+                thinking_intensity = msg.get("thinking_intensity")
+                checkpoint_id = str(msg.get("checkpoint_id") or msg.get("checkpointId") or "")
+                current_model = model_id
+                current_role_id = role_id
+                current_agent_type = agent_type
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                result = session.rewind_to_checkpoint(checkpoint_id)
+                if not result:
+                    await send_event({"type": "error", "data": validation_error("Checkpoint not found")})
+                    continue
+                await send_event({"type": "rewound", "data": result})
+                await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
+                await send_event({"type": "context_usage", "data": session.context_usage()})
+                if bool(msg.get("retry", True)):
+                    async def _rewind_retry_agent_events(
+                        session=session,
+                        chat_mode=chat_mode,
+                        thinking_intensity=thinking_intensity,
+                    ):
+                        async for event in session.run(
+                            "",
+                            None,
+                            chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
+                            thinking_intensity=thinking_intensity
+                            if thinking_intensity in ("low", "medium", "high")
+                            else None,
+                        ):
+                            yield event
+
+                    await runtime.start(session, _rewind_retry_agent_events)
 
             elif msg_type == "build_plan":
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                already_executing = session.plan_state.phase == "executing" and session.plan_state.approved
                 if not session.build_plan():
-                    await websocket.send_json({"type": "error", "data": validation_error("No plan is ready to build. Wait for the plan draft first.")})
+                    restored = session.restore_plan_state_snapshot(msg.get("plan_state") or {})
+                    if not restored or not session.build_plan():
+                        await send_event({"type": "error", "data": validation_error("No plan is ready to build. Wait for the plan draft first.")})
+                        continue
+                    already_executing = session.plan_state.phase == "executing" and session.plan_state.approved
+
+                await send_event({"type": "build_started", "data": {}})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
+                # Sync frontend mode: Build auto-switches to agent mode.
+                await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
+
+                if already_executing and runtime.is_running:
                     continue
 
-                await websocket.send_json({"type": "build_started", "data": {}})
-                await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
-                await websocket.send_json({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
-                # Sync frontend mode: Build auto-switches to agent mode.
-                await websocket.send_json({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
+                async def _plan_continue_agent_events(session=session):
+                    async for event in session.run(PLAN_CONTINUE_MARKER, None):
+                        yield event
 
-                if run_task and not run_task.done():
-                    session.cancel()
-                    run_task.cancel()
+                await runtime.start(session, _plan_continue_agent_events)
 
-                async def _plan_continue_agent():
-                    token = set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
-                    try:
-                        async for event in session.run(PLAN_CONTINUE_MARKER, None):
-                            await websocket.send_json(event)
-                        await websocket.send_json({"type": "done"})
-                    except asyncio.CancelledError:
-                        pass
-                    finally:
-                        reset_worker_event_callback(token)
+            elif msg_type == "pause_build":
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await runtime.cancel(session, broadcast=False)
+                if not session.pause_plan_build():
+                    await send_event({"type": "error", "data": validation_error("No active Build is running.")})
+                    continue
+                await send_event({"type": "build_paused", "data": session.plan_event_payload()})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
+                await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
 
-                run_task = asyncio.create_task(_plan_continue_agent())
+            elif msg_type in ("end_build", "exit_build"):
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                await runtime.cancel(session, broadcast=False)
+                if not session.exit_plan_build():
+                    await send_event({"type": "error", "data": validation_error("No active or paused Build to end.")})
+                    continue
+                await send_event({"type": "build_ended", "data": session.plan_event_payload()})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
+                await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
 
             elif msg_type == "update_plan_decision":
                 qid = msg.get("question_id") or msg.get("questionId")
                 selected = msg.get("selected") or []
                 if not isinstance(selected, list):
                     selected = [selected] if selected is not None else []
-                session = get_or_create_session(session_id, current_model)
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
                 if qid is not None:
                     session.update_plan_decision(str(qid), [str(s) for s in selected])
-                await websocket.send_json({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
                 if session.plan_state.phase == "awaiting_approval":
-                    await websocket.send_json({
+                    await send_event({
                         "type": "plan_draft",
                         "data": {
                             "goal": session.plan_state.goal,
@@ -844,84 +1683,152 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         },
                     })
                 elif session.plan_state.phase == "planning":
-                    # All decisions collected — feed back to LLM for plan_write_draft.
-                    if run_task and not run_task.done():
-                        session.cancel()
-                        run_task.cancel()
+                    # All decisions collected â€” feed back to LLM for plan_write_draft.
+                    async def _plan_clarify_agent_events(session=session):
+                        async for event in session.run("", None):
+                            yield event
 
-                    async def _plan_clarify_agent():
-                        token = set_worker_event_callback(lambda ev: asyncio.ensure_future(websocket.send_json(ev)))
-                        try:
-                            async for event in session.run("", None):
-                                await websocket.send_json(event)
-                            await websocket.send_json({"type": "done"})
-                        except asyncio.CancelledError:
-                            pass
-                        finally:
-                            reset_worker_event_callback(token)
+                    await runtime.start(session, _plan_clarify_agent_events)
 
-                    run_task = asyncio.create_task(_plan_clarify_agent())
+            elif msg_type == "submit_plan_decisions":
+                answers = msg.get("answers") or []
+                if not isinstance(answers, list):
+                    answers = []
+                session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                session.submit_plan_decisions([a for a in answers if isinstance(a, dict)])
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                if session.plan_state.phase == "awaiting_approval":
+                    await send_event({
+                        "type": "plan_draft",
+                        "data": {
+                            "goal": session.plan_state.goal,
+                            "draft": session.plan_state.draft,
+                            "structured_plan": session.plan_state.structured_plan.model_dump() if session.plan_state.structured_plan else None,
+                            "todos": [t.model_dump() for t in session.plan_state.todos],
+                            "phase": session.plan_state.phase,
+                            "pending_clarification": session.plan_state.pending_clarification,
+                        },
+                    })
+                elif session.plan_state.phase == "planning":
+                    async def _plan_submit_agent_events(session=session):
+                        async for event in session.run("", None):
+                            yield event
+
+                    await runtime.start(session, _plan_submit_agent_events)
+
+            elif msg_type == "switch_agent":
+                agent_type = msg.get("agent_type", "personal")
+                if agent_type not in ("personal", "coding"):
+                    await send_event({"type": "error", "data": {"message": f"Unknown agent_type: {agent_type}"}})
+                    continue
+                try:
+                    session = get_or_create_session(session_id, current_model, role_id=current_role_id, agent_type=agent_type)
+                    session.switch_agent(agent_type)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                current_role_id = session.role_id
+                current_agent_type = agent_type
+                current_model = session.model_id
+                await send_event({
+                    "type": "agent_switched",
+                    "data": {
+                        "agent_type": agent_type,
+                        "name": "Personal Agent" if agent_type == "personal" else "Coding Agent",
+                        "model_id": session.model_id,
+                        "thinking_intensity": session.thinking_intensity,
+                    },
+                })
 
             elif msg_type == "switch_role":
-                role_id = msg.get("role_id", "desktop-agent")
-                session = get_or_create_session(session_id, current_model, role_id)
-                session.switch_role(role_id)
-                await websocket.send_json({"type": "status", "data": {"status": "role_switched", "role_id": role_id}})
+                role_id = msg.get("role_id", current_role_id)
+                agent_type = AgentManager.get_agent_type_for_role(role_id)
+                try:
+                    session = get_or_create_session(session_id, current_model, role_id=role_id, agent_type=agent_type)
+                    session.switch_role(role_id)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                current_role_id = role_id
+                current_agent_type = agent_type
+                await send_event({
+                    "type": "agent_switched",
+                    "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
+                })
 
             elif msg_type == "switch_project":
                 project_path = msg.get("path")
                 if project_path:
                     try:
-                        # open_project shells out to git up to 4× with 5s timeouts each;
+                        # open_project shells out to git up to 4Ã— with 5s timeouts each;
                         # offloading keeps the WS event loop responsive for parallel sessions.
                         project = await asyncio.to_thread(ProjectManager.open_project, project_path)
                         await asyncio.to_thread(CredentialManager.configure_gcm, project_path)
-                        await websocket.send_json({"type": "project_changed", "data": {"project": project}})
+                        await send_event({"type": "project_changed", "data": {"project": project}})
                     except ValueError as e:
-                        await websocket.send_json({"type": "error", "data": validation_error(str(e))})
+                        await send_event({"type": "error", "data": validation_error(str(e))})
                 else:
                     ProjectManager.close_project()
-                    await websocket.send_json({"type": "project_changed", "data": {"project": None}})
+                    await send_event({"type": "project_changed", "data": {"project": None}})
+
+            elif msg_type == "set_team":
+                team_id = msg.get("team_id") or None
+                team_name = msg.get("team_name", "")
+                session.set_team(team_id, team_name)
+                await send_event({"type": "team_set", "data": {"team_id": team_id, "team_name": team_name}})
 
             elif msg_type == "tool_direct":
-                # 前端直接调用工具（仅限 SAFE_DIRECT_TOOLS 白名单中的只读/可见操作）
+                # å‰ç«¯ç›´æŽ¥è°ƒç”¨å·¥å…·ï¼ˆä»…é™ SAFE_DIRECT_TOOLS ç™½åå•ä¸­çš„åªè¯»/å¯è§æ“ä½œï¼‰
                 tool_name = msg.get("tool_name")
                 tool_args = msg.get("args", {})
                 if tool_name not in SAFE_DIRECT_TOOLS:
                     if tool_name in list_tool_names():
-                        await websocket.send_json({
+                        await send_event({
                             "type": "error",
                             "data": sandbox_error(f"Tool not allowed via direct invocation: {tool_name}"),
                         })
                     else:
-                        await websocket.send_json({"type": "error", "data": tool_not_found_error(tool_name)})
+                        await send_event({"type": "error", "data": tool_not_found_error(tool_name)})
                     continue
 
                 tool = get_tool(tool_name)
                 try:
                     result = await tool.execute(**tool_args)
                 except Exception as e:
-                    await websocket.send_json({
+                    failure = tool_failure_error(f"Tool execution failed: {e}", tool_name)
+                    await send_event({
                         "type": "tool_result",
                         "data": {
                             "name": tool_name, "args": tool_args, "output": "",
-                            "error": tool_failure_error(f"Tool execution failed: {e}", tool_name),
+                            "error": failure.get("message", str(e)),
                             "image": None,
                         }
                     })
                     continue
-                await websocket.send_json({
+                await send_event({
                     "type": "tool_result",
                     "data": {"name": tool_name, "args": tool_args, "output": result.output, "error": result.error, "image": result.base64_image}
                 })
 
     except WebSocketDisconnect:
-        if run_task and not run_task.done():
-            run_task.cancel()
         print(f"[WS] Client disconnected: {session_id}")
+        # A WebSocket disconnect is often just renderer reload/HMR/reconnect.
+        # Do not cancel the session-owned runtime here.
+        if not runtime.is_running:
+            try:
+                asyncio.create_task(HeartbeatEngine.on_session_end(session.messages, session_id))
+            except Exception:
+                pass
     except Exception as e:
         print(f"[WS] Error: {e}")
         try:
-            await websocket.send_json({"type": "error", "data": categorize_exception(e)})
+            await send_event({"type": "error", "data": categorize_exception(e)})
         except Exception:
             pass
+    finally:
+        runtime.unsubscribe(runtime_queue)
+        if runtime_forward_task and not runtime_forward_task.done():
+            runtime_forward_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime_forward_task
+        unregister_session_websocket(session_id, websocket)

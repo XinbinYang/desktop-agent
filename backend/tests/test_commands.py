@@ -16,8 +16,8 @@ class TestCommandInfo:
 
 
 class TestBuiltinCommands:
-    def test_all_nine_builtins_exist(self):
-        assert len(BUILTIN_COMMANDS) == 9
+    def test_all_twelve_builtins_exist(self):
+        assert len(BUILTIN_COMMANDS) == 12
 
     def test_essential_commands_present(self):
         names = [c.name for c in BUILTIN_COMMANDS]
@@ -68,3 +68,17 @@ class TestGetCommands:
         cmds = get_commands()
         model = next(c for c in cmds if c["name"] == "model")
         assert model["args"] == "<model_id>"
+
+    def test_skills_are_not_registered_as_dynamic_commands(self, monkeypatch):
+        from app.skills import SkillManager
+
+        monkeypatch.setattr(
+            SkillManager,
+            "list_skills",
+            classmethod(lambda cls: [{"id": "dynamic-skill", "description": "Should not appear"}]),
+        )
+        cmds = get_commands()
+        names = [c["name"] for c in cmds]
+
+        assert "skills" in names
+        assert "dynamic-skill" not in names

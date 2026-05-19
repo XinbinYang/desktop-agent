@@ -3,13 +3,13 @@ from app.config import load_config, get_provider_for_model, list_all_models, def
 
 class TestLoadConfig:
     def test_default_config_path_uses_pyinstaller_meipass(self, monkeypatch, tmp_path):
-        """Packaged PyInstaller builds should load bundled config from sys._MEIPASS."""
+        """Packaged PyInstaller builds should resolve bundled templates from sys._MEIPASS."""
         from app import runtime_paths
 
         monkeypatch.setattr(runtime_paths.sys, "frozen", True, raising=False)
         monkeypatch.setattr(runtime_paths.sys, "_MEIPASS", str(tmp_path), raising=False)
 
-        assert default_config_path() == tmp_path / "config" / "models.yaml"
+        assert runtime_paths.bundled_config_path() == tmp_path / "config" / "models.yaml"
 
     def test_user_config_copies_from_bundled_template(self, monkeypatch, tmp_path):
         """Customer runs seed a writable user config from the bundled template."""

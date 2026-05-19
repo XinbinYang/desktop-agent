@@ -270,7 +270,7 @@ def run_code_search(
             cmd.extend(["--glob", file_glob])
         cmd.extend([query, str(search_root)])
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, encoding="utf-8", errors="replace")
             output = (result.stdout or result.stderr).strip()
             return output[:40_000] if output else "No matches"
         except (OSError, subprocess.TimeoutExpired) as exc:

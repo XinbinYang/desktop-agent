@@ -1,8 +1,10 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { DiffEditor } from '@monaco-editor/react';
-import { Check, X, CheckCheck, XCircle } from 'lucide-react';
+import { X, XCircle } from 'lucide-react';
 import { FileEdit } from '../types';
 import { getLangFromFilename } from '../lib/language';
+import { ensureMonacoThemes, getMonacoThemeName } from '../lib/monacoTheme';
+import { useTheme } from '../hooks/useTheme';
 import { FileEditView } from './FileEditView';
 import { API_BASE } from '../config';
 
@@ -11,7 +13,7 @@ interface ChangesPanelProps {
   onOpenFile?: (path: string) => void;
 }
 
-type EditStatus = 'pending' | 'accepted' | 'rejected';
+type EditStatus = 'accepted' | 'rejected';
 
 function shortPath(path: string): string {
   const normalized = path.replace(/\\/g, '/');
@@ -23,26 +25,42 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
   const [activeIndex, setActiveIndex] = useState(0);
   const [statuses, setStatuses] = useState<Record<number, EditStatus>>({});
   const [reverting, setReverting] = useState(false);
+  const { resolved } = useTheme();
+  const monacoTheme = getMonacoThemeName(resolved);
 
   useEffect(() => {
+    setStatuses((prev) => {
+      const next: Record<number, EditStatus> = {};
+      let changed = Object.keys(prev).length !== edits.length;
+      edits.forEach((_, index) => {
+        next[index] = prev[index] || 'accepted';
+        if (next[index] !== prev[index]) changed = true;
+      });
+      return changed ? next : prev;
+    });
+
     if (edits.length > 0) {
       setActiveIndex(edits.length - 1);
     }
-  }, [edits.length]);
+  }, [edits]);
 
   const active = edits[activeIndex];
-  const activeStatus = statuses[activeIndex] || 'pending';
+  const activeStatus = statuses[activeIndex] || 'accepted';
 
   const rejectEdit = useCallback(async (index: number) => {
     const edit = edits[index];
-    if (!edit || !edit.old_text) return;
+    if (!edit || edit.old_text == null) return;
     setReverting(true);
     try {
-      await fetch(`${API_BASE}/api/file/revert`, {
+      const response = await fetch(`${API_BASE}/api/file/revert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: edit.path, old_content: edit.old_text }),
       });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || data?.error) {
+        throw new Error(typeof data?.error === 'string' ? data.error : 'Revert failed');
+      }
       setStatuses((prev) => ({ ...prev, [index]: 'rejected' }));
     } catch (err) {
       console.error('Revert failed:', err);
@@ -51,19 +69,9 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
     }
   }, [edits]);
 
-  const acceptEdit = useCallback((index: number) => {
-    setStatuses((prev) => ({ ...prev, [index]: 'accepted' }));
-  }, []);
-
-  const acceptAll = useCallback(() => {
-    const newStatuses: Record<number, EditStatus> = {};
-    edits.forEach((_, i) => { newStatuses[i] = 'accepted'; });
-    setStatuses(newStatuses);
-  }, [edits]);
-
   const rejectAll = useCallback(async () => {
     for (let i = 0; i < edits.length; i++) {
-      if ((statuses[i] || 'pending') !== 'rejected') {
+      if ((statuses[i] || 'accepted') !== 'rejected') {
         await rejectEdit(i);
       }
     }
@@ -77,35 +85,26 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
     );
   }
 
-  const pendingCount = edits.filter((_, i) => (statuses[i] || 'pending') === 'pending').length;
+  const acceptedCount = edits.filter((_, i) => (statuses[i] || 'accepted') === 'accepted').length;
+  const rejectedCount = edits.length - acceptedCount;
 
   return (
     <div className="h-full flex flex-col bg-app">
       {/* Toolbar */}
-      {pendingCount > 0 && (
-        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border bg-surface/50">
-          <span className="text-[10px] text-fg-muted mr-auto">
-            {pendingCount} pending
-          </span>
-          <button
-            type="button"
-            onClick={acceptAll}
-            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-colors"
-          >
-            <CheckCheck className="w-3 h-3" />
-            Accept All
-          </button>
-          <button
-            type="button"
-            onClick={rejectAll}
-            disabled={reverting}
-            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-          >
-            <XCircle className="w-3 h-3" />
-            Reject All
-          </button>
-        </div>
-      )}
+      <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border bg-surface/50">
+        <span className="text-[10px] text-fg-muted mr-auto">
+          {acceptedCount} accepted{rejectedCount > 0 ? ` · ${rejectedCount} reverted` : ''}
+        </span>
+        <button
+          type="button"
+          onClick={rejectAll}
+          disabled={reverting}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+        >
+          <XCircle className="w-3 h-3" />
+          Revert All
+        </button>
+      </div>
 
       <div className="flex-1 flex min-h-0">
         {/* Sidebar list */}
@@ -125,8 +124,7 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
                 <div className="flex items-center gap-1.5">
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     status === 'accepted' ? 'bg-green-400'
-                    : status === 'rejected' ? 'bg-red-400'
-                    : 'bg-yellow-400'
+                    : 'bg-red-400'
                   }`} />
                   <span className="text-xs truncate text-fg-secondary">{shortPath(edit.path)}</span>
                 </div>
@@ -146,34 +144,23 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
             <div className="flex items-center gap-2">
               <span className={`text-[10px] px-1.5 py-0.5 rounded ${
                 activeStatus === 'accepted' ? 'bg-green-500/10 text-green-400'
-                : activeStatus === 'rejected' ? 'bg-red-500/10 text-red-400'
-                : 'bg-yellow-500/10 text-yellow-400'
+                : 'bg-red-500/10 text-red-400'
               }`}>
                 {activeStatus}
               </span>
               <span className="text-xs text-fg-secondary truncate">{active?.path}</span>
             </div>
             <div className="flex items-center gap-1">
-              {active && activeStatus === 'pending' && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => acceptEdit(activeIndex)}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-colors"
-                  >
-                    <Check className="w-3 h-3" />
-                    Accept
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => rejectEdit(activeIndex)}
-                    disabled={reverting || !active.old_text}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-                  >
-                    <X className="w-3 h-3" />
-                    Reject
-                  </button>
-                </>
+              {active && activeStatus !== 'rejected' && (
+                <button
+                  type="button"
+                  onClick={() => rejectEdit(activeIndex)}
+                  disabled={reverting || active.old_text == null}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                >
+                  <X className="w-3 h-3" />
+                  Revert
+                </button>
               )}
               {active && onOpenFile && (
                 <button
@@ -193,7 +180,8 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
                 language={getLangFromFilename(active.path, 'monaco')}
                 original={active.old_text}
                 modified={active.new_text}
-                theme="vs-dark"
+                theme={monacoTheme}
+                beforeMount={ensureMonacoThemes}
                 options={{
                   readOnly: true,
                   renderSideBySide: true,

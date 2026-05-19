@@ -73,6 +73,19 @@ settings:
         # Restore
         client.put("/api/settings", json={"max_iterations": 50})
 
+    def test_put_settings_clamps_parallel_agent_limit(self, client):
+        response = client.put("/api/settings", json={"max_parallel_agents": 99})
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+        response = client.get("/api/settings")
+        assert response.json()["settings"]["max_parallel_agents"] == 16
+
+        response = client.put("/api/settings", json={"max_parallel_agents": 0})
+        assert response.status_code == 200
+        response = client.get("/api/settings")
+        assert response.json()["settings"]["max_parallel_agents"] == 1
+
     def test_put_provider_updates_config(self, client):
         """PUT /api/providers/{name} updates a provider."""
         # First get current state
@@ -159,11 +172,12 @@ settings:
         assert response.status_code == 404
 
     def test_config_reload(self, client):
-        """POST /api/config/reload returns default model."""
+        """POST /api/config/reload returns per-agent models."""
         response = client.post("/api/config/reload")
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
-        assert "default_model" in response.json()
+        assert response.json()["personal_model"] == "kimi-for-coding"
+        assert response.json()["coding_model"] == "kimi-for-coding"
 
     def test_provider_connection_test_success(self, client, monkeypatch):
         """POST /api/providers/test validates model listing without exposing keys."""
@@ -238,6 +252,46 @@ settings:
         assert response.status_code == 200
         assert data["ok"] is False
         assert data["model_found"] is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_provider_models_normalizes_kimi_messages_url(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"data": [{"id": "kimi-for-coding"}]}
+
+        class FakeClient:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def get(self, url, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return FakeResponse()
+
+        monkeypatch.setattr("app.routes.settings.httpx.AsyncClient", FakeClient)
+        from app.routes.settings import _fetch_provider_models
+
+        status_code, payload = await _fetch_provider_models(
+            "kimi",
+            "https://api.kimi.com/coding/v1/messages",
+            "fake-key",
+        )
+
+        assert status_code == 200
+        assert payload["data"][0]["id"] == "kimi-for-coding"
+        assert captured["url"] == "https://api.kimi.com/coding/v1/models"
+        assert captured["headers"]["Authorization"] == "Bearer fake-key"
 
     def test_roles_reload(self, client):
         """POST /api/roles/reload should clear cache and return ok."""

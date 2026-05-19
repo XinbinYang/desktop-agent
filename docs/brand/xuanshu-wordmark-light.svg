@@ -1,0 +1,44 @@
+<svg width="1280" height="360" viewBox="0 0 1280 360" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">XuanShu horizontal wordmark on light background</title>
+  <desc id="desc">The XuanShu logo lockup adapted for light surfaces.</desc>
+  <defs>
+    <linearGradient id="axis" x1="68" y1="60" x2="220" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0969DA"/>
+      <stop offset="0.48" stop-color="#0067B8"/>
+      <stop offset="1" stop-color="#005A9E"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="44" y1="40" x2="244" y2="252" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0969DA"/>
+      <stop offset="0.52" stop-color="#0067B8"/>
+      <stop offset="1" stop-color="#005A9E"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="360" rx="42" fill="#FFFFFF"/>
+  <rect x="1" y="1" width="1278" height="358" rx="41" stroke="#D4D4D4" stroke-width="2"/>
+
+  <g transform="translate(60 34)">
+    <rect width="292" height="292" rx="68" fill="#F3F3F3"/>
+    <rect x="15" y="15" width="262" height="262" rx="54" stroke="#D4D4D4" stroke-width="2"/>
+    <path d="M78 76.7A100 100 0 0 1 150.5 42" stroke="url(#ring)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M210.7 61A100 100 0 0 1 246 141" stroke="url(#ring)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M227.7 208.4A100 100 0 0 1 150.5 250" stroke="url(#ring)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M83 224.7A100 100 0 0 1 46 153.6" stroke="url(#ring)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M100 101L192 193" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round"/>
+    <path d="M193 101L99 193" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round"/>
+    <path d="M100 101L192 193" stroke="url(#axis)" stroke-width="15" stroke-linecap="round"/>
+    <path d="M193 101L99 193" stroke="url(#axis)" stroke-width="15" stroke-linecap="round"/>
+    <circle cx="146" cy="146" r="38" fill="#FFFFFF" stroke="#D4D4D4" stroke-width="7"/>
+    <circle cx="146" cy="146" r="24" fill="#0067B8"/>
+    <circle cx="146" cy="146" r="8" fill="#FFFFFF"/>
+  </g>
+
+  <g transform="translate(404 73)">
+    <text x="0" y="88" fill="#1E1E1E" font-family="'HarmonyOS Sans SC', 'Source Han Sans SC', 'Microsoft YaHei', Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="0">玄枢</text>
+    <text x="0" y="166" fill="#1E1E1E" font-family="Inter, Geist, 'IBM Plex Sans', Arial, sans-serif" font-size="64" font-weight="650" letter-spacing="0">XuanShu</text>
+    <path d="M3 202H520" stroke="#D4D4D4" stroke-width="2"/>
+    <text x="0" y="244" fill="#6B6B6B" font-family="Inter, Geist, 'IBM Plex Sans', Arial, sans-serif" font-size="28" font-weight="500" letter-spacing="0">Local Agent OS</text>
+    <circle cx="246" cy="234" r="4" fill="#1F883D"/>
+    <text x="266" y="244" fill="#6B6B6B" font-family="Inter, Geist, 'IBM Plex Sans', Arial, sans-serif" font-size="28" font-weight="500" letter-spacing="0">see, think, act</text>
+  </g>
+</svg>

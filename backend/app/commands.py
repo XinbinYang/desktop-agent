@@ -28,8 +28,23 @@ BUILTIN_COMMANDS: List[CommandInfo] = [
         category="session",
     ),
     CommandInfo(
+        name="new",
+        description="Start a fresh session; Coding creates a new session, Personal clears the current one.",
+        category="session",
+    ),
+    CommandInfo(
         name="compact",
         description="压缩对话上下文，生成摘要并释放 token",
+        category="session",
+    ),
+    CommandInfo(
+        name="rewind",
+        description="Rewind to a previous user-message checkpoint and retry from there.",
+        category="session",
+    ),
+    CommandInfo(
+        name="context",
+        description="Show current context usage and source breakdown.",
         category="session",
     ),
     CommandInfo(
@@ -70,25 +85,12 @@ BUILTIN_COMMANDS: List[CommandInfo] = [
 
 def get_commands() -> List[Dict[str, Any]]:
     """Return all registered commands as JSON-serializable dicts."""
-    result = []
-    for cmd in BUILTIN_COMMANDS:
-        result.append({
+    return [
+        {
             "name": cmd.name,
             "description": cmd.description,
             "args": cmd.args,
             "category": cmd.category,
-        })
-    # Also register skills as commands
-    try:
-        from app.skills import SkillManager
-        skills = SkillManager.list_skills()
-        for skill in skills:
-            result.append({
-                "name": skill["id"] if isinstance(skill, dict) else skill.name,
-                "description": skill.get("description", "") if isinstance(skill, dict) else skill.description,
-                "args": "",
-                "category": "skills",
-            })
-    except Exception:
-        pass
-    return result
+        }
+        for cmd in BUILTIN_COMMANDS
+    ]

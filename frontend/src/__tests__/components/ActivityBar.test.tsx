@@ -4,19 +4,32 @@ import { ActivityBar } from '../../components/ActivityBar'
 
 describe('ActivityBar', () => {
   const defaultProps = {
-    activeSection: 'tools' as const,
+    activeSection: 'skills' as const,
+    activeAgent: 'personal' as const,
     sidebarCollapsed: false,
     onSectionChange: vi.fn(),
+    onAgentChange: vi.fn(),
     onToggleSidebar: vi.fn(),
   }
 
-  it('renders all 5 section icons', () => {
+  it('renders agent entries', () => {
     render(<ActivityBar {...defaultProps} />)
-    expect(screen.getByLabelText('Tools')).toBeInTheDocument()
-    expect(screen.getByLabelText('Project')).toBeInTheDocument()
-    expect(screen.getByLabelText('Sessions')).toBeInTheDocument()
-    expect(screen.getByLabelText('Knowledge')).toBeInTheDocument()
+    expect(screen.getByLabelText('Personal Agent')).toBeInTheDocument()
+    expect(screen.getByLabelText('Coding Agent')).toBeInTheDocument()
+  })
+
+  it('renders all section icons', () => {
+    render(<ActivityBar {...defaultProps} />)
+    expect(screen.getByLabelText('Skills')).toBeInTheDocument()
+    expect(screen.getByLabelText('Workspace')).toBeInTheDocument()
     expect(screen.getByLabelText('Settings')).toBeInTheDocument()
+  })
+
+  it('calls onAgentChange when clicking an agent entry', () => {
+    const onAgentChange = vi.fn()
+    render(<ActivityBar {...defaultProps} onAgentChange={onAgentChange} sidebarCollapsed={true} />)
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+    expect(onAgentChange).toHaveBeenCalledWith('coding')
   })
 
   it('shows panel close icon when sidebar is open', () => {
@@ -32,7 +45,6 @@ describe('ActivityBar', () => {
   it('calls onSectionChange when clicking a section icon', () => {
     const onSectionChange = vi.fn()
     render(<ActivityBar {...defaultProps} onSectionChange={onSectionChange} />)
-
     fireEvent.click(screen.getByLabelText('Settings'))
     expect(onSectionChange).toHaveBeenCalledWith('settings')
   })
@@ -40,33 +52,9 @@ describe('ActivityBar', () => {
   it('calls onToggleSidebar when clicking the same active section', () => {
     const onToggleSidebar = vi.fn()
     render(
-      <ActivityBar
-        {...defaultProps}
-        activeSection="tools"
-        sidebarCollapsed={false}
-        onToggleSidebar={onToggleSidebar}
-      />
+      <ActivityBar {...defaultProps} activeSection="skills" sidebarCollapsed={false} onToggleSidebar={onToggleSidebar} />
     )
-
-    fireEvent.click(screen.getByLabelText('Tools'))
-    expect(onToggleSidebar).toHaveBeenCalled()
-  })
-
-  it('expands sidebar when clicking an icon while collapsed', () => {
-    const onSectionChange = vi.fn()
-    const onToggleSidebar = vi.fn()
-    render(
-      <ActivityBar
-        {...defaultProps}
-        activeSection="tools"
-        sidebarCollapsed={true}
-        onSectionChange={onSectionChange}
-        onToggleSidebar={onToggleSidebar}
-      />
-    )
-
-    fireEvent.click(screen.getByLabelText('Project'))
-    expect(onSectionChange).toHaveBeenCalledWith('project')
+    fireEvent.click(screen.getByLabelText('Skills'))
     expect(onToggleSidebar).toHaveBeenCalled()
   })
 
@@ -74,24 +62,17 @@ describe('ActivityBar', () => {
     const onSectionChange = vi.fn()
     const onToggleSidebar = vi.fn()
     render(
-      <ActivityBar
-        {...defaultProps}
-        activeSection="tools"
-        sidebarCollapsed={false}
-        onSectionChange={onSectionChange}
-        onToggleSidebar={onToggleSidebar}
-      />
+      <ActivityBar {...defaultProps} activeSection="skills" sidebarCollapsed={false}
+        onSectionChange={onSectionChange} onToggleSidebar={onToggleSidebar} />
     )
-
-    fireEvent.click(screen.getByLabelText('Sessions'))
-    expect(onSectionChange).toHaveBeenCalledWith('sessions')
+    fireEvent.click(screen.getByLabelText('Workspace'))
+    expect(onSectionChange).toHaveBeenCalledWith('workspace')
     expect(onToggleSidebar).not.toHaveBeenCalled()
   })
 
   it('calls onToggleSidebar when clicking bottom toggle button', () => {
     const onToggleSidebar = vi.fn()
     render(<ActivityBar {...defaultProps} onToggleSidebar={onToggleSidebar} />)
-
     fireEvent.click(screen.getByLabelText('Collapse Sidebar'))
     expect(onToggleSidebar).toHaveBeenCalled()
   })

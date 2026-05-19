@@ -1,3 +1,9 @@
+"""
+DEPRECATED — Use app.agents.manager.AgentManager instead.
+
+This module is kept for backward compatibility. All public APIs forward to AgentManager.
+"""
+
 import re
 from pathlib import Path
 from dataclasses import dataclass

@@ -4,9 +4,17 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.models import ModelRouter
-from app.message_utils import trim_messages, parse_tool_args, execute_tool
+from app.message_utils import trim_messages, parse_tool_args, execute_tool, repair_tool_call_messages
 
 WORKER_PROFILES: Dict[str, "WorkerProfile"] = {}
+
+
+def format_worker_exception(exc: Exception) -> str:
+    """Return a useful worker-facing exception string even for blank exceptions."""
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
 
 
 @dataclass
@@ -18,6 +26,7 @@ class WorkerProfile:
         "shell_execute", "shell_start",
         "browser_navigate", "browser_click", "browser_type",
         "browser_screenshot", "browser_evaluate", "browser_close",
+        "web_search", "web_fetch",
         "git_status", "git_commit", "git_diff",
     ])
     max_iterations: int = 1000
@@ -44,6 +53,7 @@ WorkerProfile(name="general", tools=[
     "shell_execute", "shell_start",
     "browser_navigate", "browser_click", "browser_type",
     "browser_screenshot", "browser_evaluate", "browser_close",
+    "web_search", "web_fetch",
     "screenshot", "mouse_click", "mouse_move", "type_text", "press_key", "scroll", "get_screen_size",
     "app_open", "app_list_windows", "app_find_window", "app_click", "app_type",
     "git_clone", "git_status", "git_commit", "git_pull", "git_push", "git_branch", "git_remote",
@@ -59,21 +69,45 @@ WorkerProfile(name="architect", tools=[
     "file_read", "file_list", "file_search",
     "git_status", "git_diff",
     "knowledge_search", "knowledge_list",
+    "web_search", "web_fetch",
 ], max_iterations=300, system_prompt_extra="""\
 ## Architect Worker: Read-Only Implementation Strategy
 
-You are a read-only architect. Your job is to understand the task and produce a precise execution brief.
+You are a read-only architect. Your job is to understand the task and produce a precise, actionable execution brief for an editor worker.
 
-### Output
-- Target files and why they matter
-- Editing strategy with minimal risk
-- Verification commands or acceptance checks
-- Risks and assumptions
+### Workflow
+1. Run `repo_map` to get project overview
+2. Use `code_search` + `file_outline` to locate relevant symbols
+3. `file_read` only the files directly related to the task
+4. Produce a structured plan (see Output Format below)
+
+### Output Format (REQUIRED — output exactly these sections)
+```
+## Goal
+[One sentence: what needs to be achieved]
+
+## Files to Modify
+- path/to/file.py (lines X-Y): [reason and what to change]
+- path/to/other.py: [reason]
+
+## Implementation Steps
+1. [Concrete step] → [file:line]
+2. [Concrete step] → [file:line]
+
+## Verification Command
+[Exact command to run after implementation, e.g. `python -m pytest tests/test_foo.py -v`]
+
+## Risks
+- [Risk 1]
+- [Risk 2]
+```
 
 ### Rules
-- Do NOT edit files.
-- Use repo_map/code_search/file_outline before broad file reads.
-- Keep the plan concrete enough for an editor worker to execute.
+- DO NOT write or edit any code. Output the plan document only.
+- Every step must reference a concrete file path and line number.
+- Steps must be small enough for an editor to execute one at a time (2-5 minutes each).
+- If technical details are ambiguous, choose the simplest project-native approach and state assumptions explicitly.
+- Ask the lead/user only about product behavior that a non-programmer can judge or about destructive/security-sensitive choices.
 """)
 
 WorkerProfile(name="editor", tools=[
@@ -85,13 +119,21 @@ WorkerProfile(name="editor", tools=[
 
 You own implementation. Make the smallest change that satisfies the task.
 
+### Workflow (follow in order)
+1. **Read the plan**: If `## Prior Work Context` is in your task, read it fully before doing anything else.
+2. **Check current state**: Run `git_diff` to see what's already been changed in this session.
+3. **Read target files**: Call `file_read` on each file you plan to modify. Never edit a file you haven't read.
+4. **Implement**: Make targeted edits using `file_patch`. One logical change per patch call.
+5. **Verify**: Run `verify_project` after all edits. Fix any failures before finishing.
+6. **Report**: End with: files changed, verification result (PASSED/FAILED), any blockers.
+
 ### Rules
-- Read the exact target file before editing.
-- Prefer file_patch for existing files; file_write is for new files or deliberate full replacement.
-- When tests fail, fix implementation code first. Do not edit tests unless the task explicitly asks for test changes.
-- Do not use broad shell editing commands.
-- Run verify_project or a targeted command when practical.
-- End with changed files, verification result, and remaining blockers.
+- Prefer `file_patch` for existing files (exact old_text → new_text). Use `file_write` only for new files or full rewrites.
+- When tests fail, fix implementation code first. Do not edit tests unless the task explicitly requires it.
+- Make minimal changes: only modify what is needed to satisfy the task.
+- Do not add unrequested features, refactoring, comments, or logging.
+- Do not bounce implementation choices back to the user. Pick the project-native pattern, implement, verify, and report blockers only.
+- Windows: avoid Unix-only shell helpers (tail, head, grep, sed); use PowerShell or rg.
 """)
 
 WorkerProfile(name="verifier", tools=[
@@ -100,26 +142,109 @@ WorkerProfile(name="verifier", tools=[
 ], max_iterations=500, system_prompt_extra="""\
 ## Verifier Worker: Tests, Build, and Failure Compression
 
-You verify the current change set. Run the smallest useful validation and compress failures into actionable issues.
+You verify the current change set. Your job is to run validation and report results clearly.
+
+### Workflow (follow in order)
+1. Run `git_diff` to understand what was changed in this session.
+2. Run `verify_project` to execute tests/typecheck/build.
+3. If failed: read the specific failing file(s) to identify root cause. Report `file:line` of the failure.
+4. If passed: summarize test counts and any warnings.
+
+### Output Format (REQUIRED)
+```
+VERIFICATION: PASSED/FAILED
+Command: [exact command run]
+Result: [X tests passed, Y failed] or [typecheck clean]
+Failures (if any):
+- file.py:42 — [error description]
+Root cause: [brief explanation]
+```
 
 ### Rules
-- Prefer verify_project before raw shell_execute.
-- Do NOT edit files.
-- Report command, pass/fail, and the first actionable failure location.
+- DO NOT edit files. Your role is observe and report only.
+- Prefer `verify_project` over raw `shell_execute` for standard test/build runs.
+- If `verify_project` cannot detect the right command, use `shell_execute` with the exact project test command.
+- Compress long output: only report the first failure location + root cause, not raw stack traces.
+""")
+
+WorkerProfile(name="explorer", tools=[
+    "repo_map", "code_search", "file_outline",
+    "file_read", "file_list", "file_search",
+    "git_status", "git_diff",
+    "knowledge_search", "knowledge_list",
+    "web_search", "web_fetch",
+], max_iterations=200, system_prompt_extra="""\
+## Explorer Worker: Focused Codebase Area Analysis
+
+You explore ONE specific area of the codebase and produce a concise structured report. You do NOT edit any files.
+
+### Workflow
+1. Run `repo_map` if you need the project overview (skip if your task scopes a specific area).
+2. Use `file_list` to enumerate relevant directories.
+3. Use `code_search` + `file_outline` to locate key symbols.
+4. `file_read` the most important files in your assigned area.
+5. Produce the report below.
+
+### Output Format (REQUIRED)
+```
+## Area: [Name of area explored]
+
+### Key Files
+- path/to/file.py — [one-line description of role]
+
+### Key Symbols
+- ClassName / function_name (file.py:L42) — [what it does]
+
+### Data Flow / Architecture Notes
+[2-5 sentences describing how this area works and connects to the rest of the system]
+
+### Dependencies on Other Areas
+- [area/module] — [why depended upon]
+
+### Potential Issues / Observations
+- [anything noteworthy for an implementer]
+```
+
+### Rules
+- DO NOT edit any files.
+- Focus only on your assigned area. Do not wander into unrelated modules.
+- Keep the report tight: 20-40 lines max. No raw code dumps.
 """)
 
 WorkerProfile(name="reviewer", tools=[
     "repo_map", "code_search", "file_outline",
     "file_read", "git_diff", "git_status", "run_review",
+    "web_search", "web_fetch",
 ], max_iterations=500, system_prompt_extra="""\
 ## Reviewer Worker: Blocking Diff Review
 
-You are a read-only reviewer. Inspect final diff for correctness, regressions, missing tests, and security issues.
+You are a read-only code reviewer. Inspect the final diff for correctness, regressions, missing tests, and risks.
+
+### Workflow
+1. Run `git_diff` to see all changes.
+2. Run `run_review` for automated pattern checks.
+3. Read changed files as needed to understand context.
+4. Produce structured review output.
+
+### Output Format (REQUIRED)
+```
+## Review Result: APPROVED / NEEDS_CHANGES / BLOCKING
+
+### Blocking Issues (must fix before merge)
+- file.py:42 — [issue description]
+
+### Warnings (should address)
+- file.py:88 — [warning description]
+
+### Summary
+[1-2 sentences on overall quality]
+```
 
 ### Rules
-- Do NOT edit files.
-- Lead with blocking findings. If none, say no blocking findings.
-- Include file:line when available.
+- DO NOT edit files.
+- Lead with blocking issues. If none, explicitly state "No blocking issues."
+- Always include file:line references.
+- Check for: unhandled exceptions, missing input validation, hardcoded secrets, test coverage gaps, breaking API changes.
 """)
 
 WorkerProfile(name="code-expert", tools=[
@@ -131,9 +256,10 @@ WorkerProfile(name="code-expert", tools=[
     "git_status", "git_commit", "git_diff",
     "git_branch", "git_pull", "git_clone", "git_remote",
     "knowledge_search", "knowledge_index", "knowledge_list",
+    "web_search", "web_fetch",
 ], max_iterations=1000, system_prompt_extra="""\
 ## Code Expert Worker Guidelines
-You are a skilled full-stack engineer. Follow this workflow:
+You are a skilled full-stack engineer. The user may not understand programming, so you own technical decisions and report in plain product terms. Follow this workflow:
 
 1. ANALYZE: Read relevant files first. Understand the codebase before touching anything.
 2. PLAN (for non-trivial tasks): Define the goal precisely, identify files to touch, plan changes before coding.
@@ -147,7 +273,7 @@ You are a skilled full-stack engineer. Follow this workflow:
    - Run tests if a test suite exists (shell_execute("python -m pytest ..."))
    - Check git_diff to review your own changes
    - Verify the task requirements are met
-   - Report results concisely: what was done, why (if non-obvious), next step
+   - Report results concisely in non-technical language: whether it works, what was checked, and any blocker
 
 ### Safety
 - NEVER shell_execute git push --force, git reset --hard, git checkout ., git clean -fd, or git branch -D
@@ -198,7 +324,7 @@ You are a disciplined TDD practitioner. Follow this cycle exactly:
 - At the end, report how many cycles and all tests passing
 """)
 
-WorkerProfile(name="explorer", tools=[
+WorkerProfile(name="legacy-explorer", tools=[
     "file_read", "file_list", "file_search",
     "git_status", "git_diff",
     "shell_execute",
@@ -227,6 +353,8 @@ You are a codebase explorer. Your job is to systematically scan and report on a 
 - If the directory is large, focus on the most important files
 - Do NOT edit any files — read-only exploration
 """)
+WORKER_PROFILES.pop("legacy-explorer", None)
+
 WorkerProfile(name="debugger", tools=[
     "file_read", "file_search",
     "shell_execute",
@@ -273,6 +401,7 @@ You are a systematic debugger. Never guess at fixes. Follow these phases:
 WorkerProfile(name="code-reviewer", tools=[
     "file_read", "file_search",
     "git_diff", "git_status",
+    "web_search", "web_fetch",
 ], max_iterations=500, system_prompt_extra="""\
 ## Code Reviewer: Spec Compliance + Code Quality Checklist
 
@@ -319,11 +448,14 @@ class WorkerSession:
         context_files: Optional[List[str]] = None,
         run_id: str = "",
         parent_tool_call_id: str = "",
+        agent_type: str = "coding",
+        active_skill_ids: Optional[List[str]] = None,
     ):
         self.worker_id = worker_id
         self.task = task
         self.profile = WORKER_PROFILES.get(profile_name, WORKER_PROFILES["general"])
         self.model_id = model_id
+        self.agent_type = agent_type if agent_type in ("coding", "personal") else "coding"
         self.run_id = run_id
         self.parent_tool_call_id = parent_tool_call_id
         self.router = ModelRouter(model_id)
@@ -334,9 +466,57 @@ class WorkerSession:
         self._context_files = context_files or []
         self._stale_count = 0
         self._started_at = time.time()
+        self.matched_skills = self._resolve_matched_skills(active_skill_ids)
         self._tool_schemas_cache = self._build_tool_schemas()
         self._build_system_prompt()
         self._add_task_message()
+
+    def _resolve_matched_skills(self, active_skill_ids: Optional[List[str]] = None) -> List[str]:
+        """Resolve enabled skills for this worker's subtask.
+
+        Workers are subagents, so skip the meta "using-superpowers" skill and
+        inject the concrete workflow skills that should shape execution.
+        """
+        try:
+            from app.project_manager import ProjectManager
+            from app.skills import SkillManager
+
+            role_id = "code-expert" if self.agent_type == "coding" else "desktop-agent"
+            if active_skill_ids is None:
+                project = ProjectManager.get_current()
+                skill_ids = SkillManager.match_skills(
+                    self.task,
+                    role_id,
+                    project is not None,
+                    agent_type=self.agent_type,
+                )
+            else:
+                skill_ids = [
+                    skill_id
+                    for skill_id in active_skill_ids
+                    if SkillManager.is_skill_enabled(skill_id, self.agent_type, role_id)
+                ]
+            return [skill_id for skill_id in skill_ids if skill_id != "using-superpowers"]
+        except Exception:
+            return []
+
+    def _build_skill_prompt(self) -> str:
+        if not self.matched_skills:
+            return ""
+        try:
+            from app.skills import SkillManager
+
+            skill_prompt = SkillManager.build_skill_prompt(self.matched_skills)
+        except Exception:
+            return ""
+        if not skill_prompt:
+            return ""
+        return (
+            "\n## Worker Active Skills\n"
+            "These skills matched this worker's subtask and are enabled for the agent. "
+            "Follow them where they apply, while keeping the assigned worker scope narrow.\n"
+            f"{skill_prompt}\n"
+        )
 
     def _build_system_prompt(self):
         from app.tools import get_static_tool, list_static_tool_names
@@ -361,6 +541,9 @@ class WorkerSession:
 """
         if self.profile.system_prompt_extra:
             prompt += f"\n{self.profile.system_prompt_extra}\n"
+        skill_prompt = self._build_skill_prompt()
+        if skill_prompt:
+            prompt += skill_prompt
         self.messages.append({"role": "system", "content": prompt})
 
     def _add_task_message(self):
@@ -407,6 +590,8 @@ class WorkerSession:
             "task": self.task,
             "profile": self.profile.name,
             "model_id": self.model_id,
+            "agent_type": self.agent_type,
+            "skills": self.matched_skills,
             "status": "running",
         })
 
@@ -421,7 +606,7 @@ class WorkerSession:
 
             try:
                 response = await self.router.chat_completion_non_stream(
-                    messages=self.messages,
+                    messages=repair_tool_call_messages(self.messages),
                     tools=self._tool_schemas_cache,
                     temperature=0.5,
                     max_tokens=8192,
@@ -429,7 +614,7 @@ class WorkerSession:
             except Exception as e:
                 yield self._worker_event("worker_done", {
                     "status": "failed",
-                    "result": f"[Worker model error: {e}]",
+                    "result": f"[Worker model error: {format_worker_exception(e)}]",
                     "iterations": self.iteration,
                     "duration_ms": round((time.time() - self._started_at) * 1000),
                 })
@@ -554,7 +739,7 @@ class WorkerSession:
         })
 
     def _trim_messages(self):
-        self.messages = trim_messages(self.messages, self.MAX_HISTORY_MESSAGES)
+        self.messages = trim_messages(repair_tool_call_messages(self.messages), self.MAX_HISTORY_MESSAGES)
 
     def _build_tool_schemas(self) -> List[Dict[str, Any]]:
         from app.tools import get_static_tool, list_static_tool_names

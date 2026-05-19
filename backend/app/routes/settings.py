@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -6,11 +7,14 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import load_config, mask_api_key, save_config, reload_config
-from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig
+from app.config import Settings, ProviderConfig, ModelInfo, CodingAgentConfig, PersonalAgentConfig, WebSearchConfig
 from app.roles import RoleManager
+from app.runtime_paths import runtime_dir
 from app.skills import SkillManager
+from app.tools.web_tool import perform_web_search
 
 router = APIRouter()
+SESSIONS_DIR = runtime_dir("sessions")
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -27,6 +31,7 @@ class SettingsUpdateRequest(BaseModel):
     max_parallel_agents: Optional[int] = None
     review_gate_enabled: Optional[bool] = None
     coding_agent: Optional[dict[str, Any]] = None
+    personal_agent: Optional[dict[str, Any]] = None
     auto_approve_rules: Optional[list[dict[str, Any]]] = None
 
 
@@ -65,6 +70,19 @@ class FetchModelsRequest(BaseModel):
     api_key: str = ""
 
 
+class WebSearchSettingsRequest(BaseModel):
+    provider: Optional[str] = None
+    brave_api_key: Optional[str] = None
+    tavily_api_key: Optional[str] = None
+    serpapi_api_key: Optional[str] = None
+    fallback_enabled: Optional[bool] = None
+    allow_private_network: Optional[bool] = None
+
+
+class WebSearchTestRequest(WebSearchSettingsRequest):
+    query: str = "OpenAI API documentation"
+
+
 class SuggestedModel(BaseModel):
     id: str
     suggested_name: str
@@ -88,6 +106,74 @@ def _is_local_provider(provider_name: str | None, base_url: str) -> bool:
         or "127.0.0.1" in lowered_url
         or lowered_url.startswith("http://[::1]")
     )
+
+
+def _session_ids_using_models(model_ids: set[str]) -> list[str]:
+    if not model_ids or not SESSIONS_DIR.exists():
+        return []
+    session_ids: list[str] = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(data.get("model_id") or "") in model_ids:
+            session_ids.append(str(data.get("session_id") or path.stem))
+    return session_ids
+
+
+def _web_search_settings_payload(cfg) -> dict[str, Any]:
+    web = cfg.web_search
+    return {
+        "provider": web.provider,
+        "fallback_enabled": web.fallback_enabled,
+        "allow_private_network": web.allow_private_network,
+        "providers": {
+            "brave": {
+                "api_key_masked": mask_api_key(web._raw_brave_api_key or web.brave_api_key),
+                "api_key_configured": bool(web.brave_api_key),
+            },
+            "tavily": {
+                "api_key_masked": mask_api_key(web._raw_tavily_api_key or web.tavily_api_key),
+                "api_key_configured": bool(web.tavily_api_key),
+            },
+            "serpapi": {
+                "api_key_masked": mask_api_key(web._raw_serpapi_api_key or web.serpapi_api_key),
+                "api_key_configured": bool(web.serpapi_api_key),
+            },
+        },
+    }
+
+
+def _apply_web_search_update(web: WebSearchConfig, req: WebSearchSettingsRequest) -> WebSearchConfig:
+    current = web.model_dump()
+    update = req.model_dump(exclude_none=True)
+    provider = update.get("provider")
+    if provider:
+        provider = str(provider).lower()
+        if provider not in {"auto", "brave", "tavily", "serpapi", "duckduckgo"}:
+            raise HTTPException(status_code=400, detail=f"Unknown web search provider: {provider}")
+        current["provider"] = provider
+    for field in ("fallback_enabled", "allow_private_network"):
+        if field in update:
+            current[field] = bool(update[field])
+
+    raw_values = {
+        "brave_api_key": web._raw_brave_api_key,
+        "tavily_api_key": web._raw_tavily_api_key,
+        "serpapi_api_key": web._raw_serpapi_api_key,
+    }
+    for field in raw_values:
+        value = update.get(field)
+        if isinstance(value, str) and value.strip():
+            current[field] = _resolve_api_key(value)
+            raw_values[field] = value.strip()
+
+    next_web = WebSearchConfig(**current)
+    next_web._raw_brave_api_key = raw_values["brave_api_key"]
+    next_web._raw_tavily_api_key = raw_values["tavily_api_key"]
+    next_web._raw_serpapi_api_key = raw_values["serpapi_api_key"]
+    return next_web
 
 
 # ---- Model ID hint table for auto-populating context / vision / name ----
@@ -158,11 +244,32 @@ def _extract_model_ids(payload: dict[str, Any]) -> list[str]:
     return ids
 
 
+def _clamp_parallel_agent_count(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 3
+    return max(1, min(16, parsed))
+
+
 async def _fetch_provider_models(provider_name: str | None, base_url: str, api_key: str) -> tuple[int, dict[str, Any]]:
-    url = base_url.rstrip("/") + "/models"
     lowered = (provider_name or "").lower() + " " + base_url.lower()
+    if "kimi" in lowered and "/coding" in base_url.lower():
+        base = base_url.rstrip("/")
+        for suffix in ("/chat/completions", "/v1/messages", "/messages", "/models"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)].rstrip("/")
+                break
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        url = f"{base}/models"
+    else:
+        url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {}
-    if "anthropic" in lowered:
+    if "kimi" in lowered and "/coding" in base_url.lower():
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    elif "anthropic" in lowered:
         headers["anthropic-version"] = "2023-06-01"
         if api_key:
             headers["x-api-key"] = api_key
@@ -211,6 +318,8 @@ def get_settings():
         "providers": providers,
         "settings": cfg.settings.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
+        "personal_agent": cfg.personal_agent.model_dump(),
+        "web_search": _web_search_settings_payload(cfg),
     }
 
 
@@ -220,13 +329,22 @@ def update_settings(req: SettingsUpdateRequest):
     cfg = load_config()
     update = req.model_dump(exclude_none=True)
     coding_update = update.pop("coding_agent", None)
+    personal_update = update.pop("personal_agent", None)
     current = cfg.settings.model_dump()
+    if "max_parallel_agents" in update:
+        update["max_parallel_agents"] = _clamp_parallel_agent_count(update["max_parallel_agents"])
     current.update(update)
     cfg.settings = Settings(**current)
     if isinstance(coding_update, dict):
+        if "max_parallel_workers" in coding_update:
+            coding_update["max_parallel_workers"] = _clamp_parallel_agent_count(coding_update["max_parallel_workers"])
         coding_current = cfg.coding_agent.model_dump()
         coding_current.update(coding_update)
         cfg.coding_agent = CodingAgentConfig(**coding_current)
+    if isinstance(personal_update, dict):
+        personal_current = cfg.personal_agent.model_dump()
+        personal_current.update(personal_update)
+        cfg.personal_agent = PersonalAgentConfig(**personal_current)
     save_config(cfg)
     return {"status": "ok"}
 
@@ -385,22 +503,73 @@ def create_provider(req: NewProviderRequest):
 
 @router.delete("/api/providers/{provider_name}")
 def delete_provider(provider_name: str):
-    """删除 Provider（拒绝删除 default_provider）"""
+    """删除 Provider（拒绝删除正在被 Agent 或会话使用的 Provider）"""
     cfg = load_config()
     if provider_name not in cfg.providers:
         raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
-    if cfg.settings.default_provider == provider_name:
-        raise HTTPException(status_code=400, detail="Cannot delete the default provider. Change the default first.")
+    model_ids = {m.id for m in cfg.providers[provider_name].models}
+    in_use_agents: list[str] = []
+    if cfg.personal_agent.model in model_ids:
+        in_use_agents.append("Personal Agent")
+    if cfg.coding_agent.model in model_ids:
+        in_use_agents.append("Coding Agent")
+    session_ids = _session_ids_using_models(model_ids)
+    if in_use_agents or session_ids:
+        details = []
+        if in_use_agents:
+            details.append(f"agents: {', '.join(in_use_agents)}")
+        if session_ids:
+            preview = ", ".join(session_ids[:5])
+            suffix = "..." if len(session_ids) > 5 else ""
+            details.append(f"sessions: {preview}{suffix}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete provider '{provider_name}' because it is in use by {'; '.join(details)}.",
+        )
     del cfg.providers[provider_name]
     save_config(cfg)
     return {"status": "ok"}
+
+
+@router.put("/api/web-search/settings")
+def update_web_search_settings(req: WebSearchSettingsRequest):
+    cfg = load_config()
+    cfg.web_search = _apply_web_search_update(cfg.web_search, req)
+    save_config(cfg)
+    return {"status": "ok", "web_search": _web_search_settings_payload(cfg)}
+
+
+@router.post("/api/web-search/test")
+async def test_web_search(req: WebSearchTestRequest):
+    try:
+        cfg = load_config()
+        web = _apply_web_search_update(cfg.web_search, req)
+        override = web.model_dump()
+        results, provider = await perform_web_search(
+            req.query,
+            max_results=3,
+            config_override=override,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": f"Web search failed: {exc}"}
+    return {
+        "ok": True,
+        "message": f"Search succeeded via {provider}",
+        "provider": provider,
+        "result_count": len(results),
+        "results": [r.to_dict() for r in results],
+    }
 
 
 @router.post("/api/config/reload")
 def force_config_reload():
     """强制刷新后端配置缓存"""
     cfg = reload_config()
-    return {"status": "ok", "default_model": cfg.settings.default_model}
+    return {
+        "status": "ok",
+        "personal_model": cfg.personal_agent.model,
+        "coding_model": cfg.coding_agent.model,
+    }
 
 
 @router.post("/api/roles/reload")

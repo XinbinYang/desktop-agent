@@ -1,0 +1,25 @@
+export {};
+
+interface CaptureRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+declare global {
+  interface Window {
+    electronAPI: {
+      selectFolder: () => Promise<string | null>;
+      selectFile: () => Promise<string | null>;
+      revealPath: (path: string) => Promise<string | null>;
+      openPath: (path: string) => Promise<string | null>;
+      openTerminal: (path: string) => Promise<string | null>;
+      getAppVersion: () => Promise<string>;
+      getAuthToken: () => Promise<string | null>;
+      setTheme: (theme: 'dark' | 'light') => Promise<'dark' | 'light'>;
+      captureRegion: (rect: CaptureRect) => Promise<string | null>;
+      onNewSession: (cb: () => void) => () => void;
+    };
+  }
+}

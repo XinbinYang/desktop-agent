@@ -1,12 +1,13 @@
 """Worker dispatch tools - Manager dispatches subagents for parallel execution."""
 import asyncio
+from copy import deepcopy
 import time
 import uuid
 from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, List, Optional
 
 from app.tools.base import BaseTool, ToolResult
-from app.worker import WorkerSession, WORKER_PROFILES
+from app.worker import WorkerSession, WORKER_PROFILES, format_worker_exception
 
 _worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
     "worker_event_callback",
@@ -27,6 +28,36 @@ def _emit_worker_event(event: Dict[str, Any]) -> None:
     cb = _worker_event_callback_var.get()
     if cb:
         cb(event)
+
+
+def _worker_completed_successfully(status: str, result: str) -> bool:
+    if status != "completed":
+        return False
+    return "ACCEPTANCE: FAIL" not in result
+
+
+def _coerce_worker_limit(value: Any, default: int = 3) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(16, limit))
+
+
+def get_parallel_worker_limit() -> int:
+    """Return the user-visible maximum for dispatch_parallel.
+
+    ``settings.max_parallel_agents`` is the setting shown in the UI. The older
+    ``coding_agent.max_parallel_workers`` field remains a config default for
+    coding behavior, but the dispatch tool must obey the visible global limit.
+    """
+    try:
+        from app.config import load_config
+
+        cfg = load_config()
+        return _coerce_worker_limit(getattr(cfg.settings, "max_parallel_agents", 3))
+    except Exception:
+        return 3
 
 
 def _register_worker(session_id: str, worker: WorkerSession) -> None:
@@ -81,6 +112,16 @@ class DispatchWorkerTool(BaseTool):
                 "items": {"type": "string"},
                 "description": "List of file paths to inject as context into the worker's system prompt.",
             },
+            "agent_type": {
+                "type": "string",
+                "enum": ["coding", "personal"],
+                "description": "Logical agent type used for skill matching. Defaults to coding.",
+                "default": "coding",
+            },
+            "prior_context": {
+                "type": "string",
+                "description": "Output from previous workers (e.g. architect plan, prior summaries). Prepended to task so worker has full context.",
+            },
         },
         "required": ["task"],
     }
@@ -91,28 +132,37 @@ class DispatchWorkerTool(BaseTool):
         profile: str = "code",
         model_id: str = "",
         context_files: Optional[List[str]] = None,
+        agent_type: str = "coding",
+        prior_context: str = "",
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
-        from app.config import load_config
+        from app.config import get_model_for_agent
         if not model_id:
-            model_id = load_config().settings.default_model
+            model_id = get_model_for_agent(agent_type)
+
+        full_task = task
+        if prior_context:
+            full_task = f"## Prior Work Context\n{prior_context[:3000]}\n\n## Your Task\n{task}"
 
         worker_id = f"worker_{uuid.uuid4().hex[:8]}"
         worker = WorkerSession(
             worker_id=worker_id,
-            task=task,
+            task=full_task,
             profile_name=profile,
             model_id=model_id,
             context_files=context_files,
             run_id=run_id,
             parent_tool_call_id=tool_call_id,
+            agent_type=agent_type,
         )
 
         started_at = time.time()
         events: List[Dict[str, Any]] = []
         final_result = ""
+        final_status = "failed"
+        final_iterations = 0
 
         _register_worker(session_id, worker)
         try:
@@ -120,7 +170,10 @@ class DispatchWorkerTool(BaseTool):
                 events.append(event)
                 _emit_worker_event(event)
                 if event["type"] == "worker_done":
-                    final_result = event["data"].get("result", "")
+                    data = event.get("data") or {}
+                    final_result = data.get("result", "")
+                    final_status = data.get("status", final_status)
+                    final_iterations = data.get("iterations", worker.iteration)
         finally:
             _unregister_worker(session_id, worker.worker_id)
 
@@ -133,16 +186,21 @@ class DispatchWorkerTool(BaseTool):
                 tool_call_summaries += f"\n  [{d['name']}] {d.get('result', '')[:200]}"
 
         output = (
-            f"Worker {worker_id} ({profile}) completed in {duration_ms}ms, {worker.iteration} iterations.\n"
+            f"Worker {worker_id} ({profile}) {final_status} in {duration_ms}ms, {final_iterations} iterations.\n"
             f"Result: {final_result}\n"
             f"Tool calls:{tool_call_summaries or ' none'}"
         )
+        if not _worker_completed_successfully(final_status, final_result):
+            return ToolResult(output=output, error=output)
         return ToolResult(output=output)
 
 
 class DispatchParallelTool(BaseTool):
     name = "dispatch_parallel"
-    description = "Dispatch MULTIPLE worker agents to execute subtasks IN PARALLEL. Workers run simultaneously. Use when tasks are independent. Each worker gets its own task and profile."
+    description = (
+        "Dispatch MULTIPLE worker agents to execute subtasks IN PARALLEL. Workers run simultaneously. "
+        "Use only when tasks are independent. Never exceed the configured max parallel sub-agent count."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -153,6 +211,19 @@ class DispatchParallelTool(BaseTool):
                     "properties": {
                         "task": {"type": "string", "description": "Task description for this worker."},
                         "profile": {"type": "string", "enum": list(WORKER_PROFILES.keys()), "default": "code"},
+                        "model_id": {"type": "string", "description": "Optional model ID for this worker only."},
+                        "agent_type": {"type": "string", "enum": ["coding", "personal"], "description": "Optional logical agent type for routing/trace context."},
+                        "context_files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional files to inject into this worker's context.",
+                        },
+                        "prior_context": {"type": "string", "description": "Prior worker output or manager notes for this worker."},
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Concrete criteria the worker must satisfy in its result.",
+                        },
                     },
                     "required": ["task"],
                 },
@@ -167,48 +238,131 @@ class DispatchParallelTool(BaseTool):
         "required": ["tasks"],
     }
 
+    def _parameters_with_limit(self) -> Dict[str, Any]:
+        params = deepcopy(self.parameters)
+        limit = get_parallel_worker_limit()
+        tasks_schema = params["properties"]["tasks"]
+        tasks_schema["maxItems"] = limit
+        tasks_schema["description"] = (
+            f"List of tasks, each dispatched to a separate worker. Hard maximum: {limit} tasks. "
+            "If more work exists, merge related scopes or dispatch in later batches."
+        )
+        return params
+
+    def get_openai_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self._parameters_with_limit(),
+            },
+        }
+
+    def get_anthropic_schema(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self._parameters_with_limit(),
+        }
+
     async def execute(
         self,
-        tasks: List[Dict[str, str]],
+        tasks: List[Dict[str, Any]],
         model_id: str = "",
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
-        from app.config import load_config
+        from app.config import get_model_for_agent
         if not model_id:
-            model_id = load_config().settings.default_model
+            model_id = get_model_for_agent("coding")
+
+        if not tasks:
+            msg = "[ERROR] dispatch_parallel requires at least one task."
+            return ToolResult(output=msg, error=msg)
+
+        worker_limit = get_parallel_worker_limit()
+        requested_workers = len(tasks)
+        if requested_workers > worker_limit:
+            msg = (
+                f"[ERROR] dispatch_parallel requested {requested_workers} workers, "
+                f"but the configured maximum is {worker_limit}. "
+                "Merge related scopes or dispatch the remaining work in a later batch."
+            )
+            return ToolResult(
+                output=msg,
+                error=msg,
+                metadata={
+                    "worker_limit": worker_limit,
+                    "requested_workers": requested_workers,
+                },
+            )
 
         started_at = time.time()
 
-        async def run_one(idx: int, task_spec: Dict[str, str]) -> Dict[str, Any]:
+        async def run_one(idx: int, task_spec: Dict[str, Any]) -> Dict[str, Any]:
             worker_id = f"worker_{uuid.uuid4().hex[:6]}_{idx}"
             profile_name = task_spec.get("profile", "code")
+            worker_model = task_spec.get("model_id") or model_id
+            worker_task = task_spec["task"]
+            prior_context = task_spec.get("prior_context") or ""
+            acceptance = task_spec.get("acceptance_criteria") or []
+            agent_type = task_spec.get("agent_type") or "coding"
+            if prior_context:
+                worker_task = f"## Prior Work Context\n{str(prior_context)[:3000]}\n\n## Your Task\n{worker_task}"
+            if acceptance:
+                criteria = "\n".join(f"- {item}" for item in acceptance if item)
+                worker_task = f"{worker_task}\n\n## Acceptance Criteria\n{criteria}"
+            if agent_type:
+                worker_task = f"## Agent Type\n{agent_type}\n\n{worker_task}"
             worker = WorkerSession(
                 worker_id=worker_id,
-                task=task_spec["task"],
+                task=worker_task,
                 profile_name=profile_name,
-                model_id=model_id,
+                model_id=worker_model,
+                context_files=task_spec.get("context_files"),
                 run_id=run_id,
                 parent_tool_call_id=tool_call_id,
+                agent_type=agent_type,
             )
             events: List[Dict[str, Any]] = []
             final = ""
+            final_status = "failed"
+            final_iterations = 0
             _register_worker(session_id, worker)
             try:
                 async for event in worker.run():
                     events.append(event)
                     _emit_worker_event(event)
                     if event["type"] == "worker_done":
-                        final = event["data"].get("result", "")
+                        data = event.get("data") or {}
+                        final = data.get("result", "")
+                        final_status = data.get("status", final_status)
+                        final_iterations = data.get("iterations", worker.iteration)
+            except Exception as e:
+                final_status = "failed"
+                final = f"[Worker dispatch error: {format_worker_exception(e)}]"
+                final_iterations = worker.iteration
+                failed_event = worker._worker_event("worker_done", {
+                    "status": final_status,
+                    "result": final,
+                    "iterations": final_iterations,
+                    "duration_ms": round((time.time() - started_at) * 1000),
+                })
+                events.append(failed_event)
+                _emit_worker_event(failed_event)
             finally:
                 _unregister_worker(session_id, worker.worker_id)
             return {
                 "worker_id": worker_id,
                 "profile": profile_name,
+                "model_id": worker_model,
+                "agent_type": agent_type,
                 "task": task_spec["task"],
                 "result": final,
-                "iterations": worker.iteration,
+                "status": final_status,
+                "iterations": final_iterations,
                 "events": events,
             }
 
@@ -229,11 +383,19 @@ class DispatchParallelTool(BaseTool):
                 output_parts.append(f"  Worker {i}: FAILED - {result_raw}")
             else:
                 result: Dict[str, Any] = result_raw  # type: ignore[assignment]
-                success_count += 1
+                status = result.get("status", "failed")
+                worker_success = _worker_completed_successfully(status, str(result.get("result", "")))
+                if worker_success:
+                    success_count += 1
+                else:
+                    fail_count += 1
                 output_parts.append(
-                    f"  {result['worker_id']} ({result['profile']}): "
+                    f"  {result['worker_id']} ({result['profile']}, {result['model_id']}, {status}): "
                     f"{result['iterations']} iterations - {result['result'][:300]}"
                 )
 
         output_parts.append(f"\n{success_count} succeeded, {fail_count} failed")
-        return ToolResult(output="\n".join(output_parts))
+        output = "\n".join(output_parts)
+        if fail_count:
+            return ToolResult(output=output, error=output)
+        return ToolResult(output=output)

@@ -1,6 +1,5 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { File, Folder, GitBranch, BookOpen, Search, Loader } from 'lucide-react';
-import { API_BASE, withAuthQuery } from '../config';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { File, Folder, GitBranch, BookOpen, Code2 } from 'lucide-react';
 import type { FileNode } from '../types';
 
 interface MentionItem {
@@ -31,10 +30,18 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   // Build items from project context
   useEffect(() => {
     const items: MentionItem[] = [];
+
+    items.push({
+      id: 'coding agent',
+      label: 'Coding Agent',
+      detail: 'Delegate this message to the engineering specialist',
+      category: 'agent',
+    });
 
     if (projectOpen) {
       // Add git reference
@@ -81,56 +88,84 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
   }, [projectOpen, fileTree]);
 
   const q = query.replace('@', '').toLowerCase();
-  const filtered = allItems.filter(
-    (item) =>
-      !q ||
-      item.label.toLowerCase().includes(q) ||
-      item.detail.toLowerCase().includes(q) ||
-      item.category.includes(q)
+  const filtered = useMemo(
+    () => allItems.filter(
+      (item) =>
+        !q ||
+        item.label.toLowerCase().includes(q) ||
+        item.detail.toLowerCase().includes(q) ||
+        item.category.includes(q)
+    ),
+    [allItems, q]
   );
 
   // Group by category
-  const grouped: Record<string, MentionItem[]> = {};
-  for (const item of filtered) {
-    if (!grouped[item.category]) grouped[item.category] = [];
-    grouped[item.category].push(item);
-  }
+  const groupedEntries = useMemo(() => {
+    const grouped: Record<string, MentionItem[]> = {};
+    for (const item of filtered) {
+      if (!grouped[item.category]) grouped[item.category] = [];
+      grouped[item.category].push(item);
+    }
+    return Object.entries(grouped);
+  }, [filtered]);
+
+  const visibleItems = useMemo(
+    () => groupedEntries.flatMap(([, items]) => items),
+    [groupedEntries]
+  );
 
   useEffect(() => {
     setSelectedIndex(0);
   }, [query]);
+
+  useEffect(() => {
+    setSelectedIndex((idx) => {
+      if (visibleItems.length === 0) return 0;
+      return Math.min(idx, visibleItems.length - 1);
+    });
+  }, [visibleItems.length]);
+
+  useEffect(() => {
+    itemRefs.current[selectedIndex]?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex]);
 
   // Keyboard navigation
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+        e.stopPropagation();
+        setSelectedIndex((i) => Math.min(i + 1, visibleItems.length - 1));
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedIndex((i) => Math.max(i - 1, 0));
-      } else if (e.key === 'Enter' && filtered.length > 0) {
+      } else if (e.key === 'Enter' && visibleItems.length > 0) {
         e.preventDefault();
-        onSelect(filtered[selectedIndex]);
+        e.stopPropagation();
+        onSelect(visibleItems[Math.min(selectedIndex, visibleItems.length - 1)]);
       } else if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         onClose();
       }
     };
     const el = inputRef.current;
     el?.addEventListener('keydown', handler);
     return () => el?.removeEventListener('keydown', handler);
-  }, [filtered, selectedIndex, onSelect, onClose, inputRef]);
+  }, [visibleItems, selectedIndex, onSelect, onClose, inputRef]);
 
-  if (filtered.length === 0) return null;
+  if (visibleItems.length === 0) return null;
 
   const categoryIcons: Record<string, React.ReactNode> = {
+    agent: <Code2 className="w-3 h-3" />,
     file: <File className="w-3 h-3" />,
     folder: <Folder className="w-3 h-3" />,
     git: <GitBranch className="w-3 h-3" />,
     knowledge: <BookOpen className="w-3 h-3" />,
   };
   const categoryLabels: Record<string, string> = {
+    agent: 'Agent',
     file: '文件',
     folder: '目录',
     git: 'Git',
@@ -152,21 +187,24 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
 
   return (
     <div ref={menuRef} style={style} className="bg-surface border border-border rounded-lg shadow-xl p-1">
-      {Object.entries(grouped).map(([category, items]) => (
+      {groupedEntries.map(([category, items]) => (
         <div key={category}>
           <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-fg-muted uppercase tracking-wide">
             {categoryIcons[category]}
             {categoryLabels[category] || category}
           </div>
-          {items.map((item, idx) => {
-            const globalIdx = filtered.indexOf(item);
+          {items.map((item) => {
+            const globalIdx = visibleItems.indexOf(item);
             const isSelected = globalIdx === selectedIndex;
             return (
               <button
                 key={item.id}
+                ref={(node) => { itemRefs.current[globalIdx] = node; }}
                 type="button"
                 onClick={() => onSelect(item)}
                 onMouseEnter={() => setSelectedIndex(globalIdx)}
+                aria-selected={isSelected}
+                data-mention-id={item.id}
                 className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-xs text-left transition-colors ${
                   isSelected ? 'bg-accent/10 text-accent' : 'text-fg hover:bg-surface-hover'
                 }`}

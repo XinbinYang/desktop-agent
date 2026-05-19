@@ -1,6 +1,6 @@
 ---
 name: output-formatting
-description: Use for ALL responses — standard Markdown output style for clean, professional, scannable agent output. Replaces star ratings with status symbols, enforces consistent heading hierarchy, and specifies clear file reference format.
+description: Use for ALL responses — Claude-like concise, scannable output. Prioritize high signal density, minimal formatting noise, and consistent code/file references.
 ---
 
 # Output Formatting Style Guide
@@ -9,14 +9,13 @@ Every response you generate must follow the formatting rules defined in `STYLE_G
 
 ## Quick Reference
 
-| Rule                | Do                                         | Don't                          |
-|---------------------|--------------------------------------------|---------------------------------|
-| Headings            | `##` → `###` → `####`, no skipping        | `#` without `##`, unbalanced   |
-| Status              | `✅` `⚠️` `❌` `ℹ️`                        | `★☆` `⭐⭐⭐` Unicode stars      |
-| Scores              | `"4/5 — 良好"`                              | `"★★★★☆"`                       |
-| File references     | `` `path/to/file:42` ``                    | Bare paths, no line numbers     |
-| Conclusions         | `>` blockquote                             | Inline text mixed with details  |
-| Code blocks         | Always mark language                       | Unlabelled fences               |
-| Tables              | Standard Markdown, header row required     | Nested tables, raw ASCII art    |
+| Rule | Do | Don't |
+|------|----|-------|
+| Brevity | Give direct answer first | Long ceremonial intros |
+| Structure | Use headings/lists only when needed | Force report template every time |
+| Tool narration | Compress repetitive actions | Dump every read/search step verbatim |
+| Symbols | Keep plain text unless needed | Decorative emoji/status icons by default |
+| File references | Use `` `path:line` `` when citing code | Bare ambiguous references |
+| Tables | Use only for real comparisons | Turn normal answers into tables |
 
-Apply these rules in every response. Consistency is the point.
+Apply this style consistently unless the user asks for a different format.

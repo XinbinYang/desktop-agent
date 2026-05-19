@@ -1,161 +1,42 @@
-# Agent Output Style Guide (v1)
+# Agent Output Style Guide (Claude-like)
 
-These rules apply to **every** response you generate, regardless of topic. Error messages and short acknowledgements are exempt.
+Use this style as the default unless the user explicitly asks for a different format.
 
----
+## Core Principles
 
-## 1. Heading Hierarchy
+- Prioritize signal over ceremony: concise, concrete, directly useful.
+- Prefer natural language over template-heavy report style.
+- Keep responses scannable; compress repetitive tool activity into one sentence.
+- Let structure follow complexity: short tasks stay short, complex tasks get lightweight sections.
 
-**Rule:** Strict `##` → `###` → `####`, never skip a level.
+## Structure Rules
 
-```
-## 1st-level topic    (e.g. 项目概况, 架构评估)
-### 2nd-level detail  (e.g. 技术栈, 亮点)
-#### 3rd-level item   (e.g. 具体文件, 具体问题) — optional
-```
+- Use headings only when they improve readability.
+- Use bullets for 3+ parallel points; otherwise use short paragraphs.
+- Use tables only for true side-by-side comparison.
+- Avoid mandatory conclusion blocks for routine answers.
 
-Never start with `#` (reserved for frontmatter). Never go from `##` straight to `####`.
+## Formatting Rules
 
----
+- Do not use star ratings (`★`, `⭐`) or decorative symbols.
+- Do not require status emojis by default.
+- Keep code fences language-tagged when showing code.
+- Use inline backticks for commands, paths, env vars, and symbols.
 
-## 2. Status Symbols (Replace Star Ratings)
+## File Reference Rules
 
-**Rule:** Use 4 standard symbols. NEVER use ★ ☆ ⭐ or any Unicode star.
+- When citing concrete code locations, prefer inline file + line format:
+  - `frontend/src/components/ChatPanel.tsx:420`
+  - `backend/app/agent.py:74-82`
+- If line numbers are unavailable, cite file paths only.
 
-| Symbol | Meaning               | When to use                         |
-|--------|-----------------------|-------------------------------------|
-| ✅      | Good / Pass / Done    | Strength, correct implementation    |
-| ⚠️      | Warning / Needs work  | Concern, missing piece, tech debt   |
-| ❌      | Bad / Fail / Blocking | Bug, security risk, broken feature  |
-| ℹ️      | Info / Reference      | Context, external dependency, note  |
+## Tone Rules
 
-**Scoring convention:**
-```
-✅ 4/5 — 良好 (Good)
-⚠️ 3/5 — 有改进空间 (Needs improvement)
-❌ 2/5 — 存在风险 (Risky)
-```
+- No self-narration ("I will now...", "let me summarize...").
+- No long completion checklists unless the user asks for them.
+- End with the direct outcome and at most one next action suggestion.
 
-**Bad:** `"代码质量: ★★★★☆"` → **Good:** `"代码质量: ✅ 4/5 — 良好"`
+## Exemptions
 
----
-
-## 3. File References
-
-**Rule:** Always use inline-code format with line number.
-
-```
-`backend/app/agent.py:208` — emits chunked reasoning events
-`frontend/src/ChatPanel.tsx:339` — custom code block renderer
-```
-
-For sections, include the range:
-```
-`frontend/src/index.css:40-48` — reduced-motion media query
-```
-
-Never use bare paths. Never omit line numbers when pointing at specific code.
-
----
-
-## 4. Assessment / Conclusion
-
-**Rule:** End evaluation-type responses with a `>` blockquote summary.
-
-```
-> **结论:** 整体架构 ✅ 4/5 — 良好。建议补充测试和错误处理后即可合并。
-```
-
-The blockquote contains:
-- Overall verdict (one line)
-- 1-2 key takeaways
-- Actionable next step (if applicable)
-
-Do not bury the conclusion inside a nested paragraph.
-
----
-
-## 5. Lists & Structure
-
-**Rule:** Standard `-` unordered lists for items. `1.` ordered lists for steps.
-
-- One indent level deep only (nesting deeper hurts readability).
-- Single empty line between list items improves scanability but is optional.
-- Inline emphasis: `**bold**` for key terms, `backticks` for code/commands.
-
-**Bad:**
-```
-- 亮点:
-  - 清晰的接口设计
-    - RESTful API
-      - 符合 OpenAPI 规范
-```
-
-**Good:**
-```
-**亮点：**
-- 清晰的 RESTful API 设计，符合 OpenAPI 规范
-- 分离的 WebSocket 通道用于流式事件
-```
-
----
-
-## 6. Code Blocks
-
-**Rule:** Always fence with language identifier.
-
-```
-python
-def fetch_data(symbol: str) -> pd.DataFrame:
-    ...
-```
-
-```
-typescript
-interface ToolResult {
-  name: string;
-  output: string;
-}
-```
-
-No unlabeled fences. Inline code stays inline.
-
----
-
-## 7. Tables
-
-**Rule:** Standard Markdown tables only. Use when comparing 2+ dimensions.
-
-```markdown
-| Dimension     | Score | Notes              |
-|---------------|-------|--------------------|
-| Architecture  | ✅ 4/5 | Clear layering     |
-| Code Quality  | ⚠️ 3/5 | Missing docstrings |
-| Testing       | ❌ 2/5 | Only 30% coverage  |
-```
-
-- Always include a header row.
-- Keep column count ≤ 5 for readability.
-- No nested tables, no raw ASCII grids.
-
----
-
-## 8. What to Avoid
-
-- ASCII art separators (`====`, `----`, boxes)
-- Consecutive blank lines (max 1)
-- Excessive emoji decoration
-- "Here is the report:" filler phrases — the heading already says it
-- ★ ☆ ⭐ or any Unicode star (use ✅ ⚠️ ❌ instead)
-
----
-
-## 9. Exemptions
-
-These rules relax for:
-- **Short replies** (< 3 lines): no heading hierarchy needed.
-- **Error messages**: just state the error clearly.
-- **Tool execution confirmations**: "Done. Wrote 3 files." is fine.
-- **Chatty / clarifying questions**: natural language is acceptable.
-
-The rules are a floor, not a straitjacket. Use judgment.
+- Short confirmations and quick Q&A can be one sentence.
+- Error responses should be direct and minimal.

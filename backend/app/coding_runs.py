@@ -95,6 +95,46 @@ def get_run_context() -> Optional[RunContext]:
     return _current_run.get()
 
 
+# Per-session project binding. Set at the top of AgentSession.run(), which
+# executes inside SessionRuntime's per-session asyncio.Task — each task owns an
+# isolated contextvars copy, so concurrent sessions in different projects never
+# clobber each other. This is what makes parallel multi-project runs safe.
+_session_project: ContextVar[Optional[str]] = ContextVar("session_project_path", default=None)
+
+
+def set_session_project(project_path: Optional[str]) -> Token:
+    return _session_project.set(project_path or None)
+
+
+def reset_session_project(token: Token) -> None:
+    _session_project.reset(token)
+
+
+def effective_project_path() -> str:
+    """Project root the *currently executing* agent task should operate in.
+
+    Priority:
+      1. Active coding RunContext (project root; worktree-aware callers use
+         ``RunContext.active_path`` directly instead).
+      2. The running session's bound project (per-asyncio-task ContextVar).
+      3. The global ProjectManager (UI-selected project) — last-resort fallback
+         for legacy / unbound sessions only.
+    """
+    ctx = _current_run.get()
+    if ctx and ctx.project_path:
+        return ctx.project_path
+    bound = _session_project.get()
+    if bound:
+        return bound
+    try:
+        project = ProjectManager.get_current()
+        if project:
+            return str(project.get("path") or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _run_git(args: List[str], cwd: str, timeout: int = 30, input_text: Optional[str] = None) -> tuple[int, str, str]:
     try:
         result = subprocess.run(
@@ -161,17 +201,31 @@ def _insert_run(ctx: RunContext, status: str = "running") -> None:
 
 
 
-def create_coding_run(session_id: str, run_id: str, prompt: str = "") -> Optional[RunContext]:
+def create_coding_run(
+    session_id: str,
+    run_id: str,
+    prompt: str = "",
+    project_path: Optional[str] = None,
+) -> Optional[RunContext]:
     cfg = load_config()
     coding_cfg = getattr(cfg, "coding_agent", None)
     if coding_cfg is not None and not getattr(coding_cfg, "enabled", True):
         return None
 
-    project = ProjectManager.get_current()
-    if not project:
+    # Bind to the calling session's project (per-session isolation), not the
+    # mutable global UI project. effective_project_path() already falls back to
+    # ProjectManager.get_current() for legacy / unbound sessions.
+    resolved = project_path or effective_project_path()
+    if not resolved:
+        return None
+    try:
+        resolved_dir = Path(resolved).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved_dir.is_dir():
         return None
 
-    project_path = str(Path(project["path"]).resolve())
+    project_path = str(resolved_dir)
     git_info = _git_info(project_path)
     default_mode = getattr(coding_cfg, "default_execution_mode", "worktree") if coding_cfg else "worktree"
     mode = "current_dir"
@@ -227,7 +281,12 @@ def record_event(run_id: str, event_type: str, data: Dict[str, Any]) -> None:
 
 
 
-def complete_run(run_id: str, status: str, summary: str = "") -> None:
+def complete_run(
+    run_id: str,
+    status: str,
+    summary: str = "",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
     if not run_id:
         return
     conn = _get_conn()
@@ -241,7 +300,10 @@ def complete_run(run_id: str, status: str, summary: str = "") -> None:
     finally:
         pass
 
-    record_event(run_id, "run_completed", {"run_id": run_id, "status": status, "summary": summary})
+    payload: Dict[str, Any] = {"run_id": run_id, "status": status, "summary": summary}
+    if details:
+        payload.update(details)
+    record_event(run_id, "run_completed", payload)
 
 
 def list_runs(limit: int = 100) -> List[Dict[str, Any]]:

@@ -17,7 +17,7 @@ export const WebViewer: React.FC<WebViewerProps> = ({ url }) => {
 
   if (!fullUrl) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-gray-500">
+      <div className="h-full flex flex-col items-center justify-center text-fg-muted">
         <div className="text-sm">暂无网页预览</div>
       </div>
     );
@@ -25,11 +25,11 @@ export const WebViewer: React.FC<WebViewerProps> = ({ url }) => {
 
   return (
     <div className="h-full flex flex-col bg-white">
-      <div className="flex items-center gap-2 px-2 py-1 bg-gray-100 border-b border-gray-200">
-        <span className="text-[10px] text-gray-500 truncate flex-1">{url}</span>
+      <div className="flex items-center gap-2 px-2 py-1 bg-surface-hover border-b border-border">
+        <span className="text-[10px] text-fg-muted truncate flex-1">{url}</span>
         <button
           onClick={() => setRefreshKey((k) => k + 1)}
-          className="p-1 text-gray-500 hover:text-gray-700"
+          className="p-1 text-fg-muted hover:text-fg"
           title="刷新"
         >
           <RefreshCw className="w-3 h-3" />

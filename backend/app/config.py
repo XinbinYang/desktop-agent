@@ -32,6 +32,10 @@ class RagConfig(BaseModel):
     min_score: float = 0.3
     top_k: int = 5
 
+class PersonalAgentConfig(BaseModel):
+    model: str = ""
+    thinking_intensity: str = "medium"
+
 class CodingAgentConfig(BaseModel):
     enabled: bool = True
     default_execution_mode: str = "worktree"
@@ -40,6 +44,20 @@ class CodingAgentConfig(BaseModel):
     require_verification: bool = True
     require_review: bool = True
     auto_generate_repo_map: bool = True
+    model: str = ""
+    thinking_intensity: str = "medium"
+
+class WebSearchConfig(BaseModel):
+    provider: str = "auto"
+    brave_api_key: str = ""
+    tavily_api_key: str = ""
+    serpapi_api_key: str = ""
+    fallback_enabled: bool = True
+    allow_private_network: bool = False
+
+    _raw_brave_api_key: str = PrivateAttr(default="")
+    _raw_tavily_api_key: str = PrivateAttr(default="")
+    _raw_serpapi_api_key: str = PrivateAttr(default="")
 
 class AutoApproveRule(BaseModel):
     """A permission rule for auto-approval of tool calls."""
@@ -49,8 +67,10 @@ class AutoApproveRule(BaseModel):
     risk: str = ""             # Optional: only match specific risk level ("low", "medium", "high")
 
 class Settings(BaseModel):
-    default_model: str
-    default_provider: str
+    # Legacy fields kept for older runtime config files and clients. Runtime
+    # model selection now comes from personal_agent/coding_agent settings.
+    default_model: str = ""
+    default_provider: str = ""
     max_iterations: int = 10000
     auto_approve: bool = False
     screenshot_on_step: bool = True
@@ -59,6 +79,9 @@ class Settings(BaseModel):
     thinking_policy_by_provider: Dict[str, Dict[str, Any]] = {}
     collaboration_mode: str = "serial"
     max_parallel_agents: int = 3
+    collaboration_enabled: bool = True
+    default_collaboration_mode: str = "hybrid"
+    auto_delegate_coding: str = "suggest"
     review_gate_enabled: bool = True
     auto_approve_rules: List[AutoApproveRule] = []
 
@@ -67,8 +90,11 @@ class AppConfig(BaseModel):
     settings: Settings
     rag: RagConfig = RagConfig()
     coding_agent: CodingAgentConfig = CodingAgentConfig()
+    personal_agent: PersonalAgentConfig = PersonalAgentConfig()
+    web_search: WebSearchConfig = WebSearchConfig()
 
 _config: Optional[AppConfig] = None
+_WEB_SEARCH_KEY_FIELDS: tuple[str, ...] = ("brave_api_key", "tavily_api_key", "serpapi_api_key")
 
 
 def mask_api_key(key: str) -> str:
@@ -90,6 +116,25 @@ def load_config() -> AppConfig:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
+    if raw is None:
+        raw = {}
+
+    # Backward compat: migrate old global default_model into explicit per-agent
+    # defaults so runtime decisions no longer depend on global model fields.
+    settings = raw.setdefault("settings", {})
+    legacy_default_model = str(settings.get("default_model") or "")
+    if "personal_agent" not in raw or not isinstance(raw.get("personal_agent"), dict):
+        raw["personal_agent"] = {}
+    if "coding_agent" not in raw or not isinstance(raw.get("coding_agent"), dict):
+        raw["coding_agent"] = {}
+    if legacy_default_model:
+        if not str(raw["personal_agent"].get("model") or "").strip():
+            raw["personal_agent"]["model"] = legacy_default_model
+        if not str(raw["coding_agent"].get("model") or "").strip():
+            raw["coding_agent"]["model"] = legacy_default_model
+    if "web_search" not in raw:
+        raw["web_search"] = {}
+
     # 保存原始 api_key（env var 解析前），用于 save_config 时写回
     raw_api_keys: Dict[str, str] = {}
     for provider_name, provider in raw.get("providers", {}).items():
@@ -99,11 +144,22 @@ def load_config() -> AppConfig:
             env_var = key[2:-1]
             provider["api_key"] = os.environ.get(env_var, "")
 
+    raw_web_keys: Dict[str, str] = {}
+    web_search = raw.get("web_search", {}) or {}
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        raw_web_keys[field] = web_search.get(field, "")
+        key = raw_web_keys[field]
+        if isinstance(key, str) and key.startswith("${") and key.endswith("}"):
+            web_search[field] = os.environ.get(key[2:-1], "")
+    raw["web_search"] = web_search
+
     _config = AppConfig(**raw)
     # Preserve the raw (un-expanded) api_key so save_config can round-trip env-var syntax.
     for provider_name, provider in _config.providers.items():
         if provider_name in raw_api_keys:
             provider._raw_api_key = raw_api_keys[provider_name]
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        setattr(_config.web_search, f"_raw_{field}", raw_web_keys.get(field, ""))
     return _config
 
 
@@ -119,11 +175,18 @@ def save_config(cfg: AppConfig) -> None:
             "models": [m.model_dump() for m in provider.models],
         }
 
+    web_search_data = cfg.web_search.model_dump()
+    for field in _WEB_SEARCH_KEY_FIELDS:
+        raw_key = getattr(cfg.web_search, f"_raw_{field}", "") or getattr(cfg.web_search, field)
+        web_search_data[field] = raw_key
+
     data: Dict[str, object] = {
         "providers": providers_data,
         "settings": cfg.settings.model_dump(),
         "rag": cfg.rag.model_dump(),
         "coding_agent": cfg.coding_agent.model_dump(),
+        "personal_agent": cfg.personal_agent.model_dump(),
+        "web_search": web_search_data,
     }
 
     # 原子写入：先写临时文件，再 os.replace
@@ -164,4 +227,32 @@ def list_all_models() -> List[dict]:
                 "vision": m.vision,
                 "context": m.context
             })
+    return result
+
+def get_model_for_agent(agent_type: str) -> str:
+    """Resolve the effective model ID for a given agent type.
+
+    Runtime model selection is agent-scoped. Old global default_model values
+    are migrated into agent configs in load_config().
+    """
+    cfg = load_config()
+    if agent_type == "coding":
+        return (cfg.coding_agent.model or "").strip()
+    if agent_type == "personal":
+        return (cfg.personal_agent.model or "").strip()
+    return ""
+
+def get_thinking_intensity_for_agent(agent_type: str) -> str:
+    """Resolve the effective thinking intensity for a given agent type."""
+    cfg = load_config()
+    default = cfg.settings.thinking_intensity_default or "medium"
+    if agent_type == "coding":
+        override = cfg.coding_agent.thinking_intensity
+    elif agent_type == "personal":
+        override = cfg.personal_agent.thinking_intensity
+    else:
+        override = ""
+    result = override if override else default
+    if result not in ("low", "medium", "high"):
+        result = "medium"
     return result

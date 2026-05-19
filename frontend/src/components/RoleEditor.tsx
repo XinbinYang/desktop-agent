@@ -66,11 +66,11 @@ export const RoleEditor: React.FC<RoleEditorProps> = ({ isOpen, onClose, onRoles
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+      <div className="bg-surface rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-gray-700">
-          <h2 className="text-sm font-bold text-white">自定义角色</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-white">
+        <div className="flex items-center justify-between p-4 border-b border-border">
+          <h2 className="text-sm font-bold text-fg">自定义角色</h2>
+          <button onClick={onClose} className="text-fg-secondary hover:text-fg">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -89,28 +89,28 @@ export const RoleEditor: React.FC<RoleEditorProps> = ({ isOpen, onClose, onRoles
               </button>
 
               {roles.length === 0 && (
-                <div className="text-xs text-gray-500 text-center py-4">暂无自定义角色</div>
+                <div className="text-xs text-fg-muted text-center py-4">暂无自定义角色</div>
               )}
 
               {roles.map((role) => (
                 <div
                   key={role.id}
-                  className="flex items-center justify-between px-3 py-2 rounded bg-gray-700/50"
+                  className="flex items-center justify-between px-3 py-2 rounded bg-surface-alt/50"
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="text-xs font-medium text-gray-200 truncate">{role.name}</div>
-                    <div className="text-[10px] text-gray-500 truncate">{role.id}</div>
+                    <div className="text-xs font-medium text-fg truncate">{role.name}</div>
+                    <div className="text-[10px] text-fg-muted truncate">{role.id}</div>
                   </div>
                   <div className="flex items-center gap-1 ml-2">
                     <button
                       onClick={() => startEdit(role)}
-                      className="p-1 text-gray-400 hover:text-white"
+                      className="p-1 text-fg-secondary hover:text-fg"
                     >
                       <Edit3 className="w-3 h-3" />
                     </button>
                     <button
                       onClick={() => handleDelete(role.id)}
-                      className="p-1 text-gray-400 hover:text-red-400"
+                      className="p-1 text-fg-secondary hover:text-danger"
                     >
                       <Trash2 className="w-3 h-3" />
                     </button>
@@ -124,44 +124,44 @@ export const RoleEditor: React.FC<RoleEditorProps> = ({ isOpen, onClose, onRoles
           {editing && (
             <div className="space-y-3">
               <div>
-                <label className="text-xs text-gray-400 block mb-1">角色 ID（英文标识）</label>
+                <label className="text-xs text-fg-secondary block mb-1">角色 ID（英文标识）</label>
                 <input
                   value={editing.id}
                   onChange={(e) => setEditing({ ...editing, id: e.target.value })}
                   disabled={!isCreating}
                   placeholder="如: my-custom-role"
-                  className="w-full text-xs bg-gray-700 border border-gray-600 rounded px-2 py-1.5 outline-none disabled:opacity-50"
+                  className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg disabled:opacity-50 focus:border-accent"
                 />
               </div>
               <div>
-                <label className="text-xs text-gray-400 block mb-1">名称</label>
+                <label className="text-xs text-fg-secondary block mb-1">名称</label>
                 <input
                   value={editing.name}
                   onChange={(e) => setEditing({ ...editing, name: e.target.value })}
                   placeholder="如: 我的自定义角色"
-                  className="w-full text-xs bg-gray-700 border border-gray-600 rounded px-2 py-1.5 outline-none"
+                  className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg focus:border-accent"
                 />
               </div>
               <div>
-                <label className="text-xs text-gray-400 block mb-1">描述</label>
+                <label className="text-xs text-fg-secondary block mb-1">描述</label>
                 <input
                   value={editing.description}
                   onChange={(e) => setEditing({ ...editing, description: e.target.value })}
                   placeholder="一句话描述角色定位"
-                  className="w-full text-xs bg-gray-700 border border-gray-600 rounded px-2 py-1.5 outline-none"
+                  className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg focus:border-accent"
                 />
               </div>
               <div>
-                <label className="text-xs text-gray-400 block mb-1">
+                <label className="text-xs text-fg-secondary block mb-1">
                   Prompt 模板
-                  <span className="text-gray-500 ml-1">(可用 {'{{tools_desc}}'} 占位符注入工具列表)</span>
+                  <span className="text-fg-muted ml-1">(可用 {'{{tools_desc}}'} 占位符注入工具列表)</span>
                 </label>
                 <textarea
                   value={editing.prompt}
                   onChange={(e) => setEditing({ ...editing, prompt: e.target.value })}
                   rows={12}
                   placeholder="你是一个..."
-                  className="w-full text-xs bg-gray-700 border border-gray-600 rounded px-2 py-1.5 outline-none font-mono leading-relaxed resize-none"
+                  className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg font-mono leading-relaxed resize-none focus:border-accent"
                 />
               </div>
               <div className="flex gap-2">
@@ -174,7 +174,7 @@ export const RoleEditor: React.FC<RoleEditorProps> = ({ isOpen, onClose, onRoles
                 </button>
                 <button
                   onClick={cancelEdit}
-                  className="px-3 py-1.5 rounded text-xs text-gray-300 hover:bg-gray-700 transition-colors"
+                  className="px-3 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
                 >
                   取消
                 </button>

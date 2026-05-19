@@ -1,45 +1,75 @@
 import React from 'react';
 import {
-  Zap,
-  FolderOpen,
-  MessageSquare,
-  BookOpen,
+  Sparkles,
+  LayoutPanelLeft,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
+  User,
+  Code,
+  Loader2,
   type LucideIcon,
 } from 'lucide-react';
-import { type SidebarSection } from '../types';
+import { type SidebarSection, type AgentType } from '../types';
 import { cn } from './ui/cn';
 import { Tooltip } from './ui/Tooltip';
 
 interface ActivityBarProps {
   activeSection: SidebarSection;
+  activeAgent: AgentType;
   sidebarCollapsed: boolean;
   onSectionChange: (section: SidebarSection) => void;
+  onAgentChange: (agent: AgentType) => void;
   onToggleSidebar: () => void;
+  personalRunning?: boolean;
+  codingRunning?: boolean;
 }
 
 interface ActivityItem {
-  id: SidebarSection;
+  id: SidebarSection | AgentType;
   icon: LucideIcon;
   label: string;
+  isAgent?: boolean;
 }
 
-const ACTIVITY_ITEMS: ActivityItem[] = [
-  { id: 'tools', icon: Zap, label: 'Tools' },
-  { id: 'project', icon: FolderOpen, label: 'Project' },
-  { id: 'sessions', icon: MessageSquare, label: 'Sessions' },
-  { id: 'knowledge', icon: BookOpen, label: 'Knowledge' },
+const AGENT_ITEMS: ActivityItem[] = [
+  { id: 'personal', icon: User, label: 'Personal', isAgent: true },
+  { id: 'coding', icon: Code, label: 'Coding', isAgent: true },
+];
+
+const SECTION_ITEMS: ActivityItem[] = [
+  { id: 'skills', icon: Sparkles, label: 'Skills' },
+  { id: 'workspace', icon: LayoutPanelLeft, label: 'Workspace' },
   { id: 'settings', icon: Settings, label: 'Settings' },
 ];
 
 export const ActivityBar: React.FC<ActivityBarProps> = ({
   activeSection,
+  activeAgent,
   sidebarCollapsed,
   onSectionChange,
+  onAgentChange,
   onToggleSidebar,
+  personalRunning = false,
+  codingRunning = false,
 }) => {
+  const agentRunning: Record<AgentType, boolean> = {
+    personal: personalRunning,
+    coding: codingRunning,
+  };
+  const handleAgentClick = (agentType: AgentType) => {
+    if (!sidebarCollapsed && activeAgent === agentType) {
+      onToggleSidebar();
+    } else if (sidebarCollapsed) {
+      onAgentChange(agentType);
+      onToggleSidebar();
+    } else {
+      onAgentChange(agentType);
+      // Auto-switch section: personal → personal, coding → workspace
+      onSectionChange(agentType === 'personal' ? 'personal' : 'workspace');
+    }
+  };
+
   const handleItemClick = (section: SidebarSection) => {
     if (!sidebarCollapsed && activeSection === section) {
       onToggleSidebar();
@@ -53,24 +83,58 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
 
   return (
     <div className="w-12 bg-surface border-r border-border flex flex-col items-center py-2 flex-shrink-0 select-none">
+      {/* Agent entries — top */}
+      <div className="flex flex-col items-center gap-1 mb-2">
+        {AGENT_ITEMS.map((item) => {
+          const isActive = activeAgent === item.id;
+          return (
+            <Tooltip key={item.id} content={<span className="text-[11px]">{item.label} Agent</span>} side="right">
+              <button
+                type="button"
+                onClick={() => handleAgentClick(item.id as AgentType)}
+                className={cn(
+                  'relative w-10 h-10 rounded-full flex items-center justify-center transition-all',
+                  isActive
+                    ? item.id === 'personal'
+                      ? 'bg-accent/10 text-accent ring-1 ring-accent/30'
+                      : 'bg-success/10 text-success ring-1 ring-success/30'
+                    : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
+                )}
+                aria-label={`${item.label} Agent`}
+              >
+                <item.icon className="w-5 h-5" />
+                {agentRunning[item.id as AgentType] && (
+                  <Loader2
+                    className="absolute -top-0.5 -right-0.5 w-3 h-3 animate-spin text-success"
+                    aria-label={`${item.label} Agent running`}
+                  />
+                )}
+              </button>
+            </Tooltip>
+          );
+        })}
+      </div>
+
+      {/* Divider */}
+      <div className="w-8 h-px bg-border my-1" />
+
       {/* Section icons */}
       <div className="flex-1 flex flex-col items-center gap-1">
-        {ACTIVITY_ITEMS.map((item) => {
+        {SECTION_ITEMS.map((item) => {
           const isActive = !sidebarCollapsed && activeSection === item.id;
           return (
             <Tooltip key={item.id} content={<span className="text-[11px]">{item.label}</span>} side="right">
               <button
                 type="button"
-                onClick={() => handleItemClick(item.id)}
+                onClick={() => handleItemClick(item.id as SidebarSection)}
                 className={cn(
                   'relative w-12 h-12 flex items-center justify-center transition-colors',
                   isActive
-                    ? 'text-white'
-                    : 'text-fg-secondary hover:text-fg'
+                    ? 'bg-accent/10 text-accent'
+                    : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
                 )}
                 aria-label={item.label}
               >
-                {/* Active indicator bar — left edge, only when sidebar is open */}
                 {isActive && (
                   <span className="absolute left-0 top-1 bottom-1 w-0.5 bg-accent rounded-r-full" />
                 )}

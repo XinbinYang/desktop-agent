@@ -1,0 +1,18 @@
+{
+  "connectors": {
+    "discord": {
+      "name": "discord",
+      "display_name": "Discord",
+      "description": "通过 Discord Bot 远程与 Agent 对话，支持 DM 和 @提及触发。",
+      "enabled": false,
+      "config": {}
+    },
+    "feishu": {
+      "name": "feishu",
+      "display_name": "飞书",
+      "description": "通过飞书 Bot 远程与 Agent 对话，支持单聊和群聊 @提及触发。",
+      "enabled": false,
+      "config": {}
+    }
+  }
+}

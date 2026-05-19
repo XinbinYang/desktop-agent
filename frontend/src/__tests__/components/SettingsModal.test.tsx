@@ -39,6 +39,28 @@ const mockSettingsResponse: SettingsResponse = {
     screenshot_on_step: true,
     sandbox_mode: 'sandbox',
   },
+  personal_agent: { model: 'gpt-4o', thinking_intensity: 'medium' },
+  coding_agent: {
+    enabled: true,
+    default_execution_mode: 'worktree',
+    max_fix_rounds: 2,
+    max_parallel_workers: 3,
+    require_verification: true,
+    require_review: true,
+    auto_generate_repo_map: true,
+    model: 'claude-sonnet',
+    thinking_intensity: 'medium',
+  },
+  web_search: {
+    provider: 'auto',
+    fallback_enabled: true,
+    allow_private_network: false,
+    providers: {
+      brave: { api_key_masked: 'brv...1234', api_key_configured: true },
+      tavily: { api_key_masked: '', api_key_configured: false },
+      serpapi: { api_key_masked: '', api_key_configured: false },
+    },
+  },
 };
 
 function mockFetchResponse(data: any) {
@@ -86,7 +108,7 @@ describe('SettingsModal', () => {
     );
 
     expect(await screen.findByText('设置')).toBeInTheDocument();
-    // Provider names appear in both cards and dropdowns
+    fireEvent.click(screen.getByText('Providers'));
     const openaiElements = screen.getAllByText('openai');
     const anthropicElements = screen.getAllByText('anthropic');
     expect(openaiElements.length).toBeGreaterThanOrEqual(1);
@@ -106,7 +128,28 @@ describe('SettingsModal', () => {
       />
     );
 
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
     expect(await screen.findByText('sk-...BwOW')).toBeInTheDocument();
+  });
+
+  it('does not render global default model/provider controls', async () => {
+    fetchMock.mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByText('设置');
+    expect(screen.queryByText('默认模型')).not.toBeInTheDocument();
+    expect(screen.queryByText('默认 Provider')).not.toBeInTheDocument();
+    expect(screen.queryByText(/使用默认/)).not.toBeInTheDocument();
   });
 
   it('shows model count badges', async () => {
@@ -122,11 +165,13 @@ describe('SettingsModal', () => {
       />
     );
 
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
     expect(await screen.findByText('2 个模型')).toBeInTheDocument();
     expect(screen.getByText('1 个模型')).toBeInTheDocument();
   });
 
-  it('default provider has "默认" badge', async () => {
+  it('shows Agent provider badges instead of a global default badge', async () => {
     fetchMock.mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
 
     render(
@@ -139,7 +184,11 @@ describe('SettingsModal', () => {
       />
     );
 
-    expect(await screen.findByText('默认')).toBeInTheDocument();
+    await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
+    expect(await screen.findByText('Personal')).toBeInTheDocument();
+    expect(screen.getByText('Coding')).toBeInTheDocument();
+    expect(screen.queryByText('默认')).not.toBeInTheDocument();
   });
 
   it('closes when X button is clicked', async () => {
@@ -180,7 +229,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
-    // "openai" appears in multiple places (dropdown + card)
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     const editButtons = screen.getAllByTitle('编辑');
     fireEvent.click(editButtons[0]);
 
@@ -206,6 +256,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     fireEvent.click(screen.getAllByTitle('编辑')[0]);
     await screen.findByText(/编辑 openai/);
     fireEvent.click(screen.getByText('保存 Provider'));
@@ -241,6 +293,8 @@ describe('SettingsModal', () => {
     );
 
     await screen.findByText('设置');
+    fireEvent.click(screen.getByText('Providers'));
+    await screen.findByText('sk-...BwOW');
     fireEvent.click(screen.getAllByTitle('编辑')[0]);
     await screen.findByText(/编辑 openai/);
     fireEvent.click(screen.getByTitle('Test connection'));
@@ -305,5 +359,71 @@ describe('SettingsModal', () => {
     );
 
     expect(await screen.findByText(/当前模型: GPT-4o/)).toBeInTheDocument();
+  });
+  it('renders web search settings and preserves existing keys on save', async () => {
+    const onSettingsChanged = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse))
+      .mockResolvedValueOnce(mockFetchResponse({ status: 'ok', web_search: mockSettingsResponse.web_search }))
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={onSettingsChanged}
+      />
+    );
+
+    fireEvent.click(await screen.findByText('Web Search'));
+    expect(await screen.findByText('Brave Search API Key')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('brv...1234')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Save Web Search'));
+
+    await waitFor(() => expect(onSettingsChanged).toHaveBeenCalled());
+    const saveCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/web-search/settings') && init?.method === 'PUT'
+    );
+    expect(saveCall).toBeTruthy();
+    const body = JSON.parse(saveCall![1].body as string);
+    expect(body.provider).toBe('auto');
+    expect(body.brave_api_key).toBe('');
+    expect(body.fallback_enabled).toBe(true);
+  });
+
+  it('tests web search settings from the form', async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockFetchResponse(mockSettingsResponse))
+      .mockResolvedValueOnce(mockFetchResponse({
+        ok: true,
+        message: 'Search succeeded via duckduckgo',
+        provider: 'duckduckgo',
+        result_count: 2,
+      }));
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        models={mockModels}
+        currentModel="gpt-4o"
+        onSettingsChanged={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByText('Web Search'));
+    fireEvent.click(await screen.findByText('Test search'));
+
+    expect(await screen.findByText('Search succeeded via duckduckgo')).toBeInTheDocument();
+    const testCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/web-search/test') && init?.method === 'POST'
+    );
+    expect(testCall).toBeTruthy();
+    const body = JSON.parse(testCall![1].body as string);
+    expect(body.query).toBe('OpenAI API documentation');
+    expect(body.brave_api_key).toBe('');
   });
 });
