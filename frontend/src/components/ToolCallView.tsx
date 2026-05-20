@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { ChevronDown, ChevronRight, CheckCircle2, XCircle, Wrench, Loader2, Bot } from 'lucide-react';
 import { WorkerEvent } from '../types';
+import { resolveToolCallLocalPath } from '../lib/localPaths';
+import { RevealPathButton } from './RevealPathAction';
 
 interface ToolCallViewProps {
   name: string;
@@ -10,6 +12,7 @@ interface ToolCallViewProps {
   durationMs?: number;
   workerEvents?: WorkerEvent[];
   variant?: 'full' | 'event-row' | 'disclosure';
+  projectPath?: string | null;
 }
 
 /** Shell/bash-style tools get a compact IN/OUT terminal view. */
@@ -258,6 +261,7 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
   durationMs,
   workerEvents,
   variant = 'full',
+  projectPath,
 }) => {
   const workerGroups = groupWorkerEvents(workerEvents);
   const workerCount = Object.keys(workerGroups).length;
@@ -265,6 +269,7 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
   const isShell = isShellTool(name);
   const command = isShell ? shellCommand(args) : '';
   const canExpand = status !== 'running' || workerCount > 0 || result != null;
+  const revealPath = resolveToolCallLocalPath(name, args, result, { projectPath });
 
   useEffect(() => {
     if (variant !== 'full' && workerCount > 0) {
@@ -288,45 +293,53 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
         }`}
         data-testid={disclosure ? 'tool-disclosure' : 'tool-event-row'}
       >
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
-          onClick={() => canExpand && setExpanded((v) => !v)}
-          className="w-full flex min-w-0 items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-left hover:bg-surface-hover transition-colors"
-        >
-          {status === 'running' ? (
-            <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
-          ) : status === 'error' ? (
-            <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
-          ) : (
-            <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
-          )}
-          {workerCount > 0 ? (
-            <Bot className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-          ) : (
-            <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-          )}
-          <span className="font-medium text-fg-secondary shrink-0">
-            {disclosure ? `Used ${label}` : label}
-          </span>
-          {target && (
-            <span
-              className={`min-w-0 flex-1 truncate text-fg-muted ${workerCount > 0 ? '' : 'font-mono'}`}
-              title={target}
-            >
-              {target}
+        <div className="w-full flex min-w-0 items-center hover:bg-surface-hover transition-colors">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
+            onClick={() => canExpand && setExpanded((v) => !v)}
+            className="flex min-w-0 flex-1 items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-left"
+          >
+            {status === 'running' ? (
+              <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
+            ) : status === 'error' ? (
+              <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
+            ) : (
+              <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
+            )}
+            {workerCount > 0 ? (
+              <Bot className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+            ) : (
+              <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+            )}
+            <span className="font-medium text-fg-secondary shrink-0">
+              {disclosure ? `Used ${label}` : label}
             </span>
-          )}
-          {typeof durationMs === 'number' && (
-            <span className="text-fg-muted tabular-nums shrink-0">{durationMs}ms</span>
-          )}
-          {canExpand ? (
-            expanded ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-          ) : (
-            <span className="text-info/80 shrink-0 font-medium">Running</span>
-          )}
-        </button>
+            {target && (
+              <span
+                className={`min-w-0 flex-1 truncate text-fg-muted ${workerCount > 0 ? '' : 'font-mono'}`}
+                title={target}
+              >
+                {target}
+              </span>
+            )}
+            {typeof durationMs === 'number' && (
+              <span className="text-fg-muted tabular-nums shrink-0">{durationMs}ms</span>
+            )}
+            {canExpand ? (
+              expanded ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+            ) : (
+              <span className="text-info/80 shrink-0 font-medium">Running</span>
+            )}
+          </button>
+          <RevealPathButton
+            path={revealPath}
+            projectPath={projectPath}
+            className="mr-2 h-6 w-6"
+            ariaLabel={revealPath ? `Show in folder: ${revealPath}` : undefined}
+          />
+        </div>
         {expanded && canExpand && (
           <CompactToolDetails
             name={name}
@@ -342,45 +355,53 @@ export const ToolCallView: React.FC<ToolCallViewProps> = ({
 
   return (
     <div className="my-[var(--chat-space-sm)] rounded-md border border-border bg-surface/40 overflow-hidden">
-      <button
-        type="button"
-        aria-expanded={expanded}
-        aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
-        onClick={() => (status !== 'running' || workerCount > 0) && setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm hover:bg-surface-hover transition-colors"
-      >
-        {status === 'running' ? (
-          <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
-        ) : status === 'error' ? (
-          <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
-        ) : (
-          <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
-        )}
-        <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-        {isShell ? (
-          <span className="flex items-baseline gap-1.5 truncate flex-1 text-left">
-            <span className="text-fg-secondary font-medium shrink-0">Bash</span>
-            {command && (
-              <span className="text-fg-muted font-mono chat-text-xs truncate">{command}</span>
-            )}
-          </span>
-        ) : (
-          <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
-        )}
-        {typeof durationMs === 'number' && (
-          <span className="text-fg-muted tabular-nums">{durationMs}ms</span>
-        )}
-        {workerCount > 0 && (
-          <span className="chat-text-xs text-info/90 shrink-0">{workerCount} agent{workerCount > 1 ? 's' : ''}</span>
-        )}
-        {status === 'running' ? (
-          <span className="chat-text-xs text-info/80 shrink-0 font-medium">Running</span>
-        ) : expanded ? (
-          <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-        ) : (
-          <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
-        )}
-      </button>
+      <div className="w-full flex min-w-0 items-center hover:bg-surface-hover transition-colors">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-label={expanded ? 'Collapse tool call details' : 'Expand tool call details'}
+          onClick={() => (status !== 'running' || workerCount > 0) && setExpanded(!expanded)}
+          className="flex min-w-0 flex-1 items-center gap-2 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-sm"
+        >
+          {status === 'running' ? (
+            <Loader2 className="w-3.5 h-3.5 text-info animate-spin shrink-0" />
+          ) : status === 'error' ? (
+            <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
+          )}
+          <Wrench className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          {isShell ? (
+            <span className="flex items-baseline gap-1.5 truncate flex-1 text-left">
+              <span className="text-fg-secondary font-medium shrink-0">Bash</span>
+              {command && (
+                <span className="text-fg-muted font-mono chat-text-xs truncate">{command}</span>
+              )}
+            </span>
+          ) : (
+            <span className="text-fg-secondary truncate flex-1 text-left">{name}</span>
+          )}
+          {typeof durationMs === 'number' && (
+            <span className="text-fg-muted tabular-nums">{durationMs}ms</span>
+          )}
+          {workerCount > 0 && (
+            <span className="chat-text-xs text-info/90 shrink-0">{workerCount} agent{workerCount > 1 ? 's' : ''}</span>
+          )}
+          {status === 'running' ? (
+            <span className="chat-text-xs text-info/80 shrink-0 font-medium">Running</span>
+          ) : expanded ? (
+            <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          )}
+        </button>
+        <RevealPathButton
+          path={revealPath}
+          projectPath={projectPath}
+          className="mr-2 h-7 w-7"
+          ariaLabel={revealPath ? `Show in folder: ${revealPath}` : undefined}
+        />
+      </div>
       {expanded && (status !== 'running' || workerCount > 0) && (
         <div className="px-[var(--chat-bubble-px)] pb-[var(--chat-space-lg)] space-y-[var(--chat-space-md)] chat-text-sm font-mono border-t border-border-subtle pt-[var(--chat-space-md)]">
           {isShell ? (

@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { PaneRenderer } from '../../../components/session/PaneRenderer';
 import type { LeafNode, PaneNode } from '../../../components/session/PaneTypes';
+import { DEFAULT_AGENT_PROFILES } from '../../../lib/agentProfiles';
 import type { Team } from '../../../lib/teamStore';
 
 vi.mock('../../../components/session/SessionView', async () => {
@@ -31,7 +32,12 @@ vi.mock('../../../components/session/SessionView', async () => {
         }, {});
       }, [props.agentType, props.isFocused, props.onSnapshot, props.sessionId]);
       return (
-        <div data-testid={`session-${props.sessionId}`} data-team-id={props.teamId || ''} onClick={props.onFocus}>
+        <div
+          data-testid={`session-${props.sessionId}`}
+          data-team-id={props.teamId || ''}
+          data-assistant-display-name={props.assistantDisplayName || ''}
+          onClick={props.onFocus}
+        >
           {props.sessionId}
         </div>
       );
@@ -142,6 +148,24 @@ describe('PaneRenderer', () => {
     expect(screen.getByText('Personal Agent')).toBeInTheDocument();
     expect(screen.getByText('Planning work')).toBeInTheDocument();
     expect(screen.getByDisplayValue('GPT Test')).toBeInTheDocument();
+  });
+
+  it('uses the Personal identity profile name instead of the selected role name', () => {
+    renderPane(leaf('a', 'pane-a', 'session-a'), {
+      agentProfiles: {
+        ...DEFAULT_AGENT_PROFILES,
+        personal: {
+          ...DEFAULT_AGENT_PROFILES.personal,
+          display_name: '镜与刃',
+          source: 'IDENTITY.md',
+        },
+      },
+      roleDisplayNames: { 'desktop-agent': '桌面助手' },
+    });
+
+    expect(screen.getByText('镜与刃')).toBeInTheDocument();
+    expect(screen.queryByText('桌面助手')).not.toBeInTheDocument();
+    expect(screen.getByTestId('session-session-a')).toHaveAttribute('data-assistant-display-name', '镜与刃');
   });
 
   it('switches the pane model from the title bar selector', () => {

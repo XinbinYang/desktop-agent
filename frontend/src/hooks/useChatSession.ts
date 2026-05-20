@@ -1336,6 +1336,8 @@ export function useChatSession(
 
         case 'run_completed':
           recordRunEvent(event);
+          isRunningRef.current = false;
+          setIsRunning(false);
           addTerminalLog(`[Run] ${event.data.status || 'completed'}: ${event.data.summary || ''}`);
           break;
 

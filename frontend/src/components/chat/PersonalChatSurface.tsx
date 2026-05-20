@@ -30,6 +30,7 @@ import {
 import { ToolCallView } from '../ToolCallView';
 import { FileEditView } from '../FileEditView';
 import { AgentRunningSpinner } from './AgentRunningStatus';
+import { RevealableInlineCode } from '../RevealPathAction';
 
 interface ImagePreviewState {
   src: string;
@@ -49,6 +50,7 @@ interface PersonalChatSurfaceProps {
   emptyPlaceholder: React.ReactNode;
   markdownTheme: 'dark' | 'light';
   assistantDisplayName?: string;
+  projectPath?: string | null;
 }
 
 interface PersonalScrollMemory {
@@ -56,6 +58,8 @@ interface PersonalScrollMemory {
   groupCount: number;
   updatedAt: number;
 }
+
+type PersonalTone = 'user' | 'assistant' | 'system-success' | 'system-error';
 
 const personalScrollMemoryBySession = new Map<string, PersonalScrollMemory>();
 const LONG_TEXT_LENGTH = 1800;
@@ -81,24 +85,26 @@ function trimCodePreview(value: string, maxLines = CODE_PREVIEW_LINES): string {
   return `${lines.slice(0, maxLines).join('\n')}\n...`;
 }
 
+function personalTone(
+  role: PersonalMessageGroup['role'],
+  noticeLevel?: PersonalConversationItem['noticeLevel'],
+): PersonalTone {
+  if (role === 'user') return 'user';
+  if (role === 'assistant') return 'assistant';
+  return noticeLevel === 'success' ? 'system-success' : 'system-error';
+}
+
 const PersonalAvatar: React.FC<{
   role: PersonalMessageGroup['role'];
-  noticeLevel?: PersonalConversationItem['noticeLevel'];
-}> = ({ role, noticeLevel }) => {
+  tone: PersonalTone;
+}> = ({ role, tone }) => {
   const isUser = role === 'user';
   const isSystem = role === 'system';
-  const isSuccessNotice = isSystem && noticeLevel === 'success';
+  const isSuccessNotice = tone === 'system-success';
   return (
     <div
-      className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border ${
-        isSuccessNotice
-          ? 'border-success/25 bg-success/10 text-success'
-          : isSystem
-          ? 'border-danger/25 bg-danger/10 text-danger'
-          : isUser
-            ? 'border-accent/25 bg-accent/15 text-accent'
-            : 'border-info/25 bg-info/12 text-info'
-      }`}
+      className="personal-chat-avatar mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+      data-tone={tone}
       aria-hidden
     >
       {isSuccessNotice ? <CheckCircle2 className="h-4 w-4" /> : isSystem ? <AlertCircle className="h-4 w-4" /> : isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
@@ -186,7 +192,8 @@ const PersonalMarkdownInner: React.FC<{
   text: string;
   streaming: boolean;
   theme: 'dark' | 'light';
-}> = ({ text, streaming, theme }) => {
+  projectPath?: string | null;
+}> = ({ text, streaming, theme, projectPath }) => {
   const [expanded, setExpanded] = useState(false);
   // Render markdown live during streaming so bullets/bold/headings appear with
   // each token. Code blocks fall back to a lightweight <pre> while streaming
@@ -217,14 +224,19 @@ const PersonalMarkdownInner: React.FC<{
         return <pre {...props}>{children}</pre>;
       },
       code({ children, ...props }: any) {
+        const value = React.Children.toArray(children).map((child) => String(child)).join('');
         return (
-          <code className="rounded bg-surface-alt px-1 py-0.5 chat-text-xs text-fg-secondary" {...props}>
+          <RevealableInlineCode
+            value={value}
+            projectPath={projectPath}
+            className="rounded bg-surface-alt px-1 py-0.5 chat-text-xs text-fg-secondary"
+          >
             {children}
-          </code>
+          </RevealableInlineCode>
         );
       },
     }),
-    [streaming, theme],
+    [streaming, theme, projectPath],
   );
 
   const long = text.length > LONG_TEXT_LENGTH;
@@ -255,7 +267,7 @@ const PersonalMarkdownInner: React.FC<{
 const PersonalMarkdown = React.memo(
   PersonalMarkdownInner,
   (prev, next) =>
-    prev.text === next.text && prev.streaming === next.streaming && prev.theme === next.theme,
+    prev.text === next.text && prev.streaming === next.streaming && prev.theme === next.theme && prev.projectPath === next.projectPath,
 );
 
 function activityIcon(activity: PersonalActivityItem) {
@@ -321,7 +333,7 @@ function summarizeActivities(activities: PersonalActivityItem[], running: boolea
   return [running ? `正在处理 ${stepCount} 步` : `我处理了 ${stepCount} 步`, ...details].join(' · ');
 }
 
-const ActivityDetails: React.FC<{ activity: PersonalActivityItem }> = ({ activity }) => {
+const ActivityDetails: React.FC<{ activity: PersonalActivityItem; projectPath?: string | null }> = ({ activity, projectPath }) => {
   if (activity.kind === 'tool' && activity.tools?.length) {
     return (
       <div className="mt-1.5 space-y-1.5">
@@ -335,6 +347,7 @@ const ActivityDetails: React.FC<{ activity: PersonalActivityItem }> = ({ activit
             durationMs={tool.durationMs}
             workerEvents={tool.workerEvents}
             variant="disclosure"
+            projectPath={projectPath}
           />
         ))}
       </div>
@@ -357,7 +370,7 @@ const ActivityDetails: React.FC<{ activity: PersonalActivityItem }> = ({ activit
   if (activity.kind === 'file_edit' && activity.edit) {
     return (
       <div className="mt-1.5">
-        <FileEditView edit={activity.edit} compact variant="event-row" />
+        <FileEditView edit={activity.edit} compact variant="event-row" projectPath={projectPath} />
       </div>
     );
   }
@@ -373,7 +386,7 @@ const ActivityDetails: React.FC<{ activity: PersonalActivityItem }> = ({ activit
   return null;
 };
 
-const ActivityChip: React.FC<{ activity: PersonalActivityItem }> = ({ activity }) => {
+const ActivityChip: React.FC<{ activity: PersonalActivityItem; projectPath?: string | null }> = ({ activity, projectPath }) => {
   const [open, setOpen] = useState(false);
   const hasDetails = !!(
     activity.text ||
@@ -399,7 +412,7 @@ const ActivityChip: React.FC<{ activity: PersonalActivityItem }> = ({ activity }
         <span className="truncate">{activity.label}</span>
         {hasDetails && (open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />)}
       </button>
-      {open && <ActivityDetails activity={activity} />}
+      {open && <ActivityDetails activity={activity} projectPath={projectPath} />}
     </div>
   );
 };
@@ -408,7 +421,8 @@ const PersonalActivityDrawer: React.FC<{
   activities: PersonalActivityItem[];
   turnComplete?: boolean;
   searchQuery?: string;
-}> = ({ activities, turnComplete, searchQuery = '' }) => {
+  projectPath?: string | null;
+}> = ({ activities, turnComplete, searchQuery = '', projectPath }) => {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
   const query = searchQuery.trim().toLowerCase();
   const hasRunning = activities.some((activity) => activity.status === 'running');
@@ -438,7 +452,7 @@ const PersonalActivityDrawer: React.FC<{
       {open && (
         <div className="mt-1.5 flex flex-col items-start gap-1.5">
           {activities.map((activity) => (
-            <ActivityChip key={activity.id} activity={activity} />
+            <ActivityChip key={activity.id} activity={activity} projectPath={projectPath} />
           ))}
         </div>
       )}
@@ -454,11 +468,13 @@ const PersonalMessageItem: React.FC<{
   onOpenImage: (preview: ImagePreviewState) => void;
   markdownTheme: 'dark' | 'light';
   searchQuery?: string;
-}> = ({ item, isLastAssistant, isRunning, onRetry, onOpenImage, markdownTheme, searchQuery }) => {
+  projectPath?: string | null;
+}> = ({ item, isLastAssistant, isRunning, onRetry, onOpenImage, markdownTheme, searchQuery, projectPath }) => {
   const canRetry = item.role === 'assistant' && isLastAssistant && !!onRetry && !isRunning && item.turnComplete !== false;
+  const tone = personalTone(item.role, item.noticeLevel);
 
   return (
-    <div className="group/message relative min-w-0">
+    <div className="personal-chat-message group/message relative min-w-0" data-role={item.role} data-tone={tone}>
       {canRetry && (
         <button
           type="button"
@@ -471,7 +487,7 @@ const PersonalMessageItem: React.FC<{
         </button>
       )}
       <div className={item.role === 'system' ? (item.noticeLevel === 'success' ? 'text-success' : 'text-danger') : 'text-fg'}>
-        <PersonalMarkdown text={item.text} streaming={item.isStreaming} theme={markdownTheme} />
+        <PersonalMarkdown text={item.text} streaming={item.isStreaming} theme={markdownTheme} projectPath={projectPath} />
         {item.images.map((base64, index) => (
           <PersonalImageThumbnail
             key={`${item.id}:image:${index}`}
@@ -485,6 +501,7 @@ const PersonalMessageItem: React.FC<{
             activities={item.activities}
             turnComplete={item.turnComplete}
             searchQuery={searchQuery}
+            projectPath={projectPath}
           />
         )}
       </div>
@@ -500,19 +517,25 @@ const PersonalGroupRow: React.FC<{
   onOpenImage: (preview: ImagePreviewState) => void;
   markdownTheme: 'dark' | 'light';
   searchQuery?: string;
-}> = ({ group, lastAssistantItemId, isRunning, onRetry, onOpenImage, markdownTheme, searchQuery }) => {
+  projectPath?: string | null;
+}> = ({ group, lastAssistantItemId, isRunning, onRetry, onOpenImage, markdownTheme, searchQuery, projectPath }) => {
   const timeLabel = formatMessageTime(group.startedAt);
+  const tone = personalTone(group.role, group.items[0]?.noticeLevel);
 
   return (
-    <div className="px-[var(--chat-space-lg)] py-2">
-      <div className="mx-auto flex w-full max-w-4xl gap-3">
-        <PersonalAvatar role={group.role} noticeLevel={group.items[0]?.noticeLevel} />
+    <div
+      className="personal-chat-row px-4 py-1.5 transition-colors"
+      data-role={group.role}
+      data-tone={tone}
+    >
+      <div className="personal-chat-row-inner mx-auto flex w-full max-w-5xl gap-3 px-1 sm:px-2">
+        <PersonalAvatar role={group.role} tone={tone} />
         <div className="min-w-0 flex-1">
-          <div className="mb-1 flex min-w-0 items-baseline gap-2">
-            <span className="chat-text-sm font-semibold text-fg">{group.authorName}</span>
-            {timeLabel && <span className="chat-text-xs text-fg-muted">{timeLabel}</span>}
+          <div className="mb-0.5 flex min-w-0 items-baseline gap-2">
+            <span className="personal-chat-author" data-role={group.role} data-tone={tone}>{group.authorName}</span>
+            {timeLabel && <span className="personal-chat-timestamp">{timeLabel}</span>}
           </div>
-          <div className="space-y-3">
+          <div className="space-y-2">
             {group.items.map((item) => (
               <PersonalMessageItem
                 key={item.id}
@@ -523,6 +546,7 @@ const PersonalGroupRow: React.FC<{
                 onOpenImage={onOpenImage}
                 markdownTheme={markdownTheme}
                 searchQuery={searchQuery}
+                projectPath={projectPath}
               />
             ))}
           </div>
@@ -597,6 +621,7 @@ export const PersonalChatSurface: React.FC<PersonalChatSurfaceProps> = ({
   emptyPlaceholder,
   markdownTheme,
   assistantDisplayName = 'Personal Agent',
+  projectPath = null,
 }) => {
   const allGroups = useMemo(
     () => buildPersonalConversation({ messages, toolCalls, fileEdits, planState, assistantDisplayName }),
@@ -701,9 +726,10 @@ export const PersonalChatSurface: React.FC<PersonalChatSurfaceProps> = ({
         onOpenImage={onOpenImage}
         markdownTheme={markdownTheme}
         searchQuery={searchQuery}
+        projectPath={projectPath}
       />
     );
-  }, [groups, isRunning, lastAssistantItemId, markdownTheme, onOpenImage, onRetry, searchQuery]);
+  }, [groups, isRunning, lastAssistantItemId, markdownTheme, onOpenImage, onRetry, projectPath, searchQuery]);
 
   const virtuosoInitialProps = useMemo(
     () => groups.length > 0 && isNearBottom
@@ -724,7 +750,7 @@ export const PersonalChatSurface: React.FC<PersonalChatSurfaceProps> = ({
   }), [allGroups.length, emptyPlaceholder]);
 
   return (
-    <div className="relative h-full min-h-0 overflow-hidden" data-testid="personal-chat-v2">
+    <div className="personal-chat-surface relative h-full min-h-0 overflow-hidden" data-testid="personal-chat-v2">
       <Virtuoso
         ref={virtuosoRef}
         className="h-full"

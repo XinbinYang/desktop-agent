@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import aiofiles
 import yaml
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -239,7 +240,26 @@ def _history_project_name(path: str) -> str:
     return Path(normalized).name or normalized
 
 
-async def _close_browser_session_after_delete(session_id: str) -> None:
+async def _delete_session_cleanup(session_id: str, session: Optional["AgentSession"]) -> None:
+    """Heavy post-delete cleanup that the API response no longer waits on.
+
+    Runtime termination, worker cancellation, recorder cleanup and Playwright
+    teardown all run as a fire-and-forget background task so the HTTP DELETE
+    can return in the ~30ms range and the frontend's optimistic UI never
+    blocks on cleanup work the user does not need to see.
+    """
+    try:
+        await terminate_session_runtime(session_id, session)
+    except Exception as exc:
+        print(f"[Session] terminate runtime failed for {session_id}: {exc}")
+    try:
+        cancel_workers_for_session(session_id)
+    except Exception as exc:
+        print(f"[Session] cancel workers failed for {session_id}: {exc}")
+    try:
+        clear_recorder(session_id)
+    except Exception as exc:
+        print(f"[Session] clear recorder failed for {session_id}: {exc}")
     try:
         await close_browser_session(session_id)
     except Exception as exc:
@@ -413,6 +433,43 @@ def _build_session_history(include_archived: bool = False) -> Dict[str, Any]:
     }
 
 
+def _session_history_etag(history: Dict[str, Any]) -> str:
+    """Compact, stable hash over the fields the sidebar renders.
+
+    Covers session identity + per-session activity (is_running, archived_at,
+    updated_at) and project-level signals (is_current, has_running, is_pinned).
+    Other fields (token usage, message counts) are intentionally excluded so a
+    silent backend write does not bust the cache when the sidebar shows the
+    same thing.
+    """
+    digest = hashlib.sha1()
+    digest.update(str(history.get("current_project_path") or "").encode("utf-8"))
+    for project in history.get("projects") or []:
+        digest.update(b"|p|")
+        digest.update(str(project.get("project_key") or project.get("path") or "").encode("utf-8"))
+        digest.update(str(project.get("name") or "").encode("utf-8"))
+        digest.update(b"1" if project.get("is_current") else b"0")
+        digest.update(b"1" if project.get("has_running") else b"0")
+        digest.update(b"1" if project.get("is_pinned") else b"0")
+        digest.update(b"1" if project.get("is_archived") else b"0")
+        digest.update(str(project.get("archived_sessions_count") or 0).encode("utf-8"))
+        for session in project.get("sessions") or []:
+            digest.update(b"|s|")
+            digest.update(str(session.get("id") or "").encode("utf-8"))
+            digest.update(str(session.get("updated_at") or 0).encode("utf-8"))
+            digest.update(str(session.get("archived_at") or "").encode("utf-8"))
+            digest.update(b"1" if session.get("is_running") else b"0")
+            digest.update(str(session.get("title") or "").encode("utf-8"))
+    for session in history.get("standalone_sessions") or []:
+        digest.update(b"|x|")
+        digest.update(str(session.get("id") or "").encode("utf-8"))
+        digest.update(str(session.get("updated_at") or 0).encode("utf-8"))
+        digest.update(str(session.get("archived_at") or "").encode("utf-8"))
+        digest.update(b"1" if session.get("is_running") else b"0")
+        digest.update(str(session.get("title") or "").encode("utf-8"))
+    return 'W/"' + digest.hexdigest()[:20] + '"'
+
+
 class StoreCredentialRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     host: str
@@ -468,9 +525,23 @@ async def chat(req: ChatRequest):
 
 
 @app.get("/api/session-history")
-def get_session_history(include_archived: bool = False):
-    """Return project-grouped session history with live per-session activity."""
-    return _build_session_history(include_archived=include_archived)
+def get_session_history(
+    request: Request,
+    response: Response,
+    include_archived: bool = False,
+):
+    """Return project-grouped session history with live per-session activity.
+
+    Honors If-None-Match by returning 304 with the same ETag header, so the
+    5s sidebar polling does not churn React state when nothing changed.
+    """
+    history = _build_session_history(include_archived=include_archived)
+    etag = _session_history_etag(history)
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and if_none_match == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    return history
 
 
 @app.get("/api/sessions")
@@ -605,13 +676,12 @@ async def delete_session(session_id: str):
         code=SESSION_DELETED_CLOSE_CODE,
         reason=SESSION_DELETED_REASON,
     )
-    session = _sessions.get(session_id)
-    runtime_terminated = await terminate_session_runtime(session_id, session)
-    cancel_workers_for_session(session_id)
-    clear_recorder(session_id)
-    asyncio.create_task(_close_browser_session_after_delete(session_id))
-    if session_id in _sessions:
-        del _sessions[session_id]
+    # Synchronous part stays cheap (<30ms): file unlink + cache forget + pop
+    # in-memory record. Runtime termination, worker cancellation, recorder
+    # clearing and Playwright teardown move to a fire-and-forget background
+    # task so the HTTP response returns immediately and the frontend's
+    # optimistic UI is not gated on heavy cleanup.
+    session = _sessions.pop(session_id, None)
     path = SESSIONS_DIR / f"{session_id}.json"
     if path.exists():
         try:
@@ -619,10 +689,11 @@ async def delete_session(session_id: str):
         except OSError:
             pass
     forget_session_record_cache(session_id)
+    asyncio.create_task(_delete_session_cleanup(session_id, session))
     return {
         "status": "ok",
         "message": f"Session {session_id} deleted",
-        "runtime_terminated": runtime_terminated,
+        "runtime_terminated": "pending",
         "closed_connections": closed_connections,
     }
 

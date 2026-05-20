@@ -7,6 +7,7 @@ import time
 import uuid
 import copy
 from collections import OrderedDict
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -55,8 +56,69 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_DIR = runtime_dir("sessions")
 SESSION_REGISTRY_PATH = runtime_file("session_registry.json")
+SESSION_INDEX_PATH = runtime_file("session_index.json")
 GLOBAL_PROJECT_KEY = "__global__"
 _SESSION_RECORD_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# Persistent-index bookkeeping. The cache itself is the authoritative in-memory
+# store; the JSON file is just a warm-start hint so the very first call after
+# launch does not have to open every session JSON to populate the cache.
+_SESSION_INDEX_LOADED = False
+_SESSION_INDEX_DIRTY = False
+
+
+def _load_session_index_from_disk() -> None:
+    """Hydrate _SESSION_RECORD_CACHE from session_index.json on first use.
+
+    Entries whose (mtime_ns, size) no longer match the file on disk are
+    skipped — _session_record_from_path will lazily refresh those.
+    """
+    global _SESSION_INDEX_LOADED
+    if _SESSION_INDEX_LOADED:
+        return
+    _SESSION_INDEX_LOADED = True
+    try:
+        with open(SESSION_INDEX_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return
+    for key, value in entries.items():
+        if not isinstance(value, list) or len(value) != 3:
+            continue
+        mtime_ns, size, record = value
+        if not isinstance(record, dict):
+            continue
+        try:
+            _SESSION_RECORD_CACHE[str(key)] = (int(mtime_ns), int(size), record)
+        except (TypeError, ValueError):
+            continue
+
+
+def _persist_session_index_if_dirty() -> None:
+    global _SESSION_INDEX_DIRTY
+    if not _SESSION_INDEX_DIRTY:
+        return
+    payload = {
+        "version": 1,
+        "entries": {
+            key: [mtime_ns, size, record]
+            for key, (mtime_ns, size, record) in _SESSION_RECORD_CACHE.items()
+        },
+    }
+    tmp_path = SESSION_INDEX_PATH.with_suffix(SESSION_INDEX_PATH.suffix + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, SESSION_INDEX_PATH)
+        _SESSION_INDEX_DIRTY = False
+    except OSError:
+        # Best-effort persistence — failures here must never break the API.
+        with suppress(OSError):
+            tmp_path.unlink()
 
 # Internal: resume agent loop after user clicks Build (WebSocket `build_plan`).
 PLAN_CONTINUE_MARKER = "__plan_continue__"
@@ -302,10 +364,12 @@ def _session_title_from_data(data: Dict[str, Any]) -> str:
 
 
 def _session_record_from_path(path: Path, canonical_cache: Dict[str, str | None]) -> Optional[Dict[str, Any]]:
+    global _SESSION_INDEX_DIRTY
     try:
         stat = path.stat()
     except OSError:
-        _SESSION_RECORD_CACHE.pop(str(path), None)
+        if _SESSION_RECORD_CACHE.pop(str(path), None) is not None:
+            _SESSION_INDEX_DIRTY = True
         return None
 
     cache_key = str(path)
@@ -337,14 +401,18 @@ def _session_record_from_path(path: Path, canonical_cache: Dict[str, str | None]
             "_plan_phase": str(plan_state.get("phase") or "") if isinstance(plan_state, dict) else "",
         }
         _SESSION_RECORD_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, dict(record))
+        _SESSION_INDEX_DIRTY = True
         return record
     except Exception:
-        _SESSION_RECORD_CACHE.pop(cache_key, None)
+        if _SESSION_RECORD_CACHE.pop(cache_key, None) is not None:
+            _SESSION_INDEX_DIRTY = True
         return None
 
 
 def forget_session_record_cache(session_id: str) -> None:
-    _SESSION_RECORD_CACHE.pop(str(SESSIONS_DIR / f"{session_id}.json"), None)
+    global _SESSION_INDEX_DIRTY
+    if _SESSION_RECORD_CACHE.pop(str(SESSIONS_DIR / f"{session_id}.json"), None) is not None:
+        _SESSION_INDEX_DIRTY = True
 
 
 def _session_title_from_messages(messages: List[Dict[str, Any]], plan_state: PlanState) -> str:
@@ -396,6 +464,10 @@ def _session_record_matches(
 
 
 def list_session_records(project_path: str = "", agent_type: str = "", include_internal: bool = False) -> List[Dict[str, Any]]:
+    # Warm the in-memory cache from disk on the first call after launch. Once
+    # loaded, subsequent calls reuse the cache and only re-parse files whose
+    # (mtime_ns, size) have changed — see _session_record_from_path.
+    _load_session_index_from_disk()
     registry = _load_session_registry()
     primary_id = registry.get("personal", {}).get("primary_session_id")
     project_filter_key = _project_key_for_path(project_path) if project_path else ""
@@ -416,6 +488,9 @@ def list_session_records(project_path: str = "", agent_type: str = "", include_i
         if not include_internal:
             record.pop("_plan_phase", None)
         sessions.append(record)
+    # Persist the (possibly extended) cache so the next process launch starts
+    # warm. Cheap when nothing changed: short-circuits on the dirty flag.
+    _persist_session_index_if_dirty()
     return sorted(
         sessions,
         key=lambda s: (0 if s.get("is_primary") else 1, -float(s.get("updated_at", 0))),
@@ -3051,7 +3126,6 @@ class AgentSession:
                     yield self._event("status", {"status": "thinking"}, run_id)
                     continue
                 self._save()
-                yield self._event("context_usage", self.context_usage(), run_id)
                 yield self._event("status", {"status": "completed"}, run_id)
                 finished = True
                 break

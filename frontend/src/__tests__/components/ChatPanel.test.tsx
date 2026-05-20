@@ -161,7 +161,7 @@ describe('ChatPanel', () => {
 
     render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
 
-    expect(screen.getByTestId('personal-chat-v2')).toBeInTheDocument()
+    expect(screen.getByTestId('personal-chat-v2')).toHaveClass('personal-chat-surface')
     expect(screen.getByText(/我处理了 2 步/)).toBeInTheDocument()
     expect(screen.getByText(/用了 2 个工具/)).toBeInTheDocument()
     expect(screen.queryByText('Used 2 tools')).not.toBeInTheDocument()
@@ -169,6 +169,72 @@ describe('ChatPanel', () => {
     expect(screen.getByText('I found the note.')).toBeInTheDocument()
     fireEvent.click(screen.getByText(/我处理了 2 步/))
     expect(screen.getByText('Used 2 tools')).toBeInTheDocument()
+  })
+
+  it('renders Personal markdown inside the Discord-like scoped surface', () => {
+    const messages: ChatMessage[] = [{
+      id: 'a-markdown',
+      role: 'assistant',
+      content: [
+        '## Scenario',
+        '',
+        'I prefer **scenario three** with `memory_search`.',
+        '',
+        '- Breakeven moved',
+        '- Duration recovered',
+        '',
+        '| Action | Effect |',
+        '| --- | --- |',
+        '| Review memory | Less duplicate output |',
+      ].join('\n'),
+      isTool: false,
+      turnComplete: true,
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    const timeline = screen.getByTestId('personal-chat-v2')
+    expect(timeline).toHaveClass('personal-chat-surface')
+    expect(timeline.querySelector('.personal-chat-row')).toBeTruthy()
+    expect(timeline.querySelector('.personal-chat-message')).toBeTruthy()
+    expect(within(timeline).getByRole('heading', { name: 'Scenario' })).toBeInTheDocument()
+
+    const strong = within(timeline).getByText('scenario three')
+    expect(strong.tagName.toLowerCase()).toBe('strong')
+
+    const inlineCode = timeline.querySelector('code')
+    expect(inlineCode).toHaveTextContent('memory_search')
+
+    expect(within(timeline).getByText('Breakeven moved')).toBeInTheDocument()
+    const table = timeline.querySelector('table') as HTMLElement | null
+    expect(table).toBeTruthy()
+    expect(within(table as HTMLElement).getByText('Action')).toBeInTheDocument()
+    expect(within(table as HTMLElement).getByText('Less duplicate output')).toBeInTheDocument()
+  })
+
+  it('marks Personal rows with stable role and tone attributes', () => {
+    const timestamp = Date.UTC(2026, 4, 20, 10, 0, 0)
+    const messages: ChatMessage[] = [
+      { id: 'u-role', role: 'user', content: 'hello', isTool: false, createdAt: timestamp },
+      { id: 'a-role', role: 'assistant', content: 'hi there', isTool: false, turnComplete: true, createdAt: timestamp + 1000 },
+      { id: 's-success', role: 'system', content: 'saved', isTool: false, noticeLevel: 'success', createdAt: timestamp + 2000 },
+      { id: 's-error', role: 'system', content: 'failed', isTool: false, noticeLevel: 'error', createdAt: timestamp + 10 * 60 * 1000 },
+    ]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    const timeline = screen.getByTestId('personal-chat-v2')
+    const rows = Array.from(timeline.querySelectorAll('.personal-chat-row')) as HTMLElement[]
+    const avatars = Array.from(timeline.querySelectorAll('.personal-chat-avatar')) as HTMLElement[]
+    const authors = Array.from(timeline.querySelectorAll('.personal-chat-author')) as HTMLElement[]
+    const messageItems = Array.from(timeline.querySelectorAll('.personal-chat-message')) as HTMLElement[]
+
+    expect(rows.map((row) => row.dataset.role)).toEqual(['user', 'assistant', 'system', 'system'])
+    expect(rows.map((row) => row.dataset.tone)).toEqual(['user', 'assistant', 'system-success', 'system-error'])
+    expect(avatars.map((avatar) => avatar.dataset.tone)).toEqual(['user', 'assistant', 'system-success', 'system-error'])
+    expect(authors.map((author) => author.dataset.tone)).toEqual(['user', 'assistant', 'system-success', 'system-error'])
+    expect(messageItems.map((item) => item.dataset.tone)).toEqual(['user', 'assistant', 'system-success', 'system-error'])
+    expect(timeline.querySelectorAll('.personal-chat-row-inner')).toHaveLength(4)
   })
 
   it('keeps Personal process summaries visually neutral when activities include errors', () => {
@@ -967,8 +1033,76 @@ describe('ChatPanel', () => {
     }
     render(<ChatPanel {...defaultProps} chatMode="agent" planState={executing} />)
     expect(screen.getByText('Build')).toBeInTheDocument()
-    expect(screen.getAllByText('Second todo').length).toBeGreaterThan(0)
+    expect(screen.getByText('First todo')).toBeInTheDocument()
+    expect(screen.getByText('Second todo')).toBeInTheDocument()
     expect(screen.getByText('2/2')).toBeInTheDocument()
+  })
+
+  it('dedupes in-stream plan execution while the fixed Build panel is visible', () => {
+    const executing: PlanState = {
+      ...idlePlanState,
+      mode: 'agent',
+      phase: 'executing',
+      goal: 'Build the plan',
+      todos: [
+        { id: 't1', title: 'First todo', status: 'completed' },
+        { id: 't2', title: 'Second todo', status: 'in_progress' },
+      ],
+      approved: true,
+    }
+    const messages: ChatMessage[] = [{
+      id: 'execution',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [{
+        type: 'plan_execution',
+        goal: 'Build the plan',
+        todos: executing.todos,
+        timestamp: 1,
+      }],
+    }]
+
+    render(<ChatPanel {...defaultProps} chatMode="agent" messages={messages} planState={executing} />)
+
+    expect(screen.getAllByText('Build')).toHaveLength(1)
+    expect(screen.getAllByText('Second todo')).toHaveLength(1)
+    expect(screen.getAllByLabelText('Pause Build')).toHaveLength(1)
+    expect(screen.getAllByLabelText('End Build')).toHaveLength(1)
+  })
+
+  it('keeps the plan draft card static after Build starts', () => {
+    const executing: PlanState = {
+      ...idlePlanState,
+      mode: 'plan',
+      phase: 'executing',
+      goal: 'Add plan UX',
+      todos: [
+        { id: 'live', title: 'Live execution todo', status: 'in_progress' },
+      ],
+      approved: true,
+    }
+    const messages: ChatMessage[] = [{
+      id: 'plan',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [{
+        type: 'plan_draft',
+        goal: 'Add plan UX',
+        draft: '',
+        todos: [{ id: 'draft', title: 'Draft review todo', status: 'pending' }],
+        structured_plan: null,
+        timestamp: 1,
+      }],
+    }]
+
+    render(<ChatPanel {...defaultProps} chatMode="plan" messages={messages} planState={executing} />)
+
+    expect(screen.getByText('Draft review todo')).toBeInTheDocument()
+    expect(screen.getByText('Live execution todo')).toBeInTheDocument()
+    expect(screen.queryByText('Building')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Plan approved/)).not.toBeInTheDocument()
   })
 
   it('offers pause/end/continue controls for build execution', () => {
@@ -997,9 +1131,12 @@ describe('ChatPanel', () => {
       />,
     )
 
-    fireEvent.click(screen.getAllByLabelText('Pause Build')[0])
+    expect(screen.getAllByLabelText('Pause Build')).toHaveLength(1)
+    expect(screen.getAllByLabelText('End Build')).toHaveLength(1)
+
+    fireEvent.click(screen.getByLabelText('Pause Build'))
     expect(onPauseBuild).toHaveBeenCalled()
-    fireEvent.click(screen.getAllByLabelText('End Build')[0])
+    fireEvent.click(screen.getByLabelText('End Build'))
     expect(onEndBuild).toHaveBeenCalled()
 
     rerender(
@@ -1017,7 +1154,8 @@ describe('ChatPanel', () => {
       />,
     )
 
-    fireEvent.click(screen.getAllByLabelText('Continue Build')[0])
+    expect(screen.getAllByLabelText('Continue Build')).toHaveLength(1)
+    fireEvent.click(screen.getByLabelText('Continue Build'))
     expect(onBuildPlan).toHaveBeenCalled()
   })
 

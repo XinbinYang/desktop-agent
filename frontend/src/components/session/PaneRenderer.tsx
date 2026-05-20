@@ -7,7 +7,7 @@ import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSess
 import type { AgentType, FileEdit, ModelInfo, ProjectInfo } from '../../types';
 import type { Team } from '../../lib/teamStore';
 import { getTeamForPane } from '../../lib/teamStore';
-import { agentForRole, displayNameForAgent, roleForAgent, type AgentProfileMap } from '../../lib/agentProfiles';
+import { agentForRole, displayNameForAgentRole, roleForAgent, type AgentProfileMap, type RoleDisplayNameMap } from '../../lib/agentProfiles';
 
 type DragDirection = 'top' | 'bottom' | 'left' | 'right' | 'center';
 type SplitPlacement = 'before' | 'after';
@@ -61,6 +61,7 @@ interface PaneRendererProps {
   currentRole: string;
   models: ModelInfo[];
   agentProfiles?: AgentProfileMap;
+  roleDisplayNames?: RoleDisplayNameMap;
   sessionMetaById?: Record<string, SessionMeta>;
   onModelChange: (leafId: string, modelId: string) => void;
   onSnapshot: (snapshot: SessionSnapshot | null, actions: SessionActions) => void;
@@ -102,6 +103,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   currentRole,
   models,
   agentProfiles,
+  roleDisplayNames,
   sessionMetaById = {},
   onModelChange,
   onSnapshot,
@@ -136,6 +138,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         currentRole={currentRole}
         models={models}
         agentProfiles={agentProfiles}
+        roleDisplayNames={roleDisplayNames}
         sessionMetaById={sessionMetaById}
         onModelChange={onModelChange}
         onSnapshot={node.id === focusedLeafId ? onSnapshot : () => {}}
@@ -193,6 +196,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               currentRole={currentRole}
               models={models}
               agentProfiles={agentProfiles}
+              roleDisplayNames={roleDisplayNames}
               sessionMetaById={sessionMetaById}
               onModelChange={onModelChange}
               onSnapshot={onSnapshot}
@@ -232,6 +236,7 @@ interface LeafPaneProps {
   currentRole: string;
   models: ModelInfo[];
   agentProfiles?: AgentProfileMap;
+  roleDisplayNames?: RoleDisplayNameMap;
   sessionMetaById: Record<string, SessionMeta>;
   onModelChange: (leafId: string, modelId: string) => void;
   onSnapshot: (snapshot: SessionSnapshot | null, actions: SessionActions) => void;
@@ -265,6 +270,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   currentRole,
   models,
   agentProfiles,
+  roleDisplayNames,
   sessionMetaById,
   onModelChange,
   onSnapshot,
@@ -416,7 +422,9 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   const borderColor = team?.color;
   const meta = sessionMetaById[pane.sessionId];
   const agentType = pane.agentType || meta?.agent_type || agentForRole(pane.role);
-  const agentLabel = agentType === 'personal' ? displayNameForAgent('personal', agentProfiles) : 'Coding';
+  const roleId = pane.role || meta?.role_id || roleForAgent(agentType);
+  const assistantDisplayName = displayNameForAgentRole(agentType, roleId, agentProfiles, roleDisplayNames);
+  const agentLabel = agentType === 'personal' ? assistantDisplayName : 'Coding';
   const paneTitle = agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')
     ? 'Main'
     : (meta?.title || pane.title || pane.sessionId.replace(/^session_(coding_)?/, '#'));
@@ -476,12 +484,14 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           <span className="text-[10px] text-fg-secondary truncate px-0.5 select-none pointer-events-none">
             {paneTitle}
           </span>
-          {meta?.is_running && (
-            <Loader2
-              className="w-3 h-3 animate-spin text-success shrink-0 pointer-events-none"
-              aria-label="Session running"
-            />
-          )}
+          <span className="w-3 h-3 shrink-0 pointer-events-none" aria-hidden={!meta?.is_running}>
+            {meta?.is_running && (
+              <Loader2
+                className="w-3 h-3 animate-spin text-success"
+                aria-label="Session running"
+              />
+            )}
+          </span>
         </div>
         <select
           value={modelLabel}
@@ -593,9 +603,9 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           }}
           sessionId={pane.sessionId}
           model={modelLabel}
-          agentType={pane.agentType || currentAgentType}
-          role={pane.role || roleForAgent(pane.agentType || currentAgentType)}
-          assistantDisplayName={displayNameForAgent(agentType, agentProfiles)}
+          agentType={agentType}
+          role={roleId}
+          assistantDisplayName={assistantDisplayName}
           teamId={pane.teamId}
           teamName={team?.name}
           isFocused={isFocused}

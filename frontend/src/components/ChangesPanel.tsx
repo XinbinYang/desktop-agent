@@ -7,10 +7,12 @@ import { ensureMonacoThemes, getMonacoThemeName } from '../lib/monacoTheme';
 import { useTheme } from '../hooks/useTheme';
 import { FileEditView } from './FileEditView';
 import { API_BASE } from '../config';
+import { RevealPathButton } from './RevealPathAction';
 
 interface ChangesPanelProps {
   edits: FileEdit[];
   onOpenFile?: (path: string) => void;
+  projectPath?: string | null;
 }
 
 type EditStatus = 'accepted' | 'rejected';
@@ -21,7 +23,7 @@ function shortPath(path: string): string {
   return parts.slice(-2).join('/');
 }
 
-export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile }) => {
+export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile, projectPath }) => {
   const [activeIndex, setActiveIndex] = useState(0);
   const [statuses, setStatuses] = useState<Record<number, EditStatus>>({});
   const [reverting, setReverting] = useState(false);
@@ -171,6 +173,13 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
                   Open
                 </button>
               )}
+              {active && (
+                <RevealPathButton
+                  path={active.path}
+                  projectPath={projectPath}
+                  className="h-6 w-6"
+                />
+              )}
             </div>
           </div>
           <div className="flex-1 min-h-0">
@@ -194,7 +203,7 @@ export const ChangesPanel: React.FC<ChangesPanelProps> = ({ edits, onOpenFile })
               />
             ) : active ? (
               <div className="h-full overflow-auto p-3">
-                <FileEditView edit={active} />
+                <FileEditView edit={active} projectPath={projectPath} />
               </div>
             ) : null}
           </div>

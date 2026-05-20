@@ -650,9 +650,51 @@ ipcMain.handle('select-file', async () => {
   return result.filePaths[0] || null;
 });
 
+const PERSONAL_WORKSPACE_DIRNAME = 'WORKSPACE';
+const PERSONAL_SYSTEM_FILES = new Set(['AGENTS.md']);
+const SHARED_SYSTEM_FILES = new Set(['base_rules.md']);
+
+function isPathInside(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function resolveInside(root, ...parts) {
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, ...parts);
+  return isPathInside(resolved, resolvedRoot) ? resolved : null;
+}
+
+function resolveAgentsLogicalPath(value) {
+  const normalized = value.trim().replace(/^[`"']+|[`"',;]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '');
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length === 0 || parts[0].toLowerCase() !== 'agents') return null;
+
+  const agentsRoot = path.join(app.getPath('userData'), 'backend', 'AGENTS');
+  if (parts.length === 1) return agentsRoot;
+
+  const agent = parts[1].toLowerCase();
+  const rest = parts.slice(2);
+  if (agent === 'personal') {
+    const personalRoot = path.join(agentsRoot, 'personal');
+    if (rest[0] === PERSONAL_WORKSPACE_DIRNAME || PERSONAL_SYSTEM_FILES.has(rest[0])) {
+      return resolveInside(personalRoot, ...rest);
+    }
+    return resolveInside(personalRoot, PERSONAL_WORKSPACE_DIRNAME, ...rest);
+  }
+  if (agent === '_shared') {
+    const sharedRoot = path.join(agentsRoot, '_shared');
+    if (rest[0] === PERSONAL_WORKSPACE_DIRNAME || SHARED_SYSTEM_FILES.has(rest[0])) {
+      return resolveInside(sharedRoot, ...rest);
+    }
+    return resolveInside(sharedRoot, PERSONAL_WORKSPACE_DIRNAME, ...rest);
+  }
+  return resolveInside(agentsRoot, ...parts.slice(1));
+}
+
 function resolveUserPath(value) {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
-  return path.resolve(value);
+  return resolveAgentsLogicalPath(value) || path.resolve(value);
 }
 
 function openExplorerFallback(resolved, isDirectory) {
@@ -670,7 +712,15 @@ ipcMain.handle('reveal-path', async (_event, targetPath) => {
   const resolved = resolveUserPath(targetPath);
   if (!resolved) return 'Invalid path';
   try {
-    if (!fs.existsSync(resolved)) return 'Path does not exist';
+    if (!fs.existsSync(resolved)) {
+      const parent = path.dirname(resolved);
+      if (parent && parent !== resolved && fs.existsSync(parent)) {
+        const error = await shell.openPath(parent);
+        if (!error) return null;
+        return openExplorerFallback(parent, true) || error;
+      }
+      return 'Path does not exist';
+    }
     const stat = fs.statSync(resolved);
     if (stat.isDirectory()) {
       const error = await shell.openPath(resolved);

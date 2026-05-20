@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { FileEditView } from '../../components/FileEditView'
 
 vi.mock('@monaco-editor/react', () => ({
@@ -19,6 +19,10 @@ const baseEdit = {
 }
 
 describe('FileEditView', () => {
+  afterEach(() => {
+    delete (window as any).electronAPI
+  })
+
   describe('header rendering', () => {
     it('renders operation label + filename for modify', () => {
       render(<FileEditView edit={baseEdit} compact />)
@@ -91,6 +95,19 @@ describe('FileEditView', () => {
       fireEvent.click(header)
       expect(screen.getByTestId('monaco-diff')).toBeInTheDocument()
       fireEvent.click(header)
+      expect(screen.queryByTestId('monaco-diff')).not.toBeInTheDocument()
+    })
+
+    it('reveals the edited file without expanding the diff', async () => {
+      const revealPath = vi.fn(() => Promise.resolve(null))
+      ;(window as any).electronAPI = { revealPath }
+      render(<FileEditView edit={{ ...baseEdit, path: 'C:\\repo\\src\\example.ts' }} compact={true} />)
+
+      fireEvent.click(screen.getByLabelText('Show in folder: C:\\repo\\src\\example.ts'))
+
+      await waitFor(() => {
+        expect(revealPath).toHaveBeenCalledWith('C:\\repo\\src\\example.ts')
+      })
       expect(screen.queryByTestId('monaco-diff')).not.toBeInTheDocument()
     })
 

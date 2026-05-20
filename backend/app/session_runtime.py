@@ -136,6 +136,17 @@ class SessionRuntime:
             return True
         return False
 
+    @staticmethod
+    def _is_completion_boundary(event: Dict[str, Any]) -> bool:
+        etype = event.get("type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        return etype == "run_completed" and data.get("status") in {
+            "completed",
+            "max_iterations_reached",
+            "cancelled",
+            "failed",
+        }
+
     def _schedule_personal_heartbeat(self, session: AgentSession) -> None:
         if session.agent_type != "personal":
             return
@@ -156,20 +167,28 @@ class SessionRuntime:
     async def _run(self, session: AgentSession, run_factory: RunFactory) -> None:
         current_task = asyncio.current_task()
         token = set_worker_event_callback(self.publish)
+        done_published = False
         try:
             async for event in run_factory():
                 if self._is_terminal_event(event):
                     self._accepts_task_guidance = False
                 self.publish(event)
+                if not done_published and self._is_completion_boundary(event):
+                    done_published = True
+                    self.publish({"type": "done"})
+                    self._schedule_personal_heartbeat(session)
+                    await asyncio.sleep(0)
             self._accepts_task_guidance = False
-            self.publish({"type": "done"})
-            self._schedule_personal_heartbeat(session)
+            if not done_published:
+                self.publish({"type": "done"})
+                self._schedule_personal_heartbeat(session)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._accepts_task_guidance = False
-            self.publish({"type": "error", "data": categorize_exception(exc)})
-            self.publish({"type": "done"})
+            if not done_published:
+                self.publish({"type": "error", "data": categorize_exception(exc)})
+                self.publish({"type": "done"})
         finally:
             reset_worker_event_callback(token)
             if self._task is current_task:

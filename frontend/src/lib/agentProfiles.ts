@@ -11,6 +11,7 @@ export const AGENT_LABEL: Record<AgentType, string> = {
 };
 
 export type AgentProfileMap = Record<AgentType, AgentProfile>;
+export type RoleDisplayNameMap = Record<string, string>;
 
 export const DEFAULT_AGENT_PROFILES: AgentProfileMap = {
   personal: {
@@ -76,4 +77,17 @@ export function profilesFromAgents(agents: AgentInfo[] | undefined): AgentProfil
 
 export function displayNameForAgent(agentType: AgentType, profiles?: Partial<Record<AgentType, AgentProfile>>): string {
   return normalizeAgentProfile(agentType, profiles?.[agentType]).display_name;
+}
+
+export function displayNameForAgentRole(
+  agentType: AgentType,
+  roleId?: string | null,
+  profiles?: Partial<Record<AgentType, AgentProfile>>,
+  roleDisplayNames?: RoleDisplayNameMap,
+): string {
+  const profileName = displayNameForAgent(agentType, profiles);
+  if (profileName) return profileName;
+
+  const roleName = roleId ? cleanText(roleDisplayNames?.[roleId], '') : '';
+  return roleName || DEFAULT_AGENT_PROFILES[agentType].display_name;
 }

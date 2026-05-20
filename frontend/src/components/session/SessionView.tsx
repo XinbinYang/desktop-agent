@@ -540,6 +540,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         onViewPlan={openPlanInEditor}
         onCommand={onCommand}
         projectOpen={agentType === 'coding' && !!currentProject}
+        projectPath={agentType === 'coding' ? currentProject?.path ?? null : null}
         agentType={agentType}
         assistantDisplayName={assistantDisplayName}
         projectName={agentType === 'coding' ? currentProject?.name : undefined}

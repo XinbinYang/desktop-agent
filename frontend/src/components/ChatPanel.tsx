@@ -35,6 +35,7 @@ import { RewindModal } from './RewindModal';
 import { PersonalChatSurface } from './chat/PersonalChatSurface';
 import { AgentRunningStatus } from './chat/AgentRunningStatus';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
+import { RevealableInlineCode } from './RevealPathAction';
 import {
   buildTimelineEvents,
   type TimelineEvent,
@@ -88,6 +89,7 @@ interface ChatPanelProps {
   rewindOpen?: boolean;
   onRewindOpenChange?: (open: boolean) => void;
   projectOpen?: boolean;
+  projectPath?: string | null;
   fileTree?: any[];
   agentType?: AgentType;
   projectName?: string;
@@ -133,6 +135,8 @@ const THINKING_LABELS: Record<ThinkingIntensity, string> = {
   medium: 'MEDIUM',
   high: 'HIGH',
 };
+const CHAT_INPUT_MIN_HEIGHT = 48;
+const CHAT_INPUT_MAX_HEIGHT = 144;
 
 function parseSlashInput(value: string): { command: string; args: string } | null {
   const trimmed = value.trim();
@@ -454,7 +458,7 @@ const PlanExecutionCard: React.FC<{
   onEnd?: () => void;
   onContinue?: () => void;
 }> = ({ goal, todos, phase = 'executing', compact = false, onPause, onEnd, onContinue }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
   const inProgressIndex = todos.findIndex((t) => t.status === 'in_progress');
   const pendingIndex = todos.findIndex((t) => t.status === 'pending');
   const currentIndex = inProgressIndex >= 0 ? inProgressIndex : pendingIndex >= 0 ? pendingIndex : 0;
@@ -1068,24 +1072,19 @@ const PlanDraftInlineCard: React.FC<{
   onBuild: () => void;
   onViewPlan?: () => void;
 }> = ({ block, planState, onBuild, onViewPlan }) => {
-  const isExecuting = planState.phase === 'executing';
   const canBuild = planState.phase === 'awaiting_approval' && !planState.approved;
   const sp = block.structured_plan || planState.structured_plan || null;
   const [open, setOpen] = useState<Record<string, boolean>>({ goal: false, tasks: true, files: false, risks: false, verification: false });
   const toggle = (k: string) => setOpen((prev) => ({ ...prev, [k]: !prev[k] }));
 
-  // Use live todos from planState when executing for real-time status
-  const tasks: PlanTodo[] = isExecuting && planState.todos.length > 0
-    ? planState.todos
-    : planTasksForCard(block, planState);
+  const reviewPlanState =
+    planState.phase === 'executing' || planState.phase === 'approved_waiting_build'
+      ? { ...planState, todos: [] }
+      : planState;
+  const tasks: PlanTodo[] = planTasksForCard(block, reviewPlanState);
   const verification = sp?.acceptance_criteria || [];
   const context = sp?.context?.trim() || '';
   const criticalFiles = sp?.critical_files || [];
-  // Defensive: only show the live "Building" pulse while a todo is actually
-  // in progress. If the backend's terminal transition is delayed, this stops
-  // the indicator from spinning forever once every todo is resolved.
-  const allTasksResolved = tasks.length > 0 && tasks.every((t) => t.status === 'completed' || t.status === 'cancelled');
-  const showBuilding = isExecuting && !allTasksResolved;
 
   return (
     <div className="my-2 rounded-xl border border-[color:var(--plan-pill-border)] overflow-hidden">
@@ -1096,12 +1095,6 @@ const PlanDraftInlineCard: React.FC<{
           <span className="chat-text-xs font-semibold text-[color:var(--plan-pill-fg)] uppercase tracking-wide">
             Implementation Plan
           </span>
-          {showBuilding && (
-            <span className="ml-auto flex items-center gap-1.5 chat-text-xs text-accent">
-              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse inline-block" />
-              Building
-            </span>
-          )}
           {canBuild && (
             <span className="ml-auto chat-text-xs text-fg-muted">Ready to build</span>
           )}
@@ -1282,12 +1275,6 @@ const PlanDraftInlineCard: React.FC<{
         </div>
       )}
 
-      {isExecuting && (
-        <div className="px-4 py-2.5 flex items-center gap-2 chat-text-xs text-accent bg-[color-mix(in_srgb,var(--plan-pill-bg)_8%,var(--bg-surface))]">
-          <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse inline-block" />
-          Plan approved — executing…
-        </div>
-      )}
     </div>
   );
 };
@@ -1436,7 +1423,8 @@ TimelineThinkingRow.displayName = 'TimelineThinkingRow';
 const TimelineToolGroupRow = React.memo<{
   event: TimelineToolEvent;
   mode: TimelineRenderMode;
-}>(({ event, mode }) => {
+  projectPath?: string | null;
+}>(({ event, mode, projectPath }) => {
   const [expanded, setExpanded] = useState(false);
   const isPersonal = mode === 'personal';
   const Icon = event.status === 'running' ? Loader2 : event.status === 'error' ? AlertCircle : CheckCircle2;
@@ -1452,6 +1440,7 @@ const TimelineToolGroupRow = React.memo<{
         durationMs={tool.durationMs}
         workerEvents={tool.workerEvents}
         variant={isPersonal ? 'disclosure' : 'event-row'}
+        projectPath={projectPath}
       />
     );
   }
@@ -1485,6 +1474,7 @@ const TimelineToolGroupRow = React.memo<{
               durationMs={tool.durationMs}
               workerEvents={tool.workerEvents}
               variant={isPersonal ? 'disclosure' : 'event-row'}
+              projectPath={projectPath}
             />
           ))}
         </div>
@@ -1694,7 +1684,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
       </div>
     )}
 
-    <div className="flex items-end gap-2">
+    <div className="flex items-center gap-2">
       <button
         onClick={() => fileInputRef.current?.click()}
         className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors"
@@ -1759,7 +1749,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
                   : 'Type a message... (Shift+Enter for new line)'
           }
           rows={1}
-          className="w-full min-h-[40px] bg-surface-input border border-border rounded-lg px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] pr-10 chat-text-sm text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-32 disabled:opacity-60"
+          className="w-full min-h-[48px] bg-surface-input border border-border rounded-lg px-3 py-[11px] pr-11 text-[15px] leading-6 text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-[144px] disabled:opacity-60"
         />
         {showSlashMenu && (
           <SlashCommandMenu
@@ -1939,6 +1929,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   rewindOpen = false,
   onRewindOpenChange,
   projectOpen = false,
+  projectPath = null,
   fileTree = [],
   agentType = 'personal',
   projectName,
@@ -2115,7 +2106,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, CHAT_INPUT_MIN_HEIGHT), CHAT_INPUT_MAX_HEIGHT)}px`;
   };
 
   const scrollToBottom = useCallback(() => {
@@ -2146,7 +2137,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setAttachedImage(null);
       onDraftClear?.();
       if (textareaRef.current) {
-        textareaRef.current.style.height = '40px';
+        textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
       }
       return;
     }
@@ -2158,7 +2149,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setSlashVisibleCommandCount(0);
       onDraftClear?.();
       if (textareaRef.current) {
-        textareaRef.current.style.height = '40px';
+        textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
       }
       return;
     }
@@ -2167,7 +2158,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     setAttachedImage(null);
     onDraftClear?.();
     if (textareaRef.current) {
-      textareaRef.current.style.height = '40px';
+      textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
     }
   };
 
@@ -2192,7 +2183,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setInput('');
       onDraftClear?.();
       if (textareaRef.current) {
-        textareaRef.current.style.height = '40px';
+        textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
       }
       onCommand?.(cmd.name, '');
     } else if (ARG_COMMANDS.has(cmd.name) || cmd.args) {
@@ -2373,7 +2364,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       runEvents,
       planState,
       mode: timelineMode,
-    });
+    }).filter((event) => !(event.kind === 'todo' && event.source === 'execution'));
   }, [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode, usePersonalChatV2]);
 
   // Markdown 自定义渲染
@@ -2416,13 +2407,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       return <pre {...props}>{children}</pre>;
     },
     code({ node, className, children, ...props }: any) {
+      const value = React.Children.toArray(children).map((child) => String(child)).join('');
       return (
-        <code className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary" {...props}>
+        <RevealableInlineCode
+          value={value}
+          projectPath={projectPath}
+          className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary"
+        >
           {children}
-        </code>
+        </RevealableInlineCode>
       );
     },
-  }), [resolved]);
+  }), [resolved, projectPath]);
 
   const lightweightMarkdownComponents = useMemo(() => ({
     pre({ node, children, ...props }: any) {
@@ -2436,13 +2432,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       return <pre {...props}>{children}</pre>;
     },
     code({ children, ...props }: any) {
+      const value = React.Children.toArray(children).map((child) => String(child)).join('');
       return (
-        <code className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary" {...props}>
+        <RevealableInlineCode
+          value={value}
+          projectPath={projectPath}
+          className="bg-surface-alt px-[var(--chat-space-xs)] py-[var(--chat-space-xs)] rounded chat-text-xs text-fg-secondary"
+        >
           {children}
-        </code>
+        </RevealableInlineCode>
       );
     },
-  }), []);
+  }), [projectPath]);
 
   const renderBlock = useCallback((block: AssistantBlock, _bi: number) => {
     switch (block.type) {
@@ -2477,10 +2478,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             status={block.status}
             durationMs={block.durationMs}
             workerEvents={block.workerEvents}
+            projectPath={projectPath}
           />
         );
       case 'file_edit':
-        return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact />;
+        return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact projectPath={projectPath} />;
       case 'image':
         return (
           <ChatImageThumbnail
@@ -2496,18 +2498,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       case 'plan_answers':
         return null;
       case 'plan_execution':
-        return (
-          <PlanExecutionCard
-            key={`pe-${block.timestamp}`}
-            goal={block.goal || planState.goal}
-            todos={block.todos}
-            phase={planState.phase}
-            compact
-            onPause={onPauseBuild}
-            onEnd={onEndBuild}
-            onContinue={onBuildPlan}
-          />
-        );
+        return null;
       case 'plan_draft':
         return (
           <PlanDraftInlineCard
@@ -2521,7 +2512,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       default:
         return null;
     }
-  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents, openImagePreview]);
+  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents, openImagePreview, projectPath]);
 
   const lastAssistantMsgId = useMemo(() => {
     const lastMsg = messages[messages.length - 1];
@@ -2593,10 +2584,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         );
         break;
       case 'tool':
-        content = <TimelineToolGroupRow event={event} mode={timelineMode} />;
+        content = <TimelineToolGroupRow event={event} mode={timelineMode} projectPath={projectPath} />;
         break;
       case 'file_edit':
-        content = <FileEditView edit={event.edit} compact variant="event-row" />;
+        content = <FileEditView edit={event.edit} compact variant="event-row" projectPath={projectPath} />;
         break;
       case 'knowledge':
         content = <KnowledgeContextBlock sources={event.sources} />;
@@ -2681,6 +2672,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     onPauseBuild,
     onEndBuild,
     openImagePreview,
+    projectPath,
   ]);
 
   const itemContent = useCallback((index: number) => {
@@ -2819,6 +2811,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             onOpenImage={openImagePreview}
             markdownTheme={resolved}
             assistantDisplayName={assistantDisplayName}
+            projectPath={projectPath}
             emptyPlaceholder={(
               <EmptyChatWelcome
                 agentType={agentType}
@@ -2920,34 +2913,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 </button>
               )}
             </div>
-
-            {/* Executing: live todo progress strip */}
-            {planState.phase === 'executing' && planState.todos.length > 0 && (
-              <div className="mt-1.5 space-y-0.5">
-                {planState.todos.slice(0, 5).map((t) => (
-                  <div key={t.id} className="flex items-center gap-1.5">
-                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                      t.status === 'completed' ? 'bg-success' :
-                      t.status === 'in_progress' ? 'bg-accent animate-pulse' :
-                      t.status === 'blocked' ? 'bg-danger' :
-                      'bg-border'
-                    }`} />
-                    <span className={`chat-text-xs truncate ${
-                      t.status === 'completed' ? 'text-fg-muted line-through' :
-                      t.status === 'in_progress' ? 'text-fg' :
-                      'text-fg-muted'
-                    }`}>
-                      {t.title}
-                    </span>
-                  </div>
-                ))}
-                {planState.todos.length > 5 && (
-                  <div className="chat-text-xs text-fg-muted pl-3">
-                    +{planState.todos.length - 5} more
-                  </div>
-                )}
-              </div>
-            )}
           </div>
         )}
         <TaskGuidanceQueueCard

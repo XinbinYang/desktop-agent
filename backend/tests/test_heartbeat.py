@@ -154,6 +154,33 @@ async def test_session_runtime_runs_heartbeat_after_personal_turn(monkeypatch):
     await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
+async def test_session_runtime_publishes_done_at_run_completed_boundary():
+    from app.agent import AgentSession
+    from app.session_runtime import SessionRuntime
+
+    session = AgentSession("gpt-4o", session_id="runtime-fast-done-test", agent_type="coding")
+    runtime = SessionRuntime(session.session_id)
+    queue = runtime.subscribe()
+    tail_release = asyncio.Event()
+
+    async def run_factory():
+        yield {"type": "run_completed", "data": {"status": "completed"}}
+        await tail_release.wait()
+
+    await runtime.start(session, run_factory)
+    first = await asyncio.wait_for(queue.get(), timeout=1)
+    second = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert first["type"] == "run_completed"
+    assert second["type"] == "done"
+    assert runtime.is_running is True
+
+    tail_release.set()
+    await asyncio.wait_for(runtime._task, timeout=1)
+    assert runtime.is_running is False
+
+
 def test_should_trigger_dream_counts_only_diaries_after_last_dream(tmp_path, monkeypatch):
     monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path)
     personal_dir = AgentManager._personal_dir()

@@ -9,11 +9,13 @@ import {
 import { FileEdit } from "../types";
 import { InlineDiffViewer } from "./InlineDiffViewer";
 import { UnifiedDiffFallback } from "./UnifiedDiffFallback";
+import { RevealPathButton } from "./RevealPathAction";
 
 interface FileEditViewProps {
   edit: FileEdit;
   compact?: boolean;
   variant?: "full" | "event-row";
+  projectPath?: string | null;
 }
 
 function basename(path: string): string {
@@ -40,6 +42,7 @@ export const FileEditView: React.FC<FileEditViewProps> = ({
   edit,
   compact = false,
   variant = "full",
+  projectPath,
 }) => {
   const [expanded, setExpanded] = useState(variant === "event-row" ? false : !compact);
 
@@ -66,10 +69,11 @@ export const FileEditView: React.FC<FileEditViewProps> = ({
       className={`${isEventRow ? "my-[var(--chat-space-xs)] rounded-md border-border-subtle bg-surface/45" : "my-2 rounded-lg border-border bg-surface/50"} border overflow-hidden`}
       data-testid={isEventRow ? "file-edit-event-row" : undefined}
     >
+      <div className="w-full flex min-w-0 items-start hover:bg-surface-hover transition-colors">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className={`w-full flex items-start gap-2 text-left hover:bg-surface-hover transition-colors ${isEventRow ? "px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)]" : "px-3 py-2"}`}
+        className={`flex min-w-0 flex-1 items-start gap-2 text-left ${isEventRow ? "px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)]" : "px-3 py-2"}`}
       >
         {expanded ? (
           <ChevronDown className={`${isEventRow ? "w-3.5 h-3.5" : "w-4 h-4"} text-fg-muted shrink-0 mt-0.5`} />
@@ -93,6 +97,12 @@ export const FileEditView: React.FC<FileEditViewProps> = ({
           </span>
         )}
       </button>
+        <RevealPathButton
+          path={edit.path}
+          projectPath={projectPath}
+          className={isEventRow ? "mr-2 mt-1 h-6 w-6" : "mr-2 mt-2 h-7 w-7"}
+        />
+      </div>
       {expanded && (
         <div className="border-t border-border">
           {isEventRow ? (

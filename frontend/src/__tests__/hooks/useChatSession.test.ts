@@ -164,7 +164,7 @@ describe('useChatSession', () => {
     expect(result.current.taskGuidanceItems).toHaveLength(0)
   })
 
-  it('keeps running after completed status until done', () => {
+  it('keeps running after completed status until run_completed or done', () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
       messageHandler = onMessage
@@ -182,6 +182,30 @@ describe('useChatSession', () => {
     expect(result.current.isRunning).toBe(true)
 
     act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'completed' } })
+    })
+    expect(result.current.isRunning).toBe(true)
+
+    act(() => {
+      messageHandler?.({ type: 'run_completed', data: { status: 'completed', summary: 'ok' } })
+    })
+    expect(result.current.isRunning).toBe(false)
+  })
+
+  it('falls back to done when no run_completed event arrives', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
       messageHandler?.({ type: 'status', data: { status: 'completed' } })
     })
     expect(result.current.isRunning).toBe(true)

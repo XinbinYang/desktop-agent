@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   ChevronRight,
@@ -76,6 +76,289 @@ function isPrimaryPersonal(session: SessionHistoryItem): boolean {
   return !!session.is_primary || session.id === 'session_personal_main';
 }
 
+interface SessionRowProps {
+  session: SessionHistoryItem;
+  agentProfiles?: AgentProfileMap;
+  isActive: boolean;
+  menuOpen: boolean;
+  onOpenMenu: (id: string | null) => void;
+  onSwitch: (id: string, projectPath?: string | null) => void;
+  onArchive: (id: string) => void;
+  onDelete: (id: string) => void;
+}
+
+const SessionRow = memo(function SessionRow({
+  session,
+  agentProfiles,
+  isActive,
+  menuOpen,
+  onOpenMenu,
+  onSwitch,
+  onArchive,
+  onDelete,
+}: SessionRowProps) {
+  const primary = isPrimaryPersonal(session);
+  const label = primary ? `${displayNameForAgent('personal', agentProfiles)} · Main` : formatSessionLabel(session);
+  const type: AgentType = session.agent_type || 'personal';
+  const canManageSession = !primary && !session.is_running;
+
+  const handleClick = useCallback(() => {
+    onSwitch(session.id, session.project_path);
+  }, [onSwitch, session.id, session.project_path]);
+
+  const handleArchive = useCallback(() => {
+    onOpenMenu(null);
+    onArchive(session.id);
+  }, [onArchive, onOpenMenu, session.id]);
+
+  const handleDelete = useCallback(() => {
+    onOpenMenu(null);
+    onDelete(session.id);
+  }, [onDelete, onOpenMenu, session.id]);
+
+  const handleMenuOpenChange = useCallback((open: boolean) => {
+    onOpenMenu(open ? session.id : null);
+  }, [onOpenMenu, session.id]);
+
+  const handleMenuTriggerClick = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation();
+    onOpenMenu(session.id);
+  }, [onOpenMenu, session.id]);
+
+  return (
+    <div
+      className={cn(
+        'group flex items-center justify-between gap-1 rounded px-2 py-1.5 text-xs transition-colors',
+        isActive
+          ? 'bg-surface-alt text-fg'
+          : 'text-fg-secondary hover:bg-surface-hover hover:text-fg',
+      )}
+    >
+      <button
+        type="button"
+        onClick={handleClick}
+        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+        title={label}
+        aria-label={`Open session ${label}`}
+      >
+        <MessageSquare className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">{label}</span>
+        <span
+          className={cn(
+            'shrink-0 rounded px-1 py-0.5 text-[9px]',
+            type === 'coding' ? 'bg-success/10 text-success' : 'bg-accent/10 text-accent',
+          )}
+        >
+          {agentLabel(type)}
+        </span>
+      </button>
+      <div className="flex min-w-[42px] items-center justify-end gap-1 text-[10px] text-fg-muted">
+        {session.is_running ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Session running" />
+        ) : (
+          <span className="whitespace-nowrap group-hover:hidden">{formatRelativeTime(session.updated_at)}</span>
+        )}
+        {canManageSession && (
+          <DropdownMenu open={menuOpen} onOpenChange={handleMenuOpenChange}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                onClick={handleMenuTriggerClick}
+                className="rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100"
+                aria-label={`Session actions for ${label}`}
+                title="Session actions"
+              >
+                <MoreHorizontal className="h-3.5 w-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-[148px]">
+              <DropdownMenuItem onSelect={handleArchive}>
+                <Archive className="h-3.5 w-3.5" />
+                <span>归档会话</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem destructive onSelect={handleDelete}>
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>永久删除</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+    </div>
+  );
+});
+
+interface ProjectRowProps {
+  project: SessionHistoryProject;
+  identityKey: string;
+  expanded: boolean;
+  menuOpen: boolean;
+  currentSession?: string;
+  agentProfiles?: AgentProfileMap;
+  openSessionMenuId: string | null;
+  onToggle: (path: string) => void;
+  onOpen: (path: string) => void;
+  onOpenMenu: (key: string | null) => void;
+  onAction: (action: ProjectHistoryAction, project: SessionHistoryProject) => void;
+  onStartSession: (project: SessionHistoryProject) => void;
+  onOpenSessionMenu: (id: string | null) => void;
+  onSwitchSession: (id: string, projectPath?: string | null) => void;
+  onArchiveSession: (id: string) => void;
+  onDeleteSession: (id: string) => void;
+}
+
+const ProjectRow = memo(function ProjectRow({
+  project,
+  identityKey,
+  expanded,
+  menuOpen,
+  currentSession,
+  agentProfiles,
+  openSessionMenuId,
+  onToggle,
+  onOpen,
+  onOpenMenu,
+  onAction,
+  onStartSession,
+  onOpenSessionMenu,
+  onSwitchSession,
+  onArchiveSession,
+  onDeleteSession,
+}: ProjectRowProps) {
+  const handleToggle = useCallback(() => onToggle(project.path), [onToggle, project.path]);
+  const handleOpen = useCallback(() => onOpen(project.path), [onOpen, project.path]);
+  const handleStart = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation();
+    onStartSession(project);
+  }, [onStartSession, project]);
+  const handleContextMenu = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    onOpenMenu(identityKey);
+  }, [onOpenMenu, identityKey]);
+  const handleMenuTriggerClick = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation();
+    onOpenMenu(identityKey);
+  }, [onOpenMenu, identityKey]);
+  const handleMenuOpenChange = useCallback((open: boolean) => {
+    onOpenMenu(open ? identityKey : null);
+  }, [onOpenMenu, identityKey]);
+  const handleAction = useCallback((action: ProjectHistoryAction) => {
+    onOpenMenu(null);
+    onAction(action, project);
+  }, [onAction, onOpenMenu, project]);
+
+  return (
+    <div className="space-y-0.5">
+      <div
+        className={cn(
+          'group flex items-center gap-1 rounded px-1 py-1 text-xs transition-colors',
+          project.is_current ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:bg-surface-hover hover:text-fg',
+        )}
+        onContextMenu={handleContextMenu}
+      >
+        <button
+          type="button"
+          onClick={handleToggle}
+          className="rounded p-0.5 text-fg-muted hover:bg-surface-hover hover:text-fg"
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} project ${project.name}`}
+          title={expanded ? 'Collapse project' : 'Expand project'}
+        >
+          <ChevronRight className={cn('h-3 w-3 transition-transform', expanded && 'rotate-90')} />
+        </button>
+        <button
+          type="button"
+          onClick={handleOpen}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          title={project.path}
+          aria-label={`Open project ${project.name}`}
+        >
+          <Folder className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">{project.name}</span>
+        </button>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {project.has_running && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Project running" />
+          )}
+          <DropdownMenu open={menuOpen} onOpenChange={handleMenuOpenChange}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                onClick={handleMenuTriggerClick}
+                className={cn(
+                  'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100',
+                  (project.is_current || menuOpen) && 'opacity-100',
+                )}
+                aria-label={`Project actions for ${project.name}`}
+                title="Project actions"
+              >
+                <MoreHorizontal className="h-3.5 w-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-[184px]">
+              <DropdownMenuItem onSelect={() => handleAction(project.is_pinned ? 'unpin' : 'pin')}>
+                <Pin className="h-3.5 w-3.5" />
+                <span>{project.is_pinned ? '取消置顶' : '置顶项目'}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => handleAction('reveal')}>
+                <FolderOpen className="h-3.5 w-3.5" />
+                <span>在资源管理器中打开</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => handleAction('worktree')}>
+                <GitBranch className="h-3.5 w-3.5" />
+                <span>创建永久工作树</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => handleAction('rename')}>
+                <Pencil className="h-3.5 w-3.5" />
+                <span>重命名项目</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => handleAction('archive')}>
+                <Archive className="h-3.5 w-3.5" />
+                <span>归档会话</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem destructive onSelect={() => handleAction('remove')}>
+                <X className="h-3.5 w-3.5" />
+                <span>移除</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <button
+            type="button"
+            onClick={handleStart}
+            className={cn(
+              'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100',
+              project.is_current && 'opacity-100',
+            )}
+            aria-label={`Start new session in ${project.name}`}
+            title={`在 ${project.name} 中开始新对话`}
+          >
+            <SquarePen className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+      {expanded && project.sessions.length > 0 && (
+        <div className="ml-5 space-y-0.5">
+          {project.sessions.map((session) => (
+            <SessionRow
+              key={session.id}
+              session={session}
+              agentProfiles={agentProfiles}
+              isActive={session.id === currentSession}
+              menuOpen={openSessionMenuId === session.id}
+              onOpenMenu={onOpenSessionMenu}
+              onSwitch={onSwitchSession}
+              onArchive={onArchiveSession}
+              onDelete={onDeleteSession}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+});
+
 export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   history,
   fallbackSessions = [],
@@ -96,28 +379,44 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   const [openProjectMenu, setOpenProjectMenu] = useState<string | null>(null);
   const [openSessionMenu, setOpenSessionMenu] = useState<string | null>(null);
 
+  const currentProjectKey = projectKey(currentProjectPath);
+
+  // Stable signature of which projects should be auto-expanded. Using the
+  // signature (rather than `projects` itself) keeps this effect quiet during
+  // 5s polling where projects gets a fresh array reference each tick.
+  const autoExpandSignature = useMemo(() => {
+    return projects
+      .map((project) => {
+        if (project.is_current || project.has_running || projectKey(project.path) === currentProjectKey) {
+          return projectIdentity(project) || '';
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('|');
+  }, [projects, currentProjectKey]);
+
   useEffect(() => {
+    if (!autoExpandSignature) return;
     setExpandedProjects((prev) => {
-      const next = new Set(prev);
+      const keys = autoExpandSignature.split('|');
       let changed = false;
-      for (const project of projects) {
-        if (project.is_current || project.has_running || projectKey(project.path) === projectKey(currentProjectPath)) {
-          const key = projectIdentity(project);
-          if (key && !next.has(key)) {
-            next.add(key);
-            changed = true;
-          }
+      const next = new Set(prev);
+      for (const key of keys) {
+        if (key && !next.has(key)) {
+          next.add(key);
+          changed = true;
         }
       }
       return changed ? next : prev;
     });
-  }, [currentProjectPath, projects]);
+  }, [autoExpandSignature]);
 
   const hasAnySession = useMemo(() => (
     standaloneSessions.length > 0 || projects.some((project) => project.sessions.length > 0)
   ), [projects, standaloneSessions.length]);
 
-  const toggleProject = (path: string) => {
+  const toggleProject = useCallback((path: string) => {
     const key = projectKey(path);
     setExpandedProjects((prev) => {
       const next = new Set(prev);
@@ -125,154 +424,45 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
       else next.add(key);
       return next;
     });
-  };
+  }, []);
 
-  const openProject = (path: string) => {
+  const openProject = useCallback((path: string) => {
     const key = projectKey(path);
-    setExpandedProjects((prev) => new Set(prev).add(key));
+    setExpandedProjects((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
     onOpenProject?.(path);
-  };
+  }, [onOpenProject]);
 
-  const handleProjectAction = (action: ProjectHistoryAction, project: SessionHistoryProject) => {
-    setOpenProjectMenu(null);
-    onProjectAction?.(action, project);
-  };
-
-  const startProjectSession = (project: SessionHistoryProject) => {
+  const startProjectSession = useCallback((project: SessionHistoryProject) => {
     const key = projectIdentity(project);
-    setExpandedProjects((prev) => new Set(prev).add(key));
+    setExpandedProjects((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
     onNewProjectSession?.(project);
-  };
+  }, [onNewProjectSession]);
 
-  const renderProjectMenu = (project: SessionHistoryProject, key: string) => (
-    <DropdownMenu open={openProjectMenu === key} onOpenChange={(open) => setOpenProjectMenu(open ? key : null)}>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            setOpenProjectMenu(key);
-          }}
-          className={cn(
-            'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100',
-            (project.is_current || openProjectMenu === key) && 'opacity-100',
-          )}
-          aria-label={`Project actions for ${project.name}`}
-          title="Project actions"
-        >
-          <MoreHorizontal className="h-3.5 w-3.5" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-[184px]">
-        <DropdownMenuItem onSelect={() => handleProjectAction(project.is_pinned ? 'unpin' : 'pin', project)}>
-          <Pin className="h-3.5 w-3.5" />
-          <span>{project.is_pinned ? '取消置顶' : '置顶项目'}</span>
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => handleProjectAction('reveal', project)}>
-          <FolderOpen className="h-3.5 w-3.5" />
-          <span>在资源管理器中打开</span>
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => handleProjectAction('worktree', project)}>
-          <GitBranch className="h-3.5 w-3.5" />
-          <span>创建永久工作树</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => handleProjectAction('rename', project)}>
-          <Pencil className="h-3.5 w-3.5" />
-          <span>重命名项目</span>
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => handleProjectAction('archive', project)}>
-          <Archive className="h-3.5 w-3.5" />
-          <span>归档会话</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem destructive onSelect={() => handleProjectAction('remove', project)}>
-          <X className="h-3.5 w-3.5" />
-          <span>移除</span>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
+  const handleProjectAction = useCallback((action: ProjectHistoryAction, project: SessionHistoryProject) => {
+    onProjectAction?.(action, project);
+  }, [onProjectAction]);
 
-  const renderSessionMenu = (session: SessionHistoryItem, label: string) => (
-    <DropdownMenu open={openSessionMenu === session.id} onOpenChange={(open) => setOpenSessionMenu(open ? session.id : null)}>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            setOpenSessionMenu(session.id);
-          }}
-          className="rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100"
-          aria-label={`Session actions for ${label}`}
-          title="Session actions"
-        >
-          <MoreHorizontal className="h-3.5 w-3.5" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-[148px]">
-        <DropdownMenuItem onSelect={() => {
-          setOpenSessionMenu(null);
-          onArchiveSession?.(session.id);
-        }}>
-          <Archive className="h-3.5 w-3.5" />
-          <span>归档会话</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem destructive onSelect={() => {
-          setOpenSessionMenu(null);
-          onDeleteSession?.(session.id);
-        }}>
-          <Trash2 className="h-3.5 w-3.5" />
-          <span>永久删除</span>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
+  const handleSwitchSession = useCallback((id: string, projectPath?: string | null) => {
+    onSwitchSession?.(id, projectPath);
+  }, [onSwitchSession]);
 
-  const renderSession = (session: SessionHistoryItem) => {
-    const label = isPrimaryPersonal(session) ? `${displayNameForAgent('personal', agentProfiles)} · Main` : formatSessionLabel(session);
-    const type = session.agent_type || 'personal';
-    const canManageSession = !isPrimaryPersonal(session) && !session.is_running;
-    return (
-      <div
-        key={session.id}
-        className={cn(
-          'group flex items-center justify-between gap-1 rounded px-2 py-1.5 text-xs transition-colors',
-          session.id === currentSession
-            ? 'bg-surface-alt text-fg'
-            : 'text-fg-secondary hover:bg-surface-hover hover:text-fg',
-        )}
-      >
-        <button
-          type="button"
-          onClick={() => onSwitchSession?.(session.id, session.project_path)}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          title={label}
-          aria-label={`Open session ${label}`}
-        >
-          <MessageSquare className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">{label}</span>
-          <span
-            className={cn(
-              'shrink-0 rounded px-1 py-0.5 text-[9px]',
-              type === 'coding' ? 'bg-success/10 text-success' : 'bg-accent/10 text-accent',
-            )}
-          >
-            {agentLabel(type)}
-          </span>
-        </button>
-        <div className="flex min-w-[42px] items-center justify-end gap-1 text-[10px] text-fg-muted">
-          {session.is_running ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Session running" />
-          ) : (
-            <span className="whitespace-nowrap group-hover:hidden">{formatRelativeTime(session.updated_at)}</span>
-          )}
-          {canManageSession && renderSessionMenu(session, label)}
-        </div>
-      </div>
-    );
-  };
+  const handleArchiveSession = useCallback((id: string) => {
+    onArchiveSession?.(id);
+  }, [onArchiveSession]);
+
+  const handleDeleteSession = useCallback((id: string) => {
+    onDeleteSession?.(id);
+  }, [onDeleteSession]);
 
   return (
     <div className="space-y-3">
@@ -287,67 +477,28 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
           <span className="truncate">New project</span>
         </button>
         {projects.map((project) => {
-          const key = projectIdentity(project);
-          const expanded = expandedProjects.has(key);
+          const identityKey = projectIdentity(project) || projectKey(project.path);
+          const expanded = expandedProjects.has(identityKey);
           return (
-            <div key={key || project.path} className="space-y-0.5">
-              <div
-                className={cn(
-                  'group flex items-center gap-1 rounded px-1 py-1 text-xs transition-colors',
-                  project.is_current ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:bg-surface-hover hover:text-fg',
-                )}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  setOpenProjectMenu(key);
-                }}
-              >
-                <button
-                  type="button"
-                  onClick={() => toggleProject(project.path)}
-                  className="rounded p-0.5 text-fg-muted hover:bg-surface-hover hover:text-fg"
-                  aria-label={`${expanded ? 'Collapse' : 'Expand'} project ${project.name}`}
-                  title={expanded ? 'Collapse project' : 'Expand project'}
-                >
-                  <ChevronRight className={cn('h-3 w-3 transition-transform', expanded && 'rotate-90')} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openProject(project.path)}
-                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                  title={project.path}
-                  aria-label={`Open project ${project.name}`}
-                >
-                  <Folder className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">{project.name}</span>
-                </button>
-                <div className="flex shrink-0 items-center gap-0.5">
-                  {project.has_running && (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-success" aria-label="Project running" />
-                  )}
-                  {renderProjectMenu(project, key)}
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      startProjectSession(project);
-                    }}
-                    className={cn(
-                      'rounded p-0.5 text-fg-muted opacity-0 transition-opacity hover:bg-surface-hover hover:text-fg group-hover:opacity-100',
-                      project.is_current && 'opacity-100',
-                    )}
-                    aria-label={`Start new session in ${project.name}`}
-                    title={`在 ${project.name} 中开始新对话`}
-                  >
-                    <SquarePen className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
-              {expanded && project.sessions.length > 0 && (
-                <div className="ml-5 space-y-0.5">
-                  {project.sessions.map(renderSession)}
-                </div>
-              )}
-            </div>
+            <ProjectRow
+              key={identityKey || project.path}
+              project={project}
+              identityKey={identityKey}
+              expanded={expanded}
+              menuOpen={openProjectMenu === identityKey}
+              currentSession={currentSession}
+              agentProfiles={agentProfiles}
+              openSessionMenuId={openSessionMenu}
+              onToggle={toggleProject}
+              onOpen={openProject}
+              onOpenMenu={setOpenProjectMenu}
+              onAction={handleProjectAction}
+              onStartSession={startProjectSession}
+              onOpenSessionMenu={setOpenSessionMenu}
+              onSwitchSession={handleSwitchSession}
+              onArchiveSession={handleArchiveSession}
+              onDeleteSession={handleDeleteSession}
+            />
           );
         })}
       </div>
@@ -356,7 +507,19 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
         <div className="px-1 text-xs text-fg-muted">对话</div>
         {standaloneSessions.length > 0 ? (
           <div className="space-y-0.5">
-            {standaloneSessions.map(renderSession)}
+            {standaloneSessions.map((session) => (
+              <SessionRow
+                key={session.id}
+                session={session}
+                agentProfiles={agentProfiles}
+                isActive={session.id === currentSession}
+                menuOpen={openSessionMenu === session.id}
+                onOpenMenu={setOpenSessionMenu}
+                onSwitch={handleSwitchSession}
+                onArchive={handleArchiveSession}
+                onDelete={handleDeleteSession}
+              />
+            ))}
           </div>
         ) : (
           <div className="px-2 py-2 text-xs text-fg-muted">暂无聊天</div>

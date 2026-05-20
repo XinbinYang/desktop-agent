@@ -1,9 +1,13 @@
-import { describe, it, expect } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { ToolCallView } from '../../components/ToolCallView'
 import type { ToolCall, WorkerEvent } from '../../types'
 
 describe('ToolCallView', () => {
+  afterEach(() => {
+    delete (window as any).electronAPI
+  })
+
   it('renders tool call name', () => {
     const toolCall: ToolCall = {
       name: 'file_read',
@@ -159,6 +163,26 @@ describe('ToolCallView', () => {
     expect(screen.queryByText('file contents here')).not.toBeInTheDocument()
     fireEvent.click(screen.getByLabelText('Expand tool call details'))
     expect(screen.getByText('file contents here')).toBeInTheDocument()
+  })
+
+  it('reveals the path extracted from a successful file tool result', async () => {
+    const revealPath = vi.fn(() => Promise.resolve(null))
+    ;(window as any).electronAPI = { revealPath }
+    render(
+      <ToolCallView
+        name="file_write"
+        args={{ path: 'AGENTS/personal/audit.md' }}
+        result={'File written: C:\\runtime\\backend\\AGENTS\\personal\\WORKSPACE\\audit.md'}
+        status="success"
+        variant="event-row"
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText(/Show in folder:/))
+
+    await waitFor(() => {
+      expect(revealPath).toHaveBeenCalledWith('C:\\runtime\\backend\\AGENTS\\personal\\WORKSPACE\\audit.md')
+    })
   })
 
   it('renders compact worker agents inline instead of hiding them behind Activity', () => {

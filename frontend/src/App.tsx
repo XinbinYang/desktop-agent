@@ -47,10 +47,12 @@ import {
   DEFAULT_AGENT_PROFILES,
   agentForRole,
   displayNameForAgent,
+  displayNameForAgentRole,
   normalizeAgentType,
   profilesFromAgents,
   roleForAgent,
   type AgentProfileMap,
+  type RoleDisplayNameMap,
 } from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
@@ -206,15 +208,18 @@ function sessionTitleForDisplay(
   pane: SessionPane | null | undefined,
   meta?: SessionListItem,
   profiles: AgentProfileMap = DEFAULT_AGENT_PROFILES,
+  roleDisplayNames: RoleDisplayNameMap = {},
 ): string {
   if (!pane) return 'No Session';
   const agentType = pane.agentType || normalizeAgentType(meta?.agent_type, meta?.role_id);
+  const roleId = pane.role || meta?.role_id || roleForAgent(agentType);
+  const agentName = displayNameForAgentRole(agentType, roleId, profiles, roleDisplayNames);
   if (agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')) {
-    return `${displayNameForAgent('personal', profiles)} · Main`;
+    return `${agentName} · Main`;
   }
   const title = (meta?.title || pane.title || '').trim();
   const label = title || sessionShortId(pane.sessionId);
-  return `${displayNameForAgent(agentType, profiles)} · ${label}`;
+  return `${agentName} · ${label}`;
 }
 
 function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
@@ -239,6 +244,39 @@ function flattenSessionHistory(history: SessionHistoryResponse | null): SessionL
   });
 }
 
+// Optimistic helper: returns a new SessionHistoryResponse with the given session
+// id removed from both standalone_sessions and any project.sessions. Untouched
+// projects keep their original object reference so memoized rows do not
+// re-render. Returns the same reference when the id is not present.
+function removeSessionFromHistory(
+  history: SessionHistoryResponse | null,
+  id: string,
+): SessionHistoryResponse | null {
+  if (!history) return history;
+  let changed = false;
+  const standalone = history.standalone_sessions || [];
+  const nextStandalone = standalone.filter((s) => s.id !== id);
+  if (nextStandalone.length !== standalone.length) changed = true;
+  const projects = history.projects || [];
+  const nextProjects = projects.map((project) => {
+    const sessions = project.sessions || [];
+    if (!sessions.some((s) => s.id === id)) return project;
+    changed = true;
+    const filtered = sessions.filter((s) => s.id !== id);
+    return {
+      ...project,
+      sessions: filtered,
+      has_running: filtered.some((s) => s.is_running),
+    };
+  });
+  if (!changed) return history;
+  return {
+    ...history,
+    standalone_sessions: nextStandalone,
+    projects: nextProjects,
+  };
+}
+
 function findFileNode(nodes: FileNode[], path: string): FileNode | undefined {
   for (const node of nodes) {
     if (node.path === path) return node;
@@ -260,6 +298,29 @@ function withDirectoryChildren(nodes: FileNode[], path: string, children: FileNo
 
 function normalizeProjectPath(path: string): string {
   return (path || '').replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function basenameOf(path: string): string {
+  const segments = (path || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  return segments.length ? segments[segments.length - 1] : path || '';
+}
+
+// Look up a cached project (name, canonical path) from sessionHistory so the
+// project switch can update the UI synchronously while the backend round-trip
+// catches up in the background.
+function findProjectMetaInHistory(
+  history: SessionHistoryResponse | null,
+  path: string,
+): { path: string; name: string; canonicalPath?: string } | null {
+  if (!history || !path) return null;
+  const key = normalizeProjectPath(path).toLowerCase();
+  for (const project of history.projects || []) {
+    const candidates = [project.path, project.canonical_path].filter(Boolean) as string[];
+    if (candidates.some((p) => normalizeProjectPath(p).toLowerCase() === key)) {
+      return { path: project.path, name: project.name, canonicalPath: project.canonical_path ?? undefined };
+    }
+  }
+  return null;
 }
 
 function projectAbsolutePath(project: ProjectInfo, relativePath: string): string {
@@ -334,6 +395,7 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [agentModels, setAgentModels] = useState<Record<string, string>>({ personal: '', coding: '' });
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileMap>(DEFAULT_AGENT_PROFILES);
+  const [roleDisplayNames, setRoleDisplayNames] = useState<RoleDisplayNameMap>({});
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   // Pane tree — restored from localStorage or fresh default
   const initialPaneTree = React.useMemo(() => loadPersistedPaneTree('personal'), []);
@@ -388,7 +450,7 @@ export default function App() {
   const focusedSessionMeta = focusedPane ? sessionMetaById[focusedPane.sessionId] : undefined;
   const focusedAgentType = focusedPane?.agentType || layout.activeAgent;
   const focusedModel = sessionModelForPane(focusedPane, focusedSessionMeta) || agentModels[focusedAgentType] || agentModel;
-  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta, agentProfiles);
+  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta, agentProfiles, roleDisplayNames);
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -442,6 +504,21 @@ export default function App() {
   const pendingSplitSizesRef = useRef<Record<string, number[]>>({});
   const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
   const manualProjectLockLeafRef = useRef<string | null>(null);
+  // Monotonic id used to drop stale fetchProjectTreePath responses when the
+  // user rapidly switches projects — only the latest request commits.
+  const projectTreeRequestIdRef = useRef(0);
+  // Mirror currentProject.path and sessionHistory through refs so the project
+  // open callback can look them up without taking them as React deps. Without
+  // this every polling tick (which replaces sessionHistory) would invalidate
+  // the callback and re-run downstream effects.
+  const currentProjectPathRef = useRef<string>('');
+  const sessionHistoryRef = useRef<SessionHistoryResponse | null>(null);
+  useEffect(() => {
+    currentProjectPathRef.current = currentProject?.path || '';
+  }, [currentProject?.path]);
+  useEffect(() => {
+    sessionHistoryRef.current = sessionHistory;
+  }, [sessionHistory]);
   const handledSkillDraftEventsRef = useRef<Set<string>>(new Set());
   const initializedSkillDraftSessionRef = useRef<string | null>(null);
 
@@ -606,11 +683,26 @@ export default function App() {
     sessionViewRefs.current.get(focusedSessionId)?.openRewind();
   }, [focusedSessionId]);
 
+  const sessionHistoryEtagRef = useRef<string | null>(null);
   const loadSessions = useCallback((projectPath?: string | null) => {
     void projectPath;
-    fetch(`${API_BASE}/api/session-history`)
-      .then((r) => r.json())
-      .then((data) => setSessionHistory(data || null))
+    const headers: Record<string, string> = {};
+    if (sessionHistoryEtagRef.current) headers['If-None-Match'] = sessionHistoryEtagRef.current;
+    fetch(`${API_BASE}/api/session-history`, { headers })
+      .then((r) => {
+        if (r.status === 304) {
+          // Unchanged on the backend — skip the React commit entirely so the
+          // memoized SessionHistoryPanel does not re-render on idle polling.
+          return null;
+        }
+        const etag = r.headers?.get?.('etag');
+        if (etag) sessionHistoryEtagRef.current = etag;
+        return r.json();
+      })
+      .then((data) => {
+        if (data === null) return;
+        setSessionHistory(data || null);
+      })
       .catch(console.error);
   }, []);
 
@@ -622,6 +714,23 @@ export default function App() {
     } catch (err) {
       console.error('[App] Failed to load agent profiles:', err);
       setAgentProfiles(DEFAULT_AGENT_PROFILES);
+    }
+  }, []);
+
+  const loadRoleDisplayNames = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/roles`);
+      const data = await res.json();
+      const next: RoleDisplayNameMap = {};
+      for (const role of data.roles || []) {
+        const id = typeof role?.id === 'string' ? role.id.trim() : '';
+        const name = typeof role?.name === 'string' ? role.name.trim().replace(/\s+/g, ' ') : '';
+        if (id && name) next[id] = name;
+      }
+      setRoleDisplayNames(next);
+    } catch (err) {
+      console.error('[App] Failed to load role display names:', err);
+      setRoleDisplayNames({});
     }
   }, []);
 
@@ -853,7 +962,7 @@ export default function App() {
     };
 
     const doLoad = async () => {
-      await Promise.all([loadModels(), loadSettingsReadiness(), loadAgentProfiles()]);
+      await Promise.all([loadModels(), loadSettingsReadiness(), loadAgentProfiles(), loadRoleDisplayNames()]);
       if (!cancelled) setIsLoadingModels(false);
     };
 
@@ -1149,13 +1258,47 @@ export default function App() {
 
   const handleOpenProjectPath = useCallback(async (
     path: string,
-    options: { touchRecent?: boolean; source?: 'manual' | 'focus-sync' } = {},
+    options: { touchRecent?: boolean; source?: 'manual' | 'focus-sync'; skipFileTreeReload?: boolean } = {},
   ): Promise<ProjectInfo | null> => {
     if (!path) return null;
     const touchRecent = options.touchRecent ?? true;
+    const skipFileTreeReload = options.skipFileTreeReload ?? false;
     if ((options.source ?? 'manual') === 'manual') {
       manualProjectLockLeafRef.current = focusedLeafId;
     }
+
+    const currentPath = currentProjectPathRef.current;
+    const normalizedNew = normalizeProjectPath(path).toLowerCase();
+    const normalizedCur = currentPath ? normalizeProjectPath(currentPath).toLowerCase() : '';
+    const samePath = normalizedNew === normalizedCur && !!currentPath;
+
+    // Synchronous UI commit from cached metadata so the click feels instant.
+    // The backend round-trip and file-tree fetch reconcile in the background.
+    if (!samePath) {
+      const cached = findProjectMetaInHistory(sessionHistoryRef.current, path);
+      const optimistic: ProjectInfo = {
+        path: cached?.path || path,
+        name: cached?.name || basenameOf(path),
+        last_opened: new Date().toISOString(),
+      };
+      setCurrentProject(optimistic);
+      setExpandedPaths(new Set());
+      setLoadingPaths(new Set());
+    }
+
+    // Kick off the file tree fetch in parallel with the project open POST.
+    // Older responses are dropped via the monotonic request id so a slow
+    // tree fetch from a previous project cannot overwrite the newer one.
+    const treeRequestId = ++projectTreeRequestIdRef.current;
+    if (!skipFileTreeReload && !samePath) {
+      void fetchProjectTreePath()
+        .then((tree) => {
+          if (projectTreeRequestIdRef.current === treeRequestId) setFileTree(tree);
+        })
+        .catch(() => {});
+    }
+
+    let canonicalProject: ProjectInfo | null = null;
     try {
       const res = await fetch(`${API_BASE}/api/projects/open`, {
         method: 'POST',
@@ -1167,17 +1310,16 @@ export default function App() {
         addTerminalLog(`[Project] Open failed: ${project.error}`);
         return null;
       }
-      setCurrentProject(project);
-      setExpandedPaths(new Set());
-      setLoadingPaths(new Set());
-      setFileTree(await fetchProjectTreePath());
-      loadSessions(project.path);
-      if (touchRecent) addTerminalLog(`[Project] Opened ${project.name || project.path}`);
-      return project as ProjectInfo;
+      canonicalProject = project as ProjectInfo;
+      setCurrentProject(canonicalProject);
+      if (touchRecent) addTerminalLog(`[Project] Opened ${canonicalProject.name || canonicalProject.path}`);
     } catch (err) {
       addTerminalLog(`[Project] Open error: ${err}`);
       return null;
     }
+
+    loadSessions(canonicalProject.path);
+    return canonicalProject;
   }, [addTerminalLog, fetchProjectTreePath, focusedLeafId, loadSessions]);
 
   // File-tree zone follows the focused pane's project. Safe to flip the global
@@ -1938,15 +2080,24 @@ export default function App() {
   ]);
 
   const archiveSession = useCallback(async (id: string) => {
-    const res = await fetch(`${API_BASE}/api/sessions/${id}/archive`, { method: 'POST' });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      addTerminalLog(`[Session] Archive failed: ${apiErrorMessage(data.detail || data.error || res.statusText)}`);
-      return;
+    let snapshot: SessionHistoryResponse | null = null;
+    setSessionHistory((prev) => {
+      snapshot = prev;
+      return removeSessionFromHistory(prev, id);
+    });
+    void replaceFocusedSessionAfterRemoval(id);
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions/${id}/archive`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSessionHistory(snapshot);
+        addTerminalLog(`[Session] Archive failed: ${apiErrorMessage(data.detail || data.error || res.statusText)}`);
+      }
+    } catch (err) {
+      setSessionHistory(snapshot);
+      addTerminalLog(`[Session] Archive error: ${err}`);
     }
-    loadSessions();
-    await replaceFocusedSessionAfterRemoval(id);
-  }, [addTerminalLog, loadSessions, replaceFocusedSessionAfterRemoval]);
+  }, [addTerminalLog, replaceFocusedSessionAfterRemoval]);
 
   const requestDeleteSession = useCallback((id: string) => {
     const existing = sessionMetaById[id];
@@ -1975,25 +2126,30 @@ export default function App() {
   const submitSessionDelete = useCallback(async () => {
     if (!deleteSessionTarget) return;
     const id = deleteSessionTarget.id;
-    setIsDeletingSession(true);
+    // Optimistic: close the dialog and drop the row immediately so the user
+    // feels < 80ms response. The backend DELETE is fired in the background;
+    // on failure we restore the snapshot and surface a toast.
+    let snapshot: SessionHistoryResponse | null = null;
+    setSessionHistory((prev) => {
+      snapshot = prev;
+      return removeSessionFromHistory(prev, id);
+    });
+    setDeleteSessionTarget(null);
     setDeleteSessionError('');
+    void Promise.allSettled([deleteSessionData(id), deleteDraft(id)]);
+    void replaceFocusedSessionAfterRemoval(id);
     try {
       const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setDeleteSessionError(apiErrorMessage(data.detail || data.error || res.statusText));
-        return;
+        setSessionHistory(snapshot);
+        addTerminalLog(`[Session] Delete failed: ${apiErrorMessage(data.detail || data.error || res.statusText)}`);
       }
-      void Promise.allSettled([deleteSessionData(id), deleteDraft(id)]);
-      setDeleteSessionTarget(null);
-      loadSessions(currentProject?.path ?? null);
-      await replaceFocusedSessionAfterRemoval(id);
     } catch (err) {
-      setDeleteSessionError(String(err));
-    } finally {
-      setIsDeletingSession(false);
+      setSessionHistory(snapshot);
+      addTerminalLog(`[Session] Delete error: ${err}`);
     }
-  }, [currentProject?.path, deleteSessionTarget, loadSessions, replaceFocusedSessionAfterRemoval]);
+  }, [addTerminalLog, deleteSessionTarget, replaceFocusedSessionAfterRemoval]);
 
   // Split a leaf into two panes (drag to edge)
   const handleSplitPane = useCallback(async (
@@ -2530,6 +2686,7 @@ export default function App() {
                     currentRole={roleForAgent(focusedAgentType)}
                     models={models}
                     agentProfiles={agentProfiles}
+                    roleDisplayNames={roleDisplayNames}
                     sessionMetaById={sessionMetaById}
                     onModelChange={handlePaneModelChange}
                     onSnapshot={handleSessionSnapshot}
