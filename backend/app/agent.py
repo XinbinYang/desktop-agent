@@ -74,6 +74,7 @@ _LOCAL_MESSAGE_META_KEYS: frozenset[str] = frozenset({
     "turn_id",
     "created_at",
     "checkpoint_id",
+    "context_epoch",
 })
 
 _LLM_MESSAGE_KEYS: frozenset[str] = frozenset({
@@ -84,6 +85,8 @@ _LLM_MESSAGE_KEYS: frozenset[str] = frozenset({
     "tool_calls",
     "reasoning_content",
 })
+
+COMMAND_NOTICE_SOURCE = "command_notice"
 
 # Plan-mode planning phase: only these tools may be offered / executed until approved.
 READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
@@ -567,6 +570,7 @@ class AgentSession:
         self.model_id = model_id
         self.router = ModelRouter(self.model_id)
         self.messages: List[Dict[str, Any]] = []
+        self.context_epoch = 0
         self.iteration = 0
         self.max_iterations = load_config().settings.max_iterations
         self.screenshot_on_step = load_config().settings.screenshot_on_step
@@ -578,6 +582,12 @@ class AgentSession:
         self._rag_cache_sources: List[Dict[str, Any]] = []
         self._rag_context_sources: List[Dict[str, Any]] = []
         self.dynamic_registry = DynamicToolRegistry()
+        # MCP tool refresh is deferred until the first run() call. Constructing
+        # a session no longer blocks the /api/sessions/resolve HTTP path on
+        # enumerating MCP servers + rebuilding the system prompt; the first
+        # turn pays that cost (and from then on the registry stays warm until
+        # something marks it dirty again, e.g. MCP server list changes).
+        self._mcp_tools_dirty = True
         self.chat_mode = "agent"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
@@ -905,11 +915,15 @@ class AgentSession:
 
     def mark_applied_task_guidance_stale(self) -> List[TaskGuidanceItem]:
         stale: List[TaskGuidanceItem] = []
+        remaining: List[TaskGuidanceItem] = []
         for item in self.task_guidance_items:
             if item.status == "applied":
                 item.status = "stale"
                 stale.append(item)
+            else:
+                remaining.append(item)
         if stale:
+            self.task_guidance_items = remaining
             self._save()
         return stale
 
@@ -971,10 +985,18 @@ class AgentSession:
         return consumed_payload
 
     def _setup_system_prompt(self):
-        self.messages.append({"role": "system", "content": self._build_system_prompt()})
+        self.messages.append({
+            "role": "system",
+            "content": self._build_system_prompt(),
+            "context_epoch": self.context_epoch,
+        })
 
     def _refresh_system_prompt(self):
-        system_msg = {"role": "system", "content": self._build_system_prompt()}
+        system_msg = {
+            "role": "system",
+            "content": self._build_system_prompt(),
+            "context_epoch": self.context_epoch,
+        }
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = system_msg
         else:
@@ -1276,11 +1298,92 @@ class AgentSession:
     ) -> Dict[str, Any]:
         message.setdefault("message_id", f"msg_{uuid.uuid4().hex[:16]}")
         message.setdefault("created_at", created_at or time.time())
+        message.setdefault("context_epoch", self.context_epoch)
         if turn_id:
             message.setdefault("turn_id", turn_id)
         if checkpoint_id:
             message.setdefault("checkpoint_id", checkpoint_id)
         return message
+
+    @staticmethod
+    def _message_context_epoch(message: Dict[str, Any]) -> int:
+        try:
+            return int(message.get("context_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_command_notice(message: Dict[str, Any]) -> bool:
+        return message.get("source") == COMMAND_NOTICE_SOURCE
+
+    @staticmethod
+    def _is_visible_transcript_message(message: Dict[str, Any]) -> bool:
+        if message.get("source") == "internal":
+            return False
+        if message.get("role") == "system":
+            return message.get("source") == COMMAND_NOTICE_SOURCE
+        return True
+
+    def _active_context_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        include_command_notices: bool = False,
+    ) -> List[Dict[str, Any]]:
+        source = self.messages if messages is None else messages
+        active: list[dict[str, Any]] = []
+        for index, msg in enumerate(source):
+            if msg.get("role") == "system" and not self._is_command_notice(msg):
+                if index == 0 or self._message_context_epoch(msg) == self.context_epoch:
+                    active.append(msg)
+                continue
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
+            if self._is_command_notice(msg) and not include_command_notices:
+                continue
+            active.append(msg)
+        return active
+
+    def _visible_transcript_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = self.messages if messages is None else messages
+        return [m for m in source if self._is_visible_transcript_message(m)]
+
+    def _active_visible_transcript_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        return [
+            m
+            for m in self._visible_transcript_messages(messages)
+            if self._message_context_epoch(m) == self.context_epoch
+        ]
+
+    def heartbeat_transcript_messages(self) -> List[Dict[str, Any]]:
+        """Return the current visible user/assistant turn set for Personal heartbeat."""
+        self._ensure_message_metadata()
+        transcript: list[dict[str, Any]] = []
+        for msg in self.messages:
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
+            if msg.get("role") not in ("user", "assistant"):
+                continue
+            if msg.get("source") in ("internal", COMMAND_NOTICE_SOURCE):
+                continue
+            transcript.append(copy.deepcopy(msg))
+        return transcript
+
+    def _clear_personal_session_handoff(self) -> None:
+        if self._agent_type != "personal":
+            return
+        try:
+            handoff_path = AgentManager._personal_dir() / "session_handoff.md"
+            if handoff_path.exists():
+                handoff_path.unlink()
+        except OSError as exc:
+            logger.warning("Failed to clear Personal session handoff: %s", exc)
 
     def _ensure_message_metadata(self) -> None:
         current_turn = ""
@@ -1340,6 +1443,8 @@ class AgentSession:
         self._ensure_message_metadata()
         checkpoint_ids: list[str] = []
         for msg in self.messages:
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
             if msg.get("role") != "user" or msg.get("source") == "internal":
                 continue
             checkpoint_id = msg.get("checkpoint_id")
@@ -1461,9 +1566,9 @@ class AgentSession:
         """
         if messages is None:
             self._ensure_message_metadata()
-            source = self.messages
+            source = self._active_context_messages()
         else:
-            source = messages
+            source = self._active_context_messages(messages)
         source_copy = copy.deepcopy(source)
         budget = self._model_input_token_budget()
         source_copy = repair_tool_call_messages(source_copy)
@@ -1513,7 +1618,7 @@ class AgentSession:
 
     def _active_turn_metadata(self) -> tuple[str, str]:
         for msg in reversed(self.messages):
-            if msg.get("role") == "user":
+            if msg.get("role") == "user" and self._message_context_epoch(msg) == self.context_epoch:
                 turn_id = msg.get("turn_id") or f"turn_{uuid.uuid4().hex[:12]}"
                 checkpoint_id = msg.get("checkpoint_id") or f"chk_{uuid.uuid4().hex[:12]}"
                 self._stamp_message(msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
@@ -1560,7 +1665,11 @@ class AgentSession:
             "tool_schemas": 0,
         }
 
-        full_context_messages = copy.deepcopy(self.messages)
+        active_messages = self._active_context_messages()
+        visible_messages = self._visible_transcript_messages()
+        active_visible_messages = self._active_visible_transcript_messages()
+        archived_message_count = max(0, len(visible_messages) - len(active_visible_messages))
+        full_context_messages = copy.deepcopy(active_messages)
         transcript_estimate = self._estimate_messages_tokens(full_context_messages)
         provider_source, summarized_message_count = self._messages_after_compaction_boundary(
             repair_tool_call_messages(copy.deepcopy(full_context_messages))
@@ -1615,12 +1724,15 @@ class AgentSession:
             "source": "provider" if exact else "estimate",
             "status": status,
             "breakdown": breakdown,
-            "transcript_message_count": len([m for m in self.messages if m.get("role") != "system"]),
+            "transcript_message_count": len(visible_messages),
             "context_message_count": len([m for m in context_messages if m.get("role") != "system"]),
             "transcript_estimated_tokens": transcript_estimate,
             "context_estimated_tokens": context_estimate,
             "context_truncated": len(context_messages) < len(full_context_messages),
             "compaction_active": bool(self.compaction_summary and summarized_message_count > 0),
+            "context_epoch": self.context_epoch,
+            "archived_message_count": archived_message_count,
+            "context_reset_active": archived_message_count > 0,
             "compacted_through_checkpoint_id": (
                 self._normalize_compaction_state(self.compaction_state).get("compacted_through_checkpoint_id") or ""
             ),
@@ -1634,6 +1746,8 @@ class AgentSession:
         self._ensure_message_metadata()
         checkpoints: list[dict[str, Any]] = []
         for index, msg in enumerate(self.messages):
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
             if msg.get("role") != "user":
                 continue
             if msg.get("source") == "internal":
@@ -1655,7 +1769,11 @@ class AgentSession:
         target_index = -1
         target: Dict[str, Any] | None = None
         for index, msg in enumerate(self.messages):
-            if msg.get("role") == "user" and msg.get("checkpoint_id") == checkpoint_id:
+            if (
+                self._message_context_epoch(msg) == self.context_epoch
+                and msg.get("role") == "user"
+                and msg.get("checkpoint_id") == checkpoint_id
+            ):
                 target_index = index
                 target = msg
                 break
@@ -2351,6 +2469,9 @@ class AgentSession:
         self.iteration = 0
         self._cancelled = False
         self._repo_map_cache = None
+        # First-turn MCP refresh: defers all session-creation cost off the
+        # /api/sessions/resolve HTTP path. No-op once warmed.
+        self._ensure_mcp_tools_ready()
         run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
         ti = self.thinking_intensity
         coding_run = None
@@ -2702,10 +2823,17 @@ class AgentSession:
             # Handle stream failure with non-streaming fallback
             if stream_error:
                 error_msg = stream_error.lower()
-                if "does not support tools" in error_msg or "tool" in error_msg.lower() or "tools" in error_msg.lower():
+                stream_failed_before_tokens = not streamed_reasoning_text and not streamed_content_text
+                retry_without_tools = (
+                    "does not support tools" in error_msg
+                    or "tool" in error_msg
+                    or "tools" in error_msg
+                )
+                if stream_failed_before_tokens or retry_without_tools:
                     try:
                         response = await self.router.chat_completion_non_stream(
                             messages=self._messages_for_llm(),
+                            tools=None if retry_without_tools else tool_schemas or None,
                             temperature=0.5,
                             max_tokens=completion_max_tokens,
                             thinking_intensity=ti,
@@ -3403,7 +3531,8 @@ class AgentSession:
 
         self._ensure_message_metadata()
         self.compaction_state = self._normalize_compaction_state(self.compaction_state)
-        before_count = len([m for m in self.messages if m.get("role") != "system"])
+        active_messages = self._active_context_messages()
+        before_count = len([m for m in active_messages if m.get("role") != "system"])
         current_usage = self.context_usage()
         if not force and before_count < COMPACTION_THRESHOLD and current_usage["used_percent"] < 70:
             return {
@@ -3419,18 +3548,18 @@ class AgentSession:
                 "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
             }
 
-        history = [m for m in self.messages if m.get("role") != "system"]
+        history = [m for m in active_messages if m.get("role") != "system"]
         real_user_checkpoint_ids = self._real_user_checkpoint_ids()
         recent_checkpoint_ids = set(real_user_checkpoint_ids[-COMPACTION_RECENT_USER_TURNS:])
         if not recent_checkpoint_ids and history:
             recent_checkpoint_ids = {str(history[-1].get("checkpoint_id") or "")}
 
-        previous_boundary_index = self._compacted_boundary_index(self.messages)
+        previous_boundary_index = self._compacted_boundary_index(active_messages)
         if previous_boundary_index is None:
             previous_boundary_index = -1
 
         to_summarize: list[dict[str, Any]] = []
-        for index, msg in enumerate(self.messages):
+        for index, msg in enumerate(active_messages):
             if msg.get("role") == "system":
                 continue
             if index <= previous_boundary_index:
@@ -3526,7 +3655,7 @@ class AgentSession:
         })
         self._refresh_system_prompt()
         self._ensure_message_metadata()
-        after_count = len([m for m in self.messages if m.get("role") != "system"])
+        after_count = len([m for m in self._active_context_messages() if m.get("role") != "system"])
         usage = self.context_usage()
         logger.info(
             "Context compacted: transcript=%d context=%d",
@@ -3560,11 +3689,23 @@ class AgentSession:
     def retry_last(self) -> bool:
         for i in range(len(self.messages) - 1, -1, -1):
             msg = self.messages[i]
-            if msg.get("role") == "assistant":
+            if (
+                msg.get("role") == "assistant"
+                and self._message_context_epoch(msg) == self.context_epoch
+                and not self._is_command_notice(msg)
+            ):
                 self.messages = self.messages[:i]
                 self.iteration = 0
                 self._cancelled = False
-                active_user = next((m for m in reversed(self.messages) if m.get("role") == "user"), None)
+                active_user = next(
+                    (
+                        m
+                        for m in reversed(self.messages)
+                        if m.get("role") == "user"
+                        and self._message_context_epoch(m) == self.context_epoch
+                    ),
+                    None,
+                )
                 if active_user:
                     self._last_user_message = _text_from_content(active_user.get("content", ""))
                 self._refresh_system_prompt()
@@ -3572,8 +3713,102 @@ class AgentSession:
                 return True
         return False
 
+    def start_new_context(self, command: str = "reset") -> Dict[str, Any]:
+        """Start a fresh model context while preserving the visible transcript."""
+        command_name = "new" if str(command).lower() == "new" else "reset"
+        self._ensure_message_metadata()
+        previous_epoch = self.context_epoch
+        self.context_epoch += 1
+        self.iteration = 0
+        self._cancelled = False
+        self._last_user_message = ""
+        self._rag_cache_key = ""
+        self._rag_cache_text = ""
+        self._rag_cache_sources = []
+        self._rag_context_sources = []
+        self._reset_compaction_state()
+        self._last_usage = {}
+        self._last_context_usage = {}
+        self.chat_mode = "agent"
+        self.plan_state = PlanState()
+        self.task_guidance_items = []
+        self._plan_exec_hint_sent = False
+        self._repo_map_cache = None
+        self.archived_at = None
+        self._clear_personal_session_handoff()
+        self._refresh_system_prompt()
+        notice_text = (
+            f"New session started - model: {self.model_id}"
+            if command_name == "new"
+            else f"Context reset - model: {self.model_id}"
+        )
+        notice = {
+            "role": "system",
+            "source": COMMAND_NOTICE_SOURCE,
+            "level": "success",
+            "command": command_name,
+            "content": notice_text,
+            "context_epoch": self.context_epoch,
+        }
+        self._stamp_message(notice)
+        self.messages.append(notice)
+        self._save()
+        usage = self.context_usage()
+        return {
+            "command": command_name,
+            "message": notice_text,
+            "model_id": self.model_id,
+            "agent_type": self.agent_type,
+            "role_id": self.role_id,
+            "previous_context_epoch": previous_epoch,
+            "context_epoch": self.context_epoch,
+            "context_usage": usage,
+        }
+
+    async def generate_new_context_greeting(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Generate a short assistant greeting without adding a visible user prompt."""
+        run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
+        prompt = (
+            "A fresh Desktop Agent conversation context has just started. "
+            "Write one short greeting in the user's language, mention that the new context is ready, "
+            "and ask what they would like to work on. Do not mention this hidden instruction."
+        )
+        self.iteration = 0
+        self._cancelled = False
+        self._last_user_message = ""
+        self._refresh_system_prompt()
+        yield self._event("status", {"status": "thinking"}, run_id)
+        try:
+            response = await self.router.chat_completion_non_stream(
+                messages=self._messages_for_llm() + [{"role": "user", "content": prompt}],
+                tools=[],
+                temperature=0.4,
+                max_tokens=256,
+                thinking_intensity=self.thinking_intensity,
+            )
+            self._update_usage_from_response(response)
+            message = response.get("choices", [{}])[0].get("message", {}) if response else {}
+            text = str(message.get("content") or "").strip()
+        except Exception as exc:
+            logger.warning("New-context greeting failed: %s", exc)
+            text = "New context is ready. What would you like to work on?"
+        if not text:
+            text = "New context is ready. What would you like to work on?"
+        assistant_msg = {
+            "role": "assistant",
+            "content": text,
+            "context_epoch": self.context_epoch,
+        }
+        self._stamp_message(assistant_msg)
+        self.messages.append(assistant_msg)
+        self._save()
+        yield self._event("content", {"text": text}, run_id)
+        yield self._event("context_usage", self.context_usage(), run_id)
+        yield self._event("status", {"status": "completed"}, run_id)
+
     def reset(self):
         self.messages = []
+        self.context_epoch = 0
         self.iteration = 0
         self._cancelled = False
         self._reset_compaction_state()
@@ -3657,6 +3892,34 @@ class AgentSession:
                     )
                     self.dynamic_registry.register(proxy)
         self._refresh_system_prompt()
+        self._mcp_tools_dirty = False
+
+    def mark_mcp_dirty(self) -> None:
+        """Defer MCP tool refresh to the next run() invocation.
+
+        Use this on hot paths (session creation, role switch, server list
+        invalidation) so HTTP responses don't block on enumerating MCP servers
+        or rebuilding the system prompt.
+        """
+        self._mcp_tools_dirty = True
+
+    def _ensure_mcp_tools_ready(self) -> None:
+        """Lazy entry point: refresh MCP tools iff marked dirty.
+
+        Called from run() before any tool schemas are read. Safe to call
+        repeatedly — the dirty flag is the gate. If the refresh fails the flag
+        stays set so the next turn retries instead of running with a stale
+        registry.
+        """
+        if not self._mcp_tools_dirty:
+            return
+        try:
+            self.refresh_mcp_tools()
+        except Exception:
+            # Keep the dirty flag set so we retry on the next turn rather than
+            # silently running with no MCP tools. We don't re-raise because the
+            # session can still serve native tools.
+            self._mcp_tools_dirty = True
 
     def _save(self):
         path = SESSIONS_DIR / f"{self.session_id}.json"
@@ -3682,6 +3945,7 @@ class AgentSession:
             "role_id": self.role_id,
             "agent_type": self._agent_type,
             "project_path": self.project_path,
+            "context_epoch": self.context_epoch,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
             "messages": self.messages,
@@ -3725,7 +3989,14 @@ class AgentSession:
                 role_id=stored_role_id,
                 agent_type=stored_agent_type,
             )
+            try:
+                session.context_epoch = max(0, int(data.get("context_epoch") or 0))
+            except (TypeError, ValueError):
+                session.context_epoch = 0
             session.messages = data.get("messages", [])
+            for msg in session.messages:
+                if isinstance(msg, dict):
+                    msg.setdefault("context_epoch", 0)
             session.iteration = 0
             archived_at = data.get("archived_at")
             session.archived_at = str(archived_at) if archived_at else None
@@ -3786,7 +4057,9 @@ class AgentSession:
             session._ensure_message_metadata()
             repaired_tool_calls = session._repair_incomplete_tool_call_history()
             session._refresh_system_prompt()
-            session.refresh_mcp_tools()
+            # Hot path: avoid blocking history-load on MCP server enumeration.
+            # First run() will pick up the registry refresh.
+            session.mark_mcp_dirty()
             if repaired_tool_calls or cleared_personal_project_path:
                 session._save()
             return session
@@ -3832,13 +4105,14 @@ class AgentSession:
 
     def to_snapshot(self) -> Dict[str, Any]:
         context_usage = self.context_usage()
-        transcript_message_count = len([m for m in self.messages if m.get("role") != "system"])
+        transcript_message_count = len(self._visible_transcript_messages())
         context_message_count = int(context_usage.get("context_message_count") or 0)
         return {
             "session_id": self.session_id,
             "model_id": self.model_id,
             "role_id": self.role_id,
             "agent_type": self._agent_type,
+            "context_epoch": self.context_epoch,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
             # Internal synthetic messages (source=="internal") are LLM-only
@@ -3898,7 +4172,9 @@ def get_or_create_session(
             loaded_from_disk = True
         else:
             _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
-            _sessions[session_id].refresh_mcp_tools()
+            # AgentSession.__init__ already marks tools dirty; first run() will
+            # populate the dynamic registry. This keeps /api/sessions/resolve
+            # responsive even when many MCP servers are registered.
 
     session = _sessions[session_id]
     changed = False
@@ -4044,10 +4320,16 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
 
 
 def refresh_all_sessions_mcp_tools():
-    """通知所有活跃会话刷新 MCP 工具。"""
+    """通知所有活跃会话刷新 MCP 工具。
+
+    Marks every live session dirty so the next run() rebuilds its dynamic
+    registry. We no longer refresh inline because some callers (e.g. MCP
+    server status webhooks) invoke this while holding event-loop locks; doing
+    the heavy work synchronously there has caused UI stalls.
+    """
     for session in _sessions.values():
         try:
-            session.refresh_mcp_tools()
+            session.mark_mcp_dirty()
         except Exception:
             pass
 

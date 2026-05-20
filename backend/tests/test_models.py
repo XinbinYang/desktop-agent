@@ -1,5 +1,6 @@
 import pytest
 import httpx
+import json
 from unittest.mock import patch, MagicMock, AsyncMock
 from app.models import ModelRouter, _safe_message_summary
 
@@ -307,6 +308,52 @@ settings:
         ])
 
         assert payload["messages"][0]["reasoning_content"] == "I need a file write."
+
+    def test_deepseek_request_converts_image_url_history_to_text(self, monkeypatch, tmp_path):
+        config_yaml = tmp_path / "models.yaml"
+        config_yaml.write_text("""
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: test-key
+    litellm_provider: deepseek
+    models:
+      - id: deepseek-chat
+        name: DeepSeek Chat
+        context: 65536
+        vision: false
+settings:
+  default_model: deepseek-chat
+  default_provider: deepseek
+""")
+        monkeypatch.setattr("app.config.CONFIG_PATH", config_yaml)
+        from app import config
+        config._config = None
+        router = ModelRouter("deepseek-chat")
+
+        original_messages = [
+            {"role": "system", "content": "system prompt"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,secretbase64"}},
+                ],
+            },
+            {"role": "assistant", "content": "ok", "reasoning_content": "reasoning"},
+        ]
+
+        _, _, payload = router._build_deepseek_request(original_messages)
+
+        assert payload["messages"][1]["content"] == (
+            "describe this\n\n"
+            "[image omitted: DeepSeek does not accept image content]"
+        )
+        rendered = json.dumps(payload["messages"])
+        assert "image_url" not in rendered
+        assert "secretbase64" not in rendered
+        assert payload["messages"][2]["reasoning_content"] == "reasoning"
+        assert original_messages[1]["content"][1]["image_url"]["url"].endswith("secretbase64")
 
     def test_kimi_anthropic_request_drops_empty_assistant_history(self, monkeypatch, tmp_path):
         config_yaml = tmp_path / "models.yaml"

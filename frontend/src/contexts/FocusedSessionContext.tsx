@@ -49,6 +49,7 @@ export interface SessionSnapshot {
 export interface SessionActions {
   sendMessage: (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => void;
   clearSession: () => void;
+  resetContext: (command?: 'reset' | 'new', greet?: boolean) => void;
   compactSession: (force?: boolean, focus?: string) => void;
   loadCheckpoints: () => Promise<ConversationCheckpoint[]>;
   rewindToCheckpoint: (checkpointId: string) => void;
@@ -81,6 +82,7 @@ export interface SessionActions {
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
   clearSession: () => {},
+  resetContext: () => {},
   compactSession: () => {},
   loadCheckpoints: async () => [],
   rewindToCheckpoint: () => {},

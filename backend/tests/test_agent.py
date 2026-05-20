@@ -256,6 +256,27 @@ class TestAgentSession:
         )
 
     @pytest.mark.asyncio
+    async def test_stream_error_before_tokens_uses_non_stream_fallback(self, session):
+        async def failing_stream(*args, **kwargs):
+            yield {"type": "error", "message": "DeepSeek stream failed: 400"}
+
+        async def non_stream_fallback(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Recovered from stream error"}}]}
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", failing_stream),
+            patch("app.agent.ModelRouter.chat_completion_non_stream", non_stream_fallback),
+        ):
+            events = []
+            async for event in session.run("hi"):
+                events.append(event)
+
+        streamed_text = "".join(e["data"]["text"] for e in events if e["type"] == "content")
+        assert streamed_text == "Recovered from stream error"
+        assert not any(e["type"] == "error" for e in events)
+        assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
+
+    @pytest.mark.asyncio
     async def test_run_with_tool_call(self, session):
         mock_response = {
             "choices": [{
@@ -469,6 +490,16 @@ class TestAgentSession:
         )
         assert "[TASK GUIDANCE]" in first_call_text
         assert "Prefer the smaller fix" in first_call_text
+
+    def test_stale_task_guidance_is_not_persisted_as_active(self, session):
+        item = session.queue_task_guidance("Turn this into a follow-up")
+        session.apply_task_guidance()
+
+        stale = session.mark_applied_task_guidance_stale()
+
+        assert stale[0].id == item.id
+        assert stale[0].status == "stale"
+        assert session.active_task_guidance_items() == []
 
     @pytest.mark.asyncio
     async def test_run_payload_keeps_prior_session_suggestion_when_context_fits(self, session):
@@ -833,6 +864,91 @@ class TestAgentSession:
         assert session.iteration == 0
         assert len(session.messages) == 1
         assert session.messages[0]["role"] == "system"
+
+    def test_start_new_context_preserves_visible_transcript_but_resets_llm_context(self, session):
+        session.messages.append({"role": "user", "content": "old visible request", "source": "user"})
+        session.messages.append({"role": "assistant", "content": "old visible answer"})
+        session.plan_state.goal = "old plan"
+        session.task_guidance_items.append(MagicMock(status="queued", model_dump=lambda: {}))
+
+        result = session.start_new_context("reset")
+
+        assert result["context_epoch"] == 1
+        assert session.context_epoch == 1
+        assert session.model_id == "gpt-4o"
+        assert any(m.get("content") == "old visible request" for m in session.messages)
+        provider_text = "\n".join(str(m.get("content", "")) for m in session._messages_for_llm())
+        assert "old visible request" not in provider_text
+        assert "old visible answer" not in provider_text
+        assert session.plan_state.goal == ""
+        assert session.task_guidance_items == []
+
+    def test_start_new_context_clears_stale_handoff_before_prompt_refresh(self, tmp_path, monkeypatch):
+        from app.agents.manager import AgentManager
+
+        agents_root = tmp_path / "AGENTS"
+        personal_workspace = agents_root / "personal" / "WORKSPACE"
+        personal_workspace.mkdir(parents=True)
+        handoff_path = personal_workspace / "session_handoff.md"
+        handoff_path.write_text("old handoff leak", encoding="utf-8")
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
+
+        session = AgentSession(model_id="gpt-4o", session_id="handoff_reset_test")
+        assert "old handoff leak" in str(session.messages[0].get("content", ""))
+
+        session.start_new_context("reset")
+
+        provider_text = "\n".join(str(m.get("content", "")) for m in session._messages_for_llm())
+        assert "old handoff leak" not in provider_text
+        assert not handoff_path.exists()
+
+    def test_context_snapshot_keeps_old_messages_and_notice(self, session):
+        session.messages.append({"role": "user", "content": "before reset", "source": "user"})
+        session.start_new_context("new")
+
+        snap = session.to_snapshot()
+        visible_text = "\n".join(str(m.get("content", "")) for m in snap["messages"])
+
+        assert snap["context_epoch"] == 1
+        assert "before reset" in visible_text
+        assert "New session started - model: gpt-4o" in visible_text
+        assert snap["context_usage"]["context_epoch"] == 1
+        assert snap["context_usage"]["context_reset_active"] is True
+        assert snap["context_usage"]["archived_message_count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_ignores_archived_epoch_and_skips_assistant_only_context(self, tmp_path, monkeypatch):
+        from app.agents.heartbeat import HeartbeatEngine
+        from app.agents.manager import AgentManager
+
+        agents_root = tmp_path / "AGENTS"
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
+        monkeypatch.setattr(HeartbeatEngine, "_store_auto_memory_items", classmethod(lambda cls, **kwargs: 0))
+        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls: False))
+
+        assistant_only = [
+            {"role": "user", "content": "archived user request", "context_epoch": 0},
+            {"role": "assistant", "content": "archived assistant answer", "context_epoch": 0},
+            {"role": "assistant", "content": "New context is ready. What shall we do next?", "context_epoch": 1},
+        ]
+        result = await HeartbeatEngine.on_session_end(assistant_only, "assistant_only_reset")
+        assert result["diary_written"] is False
+        assert result["handoff_written"] is False
+        assert not (agents_root / "personal" / "WORKSPACE" / "session_handoff.md").exists()
+
+        mixed_epochs = [
+            {"role": "user", "content": "archived user request", "context_epoch": 0},
+            {"role": "assistant", "content": "archived assistant answer", "context_epoch": 0},
+            {"role": "user", "content": "new user preference should be remembered", "context_epoch": 1},
+            {"role": "assistant", "content": "new assistant response for current context", "context_epoch": 1},
+        ]
+        result = await HeartbeatEngine.on_session_end(mixed_epochs, "mixed_epoch_reset")
+        assert result["handoff_written"] is True
+        handoff = (agents_root / "personal" / "WORKSPACE" / "session_handoff.md").read_text(encoding="utf-8")
+        assert "new user preference should be remembered" in handoff
+        assert "new assistant response for current context" in handoff
+        assert "archived user request" not in handoff
+        assert "archived assistant answer" not in handoff
 
     @pytest.mark.asyncio
     async def test_plan_mode_llm_calls_plan_ask_questions(self, session):

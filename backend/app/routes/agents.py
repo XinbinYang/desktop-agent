@@ -25,6 +25,12 @@ class WorkspaceFileSave(BaseModel):
     content: str
 
 
+class AgentProfilePatch(BaseModel):
+    display_name: Optional[str] = None
+    avatar_emoji: Optional[str] = None
+    subtitle: Optional[str] = None
+
+
 class MoodUpdate(BaseModel):
     mood: str  # "positive" | "neutral" | "negative"
 
@@ -71,6 +77,7 @@ async def list_agents():
             "default_role": AgentManager.get_default_role(agent_type),
             "model_id": get_model_for_agent(agent_type),
             "thinking_intensity": get_thinking_intensity_for_agent(agent_type),
+            "profile": AgentManager.get_agent_profile(agent_type),
             "tool_profile": {
                 "tool_count": len(tool_schemas),
                 "mode": "focused_coding" if agent_type == "coding" else "desktop_personal",
@@ -88,6 +95,22 @@ async def list_agents():
         agents.append(enriched)
 
     return {"agents": agents}
+
+
+@router.get("/personal/profile")
+async def get_personal_profile():
+    """Return editable Personal Agent display profile metadata."""
+    return {"profile": AgentManager.get_agent_profile("personal")}
+
+
+@router.patch("/personal/profile")
+async def update_personal_profile(body: AgentProfilePatch):
+    """Update Personal Agent display profile metadata."""
+    updates = body.model_dump(exclude_unset=True)
+    profile = AgentManager.save_agent_profile("personal", updates)
+    if profile is None:
+        raise HTTPException(status_code=500, detail="Failed to save profile")
+    return {"profile": profile}
 
 
 @router.get("/{agent_type}/files")

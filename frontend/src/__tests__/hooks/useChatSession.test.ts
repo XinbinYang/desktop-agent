@@ -164,6 +164,76 @@ describe('useChatSession', () => {
     expect(result.current.taskGuidanceItems).toHaveLength(0)
   })
 
+  it('keeps running after completed status until done', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+    })
+    expect(result.current.isRunning).toBe(true)
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'completed' } })
+    })
+    expect(result.current.isRunning).toBe(true)
+
+    act(() => {
+      messageHandler?.({ type: 'done', data: {} })
+    })
+    expect(result.current.isRunning).toBe(false)
+  })
+
+  it('auto-sends unread stale guidance after done', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+    mockSend.mockClear()
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+      messageHandler?.({
+        type: 'task_guidance_stale',
+        data: {
+          items: [{ id: 'tg_1', text: 'continue as a new question', status: 'stale', created_at: 1 }],
+          all_items: [],
+        },
+      })
+    })
+    expect(result.current.taskGuidanceItems).toHaveLength(0)
+
+    act(() => {
+      messageHandler?.({ type: 'done', data: {} })
+    })
+
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'chat',
+      text: 'continue as a new question',
+      model_id: 'gpt-4o',
+      agent_type: 'personal',
+      role_id: 'desktop-agent',
+      image_base64: undefined,
+      chat_mode: 'agent',
+      thinking_intensity: 'medium',
+    })
+    expect(result.current.messages.some((message) => message.role === 'user' && message.content === 'continue as a new question')).toBe(true)
+  })
+
   it('removes an optimistic chat bubble when the backend queues it as guidance', () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -256,6 +326,71 @@ describe('useChatSession', () => {
     // Re-read blocks from the updated state (not stale reference)
     expect(result.current.messages[0].blocks![0].type).toBe('text')
     expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello world')
+    vi.useRealTimers()
+  })
+
+  it('creates a replaceable assistant placeholder while waiting for the first streamed token', () => {
+    vi.useFakeTimers()
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('hello')
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+    })
+
+    expect(result.current.messages).toHaveLength(2)
+    expect(result.current.messages[1].blocks?.[0]).toMatchObject({
+      type: 'thinking',
+      text: 'Waiting for model response...',
+    })
+
+    act(() => {
+      messageHandler?.({ type: 'content', data: { text: 'Hello' } })
+      vi.advanceTimersByTime(60)
+    })
+
+    expect(result.current.messages).toHaveLength(2)
+    expect(result.current.messages[1].blocks).toEqual([
+      expect.objectContaining({ type: 'text', text: 'Hello' }),
+    ])
+    vi.useRealTimers()
+  })
+
+  it('replaces the waiting placeholder with streamed reasoning', () => {
+    vi.useFakeTimers()
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('hello')
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+      messageHandler?.({ type: 'reasoning', data: { text: 'checking context' } })
+      vi.advanceTimersByTime(60)
+    })
+
+    expect(result.current.messages).toHaveLength(2)
+    expect(result.current.messages[1].blocks).toEqual([
+      expect.objectContaining({ type: 'thinking', text: 'checking context' }),
+    ])
     vi.useRealTimers()
   })
 
@@ -453,6 +588,49 @@ describe('useChatSession', () => {
     expect(result.current.messages[0].content).toBe('hello history')
     expect(result.current.messages[1].blocks?.some((b) => b.type === 'tool_call')).toBe(true)
     expect(result.current.toolCalls[0].result).toBe('file body')
+  })
+
+  it('hydrates command notices from backend snapshots', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-1',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [
+            { role: 'system', content: 'system prompt' },
+            {
+              role: 'system',
+              source: 'command_notice',
+              level: 'success',
+              content: 'New session started - model: gpt-4o',
+            },
+          ],
+        },
+      })
+    })
+
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0]).toMatchObject({
+      role: 'system',
+      source: 'command_notice',
+      noticeLevel: 'success',
+      content: 'New session started - model: gpt-4o',
+    })
   })
 
   it('does not render internal-source messages as user bubbles', () => {
@@ -929,6 +1107,36 @@ describe('useChatSession', () => {
     expect(result.current.messages.some((m) => m.role === 'system')).toBe(true)
   })
 
+  it('removes the waiting placeholder when the model call fails before tokens arrive', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.sendMessage('hello')
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+      messageHandler?.({
+        type: 'error',
+        data: { message: 'Model call failed: DeepSeek stream failed: 400' },
+      })
+    })
+
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'system'])
+    expect(
+      result.current.messages.some((m) => m.blocks?.some((block) =>
+        block.type === 'thinking' && block.text === 'Waiting for model response...'
+      )),
+    ).toBe(false)
+  })
+
   it('handles worker events by attaching to dispatch tool call', async () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -1181,14 +1389,23 @@ describe('useChatSession', () => {
     expect(result.current.planState.phase).toBe('approved_waiting_build')
   })
 
-  it('sends compact and rewind session control messages', () => {
+  it('sends reset, compact, and rewind session control messages', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
     act(() => {
+      result.current.resetContext('new', true)
       result.current.compactSession(false)
       result.current.rewindToCheckpoint('chk_1')
     })
 
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'reset_context',
+      command: 'new',
+      greet: true,
+      model_id: 'gpt-4o',
+      agent_type: 'personal',
+      role_id: 'desktop-agent',
+    })
     expect(mockSend).toHaveBeenCalledWith({ type: 'compact', force: false, focus: '', source: 'ui' })
     expect(mockSend).toHaveBeenCalledWith({
       type: 'rewind',

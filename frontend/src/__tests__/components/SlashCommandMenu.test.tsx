@@ -6,6 +6,7 @@ import { __resetSlashCommandCacheForTests, SlashCommandMenu } from '../../compon
 const commands = [
   { name: 'help', description: 'Show help', args: '', category: 'general' },
   { name: 'clear', description: 'Clear session', args: '', category: 'session' },
+  { name: 'reset', description: 'Reset context', args: '', category: 'session' },
   { name: 'config', description: 'Open settings', args: '', category: 'general' },
   { name: 'skills', description: 'Open skills', args: '', category: 'general' },
 ]
@@ -45,6 +46,7 @@ describe('SlashCommandMenu', () => {
     const input = screen.getByLabelText('command-input')
 
     await screen.findByText('/help')
+    expect(screen.getByText('/reset')).toBeInTheDocument()
     const commandButton = (name: string) =>
       container.querySelector(`[data-command-name="${name}"]`) as HTMLElement
 

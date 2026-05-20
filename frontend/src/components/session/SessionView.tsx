@@ -24,6 +24,7 @@ interface SessionViewProps {
   model: string;
   agentType: AgentType;
   role: string;
+  assistantDisplayName?: string;
   teamId?: string;
   teamName?: string;
   isFocused: boolean;
@@ -69,6 +70,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     model,
     agentType,
     role,
+    assistantDisplayName,
     teamId,
     teamName,
     isFocused,
@@ -107,6 +109,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     deleteTaskGuidance,
     clearTaskGuidance,
     clearSession,
+    resetContext,
     compactSession,
     loadCheckpoints,
     rewindToCheckpoint,
@@ -453,6 +456,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   const actions: SessionActions = useMemo(() => ({
     sendMessage,
     clearSession,
+    resetContext,
     compactSession,
     loadCheckpoints,
     rewindToCheckpoint,
@@ -481,7 +485,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     handleOpenFileFromPanel,
     handleOpenFileFromPanelWithLine,
   }), [
-    sendMessage, clearSession, compactSession, loadCheckpoints, rewindToCheckpoint,
+    sendMessage, clearSession, resetContext, compactSession, loadCheckpoints, rewindToCheckpoint,
     stopRunning, retryLast, switchModel, switchRole, executeToolDirect, addTerminalLog,
     approvePlan, buildPlan, pauseBuild, endBuild, rejectPlan, updatePlanDecision, submitPlanDecisions,
     handleSelectFileInEditor, handleCloseFileInEditor, handleFileContentChange, handleSaveFile,
@@ -537,6 +541,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         onCommand={onCommand}
         projectOpen={agentType === 'coding' && !!currentProject}
         agentType={agentType}
+        assistantDisplayName={assistantDisplayName}
         projectName={agentType === 'coding' ? currentProject?.name : undefined}
       />
     </div>

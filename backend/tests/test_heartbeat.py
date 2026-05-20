@@ -114,10 +114,14 @@ async def test_session_runtime_runs_heartbeat_after_personal_turn(monkeypatch):
     from app.session_runtime import SessionRuntime
 
     called = {}
+    heartbeat_started = asyncio.Event()
+    heartbeat_release = asyncio.Event()
 
     async def fake_heartbeat(messages, session_id):
         called["session_id"] = session_id
         called["messages"] = messages
+        heartbeat_started.set()
+        await heartbeat_release.wait()
         return {"diary_written": True}
 
     monkeypatch.setattr("app.agents.heartbeat.HeartbeatEngine.on_session_end", fake_heartbeat)
@@ -141,8 +145,13 @@ async def test_session_runtime_runs_heartbeat_after_personal_turn(monkeypatch):
     await asyncio.wait_for(task, timeout=1)
 
     assert "done" in seen
+    assert runtime.is_running is False
+    assert runtime.accepts_task_guidance is False
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
     assert called["session_id"] == "runtime-heartbeat-test"
     assert called["messages"] == session.messages
+    heartbeat_release.set()
+    await asyncio.sleep(0)
 
 
 def test_should_trigger_dream_counts_only_diaries_after_last_dream(tmp_path, monkeypatch):

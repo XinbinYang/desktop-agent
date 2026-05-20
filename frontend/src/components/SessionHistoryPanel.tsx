@@ -18,12 +18,14 @@ import {
 import type { AgentType, SessionHistoryItem, SessionHistoryProject, SessionHistoryResponse } from '../types';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from './ui/DropdownMenu';
 import { cn } from './ui/cn';
+import { displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 
 export type ProjectHistoryAction = 'pin' | 'unpin' | 'reveal' | 'worktree' | 'rename' | 'archive' | 'remove';
 
 interface SessionHistoryPanelProps {
   history: SessionHistoryResponse | null;
   fallbackSessions?: SessionHistoryItem[];
+  agentProfiles?: AgentProfileMap;
   currentSession?: string;
   currentProjectPath?: string | null;
   onSwitchSession?: (id: string, projectPath?: string | null) => void;
@@ -77,6 +79,7 @@ function isPrimaryPersonal(session: SessionHistoryItem): boolean {
 export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   history,
   fallbackSessions = [],
+  agentProfiles,
   currentSession,
   currentProjectPath,
   onSwitchSession,
@@ -228,7 +231,7 @@ export const SessionHistoryPanel: React.FC<SessionHistoryPanelProps> = ({
   );
 
   const renderSession = (session: SessionHistoryItem) => {
-    const label = isPrimaryPersonal(session) ? 'Personal Agent · Main' : formatSessionLabel(session);
+    const label = isPrimaryPersonal(session) ? `${displayNameForAgent('personal', agentProfiles)} · Main` : formatSessionLabel(session);
     const type = session.agent_type || 'personal';
     const canManageSession = !isPrimaryPersonal(session) && !session.is_running;
     return (

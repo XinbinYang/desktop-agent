@@ -26,6 +26,7 @@ DEFAULT_REASONING_EFFORTS = {
 }
 KIMI_STREAM_FIRST_EVENT_TIMEOUT_SECONDS = 8
 KIMI_STREAM_IDLE_TIMEOUT_SECONDS = 45
+DEEPSEEK_IMAGE_OMITTED_MARKER = "[image omitted: DeepSeek does not accept image content]"
 
 
 def _is_retryable_provider_status(status_code: int) -> bool:
@@ -128,6 +129,56 @@ def _safe_message_summary(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         }
         for message in messages
     ]
+
+
+def _deepseek_text_content(content: Any) -> Any:
+    """DeepSeek chat/completions rejects OpenAI image blocks; send text only."""
+    if not isinstance(content, list):
+        return content
+
+    parts: List[str] = []
+    image_count = 0
+    for block in content:
+        if isinstance(block, str):
+            if block.strip():
+                parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            text = str(block)
+            if text.strip():
+                parts.append(text)
+            continue
+
+        block_type = block.get("type")
+        if block_type in {"text", "input_text"}:
+            text = block.get("text") or block.get("content") or ""
+            if str(text).strip():
+                parts.append(str(text))
+        elif block_type in {"image_url", "image", "input_image"}:
+            image_count += 1
+        else:
+            text = block.get("text") or block.get("content")
+            if text is not None and str(text).strip():
+                parts.append(str(text))
+            elif block_type:
+                parts.append(f"[{block_type} content omitted]")
+
+    if image_count == 1:
+        parts.append(DEEPSEEK_IMAGE_OMITTED_MARKER)
+    elif image_count > 1:
+        parts.append(f"[{image_count} images omitted: DeepSeek does not accept image content]")
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _deepseek_text_only_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized: List[Dict[str, Any]] = []
+    for message in messages:
+        safe_message = dict(message)
+        if "content" in safe_message:
+            safe_message["content"] = _deepseek_text_content(safe_message.get("content"))
+        sanitized.append(safe_message)
+    return sanitized
+
 
 class ModelRouter:
     def __init__(self, model_id: str):
@@ -1068,7 +1119,7 @@ class ModelRouter:
 
         payload: Dict[str, Any] = {
             "model": self.model_id,
-            "messages": messages,
+            "messages": _deepseek_text_only_messages(messages),
             "temperature": self._map_generic_temperature(thinking_intensity, temperature),
         }
         if max_tokens:

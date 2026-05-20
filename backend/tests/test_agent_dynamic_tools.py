@@ -82,6 +82,45 @@ class TestAgentSessionDynamicTools:
             # 验证 system prompt 被刷新
             assert session.messages[0]["role"] == "system"
 
+    def test_new_session_marks_mcp_dirty(self, session):
+        # New sessions defer MCP refresh to the first run() so that
+        # /api/sessions/resolve isn't blocked on server enumeration.
+        assert session._mcp_tools_dirty is True
+
+    def test_ensure_mcp_tools_ready_triggers_refresh_once(self, session):
+        session.mark_mcp_dirty()
+        mock_server = MagicMock()
+        mock_server.id = "lazy"
+        mock_server.connected = True
+        lazy_tool = MagicMock()
+        lazy_tool.name = "ping"
+        lazy_tool.description = "Ping"
+        lazy_tool.parameters = {}
+        mock_server.tools = [lazy_tool]
+
+        with patch("app.mcp.manager.get_mcp_manager") as mock_get_manager:
+            mock_manager = MagicMock()
+            mock_manager.list_servers.return_value = [mock_server]
+            mock_get_manager.return_value = mock_manager
+
+            session._ensure_mcp_tools_ready()
+            assert "mcp_lazy_ping" in session.dynamic_registry.list_names()
+            assert session._mcp_tools_dirty is False
+            assert mock_manager.list_servers.call_count == 1
+
+            # Second call without re-marking dirty must be a no-op.
+            session._ensure_mcp_tools_ready()
+            assert mock_manager.list_servers.call_count == 1
+
+    def test_ensure_mcp_tools_ready_keeps_dirty_on_failure(self, session):
+        session.mark_mcp_dirty()
+        with patch("app.mcp.manager.get_mcp_manager") as mock_get_manager:
+            mock_get_manager.side_effect = RuntimeError("manager unavailable")
+            # Failure must be swallowed so a single MCP hiccup doesn't kill the
+            # turn, but the flag must remain set so the next turn retries.
+            session._ensure_mcp_tools_ready()
+            assert session._mcp_tools_dirty is True
+
     def test_refresh_mcp_tools_clears_old(self, session):
         # 先注册一个旧工具
         old_proxy = McpToolProxy("old", "tool", "desc", {})

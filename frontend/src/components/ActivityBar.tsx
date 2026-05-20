@@ -13,10 +13,12 @@ import {
 import { type SidebarSection, type AgentType } from '../types';
 import { cn } from './ui/cn';
 import { Tooltip } from './ui/Tooltip';
+import { displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 
 interface ActivityBarProps {
   activeSection: SidebarSection;
   activeAgent: AgentType;
+  agentProfiles?: AgentProfileMap;
   sidebarCollapsed: boolean;
   onSectionChange: (section: SidebarSection) => void;
   onAgentChange: (agent: AgentType) => void;
@@ -46,6 +48,7 @@ const SECTION_ITEMS: ActivityItem[] = [
 export const ActivityBar: React.FC<ActivityBarProps> = ({
   activeSection,
   activeAgent,
+  agentProfiles,
   sidebarCollapsed,
   onSectionChange,
   onAgentChange,
@@ -87,8 +90,9 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
       <div className="flex flex-col items-center gap-1 mb-2">
         {AGENT_ITEMS.map((item) => {
           const isActive = activeAgent === item.id;
+          const agentName = displayNameForAgent(item.id as AgentType, agentProfiles);
           return (
-            <Tooltip key={item.id} content={<span className="text-[11px]">{item.label} Agent</span>} side="right">
+            <Tooltip key={item.id} content={<span className="text-[11px]">{agentName}</span>} side="right">
               <button
                 type="button"
                 onClick={() => handleAgentClick(item.id as AgentType)}
@@ -100,13 +104,13 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
                       : 'bg-success/10 text-success ring-1 ring-success/30'
                     : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
                 )}
-                aria-label={`${item.label} Agent`}
+                aria-label={agentName}
               >
                 <item.icon className="w-5 h-5" />
                 {agentRunning[item.id as AgentType] && (
                   <Loader2
                     className="absolute -top-0.5 -right-0.5 w-3 h-3 animate-spin text-success"
-                    aria-label={`${item.label} Agent running`}
+                    aria-label={`${agentName} running`}
                   />
                 )}
               </button>

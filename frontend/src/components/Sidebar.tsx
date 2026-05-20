@@ -10,7 +10,7 @@ import { ProjectInfo, FileNode, SidebarSection, type AgentType, type SessionHist
 import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
-import { AGENT_LABEL } from '../lib/agentProfiles';
+import { AGENT_LABEL, displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 import { type ProjectHistoryAction } from './SessionHistoryPanel';
 import { WorkspacePanel } from './WorkspacePanel';
 import type { PersonalWorkspaceTab } from './PersonalWorkspace/PersonalWorkspacePanel';
@@ -18,6 +18,7 @@ import type { PersonalWorkspaceTab } from './PersonalWorkspace/PersonalWorkspace
 interface SidebarProps {
   activeSection: SidebarSection;
   activeAgent?: AgentType;
+  agentProfiles?: AgentProfileMap;
   onSectionChange: (section: SidebarSection) => void;
   onAgentChange?: (agent: AgentType) => void;
   agentModel?: string;
@@ -60,6 +61,7 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
   activeAgent = 'personal',
+  agentProfiles,
   onSectionChange,
   agentModel = '',
   onOpenPersonalWorkspace,
@@ -98,6 +100,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const { theme, setTheme } = useTheme();
   const { t, i18n } = useTranslation();
+  const activeDisplayName = displayNameForAgent(activeAgent, agentProfiles);
 
   const changeLanguage = (lng: string) => {
     i18n.changeLanguage(lng);
@@ -121,7 +124,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="flex-1 overflow-y-auto p-3">
         {activeSection === 'personal' && (
           <div className="space-y-4">
-            <div className="text-xs font-medium text-fg-muted">Personal Agent</div>
+            <div className="text-xs font-medium text-fg-muted">{activeDisplayName}</div>
 
             {/* Persona section */}
             <div>
@@ -184,6 +187,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {(activeSection === 'workspace' || activeSection === 'coding') && (
           <div className="h-full">
             <WorkspacePanel
+              agentProfiles={agentProfiles}
               sessionHistory={sessionHistory}
               sessions={sessions}
               currentSession={currentSession}

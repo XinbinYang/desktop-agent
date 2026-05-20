@@ -1,11 +1,13 @@
 import React from 'react';
 import { X, ArrowRight } from 'lucide-react';
 import type { AgentType } from '../types';
+import { displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 
 interface SwitchAgentModalProps {
   isOpen: boolean;
   from: AgentType;
   to: AgentType;
+  agentProfiles?: AgentProfileMap;
   reason: string;
   onSwitch: () => void;
   onDismiss: () => void;
@@ -16,6 +18,7 @@ export const SwitchAgentModal: React.FC<SwitchAgentModalProps> = ({
   isOpen,
   from,
   to,
+  agentProfiles,
   reason,
   onSwitch,
   onDismiss,
@@ -23,8 +26,7 @@ export const SwitchAgentModal: React.FC<SwitchAgentModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const agentName = (type: AgentType) =>
-    type === 'personal' ? 'Personal Agent' : 'Coding Agent';
+  const agentName = (type: AgentType) => displayNameForAgent(type, agentProfiles);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">

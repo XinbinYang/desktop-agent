@@ -12,6 +12,12 @@ function messageType(data: object): string {
   return typeof (data as { type?: unknown }).type === 'string' ? (data as { type: string }).type : '';
 }
 
+function closeEventDetails(event?: CloseEvent): string {
+  if (!event) return 'code=unknown wasClean=unknown';
+  const reason = event.reason ? ` reason="${event.reason}"` : '';
+  return `code=${event.code} wasClean=${event.wasClean}${reason}`;
+}
+
 type MessageSubscriber = (msg: WS_EVENT) => void;
 type ConnectionSubscriber = (connected: boolean) => void;
 
@@ -105,7 +111,7 @@ function openWebSocket(entry: SharedSocketEntry) {
     notifyConnection(entry, false);
     if (!entry.shouldReconnect || entry.messageSubscribers.size === 0) return;
     if (event?.code !== 1000) {
-      console.warn('WS closed:', { code: event?.code, reason: event?.reason, wasClean: event?.wasClean });
+      console.warn(`WS closed for session ${entry.sessionId}: ${closeEventDetails(event)}`);
     }
     if (typeof event?.code === 'number' && STOP_RECONNECT_CLOSE_CODES.has(event.code)) {
       entry.shouldReconnect = false;
@@ -125,8 +131,8 @@ function openWebSocket(entry: SharedSocketEntry) {
     scheduleReconnect(entry);
   };
 
-  ws.onerror = (err) => {
-    console.error('WS error:', err);
+  ws.onerror = () => {
+    console.error(`WS error for session ${entry.sessionId}: readyState=${ws.readyState}`);
   };
 }
 

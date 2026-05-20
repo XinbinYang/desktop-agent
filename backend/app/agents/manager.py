@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,29 @@ _AGENT_DEFAULT_ROLE: Dict[str, str] = {
     "personal": "desktop-agent",
     "coding": "code-expert",
 }
+
+_AGENT_TYPE_LABEL: Dict[str, str] = {
+    "personal": "Personal Agent",
+    "coding": "Coding Agent",
+}
+
+_DEFAULT_PROFILE: Dict[str, Dict[str, str]] = {
+    "personal": {
+        "display_name": "Personal Agent",
+        "avatar_emoji": "",
+        "subtitle": "Personal AI companion",
+    },
+    "coding": {
+        "display_name": "Coding Agent",
+        "avatar_emoji": "",
+        "subtitle": "Engineering specialist",
+    },
+}
+
+_PROFILE_FILENAME = "profile.json"
+_PROFILE_DISPLAY_NAME_MAX = 80
+_PROFILE_SUBTITLE_MAX = 160
+_PROFILE_AVATAR_MAX = 16
 
 
 class AgentManager:
@@ -331,6 +355,271 @@ class AgentManager:
     # ──────────────────────────────────────────────
     # Workspace file management
     # ──────────────────────────────────────────────
+
+    # Agent profile metadata
+
+    @classmethod
+    def _profile_path(cls, agent_type: str) -> Path:
+        if agent_type == "personal":
+            return cls._personal_workspace_dir() / _PROFILE_FILENAME
+        return cls._agents_root() / agent_type / _PROFILE_FILENAME
+
+    @classmethod
+    def _type_label(cls, agent_type: str) -> str:
+        return _AGENT_TYPE_LABEL.get(agent_type, "Agent")
+
+    @classmethod
+    def _default_profile_values(cls, agent_type: str) -> Dict[str, str]:
+        return dict(_DEFAULT_PROFILE.get(agent_type, {
+            "display_name": cls._type_label(agent_type),
+            "avatar_emoji": "",
+            "subtitle": "",
+        }))
+
+    @classmethod
+    def _sanitize_profile_text(cls, value: Any, fallback: str = "", max_len: int = 80) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            text = fallback
+        return text[:max_len]
+
+    @classmethod
+    def _build_profile(
+        cls,
+        agent_type: str,
+        values: Optional[Dict[str, Any]] = None,
+        source: str = "default",
+    ) -> Dict[str, Any]:
+        defaults = cls._default_profile_values(agent_type)
+        values = values or {}
+        display_name = cls._sanitize_profile_text(
+            values.get("display_name") or values.get("name"),
+            defaults["display_name"],
+            _PROFILE_DISPLAY_NAME_MAX,
+        )
+        avatar_emoji = cls._sanitize_profile_text(
+            values.get("avatar_emoji") or values.get("emoji"),
+            defaults.get("avatar_emoji", ""),
+            _PROFILE_AVATAR_MAX,
+        )
+        subtitle = cls._sanitize_profile_text(
+            values.get("subtitle") or values.get("description") or values.get("role"),
+            defaults.get("subtitle", ""),
+            _PROFILE_SUBTITLE_MAX,
+        )
+        updated_at = cls._sanitize_profile_text(
+            values.get("updated_at"),
+            datetime.now().isoformat(timespec="seconds"),
+            40,
+        )
+        return {
+            "agent_type": agent_type,
+            "display_name": display_name,
+            "type_label": cls._type_label(agent_type),
+            "avatar_emoji": avatar_emoji,
+            "subtitle": subtitle,
+            "updated_at": updated_at,
+            "source": source,
+        }
+
+    @classmethod
+    def _read_profile_json(cls, agent_type: str) -> Optional[Dict[str, Any]]:
+        path = cls._profile_path(agent_type)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return cls._build_profile(agent_type, data, source="profile.json")
+
+    @classmethod
+    def _strip_wrapping_marks(cls, value: str) -> str:
+        value = value.strip().strip('"').strip("'").strip()
+        value = value.strip("`*_ ")
+        return value.strip()
+
+    @classmethod
+    def _parse_identity_profile(cls) -> Optional[Dict[str, Any]]:
+        identity = cls.load_workspace_file("personal", "IDENTITY.md")
+        if not identity.strip():
+            return None
+
+        frontmatter: Dict[str, str] = {}
+        body = identity
+        if identity.startswith("---"):
+            end = identity.find("---", 3)
+            if end != -1:
+                raw_frontmatter = identity[3:end]
+                body = identity[end + 3:]
+                for line in raw_frontmatter.splitlines():
+                    key, sep, value = line.partition(":")
+                    if sep:
+                        frontmatter[key.strip().lower()] = cls._strip_wrapping_marks(value)
+
+        body_values: Dict[str, str] = {}
+        patterns = {
+            "display_name": [
+                r"^\s*[-*]?\s*\*\*(?:名字|名称)\s*[：:]\*\*\s*(.+?)\s*$",
+                r"^\s*[-*]?\s*\*\*(?:名字|名称)\*\*\s*[：:]\s*(.+?)\s*$",
+            ],
+            "avatar_emoji": [
+                r"^\s*[-*]?\s*\*\*(?:Emoji|emoji)\s*[：:]\*\*\s*(.+?)\s*$",
+                r"^\s*[-*]?\s*\*\*(?:Emoji|emoji)\*\*\s*[：:]\s*(.+?)\s*$",
+            ],
+            "subtitle": [
+                r"^\s*[-*]?\s*\*\*(?:角色|定位)\s*[：:]\*\*\s*(.+?)\s*$",
+                r"^\s*[-*]?\s*\*\*(?:角色|定位)\*\*\s*[：:]\s*(.+?)\s*$",
+            ],
+        }
+        for line in body.splitlines():
+            for key, key_patterns in patterns.items():
+                if key in body_values:
+                    continue
+                for pattern in key_patterns:
+                    match = re.match(pattern, line)
+                    if match:
+                        body_values[key] = cls._strip_wrapping_marks(match.group(1))
+                        break
+
+        default_name = cls._default_profile_values("personal")["display_name"]
+        frontmatter_name = frontmatter.get("name", "")
+        display_name = body_values.get("display_name") or frontmatter_name
+        if frontmatter_name and frontmatter_name != default_name:
+            display_name = frontmatter_name
+
+        parsed = {
+            "display_name": display_name,
+            "avatar_emoji": body_values.get("avatar_emoji") or frontmatter.get("avatar_emoji") or frontmatter.get("emoji"),
+            "subtitle": body_values.get("subtitle") or frontmatter.get("description") or frontmatter.get("subtitle"),
+        }
+        if not any(str(v or "").strip() for v in parsed.values()):
+            return None
+        return cls._build_profile("personal", parsed, source="IDENTITY.md")
+
+    @classmethod
+    def _write_profile_json(cls, profile: Dict[str, Any]) -> bool:
+        agent_type = str(profile.get("agent_type") or "")
+        if agent_type not in cls.BUILTIN_AGENTS:
+            return False
+        path = cls._profile_path(agent_type)
+        data = {k: profile.get(k, "") for k in (
+            "agent_type",
+            "display_name",
+            "type_label",
+            "avatar_emoji",
+            "subtitle",
+            "updated_at",
+            "source",
+        )}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return True
+        except OSError as e:
+            logger.warning("Failed to write agent profile %s: %s", path, e)
+            return False
+
+    @classmethod
+    def get_agent_profile(cls, agent_type: str) -> Dict[str, Any]:
+        """Return stable UI profile metadata for an agent type."""
+        if agent_type not in cls.BUILTIN_AGENTS:
+            agent_type = "personal"
+
+        profile = cls._read_profile_json(agent_type)
+        if profile:
+            return profile
+
+        if agent_type == "personal":
+            profile = cls._parse_identity_profile()
+            if profile:
+                cls._write_profile_json({**profile, "source": "profile.json"})
+                return profile
+
+        profile = cls._build_profile(agent_type, source="default")
+        if agent_type == "personal":
+            cls._write_profile_json({**profile, "source": "profile.json"})
+        return profile
+
+    @classmethod
+    def save_agent_profile(
+        cls,
+        agent_type: str,
+        updates: Dict[str, Any],
+        sync_identity: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist editable profile metadata. Only Personal is user-editable for now."""
+        if agent_type not in cls.BUILTIN_AGENTS:
+            return None
+        current = cls.get_agent_profile(agent_type)
+        merged = {
+            **current,
+            **{k: v for k, v in updates.items() if v is not None},
+            "agent_type": agent_type,
+            "type_label": cls._type_label(agent_type),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "profile.json",
+        }
+        profile = cls._build_profile(agent_type, merged, source="profile.json")
+        if not cls._write_profile_json(profile):
+            return None
+        if sync_identity and agent_type == "personal":
+            cls._sync_personal_identity_profile(profile)
+        return profile
+
+    @classmethod
+    def _sync_personal_identity_profile(cls, profile: Dict[str, Any]) -> None:
+        """Best-effort sync of display fields back into IDENTITY.md."""
+        display_name = str(profile.get("display_name") or "").strip()
+        avatar_emoji = str(profile.get("avatar_emoji") or "").strip()
+        if not display_name:
+            return
+
+        path = cls._resolve_path("personal", "IDENTITY.md")
+        try:
+            content = path.read_text(encoding="utf-8") if path.exists() else ""
+        except (OSError, UnicodeDecodeError):
+            content = ""
+
+        if not content.strip():
+            content = "# IDENTITY.md\n\n## Profile\n\n- **名字：** " + display_name + "\n"
+            if avatar_emoji:
+                content += "- **Emoji：** " + avatar_emoji + "\n"
+        else:
+            content = cls._replace_or_insert_identity_field(content, ("名字", "名称"), display_name)
+            if avatar_emoji:
+                content = cls._replace_or_insert_identity_field(content, ("Emoji", "emoji"), avatar_emoji)
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to sync IDENTITY.md profile fields: %s", e)
+
+    @classmethod
+    def _replace_or_insert_identity_field(cls, content: str, labels: tuple[str, ...], value: str) -> str:
+        lines = content.splitlines()
+        label_pattern = "|".join(re.escape(label) for label in labels)
+        patterns = [
+            re.compile(rf"^(\s*[-*]?\s*\*\*(?:{label_pattern})\s*[：:]\*\*\s*).*$"),
+            re.compile(rf"^(\s*[-*]?\s*\*\*(?:{label_pattern})\*\*\s*[：:]\s*).*$"),
+        ]
+        for i, line in enumerate(lines):
+            for pattern in patterns:
+                match = pattern.match(line)
+                if match:
+                    lines[i] = match.group(1) + value
+                    return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+
+        insert_at = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("##"):
+                insert_at = i + 1
+                break
+        label = labels[0]
+        lines.insert(insert_at, f"- **{label}：** {value}")
+        return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
 
     @classmethod
     def _resolve_path(cls, agent_type: str, filename: str) -> Path:

@@ -696,6 +696,37 @@ class TestWebSocket:
             snapshot = client.get(f"/api/sessions/{sid}").json()
             assert snapshot["task_guidance_items"] == []
 
+    def test_websocket_chat_after_done_starts_new_turn(self, client, monkeypatch):
+        """A chat sent after done is a normal new turn, not task guidance."""
+        from app.agent import AgentSession
+
+        calls = []
+
+        async def fast_run(self, user_input, *args, **kwargs):
+            calls.append(user_input)
+            yield {"type": "status", "data": {"status": "thinking"}}
+            yield {"type": "content", "data": {"text": f"answer: {user_input}"}}
+            yield {"type": "status", "data": {"status": "completed"}}
+
+        monkeypatch.setattr(AgentSession, "run", fast_run)
+        sid = f"test_after_done_chat_{uuid.uuid4().hex}"
+
+        with client.websocket_connect(f"/ws/{sid}") as ws:
+            ws.send_json({"type": "chat", "text": "first", "model_id": "gpt-4o"})
+            receive_until(ws, "done")
+
+            ws.send_json({"type": "chat", "text": "second", "model_id": "gpt-4o"})
+            seen = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                seen.append(msg["type"])
+                if msg.get("type") == "done":
+                    break
+
+        assert calls == ["first", "second"]
+        assert "task_guidance_queued" not in seen
+        assert "content" in seen
+
     def test_websocket_plan_chat_emits_plan_draft(self, client):
         """Plan mode: LLM calls plan_write_draft → frontend receives plan_draft."""
         from unittest.mock import patch
@@ -1017,6 +1048,63 @@ class TestWebSocket:
             ws.send_json({"type": "clear"})
             msg = receive_until(ws, "cleared")
             assert msg["type"] == "cleared"
+
+    def test_websocket_reset_context_preserves_visible_history_without_model_run(self, client):
+        from unittest.mock import patch
+
+        from app.agent import get_or_create_session
+
+        sid = f"test_reset_context_{uuid.uuid4().hex}"
+        session = get_or_create_session(sid, "gpt-4o")
+        session.messages.append({"role": "user", "content": "old visible request", "source": "user"})
+        session.messages.append({"role": "assistant", "content": "old visible answer"})
+        session._save()
+
+        with patch("app.agent.ModelRouter.chat_completion_non_stream") as mocked_completion:
+            with client.websocket_connect(f"/ws/{sid}") as ws:
+                ws.send_json({
+                    "type": "reset_context",
+                    "command": "reset",
+                    "greet": False,
+                    "model_id": "gpt-4o",
+                })
+                reset = receive_until(ws, "context_reset")
+                snapshot = receive_until(ws, "history_snapshot")
+
+        assert mocked_completion.call_count == 0
+        assert reset["data"]["command"] == "reset"
+        assert reset["data"]["context_epoch"] == 1
+        visible_text = "\n".join(str(m.get("content", "")) for m in snapshot["data"]["messages"])
+        assert "old visible request" in visible_text
+        assert "Context reset - model: gpt-4o" in visible_text
+        assert snapshot["data"]["context_usage"]["archived_message_count"] >= 1
+
+    def test_websocket_new_context_generates_greeting_without_visible_internal_prompt(self, client):
+        from unittest.mock import patch
+
+        async def fake_completion(self, *args, **kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "New context is ready. What shall we do next?"}}]}
+
+        sid = f"test_new_context_{uuid.uuid4().hex}"
+        with patch("app.agent.ModelRouter.chat_completion_non_stream", fake_completion):
+            with client.websocket_connect(f"/ws/{sid}") as ws:
+                ws.send_json({
+                    "type": "reset_context",
+                    "command": "new",
+                    "greet": True,
+                    "model_id": "gpt-4o",
+                })
+                reset = receive_until(ws, "context_reset")
+                content = receive_until(ws, "content")
+                done = receive_until(ws, "done")
+
+        assert reset["data"]["command"] == "new"
+        assert "New context is ready" in content["data"]["text"]
+        assert done["type"] == "done"
+        snap = client.get(f"/api/sessions/{sid}").json()
+        visible_text = "\n".join(str(m.get("content", "")) for m in snap["messages"])
+        assert "New session started - model: gpt-4o" in visible_text
+        assert "hidden instruction" not in visible_text.lower()
 
     def test_websocket_tool_direct(self, client):
         """WebSocket tool_direct message type"""

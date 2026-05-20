@@ -27,10 +27,15 @@ class SessionRuntime:
         self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
         self._lock = asyncio.Lock()
         self._deleted = False
+        self._accepts_task_guidance = False
 
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def accepts_task_guidance(self) -> bool:
+        return self.is_running and self._accepts_task_guidance
 
     @property
     def is_deleted(self) -> bool:
@@ -62,6 +67,7 @@ class SessionRuntime:
                 raise RuntimeError(f"Session {self.session_id} has been deleted")
             await self._cancel_locked(session, broadcast=False)
             self._loop = asyncio.get_running_loop()
+            self._accepts_task_guidance = True
             self._task = asyncio.create_task(self._run(session, run_factory))
 
     async def cancel(self, session: Optional[AgentSession] = None, *, broadcast: bool = True) -> None:
@@ -81,6 +87,7 @@ class SessionRuntime:
         if task is None or task.done():
             self._task = None
             self._loop = None
+            self._accepts_task_guidance = False
             return
         owner_loop = self._loop
         current_loop = asyncio.get_running_loop()
@@ -91,6 +98,7 @@ class SessionRuntime:
             await self._cancel_task_on_owner_loop(task)
         self._task = None
         self._loop = None
+        self._accepts_task_guidance = False
         if broadcast:
             self.publish({"type": "interrupted", "data": {"message": "Session run cancelled"}})
 
@@ -99,23 +107,67 @@ class SessionRuntime:
         with suppress(asyncio.CancelledError):
             await task
 
+    async def wait_until_idle(self) -> None:
+        task = self._task
+        if task is None or task.done():
+            return
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(task)
+
+    @staticmethod
+    def _is_terminal_event(event: Dict[str, Any]) -> bool:
+        etype = event.get("type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if etype == "status":
+            return data.get("status") in {
+                "completed",
+                "max_iterations_reached",
+                "cancelled",
+                "failed",
+            }
+        if etype == "run_completed":
+            return data.get("status") in {
+                "completed",
+                "max_iterations_reached",
+                "cancelled",
+                "failed",
+            }
+        if etype == "error":
+            return True
+        return False
+
+    def _schedule_personal_heartbeat(self, session: AgentSession) -> None:
+        if session.agent_type != "personal":
+            return
+
+        async def _run_heartbeat() -> None:
+            try:
+                from app.agents.heartbeat import HeartbeatEngine
+
+                await HeartbeatEngine.on_session_end(
+                    session.heartbeat_transcript_messages(),
+                    session.session_id,
+                )
+            except Exception:
+                pass
+
+        asyncio.create_task(_run_heartbeat())
+
     async def _run(self, session: AgentSession, run_factory: RunFactory) -> None:
         current_task = asyncio.current_task()
         token = set_worker_event_callback(self.publish)
         try:
             async for event in run_factory():
+                if self._is_terminal_event(event):
+                    self._accepts_task_guidance = False
                 self.publish(event)
+            self._accepts_task_guidance = False
             self.publish({"type": "done"})
-            if session.agent_type == "personal":
-                try:
-                    from app.agents.heartbeat import HeartbeatEngine
-
-                    await HeartbeatEngine.on_session_end(session.messages, session.session_id)
-                except Exception:
-                    pass
+            self._schedule_personal_heartbeat(session)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._accepts_task_guidance = False
             self.publish({"type": "error", "data": categorize_exception(exc)})
             self.publish({"type": "done"})
         finally:
@@ -123,6 +175,7 @@ class SessionRuntime:
             if self._task is current_task:
                 self._task = None
                 self._loop = None
+                self._accepts_task_guidance = False
 
 
 _session_runtimes: Dict[str, SessionRuntime] = {}
@@ -141,6 +194,7 @@ def session_runtime_status(session_id: str) -> Dict[str, Any]:
     return {
         "session_id": session_id,
         "is_running": bool(runtime and runtime.is_running),
+        "accepts_task_guidance": bool(runtime and runtime.accepts_task_guidance),
         "is_deleted": bool(runtime and runtime.is_deleted),
     }
 

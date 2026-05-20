@@ -20,6 +20,7 @@ export type TimelineEventKind =
   | 'todo'
   | 'knowledge'
   | 'image'
+  | 'notice'
   | 'error'
   | 'run_status';
 
@@ -107,6 +108,12 @@ export interface TimelineErrorEvent extends TimelineBaseEvent {
   text: string;
 }
 
+export interface TimelineNoticeEvent extends TimelineBaseEvent {
+  kind: 'notice';
+  text: string;
+  level: 'success' | 'info' | 'warning' | 'error';
+}
+
 export interface TimelineRunStatusEvent extends TimelineBaseEvent {
   kind: 'run_status';
   event: RunEvent;
@@ -123,6 +130,7 @@ export type TimelineEvent =
   | TimelineTodoEvent
   | TimelineKnowledgeEvent
   | TimelineImageEvent
+  | TimelineNoticeEvent
   | TimelineErrorEvent
   | TimelineRunStatusEvent;
 
@@ -358,6 +366,17 @@ export function buildTimelineEvents({
     }
 
     if (message.role === 'system') {
+      if (message.source === 'command_notice') {
+        events.push({
+          id: `notice:${message.id}`,
+          kind: 'notice',
+          timestamp: baseTimestamp,
+          messageId: message.id,
+          text: message.content,
+          level: message.noticeLevel || 'success',
+        });
+        return;
+      }
       events.push({
         id: `system:${message.id}`,
         kind: 'error',

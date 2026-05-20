@@ -139,7 +139,7 @@ describe('PaneRenderer', () => {
       },
     });
 
-    expect(screen.getByText('Personal')).toBeInTheDocument();
+    expect(screen.getByText('Personal Agent')).toBeInTheDocument();
     expect(screen.getByText('Planning work')).toBeInTheDocument();
     expect(screen.getByDisplayValue('GPT Test')).toBeInTheDocument();
   });

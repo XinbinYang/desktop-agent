@@ -25,6 +25,7 @@ vi.mock('../components/session/SessionView', async () => {
   const actions = {
     sendMessage: vi.fn(),
     clearSession: vi.fn(),
+    resetContext: vi.fn(),
     compactSession: vi.fn(),
     loadCheckpoints: vi.fn(async () => []),
     rewindToCheckpoint: vi.fn(),
@@ -210,6 +211,43 @@ describe('App', () => {
     // Initially disconnected until WS connects
     expect(screen.getByText('○ Ready')).toBeInTheDocument()
   })
+  it('keeps the product brand while using the Personal Agent display name in the session title', async () => {
+    global.fetch = vi.fn((url: string) => {
+      if (url.endsWith('/api/agents')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            agents: [{
+              type: 'personal',
+              name: 'Personal Agent',
+              description: '',
+              profile: {
+                agent_type: 'personal',
+                display_name: '镜与刃',
+                type_label: 'Personal Agent',
+                avatar_emoji: '',
+                subtitle: '',
+                source: 'profile.json',
+              },
+            }],
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        json: () => Promise.resolve({
+          models: [
+            { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+          ],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+
+    render(<App />)
+
+    expect(await screen.findByText('Desktop Agent')).toBeInTheDocument()
+    expect(await screen.findByTitle('镜与刃 · Main')).toBeInTheDocument()
+  })
+
   it('opens and refreshes the Skills panel when a skill draft is ready', async () => {
     localStorage.setItem('desktop-agent-layout', JSON.stringify({
       activeSection: 'workspace',

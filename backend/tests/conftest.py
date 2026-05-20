@@ -1,6 +1,7 @@
 import pytest
 import pytest_asyncio
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -91,10 +92,16 @@ def reset_config_cache(monkeypatch, tmp_path):
         import shutil
         shutil.copy2(config.CONFIG_PATH, temp_config)
     else:
-        temp_config.write_text(
-            "providers: {}\nsettings: {default_model: '', default_provider: '', max_iterations: 50}\n",
-            encoding="utf-8",
-        )
+        from app.runtime_paths import bundled_config_path
+        import shutil
+        bundled_config = bundled_config_path()
+        if bundled_config.exists():
+            shutil.copy2(bundled_config, temp_config)
+        else:
+            temp_config.write_text(
+                "providers: {}\nsettings: {default_model: '', default_provider: '', max_iterations: 50}\n",
+                encoding="utf-8",
+            )
     monkeypatch.setattr(config, "CONFIG_PATH", temp_config)
     config._config = None
 
@@ -112,12 +119,18 @@ def reset_local_auth(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clean_sessions(monkeypatch):
-    """Lightweight: clear in-memory sessions without importing litellm cascade."""
+    """Isolate runtime transcript/memory state and clear in-memory sessions."""
     # Delay import to avoid triggering app.models -> litellm at fixture evaluation
     from app.agent import _sessions
+    from app.session_runtime import _session_runtimes
+
+    shutil.rmtree(TEST_USER_DATA_DIR, ignore_errors=True)
     _sessions.clear()
+    _session_runtimes.clear()
     yield
     _sessions.clear()
+    _session_runtimes.clear()
+    shutil.rmtree(TEST_USER_DATA_DIR, ignore_errors=True)
 
 
 @pytest.fixture

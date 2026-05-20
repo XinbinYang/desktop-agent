@@ -1276,7 +1276,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     if requested_chat_mode in ("agent", "plan")
                     else session.chat_mode
                 )
-                if runtime.is_running:
+                if runtime.accepts_task_guidance:
                     try:
                         item = session.queue_task_guidance(
                             user_text,
@@ -1304,6 +1304,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                             },
                         })
                     continue
+                if runtime.is_running:
+                    await runtime.wait_until_idle()
 
                 async def _run_agent_events(
                     session=session,
@@ -1332,9 +1334,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         msg.get("image_base64"),
                         item_id=msg.get("guidance_id") or msg.get("id"),
                     )
-                    applied = session.apply_task_guidance() if runtime.is_running else []
+                    accepts_guidance = runtime.accepts_task_guidance
+                    applied = session.apply_task_guidance() if accepts_guidance else []
                 except ValueError as exc:
                     await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                if not accepts_guidance:
+                    item.status = "stale"
+                    stale_payload = item.model_dump()
+                    session.delete_task_guidance(item.id)
+                    await send_event({
+                        "type": "task_guidance_stale",
+                        "data": {
+                            "items": [stale_payload],
+                            "all_items": session.active_task_guidance_items(),
+                            "auto_follow_up_now": not runtime.is_running,
+                        },
+                    })
                     continue
                 await send_event({
                     "type": "task_guidance_queued",
@@ -1363,13 +1379,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         "all_items": session.active_task_guidance_items(),
                     },
                 })
-                if applied and not runtime.is_running:
+                if applied and not runtime.accepts_task_guidance:
                     stale = session.mark_applied_task_guidance_stale()
                     await send_event({
                         "type": "task_guidance_stale",
                         "data": {
                             "items": [item.model_dump() for item in stale],
                             "all_items": session.active_task_guidance_items(),
+                            "auto_follow_up_now": not runtime.is_running,
                         },
                     })
 
@@ -1449,7 +1466,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     "type": "agent_switched",
                     "data": {
                         "agent_type": target_agent,
-                        "name": "Personal Agent" if target_agent == "personal" else "Coding Agent",
+                        "name": AgentManager.get_agent_profile(target_agent).get("display_name"),
                         "session_id": resolved.get("id"),
                         "model_id": resolved.get("model_id"),
                         "created": resolved.get("created"),
@@ -1465,6 +1482,39 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await send_event({"type": "cleared"})
                 await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
                 await send_event({"type": "context_usage", "data": session.context_usage()})
+
+            elif msg_type == "reset_context":
+                command_name = str(msg.get("command") or "reset").strip().lower()
+                if command_name not in ("reset", "new"):
+                    command_name = "reset"
+                model_id = msg.get("model_id", current_model)
+                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
+                current_model = model_id
+                current_role_id = role_id
+                current_agent_type = agent_type
+                try:
+                    session = get_or_create_session(session_id, model_id, role_id, agent_type=agent_type)
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                await runtime.cancel(session, broadcast=False)
+                cancel_workers_for_session(session_id)
+                clear_recorder(session_id)
+                reset_payload = session.start_new_context(command_name)
+                greet = bool(msg.get("greet", command_name == "new"))
+                await send_event({"type": "context_reset", "data": {**reset_payload, "greet": greet}})
+                await send_event({"type": "chat_mode", "data": {"chat_mode": session.chat_mode}})
+                await send_event({"type": "plan_status", "data": session.plan_event_payload()})
+                await send_event({"type": "todo_update", "data": {"todos": [t.model_dump() for t in session.plan_state.todos]}})
+                await send_event({"type": "history_snapshot", "data": session.to_snapshot()})
+                await send_event({"type": "context_usage", "data": session.context_usage()})
+                if greet:
+                    async def _new_context_greeting_events(session=session):
+                        async for event in session.generate_new_context_greeting():
+                            yield event
+
+                    await runtime.start(session, _new_context_greeting_events)
 
             elif msg_type == "set_chat_mode":
                 mode = msg.get("chat_mode") or msg.get("chatMode") or "agent"
@@ -1744,7 +1794,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     "type": "agent_switched",
                     "data": {
                         "agent_type": agent_type,
-                        "name": "Personal Agent" if agent_type == "personal" else "Coding Agent",
+                        "name": AgentManager.get_agent_profile(agent_type).get("display_name"),
                         "model_id": session.model_id,
                         "thinking_intensity": session.thinking_intensity,
                     },
@@ -1763,7 +1813,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 current_agent_type = agent_type
                 await send_event({
                     "type": "agent_switched",
-                    "data": {"agent_type": agent_type, "name": "Personal Agent" if agent_type == "personal" else "Coding Agent"},
+                    "data": {"agent_type": agent_type, "name": AgentManager.get_agent_profile(agent_type).get("display_name")},
                 })
 
             elif msg_type == "switch_project":
@@ -1850,7 +1900,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Do not cancel the session-owned runtime here.
         if not runtime.is_running:
             try:
-                asyncio.create_task(HeartbeatEngine.on_session_end(session.messages, session_id))
+                asyncio.create_task(
+                    HeartbeatEngine.on_session_end(
+                        session.heartbeat_transcript_messages(),
+                        session_id,
+                    )
+                )
             except Exception:
                 pass
     except Exception as e:

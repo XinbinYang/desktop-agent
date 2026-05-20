@@ -5,6 +5,7 @@ import type { ProjectInfo, FileNode, SessionHistoryItem, SessionHistoryResponse 
 import { ProjectPanel } from './ProjectPanel';
 import type { FileTreeAction } from './FileTree';
 import { SessionHistoryPanel, type ProjectHistoryAction } from './SessionHistoryPanel';
+import type { AgentProfileMap } from '../lib/agentProfiles';
 
 const LAYOUT_KEY = 'desktop-agent-workspace-split';
 const DEFAULT_LAYOUT: Record<string, number> = { 'ws-sessions': 58, 'ws-files': 42 };
@@ -26,6 +27,7 @@ interface WorkspacePanelProps {
   // Top zone — projects & sessions
   sessionHistory?: SessionHistoryResponse | null;
   sessions?: SessionHistoryItem[];
+  agentProfiles?: AgentProfileMap;
   currentSession?: string;
   currentProjectPath?: string | null;
   onNewSession?: () => void;
@@ -55,6 +57,7 @@ interface WorkspacePanelProps {
 export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   sessionHistory = null,
   sessions = [],
+  agentProfiles,
   currentSession,
   currentProjectPath,
   onNewSession,
@@ -148,6 +151,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
           <SessionHistoryPanel
             history={sessionHistory}
             fallbackSessions={sessions}
+            agentProfiles={agentProfiles}
             currentSession={currentSession}
             currentProjectPath={currentProjectPath}
             onSwitchSession={onSwitchSession}

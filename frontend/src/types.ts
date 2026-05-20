@@ -32,6 +32,9 @@ export interface ContextUsage {
   context_estimated_tokens?: number;
   context_truncated?: boolean;
   compaction_active?: boolean;
+  context_epoch?: number;
+  archived_message_count?: number;
+  context_reset_active?: boolean;
   compacted_through_checkpoint_id?: string;
   summarized_message_count?: number;
   unsummarized_context_truncated?: boolean;
@@ -492,9 +495,12 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  source?: string;
+  noticeLevel?: 'success' | 'info' | 'warning' | 'error';
   messageId?: string;
   turnId?: string;
   checkpointId?: string;
+  contextEpoch?: number;
   createdAt?: number;
   imageBase64?: string;
   rawContent?: unknown;
@@ -670,6 +676,17 @@ export interface AgentInfo {
   type: AgentType;
   name: string;
   description: string;
+  profile?: AgentProfile;
+}
+
+export interface AgentProfile {
+  agent_type: AgentType;
+  display_name: string;
+  type_label: string;
+  avatar_emoji?: string;
+  subtitle?: string;
+  updated_at?: string;
+  source?: string;
 }
 
 export interface KnowledgeDoc {
@@ -702,7 +719,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'automation_snapshot' | 'automation_action' | 'automation_trace' | 'automation_replay_status' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'context_reset' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'automation_snapshot' | 'automation_action' | 'automation_trace' | 'automation_replay_status' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 

@@ -43,7 +43,15 @@ import {
   type PanelLayout,
 } from './hooks/useLayoutState';
 import { getLangFromFilename } from './lib/language';
-import { AGENT_LABEL, agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
+import {
+  DEFAULT_AGENT_PROFILES,
+  agentForRole,
+  displayNameForAgent,
+  normalizeAgentType,
+  profilesFromAgents,
+  roleForAgent,
+  type AgentProfileMap,
+} from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
@@ -194,15 +202,19 @@ function sessionShortId(sessionId: string): string {
     .replace(/^session_/, '#');
 }
 
-function sessionTitleForDisplay(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
+function sessionTitleForDisplay(
+  pane: SessionPane | null | undefined,
+  meta?: SessionListItem,
+  profiles: AgentProfileMap = DEFAULT_AGENT_PROFILES,
+): string {
   if (!pane) return 'No Session';
   const agentType = pane.agentType || normalizeAgentType(meta?.agent_type, meta?.role_id);
   if (agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')) {
-    return 'Personal Agent · Main';
+    return `${displayNameForAgent('personal', profiles)} · Main`;
   }
   const title = (meta?.title || pane.title || '').trim();
   const label = title || sessionShortId(pane.sessionId);
-  return `${AGENT_LABEL[agentType]} · ${label}`;
+  return `${displayNameForAgent(agentType, profiles)} · ${label}`;
 }
 
 function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
@@ -287,6 +299,7 @@ function apiErrorMessage(error: unknown): string {
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
   clearSession: () => {},
+  resetContext: () => {},
   compactSession: () => {},
   loadCheckpoints: async () => [],
   rewindToCheckpoint: () => {},
@@ -320,6 +333,7 @@ export default function App() {
   const { t } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [agentModels, setAgentModels] = useState<Record<string, string>>({ personal: '', coding: '' });
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfileMap>(DEFAULT_AGENT_PROFILES);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   // Pane tree — restored from localStorage or fresh default
   const initialPaneTree = React.useMemo(() => loadPersistedPaneTree('personal'), []);
@@ -374,7 +388,7 @@ export default function App() {
   const focusedSessionMeta = focusedPane ? sessionMetaById[focusedPane.sessionId] : undefined;
   const focusedAgentType = focusedPane?.agentType || layout.activeAgent;
   const focusedModel = sessionModelForPane(focusedPane, focusedSessionMeta) || agentModels[focusedAgentType] || agentModel;
-  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta);
+  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta, agentProfiles);
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -600,6 +614,17 @@ export default function App() {
       .catch(console.error);
   }, []);
 
+  const loadAgentProfiles = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/agents`);
+      const data = await res.json();
+      setAgentProfiles(profilesFromAgents(data.agents || []));
+    } catch (err) {
+      console.error('[App] Failed to load agent profiles:', err);
+      setAgentProfiles(DEFAULT_AGENT_PROFILES);
+    }
+  }, []);
+
   const sessionHistoryHasRunning = React.useMemo(() => {
     if (!sessionHistory) return false;
     const standalone = Array.isArray(sessionHistory.standalone_sessions) ? sessionHistory.standalone_sessions : [];
@@ -629,16 +654,20 @@ export default function App() {
 
     switch (command.toLowerCase()) {
       case 'new':
-        newSessionRef.current();
-        addTerminalLog('[Command] Creating a new Coding Agent session');
+        a.resetContext('new', true);
+        addTerminalLog('[Command] Starting a fresh context in this session');
+        break;
+      case 'reset':
+        a.resetContext('reset', false);
+        addTerminalLog('[Command] Resetting model context for this session');
         break;
       case 'clear':
         a.clearSession();
         addTerminalLog('[命令] 已清除会话');
         break;
       case 'help':
-        addTerminalLog('[Help] Commands: /new /clear /compact /rewind /context /help /model <model_id> /role <role_id> /project <path> /config /screenshot /skills');
-        addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
+        addTerminalLog('[Help] Commands: /new /reset /clear /compact /rewind /context /help /model <model_id> /role <role_id> /project <path> /config /screenshot /skills');
+        addTerminalLog('[Help] /new and /reset preserve visible history; /clear removes it.');
         break;
       case 'compact':
         a.compactSession(false);
@@ -657,7 +686,8 @@ export default function App() {
         const parts = Object.entries(usage.breakdown || {})
           .map(([key, value]) => `${key}:${value}`)
           .join(' ');
-        addTerminalLog(`[Context] ${usage.used_percent.toFixed(1)}% (${usage.used_tokens}/${usage.model_context}, ${usage.source}) ${parts}`);
+        const archived = usage.archived_message_count ? ` archived:${usage.archived_message_count}` : '';
+        addTerminalLog(`[Context] ${usage.used_percent.toFixed(1)}% (${usage.used_tokens}/${usage.model_context}, ${usage.source})${archived} ${parts}`);
         break;
       }
       case 'config':
@@ -823,7 +853,7 @@ export default function App() {
     };
 
     const doLoad = async () => {
-      await Promise.all([loadModels(), loadSettingsReadiness()]);
+      await Promise.all([loadModels(), loadSettingsReadiness(), loadAgentProfiles()]);
       if (!cancelled) setIsLoadingModels(false);
     };
 
@@ -857,8 +887,8 @@ export default function App() {
       const newPane = { ...leaf.pane, agentType, role: defaultRole, model: newModel };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-    addTerminalLog(`[系统] 已切换到 ${agentType === 'personal' ? 'Personal Agent' : 'Coding Agent'}`);
-  }, [layout, focusedLeafId, addTerminalLog, agentModels]);
+    addTerminalLog(`[系统] 已切换到 ${displayNameForAgent(agentType, agentProfiles)}`);
+  }, [layout, focusedLeafId, addTerminalLog, agentModels, agentProfiles]);
 
   const resolveAgentSessionClient = useCallback(async (
     agentType: AgentType,
@@ -962,9 +992,9 @@ export default function App() {
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
     loadSessions(currentProject?.path ?? null);
-    addTerminalLog(`[系统] 已切换到 ${AGENT_LABEL[agentType]}`);
+    addTerminalLog(`[系统] 已切换到 ${displayNameForAgent(agentType, agentProfiles)}`);
     return resolved.session_id;
-  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+  }, [addTerminalLog, agentModel, agentModels, agentProfiles, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
 
   const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
     await openAgentSessionInPane(agentType, agentType === 'personal' ? 'canonical' : 'last_or_create');
@@ -2297,6 +2327,7 @@ export default function App() {
         <ActivityBar
           activeSection={layout.activeSection}
           activeAgent={layout.activeAgent}
+          agentProfiles={agentProfiles}
           sidebarCollapsed={layout.sidebarCollapsed}
           onSectionChange={layout.setActiveSection}
           onAgentChange={handleAgentNavigate}
@@ -2312,6 +2343,7 @@ export default function App() {
               <Sidebar
                 activeSection={layout.activeSection}
                 activeAgent={layout.activeAgent}
+                agentProfiles={agentProfiles}
                 onSectionChange={layout.setActiveSection}
                 agentModel={focusedModel}
                 onAgentChange={handleAgentNavigate}
@@ -2440,6 +2472,7 @@ export default function App() {
           isOpen={!!switchSuggestion}
           from={switchSuggestion?.from || 'personal'}
           to={switchSuggestion?.to || 'coding'}
+          agentProfiles={agentProfiles}
           reason={switchSuggestion?.reason || ''}
           onSwitch={() => {
             if (switchSuggestion) {
@@ -2496,6 +2529,7 @@ export default function App() {
                     currentAgentType={focusedAgentType}
                     currentRole={roleForAgent(focusedAgentType)}
                     models={models}
+                    agentProfiles={agentProfiles}
                     sessionMetaById={sessionMetaById}
                     onModelChange={handlePaneModelChange}
                     onSnapshot={handleSessionSnapshot}
@@ -2595,6 +2629,11 @@ export default function App() {
               <div className="flex-1 min-h-0 overflow-hidden">
                 {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
                   <PersonalWorkspacePanel
+                    profile={agentProfiles.personal}
+                    onProfileChanged={(profile) => {
+                      setAgentProfiles((prev) => ({ ...prev, personal: profile }));
+                      void loadAgentProfiles();
+                    }}
                     activeTabHint={personalWorkspaceTab}
                     focusSignal={personalWorkspaceFocusSignal}
                     artifacts={rpArtifacts}

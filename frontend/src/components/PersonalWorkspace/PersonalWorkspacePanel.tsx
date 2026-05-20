@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Brain, FileText, Zap, Activity, Moon, Bot } from 'lucide-react';
 import { cn } from '../ui/cn';
-import type { ArtifactItem, AutomationAction, AutomationReplayStatus, AutomationSnapshot, AutomationTrace, ToolCall } from '../../types';
+import type { AgentProfile, ArtifactItem, AutomationAction, AutomationReplayStatus, AutomationSnapshot, AutomationTrace, ToolCall } from '../../types';
 import { ArtifactPanel } from '../ArtifactPanel/ArtifactPanel';
 import { SoulEditor } from './SoulEditor';
 import { MemoryManager } from './MemoryManager';
@@ -24,6 +24,8 @@ const TABS: { id: PersonalWorkspaceTab; icon: React.FC<{ className?: string }>; 
 
 interface PersonalWorkspacePanelProps {
   className?: string;
+  profile?: AgentProfile;
+  onProfileChanged?: (profile: AgentProfile) => void;
   activeTabHint?: PersonalWorkspaceTab;
   focusSignal?: number;
   artifacts?: ArtifactItem[];
@@ -39,6 +41,8 @@ interface PersonalWorkspacePanelProps {
 
 export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
   className,
+  profile,
+  onProfileChanged,
   activeTabHint,
   focusSignal = 0,
   artifacts = [],
@@ -79,7 +83,7 @@ export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
       </div>
 
       <div className="flex-1 min-h-0 overflow-hidden">
-        {activeTab === 'persona' && <SoulEditor />}
+        {activeTab === 'persona' && <SoulEditor profile={profile} onProfileChanged={onProfileChanged} />}
         {activeTab === 'memory' && <MemoryManager focusSignal={focusSignal} />}
         {activeTab === 'learnings' && <LearningsPanel />}
         {activeTab === 'heartbeat' && <HeartbeatConfig />}

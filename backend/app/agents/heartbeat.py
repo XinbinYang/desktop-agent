@@ -62,6 +62,7 @@ class HeartbeatEngine:
 
         Returns a summary dict for logging / event emission.
         """
+        messages = cls._normalize_transcript_messages(messages)
         result: Dict[str, Any] = {
             "diary_written": False,
             "handoff_written": False,
@@ -76,6 +77,8 @@ class HeartbeatEngine:
             "dream_error": "",
             "memory_error": "",
         }
+        if not messages or not any(msg.get("role") == "user" for msg in messages):
+            return result
         signature = cls._session_signature(messages)
         if not signature:
             return result
@@ -139,6 +142,39 @@ class HeartbeatEngine:
         cls._mark_session_signature(signature)
 
         return result
+
+    @classmethod
+    def _message_context_epoch(cls, msg: Dict[str, Any]) -> int:
+        try:
+            return int(msg.get("context_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _normalize_transcript_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only the newest user/assistant transcript epoch for memory tasks."""
+        visible: List[Dict[str, Any]] = []
+        has_epoch = False
+        for msg in messages or []:
+            if msg.get("role") not in ("user", "assistant"):
+                continue
+            if msg.get("source") in ("internal", "command_notice"):
+                continue
+            if not cls._message_text(msg):
+                continue
+            if "context_epoch" in msg:
+                has_epoch = True
+            visible.append(msg)
+        if not visible:
+            return []
+        if not has_epoch:
+            return visible
+        newest_epoch = max(cls._message_context_epoch(msg) for msg in visible)
+        return [
+            msg
+            for msg in visible
+            if cls._message_context_epoch(msg) == newest_epoch
+        ]
 
     @classmethod
     def _session_signature(cls, messages: List[Dict[str, Any]]) -> str:
