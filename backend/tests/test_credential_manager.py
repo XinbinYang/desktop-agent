@@ -14,6 +14,7 @@ from app.credential_manager import (
 def reset_credentials():
     """Reset credential state and files before each test"""
     CredentialManager._credentials_cache = None
+    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
     for p in (CREDENTIALS_FILE, CREDENTIALS_FILE_V2, CREDENTIALS_BACKUP_FILE):
         if p.exists():
             p.unlink()

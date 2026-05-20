@@ -102,7 +102,7 @@ def test_collaboration_rest_run_lifecycle(isolated_collaboration_db, client):
 async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
     from app import agent as agent_module
     from app.agent import AgentSession
-    from app.config import load_config
+    from app.config import get_model_for_agent
     from app.project_manager import ProjectManager
 
     project = tmp_path / "opened-project"
@@ -116,7 +116,7 @@ async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypat
 
     monkeypatch.setattr(agent_module, "run_consult_worker", fake_consult_worker)
     session = AgentSession(
-        model_id=load_config().settings.default_model,
+        model_id=get_model_for_agent("personal"),
         session_id="test_collab_session",
         agent_type="personal",
     )
@@ -138,14 +138,14 @@ async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypat
 async def test_personal_explicit_coding_mention_without_project_blocks(monkeypatch, isolated_collaboration_db, isolate_projects):
     from app import agent as agent_module
     from app.agent import AgentSession
-    from app.config import load_config
+    from app.config import get_model_for_agent
 
     async def fake_consult_worker(*args, **kwargs):
         raise AssertionError("Coding worker should not run without a project path")
 
     monkeypatch.setattr(agent_module, "run_consult_worker", fake_consult_worker)
     session = AgentSession(
-        model_id=load_config().settings.default_model,
+        model_id=get_model_for_agent("personal"),
         session_id="test_collab_no_project",
         agent_type="personal",
     )

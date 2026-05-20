@@ -1218,6 +1218,7 @@ class TestWebSocket:
     def test_delete_session_cancels_running_runtime(self, client, monkeypatch):
         """Deleting a historical session permanently terminates its live run."""
         import asyncio
+        import time
         from app.agent import AgentSession
 
         markers = {"cancelled": False}
@@ -1239,7 +1240,10 @@ class TestWebSocket:
             response = client.delete(f"/api/sessions/{sid}")
 
         assert response.status_code == 200
-        assert response.json()["runtime_terminated"] is True
+        assert response.json()["runtime_terminated"] == "pending"
+        deadline = time.monotonic() + 2
+        while not markers["cancelled"] and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert markers["cancelled"] is True
 
     def test_stop_session_runtime_only_cancels_target_session(self, client, monkeypatch):

@@ -303,6 +303,7 @@ class ProjectManager:
     @classmethod
     def _save_recent(cls, projects: List[Dict[str, Any]]) -> None:
         try:
+            RECENT_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = RECENT_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, RECENT_FILE)

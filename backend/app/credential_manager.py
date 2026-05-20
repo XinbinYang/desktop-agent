@@ -60,6 +60,7 @@ def _decrypt_blob(blob: bytes, is_encrypted: bool) -> Optional[bytes]:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)

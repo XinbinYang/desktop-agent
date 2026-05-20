@@ -191,7 +191,7 @@ class TestSkillManager:
 
     def test_personal_crystallized_skills_default_enabled(self, tmp_path, monkeypatch):
         agents_root = tmp_path / "AGENTS"
-        skill_dir = agents_root / "personal" / "skills"
+        skill_dir = agents_root / "personal" / "WORKSPACE" / "skills"
         skill_dir.mkdir(parents=True)
         (skill_dir / "analysis_notes.md").write_text(
             "---\nname: Analysis Notes\ndescription: Use the user's analysis style.\n---\n\nBody",
