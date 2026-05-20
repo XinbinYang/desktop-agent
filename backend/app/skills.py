@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
-from app.runtime_paths import agents_dir, runtime_file
+from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir, runtime_file
 
 
 SKILL_DIR = Path(__file__).parent.parent / "prompts" / "skills"
@@ -286,7 +286,7 @@ class SkillManager:
 
     @classmethod
     def _personal_skills_dir(cls) -> Path:
-        return agents_dir() / "personal" / "skills"
+        return agents_dir() / "personal" / PERSONAL_WORKSPACE_DIRNAME / "skills"
 
     @classmethod
     def _parse_skill_md(cls, path: Path, *, skill_id: str = "", source: str = "superpowers") -> Optional[Dict[str, Any]]:

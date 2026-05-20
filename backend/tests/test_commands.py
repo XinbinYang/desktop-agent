@@ -16,13 +16,15 @@ class TestCommandInfo:
 
 
 class TestBuiltinCommands:
-    def test_all_twelve_builtins_exist(self):
-        assert len(BUILTIN_COMMANDS) == 12
+    def test_all_thirteen_builtins_exist(self):
+        assert len(BUILTIN_COMMANDS) == 13
 
     def test_essential_commands_present(self):
         names = [c.name for c in BUILTIN_COMMANDS]
         assert "help" in names
         assert "clear" in names
+        assert "reset" in names
+        assert "new" in names
         assert "compact" in names
         assert "model" in names
         assert "role" in names
@@ -68,6 +70,13 @@ class TestGetCommands:
         cmds = get_commands()
         model = next(c for c in cmds if c["name"] == "model")
         assert model["args"] == "<model_id>"
+
+    def test_new_and_reset_describe_context_reset(self):
+        cmds = get_commands()
+        reset = next(c for c in cmds if c["name"] == "reset")
+        new = next(c for c in cmds if c["name"] == "new")
+        assert "fresh model context" in reset["description"]
+        assert "fresh context" in new["description"]
 
     def test_skills_are_not_registered_as_dynamic_commands(self, monkeypatch):
         from app.skills import SkillManager

@@ -59,7 +59,23 @@ LANGUAGE_BY_EXT = {
 }
 
 
-def current_project_path() -> Optional[Path]:
+def current_project_path(*, allow_global: bool = True) -> Optional[Path]:
+    try:
+        from app.coding_runs import effective_project_path, get_run_context
+        ctx = get_run_context()
+        if ctx and ctx.active_path:
+            return Path(ctx.active_path).resolve()
+        bound = effective_project_path(allow_global=allow_global)
+        if bound:
+            return Path(bound).resolve()
+    except (OSError, ValueError):
+        return None
+    except Exception:
+        pass
+
+    if not allow_global:
+        return None
+
     project = ProjectManager.get_current()
     if not project:
         return None

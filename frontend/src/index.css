@@ -362,3 +362,32 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+@keyframes agent-running-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.agent-running-spinner {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  animation-name: agent-running-spin !important;
+  animation-duration: 900ms !important;
+  animation-timing-function: linear !important;
+  animation-iteration-count: infinite !important;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.agent-running-spinner > svg {
+  display: block;
+  height: 100%;
+  width: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-running-spinner {
+    animation: none !important;
+  }
+}

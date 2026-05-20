@@ -107,6 +107,15 @@ class PlatformConnector(ABC):
             "required": [],
         }
 
+    async def send_notification(self, message: str) -> Dict[str, Any]:
+        """Send an outbound notification through this connector.
+
+        Connectors that support proactive delivery override this. The base
+        implementation gives the API a clear, typed failure instead of leaking
+        an AttributeError.
+        """
+        raise NotImplementedError(f"{self.display_name or self.name} does not support outbound notifications")
+
     def cancel_session_run(self, session_id: str) -> None:
         existing = self._running_tasks.pop(session_id, None)
         if existing and not existing.done():

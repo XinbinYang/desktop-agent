@@ -53,6 +53,27 @@ def test_draft_publish_and_match_user_skill(monkeypatch, tmp_path):
     assert any(s["id"] == "user:daily-report" for s in trace["skills"])
 
 
+def test_publish_draft_honors_requested_agent_scope(monkeypatch, tmp_path):
+    authoring, skills_module = _isolate_skill_authoring(monkeypatch, tmp_path)
+
+    draft = authoring.save_draft(
+        name="Wind Data Reference",
+        description="Use when querying WIND financial data and validating indicator references.",
+        body="# Wind Data Reference\n\nPrefer vetted EDB codes and fetch related indicators together.",
+        scopes=["personal", "coding"],
+    )
+
+    published = authoring.publish_draft(draft["draft_id"], enable_for=["coding"])
+    skills_module.SkillManager.reload_skills()
+
+    assert published["enabledByAgent"]["coding"] is True
+    assert published["enabledByAgent"]["personal"] is False
+    catalog = skills_module.SkillManager.list_skill_catalog()
+    user_skill = next(s for s in catalog["skills"] if s["id"] == "user:wind-data-reference")
+    assert user_skill["enabledByAgent"]["coding"] is True
+    assert user_skill["enabledByAgent"]["personal"] is False
+
+
 def test_read_skill_supports_bundled_skill():
     import app.skill_authoring as authoring
 

@@ -695,6 +695,8 @@ class WorkerSession:
                     tool_call_id=tool_id,
                     worker_id=self.worker_id,
                     parent_tool_call_id=self.parent_tool_call_id,
+                    agent_type=self.agent_type,
+                    session_model_id=self.model_id,
                     get_tool_fn=get_static_tool,
                 )
 

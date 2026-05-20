@@ -44,6 +44,7 @@ async def run_consult_worker(
     *,
     run_id: str,
     task_id: str,
+    project_path: str = "",
 ) -> Tuple[ResultPacket, List[Dict[str, Any]]]:
     """Run a read-only Coding specialist using the architect worker profile."""
     model_id = get_model_for_agent("coding")
@@ -59,13 +60,28 @@ async def run_consult_worker(
     events: List[Dict[str, Any]] = []
     final = ""
     status = "pass"
-    async for event in worker.run():
-        events.append(event)
-        if event.get("type") == "worker_done":
-            data = event.get("data") or {}
-            final = data.get("result", "")
-            if data.get("status") not in ("completed", "max_iterations_reached"):
-                status = "fail"
+    token = None
+    if project_path:
+        try:
+            from app.coding_runs import set_session_project
+            token = set_session_project(project_path)
+        except Exception:
+            token = None
+    try:
+        async for event in worker.run():
+            events.append(event)
+            if event.get("type") == "worker_done":
+                data = event.get("data") or {}
+                final = data.get("result", "")
+                if data.get("status") not in ("completed", "max_iterations_reached"):
+                    status = "fail"
+    finally:
+        if token is not None:
+            try:
+                from app.coding_runs import reset_session_project
+                reset_session_project(token)
+            except Exception:
+                pass
     if "ACCEPTANCE: FAIL" in final:
         status = "fail"
     return ResultPacket(status=status, summary=final[:4000], details=final), events
@@ -76,6 +92,7 @@ async def run_execute_agent_events(
     *,
     session_id: str,
     run_id: str,
+    project_path: str = "",
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Run a full Coding Agent session and yield its native events."""
     from app.agent import AgentSession
@@ -88,6 +105,7 @@ async def run_execute_agent_events(
         role_id=AgentManager.get_default_role("coding"),
         agent_type="coding",
     )
+    coding_session.project_path = project_path or None
     # Keep delegated specialist sessions out of the user's visible session list.
     coding_session._save = lambda: None  # type: ignore[method-assign]
     async for event in coding_session.run(_task_text(packet), None, chat_mode="agent"):

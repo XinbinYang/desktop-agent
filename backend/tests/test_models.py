@@ -1,4 +1,6 @@
 import pytest
+import httpx
+import json
 from unittest.mock import patch, MagicMock, AsyncMock
 from app.models import ModelRouter, _safe_message_summary
 
@@ -268,6 +270,91 @@ settings:
             {"role": "user", "content": "continue"},
         ]
 
+    def test_kimi_openai_request_preserves_reasoning_content(self, monkeypatch, tmp_path):
+        config_yaml = tmp_path / "models.yaml"
+        config_yaml.write_text("""
+providers:
+  kimi:
+    base_url: https://api.kimi.com/coding/v1
+    api_key: test-key
+    models:
+      - id: kimi-for-coding
+        name: Kimi Coding
+        context: 256000
+        vision: true
+settings:
+  default_model: kimi-for-coding
+  default_provider: kimi
+""")
+        monkeypatch.setattr("app.config.CONFIG_PATH", config_yaml)
+        from app import config
+        config._config = None
+        router = ModelRouter("kimi-for-coding")
+
+        _, _, payload = router._build_kimi_openai_request([
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I need a file write.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_write", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "file_write", "content": "ok"},
+        ])
+
+        assert payload["messages"][0]["reasoning_content"] == "I need a file write."
+
+    def test_deepseek_request_converts_image_url_history_to_text(self, monkeypatch, tmp_path):
+        config_yaml = tmp_path / "models.yaml"
+        config_yaml.write_text("""
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: test-key
+    litellm_provider: deepseek
+    models:
+      - id: deepseek-chat
+        name: DeepSeek Chat
+        context: 65536
+        vision: false
+settings:
+  default_model: deepseek-chat
+  default_provider: deepseek
+""")
+        monkeypatch.setattr("app.config.CONFIG_PATH", config_yaml)
+        from app import config
+        config._config = None
+        router = ModelRouter("deepseek-chat")
+
+        original_messages = [
+            {"role": "system", "content": "system prompt"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,secretbase64"}},
+                ],
+            },
+            {"role": "assistant", "content": "ok", "reasoning_content": "reasoning"},
+        ]
+
+        _, _, payload = router._build_deepseek_request(original_messages)
+
+        assert payload["messages"][1]["content"] == (
+            "describe this\n\n"
+            "[image omitted: DeepSeek does not accept image content]"
+        )
+        rendered = json.dumps(payload["messages"])
+        assert "image_url" not in rendered
+        assert "secretbase64" not in rendered
+        assert payload["messages"][2]["reasoning_content"] == "reasoning"
+        assert original_messages[1]["content"][1]["image_url"]["url"].endswith("secretbase64")
+
     def test_kimi_anthropic_request_drops_empty_assistant_history(self, monkeypatch, tmp_path):
         config_yaml = tmp_path / "models.yaml"
         config_yaml.write_text("""
@@ -298,6 +385,71 @@ settings:
         assert payload["messages"] == [
             {"role": "user", "content": "hello\ncontinue"},
         ]
+
+    def test_kimi_anthropic_request_preserves_reasoning_content(self, monkeypatch, tmp_path):
+        config_yaml = tmp_path / "models.yaml"
+        config_yaml.write_text("""
+providers:
+  kimi:
+    base_url: https://api.kimi.com/coding
+    api_key: test-key
+    models:
+      - id: kimi-for-coding
+        name: Kimi Coding
+        context: 256000
+        vision: true
+settings:
+  default_model: kimi-for-coding
+  default_provider: kimi
+""")
+        monkeypatch.setattr("app.config.CONFIG_PATH", config_yaml)
+        from app import config
+        config._config = None
+        router = ModelRouter("kimi-for-coding")
+
+        _, _, payload = router._build_kimi_anthropic_request([
+            {"role": "user", "content": "write a file"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I need a file write.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_write", "arguments": "{\"path\":\"x\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "file_write", "content": "ok"},
+        ])
+
+        assert payload["messages"][1]["reasoning_content"] == "I need a file write."
+
+    @pytest.mark.asyncio
+    async def test_kimi_post_retries_transport_disconnect(self, router):
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def post(self, url, headers=None, json=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+                request = httpx.Request("POST", url)
+                return httpx.Response(200, json={"ok": True}, request=request)
+
+        client = FakeClient()
+        response = await router._kimi_post_json_with_retries(
+            client,
+            "https://api.kimi.com/coding/v1/messages",
+            {},
+            {"messages": [{"role": "user", "content": "hello"}]},
+            "test",
+        )
+
+        assert response.status_code == 200
+        assert client.calls == 2
 
     @pytest.mark.asyncio
     async def test_kimi_stream_uses_non_stream_call(self, monkeypatch, tmp_path):

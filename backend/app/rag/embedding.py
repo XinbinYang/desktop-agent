@@ -15,6 +15,10 @@ def _get_model_dir() -> Path:
     return base
 
 
+def get_model_cache_dir() -> str:
+    return str(_get_model_dir())
+
+
 def _resolve_model_config():
     global _model_name, _embedding_dim
     if _model_name is not None:

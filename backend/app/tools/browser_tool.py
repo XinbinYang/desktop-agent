@@ -1,4 +1,5 @@
 import base64
+from contextlib import suppress
 from typing import Optional
 import contextvars
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, async_playwright
@@ -25,6 +26,36 @@ async def _ensure_browser():
         sess["page"] = await context.new_page()
     return sess["page"]
 
+
+def has_browser_page(session_id: str | None = None) -> bool:
+    """Return True when a visible Playwright page already exists for a session."""
+    sid = session_id or _BROWSER_SESSION_CTX.get()
+    sess = _SESSIONS.get(sid)
+    if not sess:
+        return False
+    page = sess.get("page")
+    try:
+        return bool(page and not page.is_closed())
+    except Exception:
+        return False
+
+
+async def get_browser_page(launch: bool = True):
+    """Return the current session page, optionally launching it if missing."""
+    if launch:
+        return await _ensure_browser()
+    session_id = _BROWSER_SESSION_CTX.get()
+    sess = _SESSIONS.get(session_id)
+    if not sess:
+        return None
+    page = sess.get("page")
+    try:
+        if page and not page.is_closed():
+            return page
+    except Exception:
+        return None
+    return None
+
 def set_browser_session(session_id: str):
     """设置当前浏览器会话 ID（由 AgentSession 调用）"""
     _BROWSER_SESSION_CTX.set(session_id)
@@ -35,11 +66,14 @@ async def close_browser_session(session_id: str) -> None:
     if not sess:
         return
     if sess.get("page"):
-        await sess["page"].close()
+        with suppress(Exception):
+            await sess["page"].close()
     if sess.get("browser"):
-        await sess["browser"].close()
+        with suppress(Exception):
+            await sess["browser"].close()
     if sess.get("playwright"):
-        await sess["playwright"].stop()
+        with suppress(Exception):
+            await sess["playwright"].stop()
 
 
 class BrowserNavigateTool(BaseTool):

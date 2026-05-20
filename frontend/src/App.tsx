@@ -26,12 +26,13 @@ import {
 import { TerminalPanel } from './components/TerminalPanel';
 import { WorkspacePanel, type WorkspaceView } from './components/workspace/WorkspacePanel';
 import { ActivityPanel } from './components/activity/ActivityPanel';
-import { PersonalWorkspacePanel } from './components/PersonalWorkspace/PersonalWorkspacePanel';
+import { PersonalWorkspacePanel, type PersonalWorkspaceTab } from './components/PersonalWorkspace/PersonalWorkspacePanel';
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
 import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
 import { API_BASE } from './config';
+import { deleteDraft, deleteSessionData } from './lib/db';
 import {
   DEFAULT_MAIN_LAYOUT,
   DEFAULT_SIDEBAR_WIDTH,
@@ -42,7 +43,15 @@ import {
   type PanelLayout,
 } from './hooks/useLayoutState';
 import { getLangFromFilename } from './lib/language';
-import { AGENT_LABEL, agentForRole, normalizeAgentType, roleForAgent } from './lib/agentProfiles';
+import {
+  DEFAULT_AGENT_PROFILES,
+  agentForRole,
+  displayNameForAgent,
+  normalizeAgentType,
+  profilesFromAgents,
+  roleForAgent,
+  type AgentProfileMap,
+} from './lib/agentProfiles';
 import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
@@ -87,6 +96,8 @@ interface SplitPaneOptions {
 }
 
 const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
+const SESSION_HISTORY_POLL_MS = 5000;
+const SPLIT_RESIZE_COMMIT_MS = 80;
 
 function clampSidebarWidth(width: number): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
@@ -191,15 +202,19 @@ function sessionShortId(sessionId: string): string {
     .replace(/^session_/, '#');
 }
 
-function sessionTitleForDisplay(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
+function sessionTitleForDisplay(
+  pane: SessionPane | null | undefined,
+  meta?: SessionListItem,
+  profiles: AgentProfileMap = DEFAULT_AGENT_PROFILES,
+): string {
   if (!pane) return 'No Session';
   const agentType = pane.agentType || normalizeAgentType(meta?.agent_type, meta?.role_id);
   if (agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')) {
-    return 'Personal Agent · Main';
+    return `${displayNameForAgent('personal', profiles)} · Main`;
   }
   const title = (meta?.title || pane.title || '').trim();
   const label = title || sessionShortId(pane.sessionId);
-  return `${AGENT_LABEL[agentType]} · ${label}`;
+  return `${displayNameForAgent(agentType, profiles)} · ${label}`;
 }
 
 function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
@@ -284,6 +299,7 @@ function apiErrorMessage(error: unknown): string {
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
   clearSession: () => {},
+  resetContext: () => {},
   compactSession: () => {},
   loadCheckpoints: async () => [],
   rewindToCheckpoint: () => {},
@@ -317,6 +333,7 @@ export default function App() {
   const { t } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [agentModels, setAgentModels] = useState<Record<string, string>>({ personal: '', coding: '' });
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfileMap>(DEFAULT_AGENT_PROFILES);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   // Pane tree — restored from localStorage or fresh default
   const initialPaneTree = React.useMemo(() => loadPersistedPaneTree('personal'), []);
@@ -329,6 +346,8 @@ export default function App() {
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryResponse | null>(null);
   const sessions = React.useMemo(() => flattenSessionHistory(sessionHistory), [sessionHistory]);
   const [showSettings, setShowSettings] = useState(false);
+  const [personalWorkspaceTab, setPersonalWorkspaceTab] = useState<PersonalWorkspaceTab>('persona');
+  const [personalWorkspaceFocusSignal, setPersonalWorkspaceFocusSignal] = useState(0);
 
   const [currentProject, setCurrentProject] = useState<ProjectInfo | null>(null);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -352,6 +371,12 @@ export default function App() {
   const layout = useLayoutState();
   const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
   const sidebarWidth = sidebarDragWidth ?? layout.sidebarWidth;
+  const openPersonalWorkspace = useCallback((tab: PersonalWorkspaceTab = 'persona') => {
+    setPersonalWorkspaceTab(tab);
+    setPersonalWorkspaceFocusSignal((value) => value + 1);
+    layout.setRightPanelVisible(true);
+    layout.setRightZone('workspace');
+  }, [layout]);
   const agentModel = agentModels[layout.activeAgent] || '';
   const sessionMetaById = React.useMemo(() => {
     const map: Record<string, SessionListItem> = {};
@@ -363,7 +388,7 @@ export default function App() {
   const focusedSessionMeta = focusedPane ? sessionMetaById[focusedPane.sessionId] : undefined;
   const focusedAgentType = focusedPane?.agentType || layout.activeAgent;
   const focusedModel = sessionModelForPane(focusedPane, focusedSessionMeta) || agentModels[focusedAgentType] || agentModel;
-  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta);
+  const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta, agentProfiles);
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -374,6 +399,8 @@ export default function App() {
 
   const [focusedSnapshot, setFocusedSnapshot] = useState<SessionSnapshot | null>(null);
   const [focusedActions, setFocusedActions] = useState<SessionActions>(NOOP_ACTIONS);
+  const [skillsRefreshToken, setSkillsRefreshToken] = useState(0);
+  const [highlightedSkillDraftId, setHighlightedSkillDraftId] = useState<string | null>(null);
   // Per-agent "is any session running" — drives the persistent spinner on the
   // ActivityBar agent buttons so a backgrounded agent's work stays visible.
   // Server truth (session-history poll) plus the focused pane's live snapshot.
@@ -411,8 +438,61 @@ export default function App() {
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
   const projectRefreshTimerRef = useRef<number | null>(null);
+  const splitResizeTimersRef = useRef<Record<string, number>>({});
+  const pendingSplitSizesRef = useRef<Record<string, number[]>>({});
   const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
   const manualProjectLockLeafRef = useRef<string | null>(null);
+  const handledSkillDraftEventsRef = useRef<Set<string>>(new Set());
+  const initializedSkillDraftSessionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!focusedSnapshot) return;
+    const eventKeyFor = (event: NonNullable<SessionSnapshot['runEvents']>[number]) => (
+      event.id || `${event.runId || ''}:${event.data?.draft_id || event.data?.id || ''}:${event.timestamp}`
+    );
+    const draftEvents = (focusedSnapshot.runEvents || [])
+      .filter((event) => event.type === 'skill_draft_ready');
+
+    if (initializedSkillDraftSessionRef.current !== focusedSnapshot.sessionId) {
+      initializedSkillDraftSessionRef.current = focusedSnapshot.sessionId;
+      for (const event of draftEvents) {
+        handledSkillDraftEventsRef.current.add(eventKeyFor(event));
+      }
+      return;
+    }
+
+    const latestDraftEvent = [...draftEvents]
+      .reverse()
+      .find((event) => !handledSkillDraftEventsRef.current.has(eventKeyFor(event)));
+    const draftId = String(
+      latestDraftEvent?.data?.draft_id ||
+      latestDraftEvent?.data?.id ||
+      '',
+    );
+    if (!latestDraftEvent || !draftId) return;
+
+    const eventKey = eventKeyFor(latestDraftEvent);
+    if (handledSkillDraftEventsRef.current.has(eventKey)) return;
+    handledSkillDraftEventsRef.current.add(eventKey);
+    if (handledSkillDraftEventsRef.current.size > 100) {
+      handledSkillDraftEventsRef.current = new Set([...handledSkillDraftEventsRef.current].slice(-50));
+    }
+
+    setHighlightedSkillDraftId(draftId);
+    setSkillsRefreshToken((value) => value + 1);
+    if (focusedSnapshot?.agentType) {
+      layout.setActiveAgent(focusedSnapshot.agentType);
+    }
+    layout.setSidebarCollapsed(false);
+    layout.setActiveSection('skills');
+  }, [
+    focusedSnapshot?.agentType,
+    focusedSnapshot?.runEvents,
+    focusedSnapshot?.sessionId,
+    layout.setActiveAgent,
+    layout.setActiveSection,
+    layout.setSidebarCollapsed,
+  ]);
 
   const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -534,6 +614,17 @@ export default function App() {
       .catch(console.error);
   }, []);
 
+  const loadAgentProfiles = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/agents`);
+      const data = await res.json();
+      setAgentProfiles(profilesFromAgents(data.agents || []));
+    } catch (err) {
+      console.error('[App] Failed to load agent profiles:', err);
+      setAgentProfiles(DEFAULT_AGENT_PROFILES);
+    }
+  }, []);
+
   const sessionHistoryHasRunning = React.useMemo(() => {
     if (!sessionHistory) return false;
     const standalone = Array.isArray(sessionHistory.standalone_sessions) ? sessionHistory.standalone_sessions : [];
@@ -552,7 +643,7 @@ export default function App() {
     if (layout.activeSection !== 'workspace' && !sessionHistoryHasRunning && !hasMultiplePanes) return;
     const timer = window.setInterval(() => {
       loadSessions(currentProject?.path ?? null);
-    }, 2000);
+    }, SESSION_HISTORY_POLL_MS);
     return () => window.clearInterval(timer);
   }, [currentProject?.path, layout.activeSection, loadSessions, sessionHistoryHasRunning, paneRoot]);
 
@@ -563,16 +654,20 @@ export default function App() {
 
     switch (command.toLowerCase()) {
       case 'new':
-        newSessionRef.current();
-        addTerminalLog('[Command] Creating a new Coding Agent session');
+        a.resetContext('new', true);
+        addTerminalLog('[Command] Starting a fresh context in this session');
+        break;
+      case 'reset':
+        a.resetContext('reset', false);
+        addTerminalLog('[Command] Resetting model context for this session');
         break;
       case 'clear':
         a.clearSession();
         addTerminalLog('[命令] 已清除会话');
         break;
       case 'help':
-        addTerminalLog('[Help] Commands: /new /clear /compact /rewind /context /help /model <model_id> /role <role_id> /project <path> /config /screenshot /skills');
-        addTerminalLog('[帮助] 可用命令: /help /clear /compact /model /role /project /config /screenshot /skills');
+        addTerminalLog('[Help] Commands: /new /reset /clear /compact /rewind /context /help /model <model_id> /role <role_id> /project <path> /config /screenshot /skills');
+        addTerminalLog('[Help] /new and /reset preserve visible history; /clear removes it.');
         break;
       case 'compact':
         a.compactSession(false);
@@ -591,7 +686,8 @@ export default function App() {
         const parts = Object.entries(usage.breakdown || {})
           .map(([key, value]) => `${key}:${value}`)
           .join(' ');
-        addTerminalLog(`[Context] ${usage.used_percent.toFixed(1)}% (${usage.used_tokens}/${usage.model_context}, ${usage.source}) ${parts}`);
+        const archived = usage.archived_message_count ? ` archived:${usage.archived_message_count}` : '';
+        addTerminalLog(`[Context] ${usage.used_percent.toFixed(1)}% (${usage.used_tokens}/${usage.model_context}, ${usage.source})${archived} ${parts}`);
         break;
       }
       case 'config':
@@ -757,7 +853,7 @@ export default function App() {
     };
 
     const doLoad = async () => {
-      await Promise.all([loadModels(), loadSettingsReadiness()]);
+      await Promise.all([loadModels(), loadSettingsReadiness(), loadAgentProfiles()]);
       if (!cancelled) setIsLoadingModels(false);
     };
 
@@ -791,15 +887,15 @@ export default function App() {
       const newPane = { ...leaf.pane, agentType, role: defaultRole, model: newModel };
       return replaceNode(prev, focusedLeafId, { ...leaf, pane: newPane });
     });
-    addTerminalLog(`[系统] 已切换到 ${agentType === 'personal' ? 'Personal Agent' : 'Coding Agent'}`);
-  }, [layout, focusedLeafId, addTerminalLog, agentModels]);
+    addTerminalLog(`[系统] 已切换到 ${displayNameForAgent(agentType, agentProfiles)}`);
+  }, [layout, focusedLeafId, addTerminalLog, agentModels, agentProfiles]);
 
   const resolveAgentSessionClient = useCallback(async (
     agentType: AgentType,
     policy: 'canonical' | 'last_or_create' | 'new',
     projectPathOverride?: string | null,
   ): Promise<ResolvedSession> => {
-    const projectPath = projectPathOverride ?? currentProject?.path;
+    const projectPath = agentType === 'coding' ? (projectPathOverride ?? currentProject?.path) : null;
     const res = await fetch(`${API_BASE}/api/sessions/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -896,9 +992,9 @@ export default function App() {
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
     loadSessions(currentProject?.path ?? null);
-    addTerminalLog(`[系统] 已切换到 ${AGENT_LABEL[agentType]}`);
+    addTerminalLog(`[系统] 已切换到 ${displayNameForAgent(agentType, agentProfiles)}`);
     return resolved.session_id;
-  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+  }, [addTerminalLog, agentModel, agentModels, agentProfiles, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
 
   const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
     await openAgentSessionInPane(agentType, agentType === 'personal' ? 'canonical' : 'last_or_create');
@@ -1601,6 +1697,10 @@ export default function App() {
     handleOpenFileFromPanel(path);
   }, [handleOpenFileFromPanel]);
 
+  const handleRevealWorkspaceZone = useCallback(() => {
+    layout.setRightZone('workspace');
+  }, [layout.setRightZone]);
+
   const handleOpenPlanInWorkspace = useCallback(() => {
     revealWorkspaceEditor();
   }, [revealWorkspaceEditor]);
@@ -1884,6 +1984,7 @@ export default function App() {
         setDeleteSessionError(apiErrorMessage(data.detail || data.error || res.statusText));
         return;
       }
+      void Promise.allSettled([deleteSessionData(id), deleteDraft(id)]);
       setDeleteSessionTarget(null);
       loadSessions(currentProject?.path ?? null);
       await replaceFocusedSessionAfterRemoval(id);
@@ -2042,7 +2143,23 @@ export default function App() {
   }, [agentModel, layout.activeAgent, paneRoot, stopSessionById]);
 
   const handleSplitResize = useCallback((splitId: string, sizes: number[]) => {
-    setPaneRoot((prev) => updateSplitSizes(prev, splitId, sizes));
+    pendingSplitSizesRef.current[splitId] = sizes;
+    if (splitResizeTimersRef.current[splitId]) return;
+    splitResizeTimersRef.current[splitId] = window.setTimeout(() => {
+      const pending = pendingSplitSizesRef.current[splitId];
+      delete pendingSplitSizesRef.current[splitId];
+      delete splitResizeTimersRef.current[splitId];
+      if (!pending) return;
+      setPaneRoot((prev) => updateSplitSizes(prev, splitId, pending));
+    }, SPLIT_RESIZE_COMMIT_MS);
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of Object.values(splitResizeTimersRef.current)) {
+      window.clearTimeout(timer);
+    }
+    splitResizeTimersRef.current = {};
+    pendingSplitSizesRef.current = {};
   }, []);
 
   // ---- Team callbacks ----
@@ -2146,6 +2263,10 @@ export default function App() {
   const rpEdits = focusedSnapshot?.fileEdits ?? [];
   const rpRuns = focusedSnapshot?.runEvents ?? [];
   const rpArtifacts = focusedSnapshot?.artifacts ?? [];
+  const rpAutomationSnapshots = focusedSnapshot?.automationSnapshots ?? [];
+  const rpAutomationActions = focusedSnapshot?.automationActions ?? [];
+  const rpAutomationTraces = focusedSnapshot?.automationTraces ?? [];
+  const rpAutomationReplayStatus = focusedSnapshot?.automationReplayStatus ?? null;
   const rpIsRunning = focusedSnapshot?.isRunning ?? false;
   const rpLatestToolCall = focusedSnapshot?.latestToolCall ?? null;
   const rpEditorGroups = focusedSnapshot?.editorGroups ?? [{ id: 'main', activeFileId: null, openFiles: [] }];
@@ -2206,6 +2327,7 @@ export default function App() {
         <ActivityBar
           activeSection={layout.activeSection}
           activeAgent={layout.activeAgent}
+          agentProfiles={agentProfiles}
           sidebarCollapsed={layout.sidebarCollapsed}
           onSectionChange={layout.setActiveSection}
           onAgentChange={handleAgentNavigate}
@@ -2221,17 +2343,17 @@ export default function App() {
               <Sidebar
                 activeSection={layout.activeSection}
                 activeAgent={layout.activeAgent}
+                agentProfiles={agentProfiles}
                 onSectionChange={layout.setActiveSection}
                 agentModel={focusedModel}
                 onAgentChange={handleAgentNavigate}
-                onOpenPersonalWorkspace={() => {
-                  layout.setRightPanelVisible(true);
-                  layout.setRightZone('workspace');
-                }}
+                onOpenPersonalWorkspace={openPersonalWorkspace}
                 onOpenSettings={() => setShowSettings(true)}
                 onClear={focusedActions.clearSession}
                 onExecuteTool={focusedActions.executeToolDirect}
                 isConnected={isConnected}
+                skillsRefreshToken={skillsRefreshToken}
+                highlightedSkillDraftId={highlightedSkillDraftId}
                 sessionHistory={sessionHistory}
                 sessions={sessions}
                 currentSession={focusedSessionId}
@@ -2350,6 +2472,7 @@ export default function App() {
           isOpen={!!switchSuggestion}
           from={switchSuggestion?.from || 'personal'}
           to={switchSuggestion?.to || 'coding'}
+          agentProfiles={agentProfiles}
           reason={switchSuggestion?.reason || ''}
           onSwitch={() => {
             if (switchSuggestion) {
@@ -2406,6 +2529,7 @@ export default function App() {
                     currentAgentType={focusedAgentType}
                     currentRole={roleForAgent(focusedAgentType)}
                     models={models}
+                    agentProfiles={agentProfiles}
                     sessionMetaById={sessionMetaById}
                     onModelChange={handlePaneModelChange}
                     onSnapshot={handleSessionSnapshot}
@@ -2414,6 +2538,7 @@ export default function App() {
                     openRunWorktree={openRunWorktree}
                     handleOpenFileFromPanel={handleOpenFileFromPanel}
                     handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+                    onRevealWorkspace={handleRevealWorkspaceZone}
                     onOpenPlanInWorkspace={handleOpenPlanInWorkspace}
                     onProjectFileEdit={scheduleProjectRefresh}
                   />
@@ -2503,7 +2628,28 @@ export default function App() {
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
-                  <PersonalWorkspacePanel />
+                  <PersonalWorkspacePanel
+                    profile={agentProfiles.personal}
+                    onProfileChanged={(profile) => {
+                      setAgentProfiles((prev) => ({ ...prev, personal: profile }));
+                      void loadAgentProfiles();
+                    }}
+                    activeTabHint={personalWorkspaceTab}
+                    focusSignal={personalWorkspaceFocusSignal}
+                    artifacts={rpArtifacts}
+                    isRunning={rpIsRunning}
+                    latestToolCall={rpLatestToolCall}
+                    automationSnapshots={rpAutomationSnapshots}
+                    automationActions={rpAutomationActions}
+                    automationTraces={rpAutomationTraces}
+                    automationReplayStatus={rpAutomationReplayStatus}
+                    onAutomationObserve={(source = 'auto') => {
+                      focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                    }}
+                    onAutomationReplay={(traceId) => {
+                      focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                    }}
+                  />
                 )}
                 {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
                   <FocusedDataProvider value={focusedSnapshot}>
@@ -2525,6 +2671,16 @@ export default function App() {
                         artifacts={rpArtifacts}
                         isRunning={rpIsRunning}
                         latestToolCall={rpLatestToolCall}
+                        automationSnapshots={rpAutomationSnapshots}
+                        automationActions={rpAutomationActions}
+                        automationTraces={rpAutomationTraces}
+                        automationReplayStatus={rpAutomationReplayStatus}
+                        onAutomationObserve={(source = 'auto') => {
+                          focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                        }}
+                        onAutomationReplay={(traceId) => {
+                          focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                        }}
                         previewUrl={previewUrl}
                         onAnnotate={(a) => {
                           const msg = `[标注] [${a.url || '预览页面'}] 区域(${a.rect.x}%,${a.rect.y}%,${a.rect.w}%x${a.rect.h}%): ${a.note}`;

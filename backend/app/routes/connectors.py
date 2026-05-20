@@ -12,6 +12,10 @@ class UpdateConnectorRequest(BaseModel):
     config: dict = Field(default_factory=dict)
 
 
+class TestMessageRequest(BaseModel):
+    message: str = "Desktop Agent connector test message."
+
+
 @router.get("")
 def list_connectors():
     manager = get_connector_manager()
@@ -58,7 +62,7 @@ async def restart_connector(name: str):
 @router.post("/health")
 async def health_check_all():
     manager = get_connector_manager()
-    return manager.check_health()
+    return await manager.check_health()
 
 
 @router.post("/{name}/health")
@@ -68,6 +72,21 @@ async def health_check(name: str):
     if name not in result:
         raise HTTPException(status_code=404, detail=f"Connector not found: {name}")
     return result[name]
+
+
+@router.post("/{name}/test-message")
+async def test_connector_message(name: str, req: TestMessageRequest):
+    manager = get_connector_manager()
+    connector = manager.get(name)
+    if not connector:
+        raise HTTPException(status_code=404, detail=f"Connector not found: {name}")
+    try:
+        details = await manager.send_test_message(name, req.message.strip() or TestMessageRequest().message)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to send test message: {exc}") from exc
+    return {"status": "sent", "name": name, "details": details}
 
 
 @router.delete("/{name}")

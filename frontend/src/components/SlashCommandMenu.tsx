@@ -14,6 +14,7 @@ interface SlashCommandMenuProps {
   onSelect: (cmd: Command) => void;
   onClose: () => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  onVisibleCommandsChange?: (count: number) => void;
 }
 
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
@@ -32,17 +33,52 @@ const CATEGORY_LABELS: Record<string, string> = {
   skills: '技能',
 };
 
-export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ query, onSelect, onClose, inputRef }) => {
-  const [commands, setCommands] = useState<Command[]>([]);
+let cachedCommands: Command[] | null = null;
+let commandsRequest: Promise<Command[]> | null = null;
+
+export function __resetSlashCommandCacheForTests() {
+  cachedCommands = null;
+  commandsRequest = null;
+}
+
+function loadCommands(): Promise<Command[]> {
+  if (cachedCommands) return Promise.resolve(cachedCommands);
+  if (!commandsRequest) {
+    commandsRequest = fetch(`${API_BASE}/api/commands`)
+      .then((r) => r.json())
+      .then((data) => {
+        cachedCommands = Array.isArray(data.commands) ? data.commands : [];
+        return cachedCommands;
+      })
+      .catch(() => {
+        cachedCommands = [];
+        return cachedCommands;
+      })
+      .finally(() => {
+        commandsRequest = null;
+      });
+  }
+  return commandsRequest;
+}
+
+export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({
+  query,
+  onSelect,
+  onClose,
+  inputRef,
+  onVisibleCommandsChange,
+}) => {
+  const [commands, setCommands] = useState<Command[]>(() => cachedCommands || []);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/commands`)
-      .then((r) => r.json())
-      .then((data) => setCommands(data.commands || []))
-      .catch(() => setCommands([]));
+    let cancelled = false;
+    loadCommands().then((nextCommands) => {
+      if (!cancelled) setCommands(nextCommands);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   const queryText = query.replace('/', '').toLowerCase();
@@ -82,8 +118,13 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ query, onSel
   }, [visibleCommands.length]);
 
   useEffect(() => {
-    itemRefs.current[selectedIndex]?.scrollIntoView({ block: 'nearest' });
+    itemRefs.current[selectedIndex]?.scrollIntoView?.({ block: 'nearest' });
   }, [selectedIndex]);
+
+  useEffect(() => {
+    onVisibleCommandsChange?.(visibleCommands.length);
+    return () => onVisibleCommandsChange?.(0);
+  }, [onVisibleCommandsChange, visibleCommands.length]);
 
   // Keyboard navigation
   useEffect(() => {

@@ -44,7 +44,23 @@ from app.tools.plan_tool import PlanAskQuestionsTool, PlanWriteDraftTool, PlanUp
 from app.tools.test_tool import RunTestsTool
 from app.tools.diagnostics_tool import ListDiagnosticsTool
 from app.tools.ocr_tool import OCRClickTool, OCRFindTool, OCRReadTool
-from app.tools.memory_tool import MemorySearchTool, MemoryHandoffTool, MemoryListTool
+from app.tools.automation_tool import (
+    AutomationObserveTool,
+    AutomationClickTool,
+    AutomationTypeTool,
+    AutomationKeyTool,
+    AutomationScrollTool,
+    AutomationReplayTool,
+)
+from app.tools.memory_tool import (
+    MemorySearchTool,
+    MemoryHandoffTool,
+    MemoryListTool,
+    MemoryRememberTool,
+    MemoryUpdateTool,
+    MemoryForgetTool,
+    MemoryRebuildTool,
+)
 from app.tools.collaboration_tool import (
     ConsultCodingAgentTool,
     DelegateToCodingAgentTool,
@@ -143,8 +159,18 @@ ALL_TOOLS: list[BaseTool] = [
     OCRClickTool(),
     OCRFindTool(),
     OCRReadTool(),
+    AutomationObserveTool(),
+    AutomationClickTool(),
+    AutomationTypeTool(),
+    AutomationKeyTool(),
+    AutomationScrollTool(),
+    AutomationReplayTool(),
     # 记忆管理工具
     MemorySearchTool(),
+    MemoryRememberTool(),
+    MemoryUpdateTool(),
+    MemoryForgetTool(),
+    MemoryRebuildTool(),
     MemoryHandoffTool(),
     MemoryListTool(),
     ConsultCodingAgentTool(),
@@ -194,28 +220,56 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     "get_screen_size",
     # OCR (for reading error dialogs, etc.)
     "ocr_read", "ocr_click", "ocr_find",
+    # Unified browser/desktop automation
+    "automation_observe", "automation_click", "automation_type",
+    "automation_key", "automation_scroll", "automation_replay",
 })
 
-# Personal Agent gets all tools (no filtering).
-# Coding Agent is restricted to CODING_AGENT_TOOLS.
+PERSONAL_AGENT_TOOLS: frozenset[str] = frozenset({
+    "file_read", "file_write", "file_patch", "file_list", "file_search", "file_delete",
+    "shell_execute", "shell_start",
+    "browser_navigate", "browser_click", "browser_type",
+    "browser_screenshot", "browser_evaluate", "browser_close",
+    "web_search", "web_fetch",
+    "screenshot", "mouse_click", "mouse_move", "type_text",
+    "press_key", "scroll", "get_screen_size",
+    "app_open", "app_list_windows", "app_find_window", "app_click", "app_type",
+    "wind_wsd", "wind_wss", "wind_wset", "wind_edb", "wind_tdays", "wind_sync",
+    "strategy_list", "backtest_run", "backtest_report",
+    "knowledge_index", "knowledge_search", "knowledge_list", "knowledge_clear",
+    "workflow_record", "workflow_stop", "workflow_list", "workflow_run",
+    "consult_coding_agent", "delegate_to_coding_agent",
+    "plan_ask_questions", "plan_write_draft", "plan_update_todos",
+    "ocr_read", "ocr_click", "ocr_find",
+    "automation_observe", "automation_click", "automation_type",
+    "automation_key", "automation_scroll", "automation_replay",
+    "memory_search", "memory_remember", "memory_update", "memory_forget",
+    "memory_rebuild", "memory_handoff_write", "memory_list",
+    "skill_draft_save", "skill_validate", "skill_publish",
+    "skill_list", "skill_read", "skill_archive",
+})
 
 
 def _filter_tools_by_agent(agent_type: str | None) -> frozenset[str] | None:
     """Return the allowed tool name set for an agent type, or None for all tools."""
     if agent_type == "coding":
         return CODING_AGENT_TOOLS
-    return None  # personal → all tools
+    if agent_type == "personal":
+        return PERSONAL_AGENT_TOOLS
+    return None
 
 
 # Tools the frontend may invoke via WebSocket `tool_direct`. Restricted to
-# read-only or user-visible actions so a compromised renderer (or any process
-# on localhost in dev mode) cannot call shell_execute / file_write / etc.
+# read-only or explicit user-visible actions so a compromised renderer (or any
+# process on localhost in dev mode) cannot call shell_execute / file_write / etc.
 # without going through the agent.
 SAFE_DIRECT_TOOLS: set[str] = {
     "screenshot",
     "get_screen_size",
     "browser_navigate",
     "browser_screenshot",
+    "automation_observe",
+    "automation_replay",
     "app_list_windows",
     "git_status",
     "knowledge_list",
@@ -233,6 +287,10 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     "桌面操控": [
         "screenshot", "mouse_click", "mouse_move", "type_text",
         "press_key", "scroll", "get_screen_size",
+    ],
+    "自动化检查": [
+        "automation_observe", "automation_click", "automation_type",
+        "automation_key", "automation_scroll", "automation_replay",
     ],
     "应用控制": ["app_open", "app_list_windows", "app_find_window", "app_click", "app_type"],
     "Git 版本控制": [
@@ -254,7 +312,15 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "skill_draft_save", "skill_validate", "skill_publish",
         "skill_list", "skill_read", "skill_archive",
     ],
-    "记忆管理": ["memory_search", "memory_list", "memory_handoff_write"],
+    "记忆管理": [
+        "memory_search",
+        "memory_remember",
+        "memory_update",
+        "memory_forget",
+        "memory_rebuild",
+        "memory_list",
+        "memory_handoff_write",
+    ],
 }
 
 
@@ -345,8 +411,9 @@ def get_tool(name: str, dynamic_registry: DynamicToolRegistry | None = None) -> 
     raise KeyError(f"Tool not found: {name}")
 
 
-def list_tool_names(dynamic_registry: DynamicToolRegistry | None = None) -> list[str]:
-    names = list(TOOLS_BY_NAME.keys())
+def list_tool_names(dynamic_registry: DynamicToolRegistry | None = None, agent_type: str | None = None) -> list[str]:
+    allowed = _filter_tools_by_agent(agent_type)
+    names = [name for name in TOOLS_BY_NAME.keys() if allowed is None or name in allowed]
     if dynamic_registry:
         names.extend(dynamic_registry.list_names())
     return names

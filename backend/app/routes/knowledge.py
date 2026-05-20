@@ -22,13 +22,19 @@ class KnowledgeSearchRequest(BaseModel):
 @router.get("/api/knowledge/docs")
 def list_knowledge_docs():
     from app.rag.engine import get_rag_engine
-    return {"docs": get_rag_engine().list_docs()}
+    try:
+        return {"docs": get_rag_engine().list_docs()}
+    except Exception as exc:
+        return {"docs": [], "error": str(exc)}
 
 
 @router.post("/api/knowledge/index")
 async def index_knowledge(req: KnowledgeIndexRequest):
     from app.rag.engine import get_rag_engine
-    result = get_rag_engine().index_file(req.path, recursive=req.recursive)
+    try:
+        result = get_rag_engine().index_file(req.path, recursive=req.recursive)
+    except Exception as exc:
+        result = {"error": str(exc)}
     if "error" in result:
         return {"error": result["error"]}
     return result
@@ -37,27 +43,35 @@ async def index_knowledge(req: KnowledgeIndexRequest):
 @router.delete("/api/knowledge/docs")
 def delete_knowledge_doc(path: str):
     from app.rag.engine import get_rag_engine
-    return get_rag_engine().delete_doc(path)
+    try:
+        return get_rag_engine().delete_doc(path)
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @router.post("/api/knowledge/search")
 async def search_knowledge(req: KnowledgeSearchRequest):
     from app.rag.engine import get_rag_engine
-    results = get_rag_engine().search(req.query, top_k=req.top_k, source_filter=req.source_filter)
-    return {"results": [r.model_dump() for r in results]}
+    try:
+        results = get_rag_engine().search(req.query, top_k=req.top_k, source_filter=req.source_filter)
+        return {"results": [r.model_dump() for r in results]}
+    except Exception as exc:
+        return {"results": [], "error": str(exc)}
 
 
 @router.delete("/api/knowledge")
 def clear_knowledge():
     from app.rag.engine import get_rag_engine
-    result = get_rag_engine().clear_all()
-    return result
+    try:
+        return get_rag_engine().clear_all()
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @router.get("/api/knowledge/stats")
 def knowledge_stats():
-    from app.rag.engine import get_rag_engine
-    return get_rag_engine().get_stats()
+    from app.rag.engine import get_rag_status
+    return get_rag_status()
 
 
 # ── Memory endpoints (cross-session project memory) ──────────────────────

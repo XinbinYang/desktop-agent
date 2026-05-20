@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Loader2, RefreshCw, FlaskConical, Archive, Sparkles } from 'lucide-react';
+import { Loader2, RefreshCw, FlaskConical, Archive, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
 import { API_BASE } from '../../config';
 
 interface SkillInfo {
@@ -20,6 +20,7 @@ export const EvolutionPanel: React.FC = () => {
   const [archives, setArchives] = useState<ArchiveInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -43,6 +44,9 @@ export const EvolutionPanel: React.FC = () => {
   useEffect(() => { load(); }, [load]);
 
   const triggerEvolution = useCallback(async () => {
+    if (!window.confirm('能力进化会创建快照，并可能沉淀长期规则或生成技能草稿。确认现在手动运行吗？')) {
+      return;
+    }
     setTriggering(true);
     try {
       const res = await fetch(`${API_BASE}/api/agents/personal/evolve/trigger`, { method: 'POST' });
@@ -60,6 +64,10 @@ export const EvolutionPanel: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full">
+      <div className="shrink-0 border-b border-border bg-surface-alt/50 px-3 py-2 text-[11px] leading-relaxed text-fg-muted">
+        能力进化由 Agent 根据任务和反馈自动判断。这里展示已沉淀的技能与快照，手动运行只放在高级维护里。
+      </div>
+
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border shrink-0">
         <div className="flex items-center gap-1.5">
@@ -77,16 +85,12 @@ export const EvolutionPanel: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={triggerEvolution}
-            disabled={triggering}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/20"
+            onClick={() => setShowAdvanced((value) => !value)}
+            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] border border-border text-fg-muted hover:bg-surface-hover hover:text-fg"
+            aria-expanded={showAdvanced}
           >
-            {triggering ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
-            ) : (
-              <Sparkles className="w-3 h-3" />
-            )}
-            Evolve Now
+            {showAdvanced ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+            高级维护
           </button>
         </div>
       </div>
@@ -143,9 +147,31 @@ export const EvolutionPanel: React.FC = () => {
 
             {/* Trigger info */}
             <div className="text-[10px] text-fg-muted">
-              <p>Evolution triggers automatically after 15 completed tasks or 5 user feedback items.</p>
-              <p className="mt-1">Before each evolution, a snapshot of SOUL.md, INNER.md, IDENTITY.md, AGENTS.md, and MEMORY.md is archived.</p>
+              <p>能力进化会在 15 个任务完成或 5 条用户反馈后自动判断是否运行。</p>
+              <p className="mt-1">每次进化前都会创建可变身份文件和规则文件快照。</p>
             </div>
+
+            {showAdvanced && (
+              <div className="rounded border border-border bg-surface-alt p-2">
+                <div className="mb-2 text-[11px] font-medium text-fg">高级维护</div>
+                <div className="mb-2 text-[10px] leading-relaxed text-fg-muted">
+                  仅在需要调试或立即沉淀规则时手动运行；普通使用会由 Agent 自动判断时机。
+                </div>
+                <button
+                  type="button"
+                  onClick={triggerEvolution}
+                  disabled={triggering}
+                  className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
+                >
+                  {triggering ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3 h-3" />
+                  )}
+                  立即进化
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>

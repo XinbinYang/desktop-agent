@@ -1,5 +1,23 @@
 import React, { createContext, useContext, useCallback, useRef } from 'react';
-import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, PlanDecisionAnswer, ClientChatMode, ThinkingIntensity, AgentType, ContextUsage, ConversationCheckpoint } from '../types';
+import type {
+  ChatMessage,
+  ToolCall,
+  FileEdit,
+  RunEvent,
+  ArtifactItem,
+  EditorGroup,
+  PlanState,
+  PlanDecisionAnswer,
+  ClientChatMode,
+  ThinkingIntensity,
+  AgentType,
+  ContextUsage,
+  ConversationCheckpoint,
+  AutomationSnapshot,
+  AutomationAction,
+  AutomationTrace,
+  AutomationReplayStatus,
+} from '../types';
 
 // ---- Types ----
 
@@ -23,10 +41,15 @@ export interface SessionSnapshot {
   fileEdits: FileEdit[];
   toolCalls: ToolCall[];
   runEvents: RunEvent[];
+  automationSnapshots: AutomationSnapshot[];
+  automationActions: AutomationAction[];
+  automationTraces: AutomationTrace[];
+  automationReplayStatus: AutomationReplayStatus | null;
 }
 export interface SessionActions {
   sendMessage: (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => void;
   clearSession: () => void;
+  resetContext: (command?: 'reset' | 'new', greet?: boolean) => void;
   compactSession: (force?: boolean, focus?: string) => void;
   loadCheckpoints: () => Promise<ConversationCheckpoint[]>;
   rewindToCheckpoint: (checkpointId: string) => void;
@@ -59,6 +82,7 @@ export interface SessionActions {
 const NOOP_ACTIONS: SessionActions = {
   sendMessage: () => {},
   clearSession: () => {},
+  resetContext: () => {},
   compactSession: () => {},
   loadCheckpoints: async () => [],
   rewindToCheckpoint: () => {},

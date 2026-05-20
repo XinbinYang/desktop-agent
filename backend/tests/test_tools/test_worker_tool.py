@@ -2,8 +2,27 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
+from app.message_utils import execute_tool
+from app.tools.base import ToolResult
 from app.tools.worker_tool import DispatchWorkerTool, DispatchParallelTool, reset_worker_event_callback, set_worker_event_callback
 from app.worker import WorkerSession
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_injects_session_model_id_context():
+    class CaptureModelTool:
+        async def execute(self, session_model_id: str = ""):
+            return ToolResult(output=session_model_id)
+
+    result = await execute_tool(
+        "capture_model",
+        {"session_model_id": "kimi-for-coding"},
+        ["capture_model"],
+        session_model_id="gpt-4o-mini",
+        get_tool_fn=lambda _name: CaptureModelTool(),
+    )
+
+    assert result.result_text == "gpt-4o-mini"
 
 
 class TestDispatchWorkerTool:
@@ -100,6 +119,31 @@ class TestDispatchWorkerTool:
 
         assert "Worker" in result.output
         assert seen == ["personal"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_inherits_session_model_when_model_omitted(self):
+        seen = []
+
+        async def replacement_run(self):
+            seen.append(self.model_id)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Task completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchWorkerTool()
+            result = await tool.execute(
+                task="Summarize notes",
+                profile="general",
+                session_model_id="gpt-4o",
+            )
+
+        assert "Worker" in result.output
+        assert seen == ["gpt-4o"]
 
     @pytest.mark.asyncio
     async def test_dispatch_worker_failed_done_returns_tool_error(self):
@@ -321,6 +365,60 @@ class TestDispatchParallelTool:
         assert seen[1]["model_id"] == second_model
         assert seen[1]["profile"] == "reviewer"
         assert seen[1]["agent_type"] == "coding"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_inherits_session_model_when_model_omitted(self):
+        seen = []
+
+        async def replacement_run(self):
+            seen.append(self.model_id)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Task completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(
+                tasks=[
+                    {"task": "Task A", "profile": "code"},
+                    {"task": "Task B", "profile": "reviewer"},
+                ],
+                session_model_id="gpt-4o-mini",
+            )
+
+        assert "2 succeeded" in result.output
+        assert seen == ["gpt-4o-mini", "gpt-4o-mini"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_task_model_overrides_session_model(self):
+        seen = []
+
+        async def replacement_run(self):
+            seen.append(self.model_id)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Task completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        with patch.object(WorkerSession, "run", new=replacement_run):
+            tool = DispatchParallelTool()
+            result = await tool.execute(
+                tasks=[
+                    {"task": "Task A", "profile": "code", "model_id": "gpt-4o"},
+                    {"task": "Task B", "profile": "reviewer"},
+                ],
+                session_model_id="gpt-4o-mini",
+            )
+
+        assert "2 succeeded" in result.output
+        assert seen == ["gpt-4o", "gpt-4o-mini"]
 
     @pytest.mark.asyncio
     async def test_dispatch_parallel_empty_tasks(self, mock_litellm):

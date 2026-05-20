@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X } from 'lucide-react';
+import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X, Maximize2 } from 'lucide-react';
 import { Virtuoso, VirtuosoHandle, type IndexLocationWithAlign, type ListRange, type StateSnapshot } from 'react-virtuoso';
 import { useTranslation } from 'react-i18next';
 import {
@@ -32,6 +32,8 @@ import { SlashCommandMenu } from './SlashCommandMenu';
 import { AtMentionMenu } from './AtMentionMenu';
 import { ContextMeter } from './ContextMeter';
 import { RewindModal } from './RewindModal';
+import { PersonalChatSurface } from './chat/PersonalChatSurface';
+import { AgentRunningStatus } from './chat/AgentRunningStatus';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
 import {
   buildTimelineEvents,
@@ -89,9 +91,16 @@ interface ChatPanelProps {
   fileTree?: any[];
   agentType?: AgentType;
   projectName?: string;
+  assistantDisplayName?: string;
 }
 
 type OutputMode = 'concise' | 'balanced' | 'verbose';
+type SandboxMode = 'sandbox' | 'unrestricted';
+
+interface ImagePreviewState {
+  src: string;
+  alt: string;
+}
 
 interface ChatScrollMemory {
   atBottom?: boolean;
@@ -106,6 +115,7 @@ const chatScrollMemoryBySession = new Map<string, ChatScrollMemory>();
 const COMMAND_KEYS = new Set(['ArrowDown', 'ArrowUp', 'Enter', 'Escape']);
 const DIRECT_COMMANDS = new Set([
   'clear',
+  'reset',
   'new',
   'help',
   'compact',
@@ -149,6 +159,46 @@ function getInitialNoiseFilter(): boolean {
     if (raw === '0') return false;
   } catch { /* ignore */ }
   return true;
+}
+
+function getPersonalChatV2Enabled(): boolean {
+  try {
+    return localStorage.getItem('desktop-agent-personal-chat-v2') !== '0';
+  } catch {
+    return true;
+  }
+}
+
+let sandboxModeCache: SandboxMode | null = null;
+let sandboxModePromise: Promise<SandboxMode | null> | null = null;
+const sandboxModeSubscribers = new Set<(mode: SandboxMode) => void>();
+
+function publishSandboxMode(mode: SandboxMode) {
+  sandboxModeCache = mode;
+  for (const subscriber of Array.from(sandboxModeSubscribers)) {
+    subscriber(mode);
+  }
+}
+
+function loadSandboxModeOnce(): Promise<SandboxMode | null> {
+  if (sandboxModeCache) return Promise.resolve(sandboxModeCache);
+  if (!sandboxModePromise) {
+    sandboxModePromise = fetch(`${API_BASE}/api/settings`)
+      .then((res) => res.json())
+      .then((data) => {
+        const mode = data.settings?.sandbox_mode;
+        if (mode === 'sandbox' || mode === 'unrestricted') {
+          sandboxModeCache = mode;
+          return mode as SandboxMode;
+        }
+        return null;
+      })
+      .catch(() => null)
+      .finally(() => {
+        sandboxModePromise = null;
+      });
+  }
+  return sandboxModePromise;
 }
 
 function isNoisyToolBlock(block: Extract<AssistantBlock, { type: 'tool_call' }>): boolean {
@@ -229,14 +279,17 @@ const EmptyChatWelcome: React.FC<{
   agentType: AgentType;
   chatMode: ClientChatMode;
   projectName?: string;
-}> = ({ agentType, chatMode, projectName }) => {
+  assistantDisplayName?: string;
+}> = ({ agentType, chatMode, projectName, assistantDisplayName }) => {
   const { t } = useTranslation();
   const isCoding = agentType === 'coding';
+  const visibleProjectName = isCoding ? projectName : undefined;
   const AgentIcon = isCoding ? Code2 : Bot;
-  const agentLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
+  const typeLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
+  const agentLabel = isCoding ? typeLabel : (assistantDisplayName?.trim() || typeLabel);
   const modeLabel = chatMode === 'plan' ? t('chat.empty.planMode') : t('chat.empty.agentMode');
-  const title = projectName
-    ? t('chat.empty.projectReady', { projectName })
+  const title = visibleProjectName
+    ? t('chat.empty.projectReady', { projectName: visibleProjectName })
     : t('chat.empty.ready');
 
   return (
@@ -258,12 +311,13 @@ const EmptyChatWelcome: React.FC<{
         <h2 className="chat-text-lg font-semibold text-fg">{title}</h2>
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
           <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
+          {!isCoding && agentLabel !== typeLabel && <EmptyStatusChip tone="neutral">{typeLabel}</EmptyStatusChip>}
           <EmptyStatusChip tone={chatMode === 'plan' ? 'accent' : 'neutral'}>{modeLabel}</EmptyStatusChip>
-          {projectName && (
-            <EmptyStatusChip title={projectName}>
+          {visibleProjectName && (
+            <EmptyStatusChip title={visibleProjectName}>
               <span className="inline-flex min-w-0 items-center gap-1.5">
                 <FolderOpen className="h-3 w-3 shrink-0" />
-                <span className="truncate">{projectName}</span>
+                <span className="truncate">{visibleProjectName}</span>
               </span>
             </EmptyStatusChip>
           )}
@@ -309,10 +363,12 @@ const TaskGuidanceQueueCard: React.FC<{
   onDelete?: (id: string) => void;
   onClear?: () => void;
 }> = ({ items, isRunning, onApply, onDelete, onClear }) => {
-  const visible = items.filter((item) => item.status !== 'consumed');
-  if (visible.length === 0) return null;
+  const visible = isRunning
+    ? items.filter((item) => item.status === 'queued' || item.status === 'applied')
+    : [];
+  if (!isRunning || visible.length === 0) return null;
 
-  const actionableCount = visible.filter((item) => item.status === 'queued' || item.status === 'stale').length;
+  const actionableCount = visible.filter((item) => item.status === 'queued').length;
   const waitingCount = visible.filter((item) => item.status === 'applied').length;
 
   return (
@@ -348,9 +404,7 @@ const TaskGuidanceQueueCard: React.FC<{
           const statusText =
             item.status === 'applied'
               ? '等待读取'
-              : item.status === 'stale'
-                ? '未读取'
-                : '已排队';
+              : '已排队';
           const preview = item.text?.trim() || (item.image_base64 ? 'Image attached' : '');
           return (
             <div key={item.id} className="flex items-center gap-2 rounded-md bg-surface/70 px-2 py-1.5">
@@ -1441,6 +1495,409 @@ const TimelineToolGroupRow = React.memo<{
 
 TimelineToolGroupRow.displayName = 'TimelineToolGroupRow';
 
+const imageDataUrl = (base64: string) => `data:image/png;base64,${base64}`;
+
+const ChatImageThumbnail = React.memo<{
+  base64: string;
+  alt: string;
+  ariaLabel: string;
+  onOpen: (preview: ImagePreviewState) => void;
+  buttonClassName?: string;
+  imageClassName?: string;
+}>(({
+  base64,
+  alt,
+  ariaLabel,
+  onOpen,
+  buttonClassName = 'mb-[var(--chat-space-sm)]',
+  imageClassName = 'max-w-full max-h-40',
+}) => {
+  const src = imageDataUrl(base64);
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen({ src, alt })}
+      className={`group/image relative block max-w-full cursor-zoom-in rounded border border-border-subtle bg-surface/35 p-0 leading-none overflow-hidden focus:outline-none focus:ring-2 focus:ring-accent/60 ${buttonClassName}`}
+      aria-label={ariaLabel}
+      title={ariaLabel}
+    >
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        draggable={false}
+        className={`${imageClassName} block rounded object-contain transition-transform duration-150 group-hover/image:scale-[1.01]`}
+      />
+      <span className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded bg-black/55 text-white opacity-0 transition-opacity group-hover/image:opacity-100 group-focus-visible/image:opacity-100">
+        <Maximize2 className="h-3.5 w-3.5" />
+      </span>
+    </button>
+  );
+});
+
+ChatImageThumbnail.displayName = 'ChatImageThumbnail';
+
+const ImagePreviewOverlay = React.memo<{
+  preview: ImagePreviewState | null;
+  onClose: () => void;
+}>(({ preview, onClose }) => {
+  useEffect(() => {
+    if (!preview) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [preview, onClose]);
+
+  if (!preview) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Image preview"
+      onClick={onClose}
+    >
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white hover:bg-black/70 focus:outline-none focus:ring-2 focus:ring-white/70"
+        aria-label="Close image preview"
+        title="Close image preview"
+      >
+        <X className="h-4 w-4" />
+      </button>
+      <div className="max-h-full max-w-full overflow-auto" onClick={(event) => event.stopPropagation()}>
+        <img
+          src={preview.src}
+          alt={preview.alt}
+          className="max-h-[92vh] max-w-[92vw] rounded-md object-contain shadow-2xl"
+        />
+      </div>
+    </div>
+  );
+});
+
+ImagePreviewOverlay.displayName = 'ImagePreviewOverlay';
+
+interface ChatComposerProps {
+  input: string;
+  attachedImage: string | null;
+  isRecording: boolean;
+  recordingTime: number;
+  isTranscribing: boolean;
+  isRunning: boolean;
+  planBlocksChatSend: boolean;
+  showSlashMenu: boolean;
+  slashQuery: string;
+  showAtMenu: boolean;
+  atQuery: string;
+  mentionProjectOpen: boolean;
+  fileTree: any[];
+  sandboxMode: SandboxMode;
+  chatMode: ClientChatMode;
+  isPlanModeActive: boolean;
+  thinkingIntensity: ThinkingIntensity;
+  planState: PlanState;
+  contextUsage?: ContextUsage | null;
+  fileInputRef: React.RefObject<HTMLInputElement>;
+  textareaRef: React.RefObject<HTMLTextAreaElement>;
+  onInputChange: (value: string) => void;
+  onSend: () => void;
+  onStop?: () => void;
+  onFileSelect: (event: React.ChangeEvent<HTMLInputElement>) => void;
+  onStartRecording: () => void;
+  onStopRecording: () => void;
+  onKeyDown: (event: React.KeyboardEvent) => void;
+  onPaste: (event: React.ClipboardEvent) => void;
+  onCommand: (command: { name: string; args: string }) => void;
+  onAtMention: (item: { id: string; label: string; category: string }) => void;
+  onCloseSlash: () => void;
+  onVisibleCommandsChange: (count: number) => void;
+  onCloseAt: () => void;
+  onRemoveImage: () => void;
+  onOpenImage: (preview: ImagePreviewState) => void;
+  onToggleSandboxMode: () => void;
+  onChatModeChange: (mode: ClientChatMode) => void;
+  onThinkingIntensityChange: (intensity: ThinkingIntensity) => void;
+  onCompact?: () => void;
+  formatTime: (seconds: number) => string;
+}
+
+const ChatComposer: React.FC<ChatComposerProps> = ({
+  input,
+  attachedImage,
+  isRecording,
+  recordingTime,
+  isTranscribing,
+  isRunning,
+  planBlocksChatSend,
+  showSlashMenu,
+  slashQuery,
+  showAtMenu,
+  atQuery,
+  mentionProjectOpen,
+  fileTree,
+  sandboxMode,
+  chatMode,
+  isPlanModeActive,
+  thinkingIntensity,
+  planState,
+  contextUsage,
+  fileInputRef,
+  textareaRef,
+  onInputChange,
+  onSend,
+  onStop,
+  onFileSelect,
+  onStartRecording,
+  onStopRecording,
+  onKeyDown,
+  onPaste,
+  onCommand,
+  onAtMention,
+  onCloseSlash,
+  onVisibleCommandsChange,
+  onCloseAt,
+  onRemoveImage,
+  onOpenImage,
+  onToggleSandboxMode,
+  onChatModeChange,
+  onThinkingIntensityChange,
+  onCompact,
+  formatTime,
+}) => (
+  <>
+    {attachedImage && (
+      <div className="mb-2 flex items-center gap-2">
+        <div className="relative inline-block">
+          <ChatImageThumbnail
+            base64={attachedImage}
+            alt="preview"
+            ariaLabel="Open attached image preview"
+            onOpen={onOpenImage}
+            buttonClassName=""
+            imageClassName="h-16 max-w-[12rem]"
+          />
+          <button
+            onClick={onRemoveImage}
+            className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-fg-on-danger flex items-center justify-center"
+            aria-label="Remove image"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </div>
+        <span className="text-xs text-fg-muted">Image attached (will be sent to vision-capable models)</span>
+      </div>
+    )}
+
+    <div className="flex items-end gap-2">
+      <button
+        onClick={() => fileInputRef.current?.click()}
+        className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors"
+        title="Upload image"
+        aria-label="Upload image"
+      >
+        <Image className="w-5 h-5" />
+      </button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={onFileSelect}
+        aria-label="Select image to upload"
+        title="Select image to upload"
+      />
+
+      {isRecording ? (
+        <button
+          onClick={onStopRecording}
+          className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger animate-pulse"
+          title="Click to stop recording"
+          aria-label="Stop recording"
+        >
+          <div className="flex items-center gap-1.5">
+            <MicOff className="w-5 h-5" />
+            <span className="text-xs font-mono">{formatTime(recordingTime)}</span>
+          </div>
+        </button>
+      ) : (
+        <button
+          onClick={onStartRecording}
+          disabled={isTranscribing || isRunning || planBlocksChatSend}
+          className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors disabled:opacity-50"
+          title={planBlocksChatSend ? 'Voice input disabled while answering plan questions' : 'Voice input'}
+          aria-label="Voice input"
+        >
+          {isTranscribing ? (
+            <Loader2 className="w-5 h-5 animate-spin text-accent" />
+          ) : (
+            <Mic className="w-5 h-5" />
+          )}
+        </button>
+      )}
+
+      <div className="flex-1 relative">
+        <textarea
+          ref={textareaRef}
+          value={input}
+          disabled={isRecording || isTranscribing || planBlocksChatSend}
+          onChange={(event) => onInputChange(event.target.value)}
+          onKeyDown={onKeyDown}
+          onPaste={onPaste}
+          placeholder={
+            planBlocksChatSend
+              ? 'Complete the plan questions above to continue...'
+              : isRecording
+                ? 'Recording... Click mic to stop'
+                : isTranscribing
+                  ? 'Transcribing audio...'
+                  : 'Type a message... (Shift+Enter for new line)'
+          }
+          rows={1}
+          className="w-full min-h-[40px] bg-surface-input border border-border rounded-lg px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] pr-10 chat-text-sm text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-32 disabled:opacity-60"
+        />
+        {showSlashMenu && (
+          <SlashCommandMenu
+            query={slashQuery}
+            onSelect={onCommand}
+            onClose={onCloseSlash}
+            inputRef={textareaRef}
+            onVisibleCommandsChange={onVisibleCommandsChange}
+          />
+        )}
+        {showAtMenu && (
+          <AtMentionMenu
+            query={atQuery}
+            onSelect={onAtMention}
+            onClose={onCloseAt}
+            inputRef={textareaRef}
+            projectOpen={mentionProjectOpen}
+            fileTree={fileTree}
+          />
+        )}
+      </div>
+
+      <button
+        onClick={onToggleSandboxMode}
+        disabled={isRunning}
+        title={sandboxMode === 'sandbox' ? 'Sandbox mode - click for Unrestricted' : 'Unrestricted mode - click for Sandbox'}
+        className={`p-2 rounded-lg transition-colors disabled:opacity-50 ${
+          sandboxMode === 'sandbox'
+            ? 'text-success hover:bg-surface-hover hover:text-success/85'
+            : 'text-warning hover:bg-surface-hover hover:text-warning/85'
+        }`}
+      >
+        {sandboxMode === 'sandbox' ? <Shield className="w-5 h-5" /> : <ShieldOff className="w-5 h-5" />}
+      </button>
+
+      <button
+        onClick={onSend}
+        disabled={planBlocksChatSend || (!input.trim() && !attachedImage)}
+        aria-label={isRunning ? 'Queue task guidance' : 'Send'}
+        title={
+          planBlocksChatSend
+            ? 'Send disabled until plan questions are answered'
+            : isRunning
+              ? 'Add to task guidance queue'
+              : undefined
+        }
+        className="p-2 rounded-lg transition-colors bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted"
+      >
+        <Send className="w-5 h-5" />
+      </button>
+      {isRunning && (
+        <button
+          type="button"
+          onClick={onStop}
+          aria-label="Stop"
+          title="Stop"
+          className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger"
+        >
+          <Square className="w-5 h-5" />
+        </button>
+      )}
+    </div>
+
+    <div
+      className="mt-2 pt-2 border-t border-border-subtle flex items-center justify-between gap-3 flex-wrap"
+      aria-label="Chat mode and thinking intensity"
+    >
+      <div className="flex items-center gap-2">
+        <span className="chat-text-xs text-fg-muted">Mode</span>
+        <button
+          type="button"
+          onClick={() => onChatModeChange('agent')}
+          className={`chat-text-xs px-2.5 py-1 rounded-md border transition-colors ${
+            chatMode === 'agent'
+              ? 'bg-surface-alt border-border text-fg'
+              : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
+          }`}
+        >
+          Agent
+        </button>
+        <button
+          type="button"
+          onClick={() => onChatModeChange('plan')}
+          aria-pressed={isPlanModeActive}
+          aria-label="Plan mode"
+          className={`chat-text-xs inline-flex items-center gap-1 pl-2 pr-1.5 py-1 rounded-full border transition-colors ${
+            isPlanModeActive
+              ? 'shadow-sm border-[color:var(--plan-pill-border)] bg-[color:var(--plan-pill-bg)] text-[color:var(--plan-pill-fg)]'
+              : 'border-border-subtle text-fg-muted hover:text-fg-secondary bg-surface'
+          }`}
+        >
+          <PlanModeIcon className="shrink-0 opacity-90" />
+          <span className="font-medium pr-0.5">Plan</span>
+          <ChevronDown className="w-3 h-3 shrink-0 opacity-60" aria-hidden />
+        </button>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="chat-text-xs inline-flex h-7 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-fg-secondary transition-colors hover:border-border hover:bg-surface-hover hover:text-fg"
+              aria-label={`Thinking intensity ${THINKING_LABELS[thinkingIntensity]}`}
+            >
+              <span className="text-fg-muted">Thinking</span>
+              <span className="font-semibold text-info">{THINKING_LABELS[thinkingIntensity]}</span>
+              <ChevronDown className="h-3 w-3 text-fg-muted" aria-hidden />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[128px]">
+            {THINKING_LEVELS.map((level) => (
+              <DropdownMenuItem
+                key={level}
+                onSelect={() => onThinkingIntensityChange(level)}
+                className={`justify-between ${
+                  thinkingIntensity === level ? 'text-info bg-info/10' : ''
+                }`}
+              >
+                <span>{THINKING_LABELS[level]}</span>
+                {thinkingIntensity === level && <Check className="h-3.5 w-3.5" aria-hidden />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <span className="chat-text-xs text-fg-muted ml-1" title="Server plan phase">
+          Status: {planPhaseLabel(planState.phase)}
+        </span>
+        <ContextMeter
+          usage={contextUsage}
+          onCompact={onCompact}
+          disabled={isRunning}
+        />
+      </div>
+    </div>
+  </>
+);
+
 export const ChatPanel: React.FC<ChatPanelProps> = ({
   sessionId,
   messages,
@@ -1485,29 +1942,43 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   fileTree = [],
   agentType = 'personal',
   projectName,
+  assistantDisplayName,
 }) => {
   const planBlocksChatSend = (chatMode === 'plan' || planState.mode === 'plan') && planState.phase === 'awaiting_decision';
   const isPlanModeActive = chatMode === 'plan';
+  const mentionProjectOpen = agentType === 'coding' && projectOpen;
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
   const [attachedImage, setAttachedImage] = useState<string | null>(null);
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
-  const [sandboxMode, setSandboxMode] = useState<'sandbox' | 'unrestricted'>('sandbox');
+  const [sandboxMode, setSandboxMode] = useState<SandboxMode>(() => sandboxModeCache || 'sandbox');
   const [expandedToolDetails, setExpandedToolDetails] = useState<Record<string, boolean>>({});
   const [showAllToolDetails, setShowAllToolDetails] = useState<Record<string, boolean>>({});
   const [outputMode, setOutputMode] = useState<OutputMode>(getInitialOutputMode);
   const [hideToolNoise, setHideToolNoise] = useState<boolean>(getInitialNoiseFilter);
+  const [personalChatV2Enabled] = useState(getPersonalChatV2Enabled);
   const [slashQuery, setSlashQuery] = useState('');
   const showSlashMenu = slashQuery !== '';
+  const [slashVisibleCommandCount, setSlashVisibleCommandCount] = useState(0);
   const [atQuery, setAtQuery] = useState('');
   const showAtMenu = atQuery !== '';
 
   const density = outputMode === 'concise' ? 'compact' : outputMode === 'verbose' ? 'comfortable' : 'balanced';
+  const usePersonalChatV2 = agentType === 'personal' && personalChatV2Enabled && chatMode !== 'plan';
+
+  const openImagePreview = useCallback((preview: ImagePreviewState) => {
+    setImagePreview(preview);
+  }, []);
+
+  const closeImagePreview = useCallback(() => {
+    setImagePreview(null);
+  }, []);
 
   useEffect(() => {
     try {
@@ -1523,15 +1994,22 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   // 加载当前权限模式
   useEffect(() => {
-    fetch(`${API_BASE}/api/settings`)
-      .then((res) => res.json())
-      .then((data) => {
-        const mode = data.settings?.sandbox_mode;
-        if (mode === 'sandbox' || mode === 'unrestricted') {
-          setSandboxMode(mode);
-        }
-      })
-      .catch(() => {});
+    let cancelled = false;
+    const subscriber = (mode: SandboxMode) => {
+      if (!cancelled) setSandboxMode(mode);
+    };
+    sandboxModeSubscribers.add(subscriber);
+    if (sandboxModeCache) {
+      setSandboxMode(sandboxModeCache);
+    } else {
+      void loadSandboxModeOnce().then((mode) => {
+        if (mode && !cancelled) setSandboxMode(mode);
+      });
+    }
+    return () => {
+      cancelled = true;
+      sandboxModeSubscribers.delete(subscriber);
+    };
   }, []);
 
   const toggleSandboxMode = async () => {
@@ -1547,7 +2025,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         body: JSON.stringify({ sandbox_mode: next }),
       });
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
-      setSandboxMode(next);
+      publishSandboxMode(next);
     } catch {
       // ignore
     }
@@ -1677,6 +2155,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       onCommand?.(slashCommand.command, slashCommand.args);
       setInput('');
       setSlashQuery('');
+      setSlashVisibleCommandCount(0);
       onDraftClear?.();
       if (textareaRef.current) {
         textareaRef.current.style.height = '40px';
@@ -1708,9 +2187,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   const handleCommand = useCallback((cmd: { name: string; args: string }) => {
     setSlashQuery('');
+    setSlashVisibleCommandCount(0);
     if (DIRECT_COMMANDS.has(cmd.name)) {
-      onCommand?.(cmd.name, '');
       setInput('');
+      onDraftClear?.();
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      onCommand?.(cmd.name, '');
     } else if (ARG_COMMANDS.has(cmd.name) || cmd.args) {
       // For commands with args, fill the command prefix and let user type args
       setInput(`/${cmd.name} `);
@@ -1719,7 +2203,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setInput(`/${cmd.name} `);
       setTimeout(() => textareaRef.current?.focus(), 0);
     }
-  }, [onCommand]);
+  }, [onCommand, onDraftClear]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.defaultPrevented) return;
@@ -1728,7 +2212,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       onChatModeChange('plan');
       return;
     }
-    if (showSlashMenu && COMMAND_KEYS.has(e.key)) {
+    if (showSlashMenu && e.key === 'Escape') {
+      e.preventDefault();
+      setSlashQuery('');
+      setSlashVisibleCommandCount(0);
+      return;
+    }
+    if (showSlashMenu && slashVisibleCommandCount > 0 && COMMAND_KEYS.has(e.key)) {
       e.preventDefault();
       return;
     }
@@ -1765,6 +2255,28 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           reader.readAsDataURL(file);
         }
       }
+    }
+  };
+
+  const handleInputChange = (val: string) => {
+    setInput(val);
+    adjustTextareaHeight();
+    if (val.startsWith('/') && !val.includes(' ')) {
+      setSlashQuery(val);
+    } else {
+      setSlashQuery('');
+      setSlashVisibleCommandCount(0);
+    }
+    const atIdx = val.lastIndexOf('@');
+    if (atIdx >= 0) {
+      const afterAt = val.slice(atIdx);
+      if (!afterAt.includes(' ') && afterAt.length <= 30) {
+        setAtQuery(afterAt);
+      } else {
+        setAtQuery('');
+      }
+    } else {
+      setAtQuery('');
     }
   };
 
@@ -1852,14 +2364,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   }, [messages, searchQuery]);
 
   const timelineMode: TimelineRenderMode = agentType === 'coding' ? 'coding' : 'personal';
-  const timelineEvents = useMemo(() => buildTimelineEvents({
-    messages: filteredMessages,
-    toolCalls,
-    fileEdits,
-    runEvents,
-    planState,
-    mode: timelineMode,
-  }), [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode]);
+  const timelineEvents = useMemo(() => {
+    if (usePersonalChatV2) return [];
+    return buildTimelineEvents({
+      messages: filteredMessages,
+      toolCalls,
+      fileEdits,
+      runEvents,
+      planState,
+      mode: timelineMode,
+    });
+  }, [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode, usePersonalChatV2]);
 
   // Markdown 自定义渲染
   // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
@@ -1968,13 +2483,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact />;
       case 'image':
         return (
-          <img
+          <ChatImageThumbnail
             key={`img-${block.timestamp}`}
-            src={`data:image/png;base64,${block.base64}`}
+            base64={block.base64}
             alt="tool screenshot"
-            loading="lazy"
-            decoding="async"
-            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+            ariaLabel="Open tool screenshot"
+            onOpen={openImagePreview}
           />
         );
       case 'plan_questions':
@@ -2007,7 +2521,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       default:
         return null;
     }
-  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents]);
+  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents, openImagePreview]);
 
   const lastAssistantMsgId = useMemo(() => {
     const lastMsg = messages[messages.length - 1];
@@ -2033,12 +2547,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               : 'bg-accent/15 text-fg rounded-lg px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] ml-auto max-w-[85%] border border-accent/20 chat-text-sm'
           }`}>
             {event.imageBase64 && (
-              <img
-                src={`data:image/png;base64,${event.imageBase64}`}
+              <ChatImageThumbnail
+                base64={event.imageBase64}
                 alt="attached"
-                loading="lazy"
-                decoding="async"
-                className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+                ariaLabel="Open attached image"
+                onOpen={openImagePreview}
               />
             )}
             <div className="prose prose-sm chat-prose chat-prose-plain max-w-none">
@@ -2051,6 +2564,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         content = <TimelineThinkingRow event={event} />;
         break;
       case 'text_summary':
+        const streamingText = event.message?.turnComplete === false;
         content = (
           <div className="relative group py-[var(--chat-space-xs)] text-fg">
             {retryable && (
@@ -2064,11 +2578,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 <RotateCcw className="w-2.5 h-2.5 text-fg-secondary" />
               </button>
             )}
-            <div className="prose prose-sm chat-prose max-w-none">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownForMode}>
+            {streamingText ? (
+              <div className="chat-text-sm whitespace-pre-wrap leading-[var(--chat-line-height)] text-fg">
                 {event.text}
-              </ReactMarkdown>
-            </div>
+              </div>
+            ) : (
+              <div className="prose prose-sm chat-prose max-w-none">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownForMode}>
+                  {event.text}
+                </ReactMarkdown>
+              </div>
+            )}
           </div>
         );
         break;
@@ -2083,13 +2603,19 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         break;
       case 'image':
         content = (
-          <img
-            src={`data:image/png;base64,${event.base64}`}
+          <ChatImageThumbnail
+            base64={event.base64}
             alt="tool screenshot"
-            loading="lazy"
-            decoding="async"
-            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+            ariaLabel="Open tool screenshot"
+            onOpen={openImagePreview}
           />
+        );
+        break;
+      case 'notice':
+        content = (
+          <div className="rounded-md border border-success/20 bg-success/10 px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] chat-text-xs text-success">
+            {event.text}
+          </div>
         );
         break;
       case 'todo':
@@ -2154,6 +2680,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     onViewPlan,
     onPauseBuild,
     onEndBuild,
+    openImagePreview,
   ]);
 
   const itemContent = useCallback((index: number) => {
@@ -2194,10 +2721,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             <div className="relative pl-[var(--chat-timeline-indent)] py-[var(--chat-space-xs)]">
               <div className="absolute left-[5px] top-0 bottom-0 w-px bg-border-subtle" />
               <div className="absolute left-[2px] top-1.5 w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-              <div className="pl-1 chat-text-xs text-fg-muted flex items-center gap-1.5">
-                <Loader2 className="w-3 h-3 animate-spin text-accent" />
-                <span>Agent is working...</span>
-              </div>
+              <AgentRunningStatus
+                label="Agent is working..."
+                className="pl-1 chat-text-xs text-fg-muted"
+                iconClassName="w-3 h-3 text-accent"
+              />
             </div>
           </div>
         )
@@ -2208,13 +2736,15 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             agentType={agentType}
             chatMode={chatMode}
             projectName={projectName}
+            assistantDisplayName={assistantDisplayName}
           />
         )
       : null,
-  }), [agentType, chatMode, isRunning, messages.length, planTaskRequirement, projectName]);
+  }), [agentType, assistantDisplayName, chatMode, isRunning, messages.length, planTaskRequirement, projectName]);
 
   return (
     <div className="relative h-full min-h-0 flex flex-col overflow-hidden bg-app" data-density={density}>
+      <ImagePreviewOverlay preview={imagePreview} onClose={closeImagePreview} />
       {/* 搜索栏 */}
       {showSearch && (
         <div className="px-4 pt-3 pb-1 border-b border-border flex items-center gap-2">
@@ -2239,6 +2769,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       )}
 
       {/* 输出风格控制 */}
+      {!usePersonalChatV2 && (
       <div className="px-[var(--chat-space-lg)] pt-[var(--chat-space-md)] pb-[var(--chat-space-sm)] border-b border-border-subtle flex items-center justify-between gap-3">
         <div className="flex items-center gap-1.5">
           {(['concise', 'balanced', 'verbose'] as OutputMode[]).map((mode) => (
@@ -2268,28 +2799,53 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           {hideToolNoise ? 'Noise filter: ON' : 'Noise filter: OFF'}
         </button>
       </div>
+      )}
 
       {/* 消息列表 */}
       <div
         className="min-h-0 flex-1 relative overflow-hidden"
-        data-testid={timelineMode === 'coding' ? 'coding-event-timeline' : 'personal-conversation-timeline'}
+        data-testid={usePersonalChatV2 ? 'personal-chat-v2-container' : timelineMode === 'coding' ? 'coding-event-timeline' : 'personal-conversation-timeline'}
       >
-        <Virtuoso
-          ref={virtuosoRef}
-          className="h-full"
-          data={timelineEvents}
-          {...virtuosoInitialProps}
-          followOutput={isNearBottom ? 'smooth' : false}
-          atBottomStateChange={handleAtBottomStateChange}
-          rangeChanged={handleRangeChanged}
-          overscan={200}
-          itemContent={itemContent}
-          components={virtuosoComponents}
-        />
+        {usePersonalChatV2 ? (
+          <PersonalChatSurface
+            sessionId={sessionId}
+            messages={messages}
+            toolCalls={toolCalls}
+            fileEdits={fileEdits}
+            planState={planState}
+            searchQuery={searchQuery}
+            isRunning={isRunning}
+            onRetry={onRetry}
+            onOpenImage={openImagePreview}
+            markdownTheme={resolved}
+            assistantDisplayName={assistantDisplayName}
+            emptyPlaceholder={(
+              <EmptyChatWelcome
+                agentType={agentType}
+                chatMode={chatMode}
+                projectName={projectName}
+                assistantDisplayName={assistantDisplayName}
+              />
+            )}
+          />
+        ) : (
+          <Virtuoso
+            ref={virtuosoRef}
+            className="h-full"
+            data={timelineEvents}
+            {...virtuosoInitialProps}
+            followOutput={isNearBottom ? 'smooth' : false}
+            atBottomStateChange={handleAtBottomStateChange}
+            rangeChanged={handleRangeChanged}
+            overscan={200}
+            itemContent={itemContent}
+            components={virtuosoComponents}
+          />
+        )}
       </div>
 
       {/* Scroll to bottom button */}
-      {!isNearBottom && messages.length > 0 && (
+      {!usePersonalChatV2 && !isNearBottom && messages.length > 0 && (
         <button
           onClick={scrollToBottom}
           className="absolute bottom-20 left-1/2 -translate-x-1/2 bg-surface-alt hover:bg-surface-hover text-fg chat-text-xs px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] rounded-full border border-border flex items-center gap-1 shadow-lg transition-colors z-10"
@@ -2401,250 +2957,52 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           onDelete={onDeleteTaskGuidance}
           onClear={onClearTaskGuidance}
         />
-        {attachedImage && (
-          <div className="mb-2 flex items-center gap-2">
-            <div className="relative inline-block">
-              <img
-                src={`data:image/png;base64,${attachedImage}`}
-                alt="preview"
-                className="h-16 rounded border border-border"
-              />
-              <button
-                onClick={() => setAttachedImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-fg-on-danger text-xs flex items-center justify-center"
-                aria-label="Remove image"
-              >
-                ×
-              </button>
-            </div>
-            <span className="text-xs text-fg-muted">Image attached (will be sent to vision-capable models)</span>
-          </div>
-        )}
-
-        <div className="flex items-end gap-2">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors"
-            title="Upload image"
-            aria-label="Upload image"
-          >
-            <Image className="w-5 h-5" />
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={handleFileSelect}
-            aria-label="Select image to upload"
-            title="Select image to upload"
-          />
-
-          {/* Voice recording button */}
-          {isRecording ? (
-            <button
-              onClick={stopRecording}
-              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger animate-pulse"
-              title="Click to stop recording"
-              aria-label="Stop recording"
-            >
-              <div className="flex items-center gap-1.5">
-                <MicOff className="w-5 h-5" />
-                <span className="text-xs font-mono">{formatTime(recordingTime)}</span>
-              </div>
-            </button>
-          ) : (
-            <button
-              onClick={startRecording}
-              disabled={isTranscribing || isRunning || planBlocksChatSend}
-              className="p-2 text-fg-muted hover:text-fg-secondary hover:bg-surface-hover rounded-lg transition-colors disabled:opacity-50"
-              title={planBlocksChatSend ? 'Voice input disabled while answering plan questions' : 'Voice input'}
-              aria-label="Voice input"
-            >
-              {isTranscribing ? (
-                <Loader2 className="w-5 h-5 animate-spin text-accent" />
-              ) : (
-                <Mic className="w-5 h-5" />
-              )}
-            </button>
-          )}
-
-          <div className="flex-1 relative">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              disabled={isRecording || isTranscribing || planBlocksChatSend}
-              onChange={(e) => {
-                const val = e.target.value;
-                setInput(val);
-                adjustTextareaHeight();
-                // Slash command detection: / at start of input
-                if (val.startsWith('/') && !val.includes(' ')) {
-                  setSlashQuery(val);
-                } else {
-                  setSlashQuery('');
-                }
-                // @Mention detection: @ anywhere in input (look for last @)
-                const atIdx = val.lastIndexOf('@');
-                if (atIdx >= 0) {
-                  const afterAt = val.slice(atIdx);
-                  if (!afterAt.includes(' ') && afterAt.length <= 30) {
-                    setAtQuery(afterAt);
-                  } else {
-                    setAtQuery('');
-                  }
-                } else {
-                  setAtQuery('');
-                }
-              }}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
-              placeholder={
-                planBlocksChatSend
-                  ? 'Complete the plan questions above to continue…'
-                  : isRecording
-                  ? 'Recording... Click mic to stop'
-                  : isTranscribing
-                  ? 'Transcribing audio...'
-                  : 'Type a message... (Shift+Enter for new line)'
-              }
-              rows={1}
-              className="w-full min-h-[40px] bg-surface-input border border-border rounded-lg px-[var(--chat-space-lg)] py-[var(--chat-space-sm)] pr-10 chat-text-sm text-fg placeholder:text-fg-muted outline-none focus:border-accent resize-none max-h-32 disabled:opacity-60"
-            />
-            {showSlashMenu && (
-              <SlashCommandMenu
-                query={slashQuery}
-                onSelect={(cmd) => handleCommand(cmd)}
-                onClose={() => setSlashQuery('')}
-                inputRef={textareaRef}
-              />
-            )}
-            {showAtMenu && (
-              <AtMentionMenu
-                query={atQuery}
-                onSelect={(item) => handleAtMention(item)}
-                onClose={() => setAtQuery('')}
-                inputRef={textareaRef}
-                projectOpen={projectOpen}
-                fileTree={fileTree}
-              />
-            )}
-          </div>
-
-          {/* Sandbox mode toggle */}
-          <button
-            onClick={toggleSandboxMode}
-            disabled={isRunning}
-            title={sandboxMode === 'sandbox' ? 'Sandbox mode — click for Unrestricted' : 'Unrestricted mode — click for Sandbox'}
-            className={`p-2 rounded-lg transition-colors disabled:opacity-50 ${
-              sandboxMode === 'sandbox'
-                ? 'text-success hover:bg-surface-hover hover:text-success/85'
-                : 'text-warning hover:bg-surface-hover hover:text-warning/85'
-            }`}
-          >
-            {sandboxMode === 'sandbox' ? <Shield className="w-5 h-5" /> : <ShieldOff className="w-5 h-5" />}
-          </button>
-
-          <button
-            onClick={handleSend}
-            disabled={planBlocksChatSend || (!input.trim() && !attachedImage)}
-            aria-label={isRunning ? 'Queue task guidance' : 'Send'}
-            title={
-              planBlocksChatSend
-                ? 'Send disabled until plan questions are answered'
-                : isRunning
-                  ? 'Add to task guidance queue'
-                  : undefined
-            }
-            className="p-2 rounded-lg transition-colors bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted"
-          >
-            <Send className="w-5 h-5" />
-          </button>
-          {isRunning && (
-            <button
-              type="button"
-              onClick={onStop}
-              aria-label="Stop"
-              title="Stop"
-              className="p-2 rounded-lg transition-colors bg-danger hover:bg-danger/85 text-fg-on-danger"
-            >
-              <Square className="w-5 h-5" />
-            </button>
-          )}
-        </div>
-
-        <div
-          className="mt-2 pt-2 border-t border-border-subtle flex items-center justify-between gap-3 flex-wrap"
-          aria-label="Chat mode and thinking intensity"
-        >
-          <div className="flex items-center gap-2">
-            <span className="chat-text-xs text-fg-muted">Mode</span>
-            <button
-              type="button"
-              onClick={() => onChatModeChange('agent')}
-              className={`chat-text-xs px-2.5 py-1 rounded-md border transition-colors ${
-                chatMode === 'agent'
-                  ? 'bg-surface-alt border-border text-fg'
-                  : 'bg-surface border-border-subtle text-fg-muted hover:text-fg-secondary'
-              }`}
-            >
-              Agent
-            </button>
-            <button
-              type="button"
-              onClick={() => onChatModeChange('plan')}
-              aria-pressed={isPlanModeActive}
-              aria-label="Plan mode"
-              className={`chat-text-xs inline-flex items-center gap-1 pl-2 pr-1.5 py-1 rounded-full border transition-colors ${
-                isPlanModeActive
-                  ? 'shadow-sm border-[color:var(--plan-pill-border)] bg-[color:var(--plan-pill-bg)] text-[color:var(--plan-pill-fg)]'
-                  : 'border-border-subtle text-fg-muted hover:text-fg-secondary bg-surface'
-              }`}
-            >
-              <PlanModeIcon className="shrink-0 opacity-90" />
-              <span className="font-medium pr-0.5">Plan</span>
-              <ChevronDown className="w-3 h-3 shrink-0 opacity-60" aria-hidden />
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2 flex-wrap">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className="chat-text-xs inline-flex h-7 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-fg-secondary transition-colors hover:border-border hover:bg-surface-hover hover:text-fg"
-                  aria-label={`Thinking intensity ${THINKING_LABELS[thinkingIntensity]}`}
-                >
-                  <span className="text-fg-muted">Thinking</span>
-                  <span className="font-semibold text-info">{THINKING_LABELS[thinkingIntensity]}</span>
-                  <ChevronDown className="h-3 w-3 text-fg-muted" aria-hidden />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="min-w-[128px]">
-                {THINKING_LEVELS.map((level) => (
-                  <DropdownMenuItem
-                    key={level}
-                    onSelect={() => onThinkingIntensityChange(level)}
-                    className={`justify-between ${
-                      thinkingIntensity === level ? 'text-info bg-info/10' : ''
-                    }`}
-                  >
-                    <span>{THINKING_LABELS[level]}</span>
-                    {thinkingIntensity === level && <Check className="h-3.5 w-3.5" aria-hidden />}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <span className="chat-text-xs text-fg-muted ml-1" title="Server plan phase">
-              Status: {planPhaseLabel(planState.phase)}
-            </span>
-            <ContextMeter
-              usage={contextUsage}
-              onCompact={() => onCompact?.(false)}
-              disabled={isRunning}
-            />
-          </div>
-        </div>
+        <ChatComposer
+          input={input}
+          attachedImage={attachedImage}
+          isRecording={isRecording}
+          recordingTime={recordingTime}
+          isTranscribing={isTranscribing}
+          isRunning={isRunning}
+          planBlocksChatSend={planBlocksChatSend}
+          showSlashMenu={showSlashMenu}
+          slashQuery={slashQuery}
+          showAtMenu={showAtMenu}
+          atQuery={atQuery}
+          mentionProjectOpen={mentionProjectOpen}
+          fileTree={fileTree}
+          sandboxMode={sandboxMode}
+          chatMode={chatMode}
+          isPlanModeActive={isPlanModeActive}
+          thinkingIntensity={thinkingIntensity}
+          planState={planState}
+          contextUsage={contextUsage}
+          fileInputRef={fileInputRef}
+          textareaRef={textareaRef}
+          onInputChange={handleInputChange}
+          onSend={handleSend}
+          onStop={onStop}
+          onFileSelect={handleFileSelect}
+          onStartRecording={startRecording}
+          onStopRecording={stopRecording}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          onCommand={handleCommand}
+          onAtMention={handleAtMention}
+          onCloseSlash={() => {
+            setSlashQuery('');
+            setSlashVisibleCommandCount(0);
+          }}
+          onVisibleCommandsChange={setSlashVisibleCommandCount}
+          onCloseAt={() => setAtQuery('')}
+          onRemoveImage={() => setAttachedImage(null)}
+          onOpenImage={openImagePreview}
+          onToggleSandboxMode={toggleSandboxMode}
+          onChatModeChange={onChatModeChange}
+          onThinkingIntensityChange={onThinkingIntensityChange}
+          onCompact={() => onCompact?.(false)}
+          formatTime={formatTime}
+        />
       </div>
       <RewindModal
         open={rewindOpen}

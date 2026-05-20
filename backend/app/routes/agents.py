@@ -25,8 +25,35 @@ class WorkspaceFileSave(BaseModel):
     content: str
 
 
+class AgentProfilePatch(BaseModel):
+    display_name: Optional[str] = None
+    avatar_emoji: Optional[str] = None
+    subtitle: Optional[str] = None
+
+
 class MoodUpdate(BaseModel):
     mood: str  # "positive" | "neutral" | "negative"
+
+
+class MemorySearchRequest(BaseModel):
+    query: str = ""
+    memory_type: str = ""
+    tier: str = ""
+    source: str = ""
+    include_deleted: bool = False
+    limit: int = 20
+
+
+class MemoryPatchRequest(BaseModel):
+    memory_type: Optional[str] = None
+    content: Optional[str] = None
+    summary: Optional[str] = None
+    source: Optional[str] = None
+    source_ref: Optional[str] = None
+    scope: Optional[str] = None
+    tier: Optional[str] = None
+    confidence: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @router.get("")
@@ -50,6 +77,7 @@ async def list_agents():
             "default_role": AgentManager.get_default_role(agent_type),
             "model_id": get_model_for_agent(agent_type),
             "thinking_intensity": get_thinking_intensity_for_agent(agent_type),
+            "profile": AgentManager.get_agent_profile(agent_type),
             "tool_profile": {
                 "tool_count": len(tool_schemas),
                 "mode": "focused_coding" if agent_type == "coding" else "desktop_personal",
@@ -67,6 +95,22 @@ async def list_agents():
         agents.append(enriched)
 
     return {"agents": agents}
+
+
+@router.get("/personal/profile")
+async def get_personal_profile():
+    """Return editable Personal Agent display profile metadata."""
+    return {"profile": AgentManager.get_agent_profile("personal")}
+
+
+@router.patch("/personal/profile")
+async def update_personal_profile(body: AgentProfilePatch):
+    """Update Personal Agent display profile metadata."""
+    updates = body.model_dump(exclude_unset=True)
+    profile = AgentManager.save_agent_profile("personal", updates)
+    if profile is None:
+        raise HTTPException(status_code=500, detail="Failed to save profile")
+    return {"profile": profile}
 
 
 @router.get("/{agent_type}/files")
@@ -100,6 +144,75 @@ async def save_workspace_file(agent_type: str, filename: str, body: WorkspaceFil
 
 
 # ── Personal Agent specific endpoints ──
+
+
+def _memory_os():
+    from app.agents.memory_os import get_memory_os
+    return get_memory_os()
+
+
+@router.get("/personal/memory/status")
+async def get_memory_status():
+    """Return Personal Memory OS health and counts."""
+    return _memory_os().status()
+
+
+@router.get("/personal/memory/items")
+async def list_memory_items(
+    memory_type: str = "",
+    tier: str = "",
+    source: str = "",
+    include_deleted: bool = False,
+    limit: int = 100,
+):
+    """List Personal Memory OS items."""
+    items = _memory_os().list_items(
+        memory_type=memory_type,
+        tier=tier,
+        source=source,
+        include_deleted=include_deleted,
+        limit=limit,
+    )
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/personal/memory/search")
+async def search_memory(req: MemorySearchRequest):
+    """Hybrid-search Personal Memory OS items."""
+    items = _memory_os().search(
+        query=req.query,
+        memory_type=req.memory_type,
+        tier=req.tier,
+        source=req.source,
+        include_deleted=req.include_deleted,
+        limit=req.limit,
+    )
+    return {"items": items, "count": len(items), "query": req.query}
+
+
+@router.post("/personal/memory/rebuild")
+async def rebuild_memory_index():
+    """Rebuild the Memory OS index from existing Personal Agent workspace files."""
+    return _memory_os().rebuild_from_workspace()
+
+
+@router.patch("/personal/memory/items/{item_id}")
+async def patch_memory_item(item_id: str, req: MemoryPatchRequest):
+    """Edit a Memory OS item and write an audit record."""
+    updates = req.model_dump(exclude_unset=True)
+    item = _memory_os().patch_item(item_id, updates, actor="user")
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Memory item not found: {item_id}")
+    return {"item": item}
+
+
+@router.delete("/personal/memory/items/{item_id}")
+async def delete_memory_item(item_id: str):
+    """Soft-delete a Memory OS item and remove it from active search indexes."""
+    ok = _memory_os().delete_item(item_id, actor="user")
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Memory item not found: {item_id}")
+    return {"status": "ok", "deleted": item_id}
 
 
 @router.get("/personal/diaries")
@@ -180,6 +293,15 @@ async def reset_bootstrap():
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to reset bootstrap")
     return {"status": "ok", "message": "BOOTSTRAP.md re-created. Agent will re-enter onboarding on next session."}
+
+
+@router.post("/personal/bootstrap/complete")
+async def complete_bootstrap():
+    """Mark bootstrap onboarding as complete by archiving BOOTSTRAP.md."""
+    ok = AgentManager.complete_bootstrap()
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to complete bootstrap")
+    return {"status": "ok", "bootstrapped": AgentManager.is_bootstrapped()}
 
 
 @router.get("/personal/bootstrap/status")

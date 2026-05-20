@@ -1,8 +1,32 @@
 from pathlib import Path
 
-from app.connectors.base import ConnectorConfig
+from app.connectors.base import ConnectorConfig, PlatformConnector
 from app.connectors.discord_connector import DiscordConnector
 from app.connectors.feishu_connector import FeishuConnector
+
+
+class NotifyTestConnector(PlatformConnector):
+    name = "notify_test"
+    display_name = "Notify Test"
+    description = "Test connector"
+
+    def __init__(self):
+        super().__init__(ConnectorConfig(name=self.name, display_name=self.display_name))
+        self.sent_messages = []
+
+    @property
+    def status(self) -> str:
+        return "running"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def send_notification(self, message: str):
+        self.sent_messages.append(message)
+        return {"message_id": "msg-1"}
 
 
 def _write_agent_model_config(path: Path) -> None:
@@ -128,3 +152,21 @@ def test_connector_update_rejects_invalid_target_agent(client):
 
     assert response.status_code == 422
     assert "target_agent" in response.json()["detail"]
+
+
+def test_connector_test_message_endpoint_sends(client):
+    from app.connectors import get_connector_manager
+
+    manager = get_connector_manager()
+    connector = NotifyTestConnector()
+    manager.register(connector)
+
+    response = client.post(
+        "/api/connectors/notify_test/test-message",
+        json={"message": "ping"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "sent"
+    assert response.json()["details"] == {"message_id": "msg-1"}
+    assert connector.sent_messages == ["ping"]

@@ -25,10 +25,13 @@ export const DreamsViewer: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full">
+      <div className="shrink-0 border-b border-border bg-surface-alt/50 px-3 py-2 text-[11px] leading-relaxed text-fg-muted">
+        记忆整理由 Agent 自动运行，用来把日记和学习记录沉淀为长期记忆。这里是整理日志，不是用户操作台。
+      </div>
       <div className="flex items-center justify-between px-3 py-2 border-b border-border shrink-0">
         <div className="flex items-center gap-1.5">
           <Moon className="w-3.5 h-3.5 text-fg-muted" />
-          <span className="text-xs font-medium">DREAMS.md</span>
+          <span className="text-xs font-medium">记忆整理日志</span>
         </div>
         <button
           type="button"
@@ -49,8 +52,8 @@ export const DreamsViewer: React.FC = () => {
         ) : (
           <div className="text-xs text-fg-muted text-center py-8">
             <Moon className="w-6 h-6 mx-auto mb-2 opacity-30" />
-            <p>No dreams yet.</p>
-            <p className="text-[10px] mt-1">DREAM consolidation runs automatically after enough sessions accumulate.</p>
+            <p>暂无整理日志。</p>
+            <p className="text-[10px] mt-1">积累足够会话后，Agent 会自动运行记忆整理。</p>
           </div>
         )}
       </div>

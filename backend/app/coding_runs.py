@@ -110,7 +110,7 @@ def reset_session_project(token: Token) -> None:
     _session_project.reset(token)
 
 
-def effective_project_path() -> str:
+def effective_project_path(*, allow_global: bool = True) -> str:
     """Project root the *currently executing* agent task should operate in.
 
     Priority:
@@ -126,6 +126,8 @@ def effective_project_path() -> str:
     bound = _session_project.get()
     if bound:
         return bound
+    if not allow_global:
+        return ""
     try:
         project = ProjectManager.get_current()
         if project:

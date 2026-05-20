@@ -122,6 +122,22 @@ def check_rest_api(base_url: str, token: str, report: dict[str, Any]) -> None:
         report["checks"]["tool_count"] = health.json().get("tools")
 
 
+def check_knowledge_api(base_url: str, token: str, report: dict[str, Any]) -> None:
+    headers = {"X-Desktop-Agent-Token": token}
+    with httpx.Client(timeout=10.0) as client:
+        stats = client.get(f"{base_url}/api/knowledge/stats", headers=headers)
+        report["checks"]["knowledge_stats_status"] = stats.status_code
+        if stats.status_code != 200:
+            raise AcceptanceError(f"Knowledge stats failed: HTTP {stats.status_code}: {stats.text[:500]}")
+        data = stats.json()
+        if data.get("error"):
+            raise AcceptanceError(f"Knowledge stats returned error: {data}")
+        report["checks"]["knowledge_embedding_model"] = data.get("embedding_model")
+        report["checks"]["knowledge_embedding_dim"] = data.get("embedding_dim")
+        if not data.get("embedding_model") or not data.get("embedding_dim"):
+            raise AcceptanceError(f"Knowledge stats missing embedding metadata: {data}")
+
+
 async def check_websocket(ws_url: str, token: str, report: dict[str, Any]) -> None:
     no_token_failed = False
     try:
@@ -329,6 +345,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise AcceptanceError(f"No backend process found at expected path: {backend_exe}")
 
     check_rest_api(args.base_url, token, report)
+    check_knowledge_api(args.base_url, token, report)
     asyncio.run(check_websocket(args.ws_url, token, report))
     check_project_file_api(args.base_url, token, report)
 

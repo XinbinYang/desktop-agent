@@ -10,21 +10,25 @@ import { ProjectInfo, FileNode, SidebarSection, type AgentType, type SessionHist
 import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
-import { AGENT_LABEL } from '../lib/agentProfiles';
+import { AGENT_LABEL, displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 import { type ProjectHistoryAction } from './SessionHistoryPanel';
 import { WorkspacePanel } from './WorkspacePanel';
+import type { PersonalWorkspaceTab } from './PersonalWorkspace/PersonalWorkspacePanel';
 
 interface SidebarProps {
   activeSection: SidebarSection;
   activeAgent?: AgentType;
+  agentProfiles?: AgentProfileMap;
   onSectionChange: (section: SidebarSection) => void;
   onAgentChange?: (agent: AgentType) => void;
   agentModel?: string;
-  onOpenPersonalWorkspace?: () => void;
+  onOpenPersonalWorkspace?: (tab?: PersonalWorkspaceTab) => void;
   onOpenSettings: () => void;
   onClear: () => void;
   onExecuteTool: (name: string, args: any) => void;
   isConnected: boolean;
+  skillsRefreshToken?: number;
+  highlightedSkillDraftId?: string | null;
   sessionHistory?: SessionHistoryResponse | null;
   sessions?: SessionHistoryItem[];
   currentSession?: string;
@@ -57,6 +61,7 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
   activeAgent = 'personal',
+  agentProfiles,
   onSectionChange,
   agentModel = '',
   onOpenPersonalWorkspace,
@@ -64,6 +69,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClear,
   onExecuteTool,
   isConnected,
+  skillsRefreshToken = 0,
+  highlightedSkillDraftId = null,
   sessionHistory = null,
   sessions = [],
   currentSession,
@@ -93,6 +100,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const { theme, setTheme } = useTheme();
   const { t, i18n } = useTranslation();
+  const activeDisplayName = displayNameForAgent(activeAgent, agentProfiles);
 
   const changeLanguage = (lng: string) => {
     i18n.changeLanguage(lng);
@@ -116,7 +124,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="flex-1 overflow-y-auto p-3">
         {activeSection === 'personal' && (
           <div className="space-y-4">
-            <div className="text-xs font-medium text-fg-muted">Personal Agent</div>
+            <div className="text-xs font-medium text-fg-muted">{activeDisplayName}</div>
 
             {/* Persona section */}
             <div>
@@ -125,11 +133,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <button
                 type="button"
-                onClick={onOpenPersonalWorkspace}
+                onClick={() => onOpenPersonalWorkspace?.('persona')}
                 className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <UserCog className="w-3.5 h-3.5" />
-                Edit SOUL / INNER / IDENTITY / USER
+                查看/修正身份与偏好
               </button>
             </div>
 
@@ -140,11 +148,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => onExecuteTool?.('memory_list', {})}
+                onClick={() => onOpenPersonalWorkspace?.('memory')}
                 className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-fg-secondary hover:bg-surface-hover transition-colors"
               >
                 <BookOpen className="w-3.5 h-3.5" />
-                Search Memory
+                查看 Agent 记忆
               </button>
             </div>
 
@@ -156,15 +164,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="space-y-0.5 text-[10px] text-fg-muted">
                 <div className="flex items-center gap-1.5 px-2 py-0.5">
                   <Activity className="w-2.5 h-2.5 text-green-400" />
-                  HEARTBEAT: active
+                  自动维护：自动运行
                 </div>
                 <div className="flex items-center gap-1.5 px-2 py-0.5">
                   <MoonIcon className="w-2.5 h-2.5 text-fg-muted" />
-                  DREAM: on trigger
+                  记忆整理：自动触发
                 </div>
                 <div className="flex items-center gap-1.5 px-2 py-0.5">
                   <Sparkles className="w-2.5 h-2.5 text-fg-muted" />
-                  EVOLUTION: on trigger
+                  能力进化：自动判断
                 </div>
               </div>
             </div>
@@ -179,6 +187,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {(activeSection === 'workspace' || activeSection === 'coding') && (
           <div className="h-full">
             <WorkspacePanel
+              agentProfiles={agentProfiles}
               sessionHistory={sessionHistory}
               sessions={sessions}
               currentSession={currentSession}
@@ -209,7 +218,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
 
         {activeSection === 'skills' && (
-          <SkillsPanel activeAgent={activeAgent} />
+          <SkillsPanel
+            activeAgent={activeAgent}
+            refreshToken={skillsRefreshToken}
+            highlightedDraftId={highlightedSkillDraftId}
+          />
         )}
 
         {activeSection === 'settings' && (

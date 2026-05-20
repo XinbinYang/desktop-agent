@@ -17,6 +17,10 @@ def _project_path() -> str:
     return effective_project_path()
 
 
+def _missing_project_error() -> str:
+    return "需要先打开一个项目，或在任务中提供明确项目路径，然后再让 Coding Agent 处理项目代码。"
+
+
 def _event_payloads(run_id: str) -> List[Dict[str, Any]]:
     return [event.model_dump() for event in list_events(run_id)]
 
@@ -47,11 +51,14 @@ class ConsultCodingAgentTool(BaseTool):
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
+        project_path = _project_path()
+        if not project_path:
+            return ToolResult(error=_missing_project_error())
         collab = create_run(
             session_id=session_id or "default",
             goal=goal,
             mode="consult",
-            project_path=_project_path(),
+            project_path=project_path,
         )
         packet = TaskPacket(
             goal=goal,
@@ -68,7 +75,12 @@ class ConsultCodingAgentTool(BaseTool):
         )
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
-        result, _worker_events = await run_consult_worker(packet, run_id=collab.run_id, task_id=task.task_id)
+        result, _worker_events = await run_consult_worker(
+            packet,
+            run_id=collab.run_id,
+            task_id=task.task_id,
+            project_path=project_path,
+        )
         update_task(task.task_id, status="completed" if result.status == "pass" else "failed", result=result)
         complete_run(collab.run_id, "completed" if result.status == "pass" else "failed", result.summary)
         return ToolResult(
@@ -113,11 +125,14 @@ class DelegateToCodingAgentTool(BaseTool):
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
+        project_path = _project_path()
+        if not project_path:
+            return ToolResult(error=_missing_project_error())
         collab = create_run(
             session_id=session_id or "default",
             goal=goal,
             mode="execute",
-            project_path=_project_path(),
+            project_path=project_path,
         )
         packet = TaskPacket(
             goal=goal,
@@ -130,7 +145,12 @@ class DelegateToCodingAgentTool(BaseTool):
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
         events: List[Dict[str, Any]] = []
-        async for event in run_execute_agent_events(packet, session_id=session_id or "default", run_id=collab.run_id):
+        async for event in run_execute_agent_events(
+            packet,
+            session_id=session_id or "default",
+            run_id=collab.run_id,
+            project_path=project_path,
+        ):
             events.append(event)
         result = result_from_execute_events(events)
         update_task(task.task_id, status="completed" if result.status == "pass" else "failed", result=result)

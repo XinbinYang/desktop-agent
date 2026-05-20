@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useRef } from 'react'
-import { SlashCommandMenu } from '../../components/SlashCommandMenu'
+import { __resetSlashCommandCacheForTests, SlashCommandMenu } from '../../components/SlashCommandMenu'
 
 const commands = [
   { name: 'help', description: 'Show help', args: '', category: 'general' },
   { name: 'clear', description: 'Clear session', args: '', category: 'session' },
+  { name: 'reset', description: 'Reset context', args: '', category: 'session' },
   { name: 'config', description: 'Open settings', args: '', category: 'general' },
   { name: 'skills', description: 'Open skills', args: '', category: 'general' },
 ]
@@ -27,6 +28,7 @@ function Harness({ onSelect }: { onSelect: (cmd: any) => void }) {
 
 describe('SlashCommandMenu', () => {
   beforeEach(() => {
+    __resetSlashCommandCacheForTests()
     Element.prototype.scrollIntoView = vi.fn()
     vi.stubGlobal('fetch', vi.fn(async () => ({
       json: async () => ({ commands }),
@@ -44,6 +46,7 @@ describe('SlashCommandMenu', () => {
     const input = screen.getByLabelText('command-input')
 
     await screen.findByText('/help')
+    expect(screen.getByText('/reset')).toBeInTheDocument()
     const commandButton = (name: string) =>
       container.querySelector(`[data-command-name="${name}"]`) as HTMLElement
 

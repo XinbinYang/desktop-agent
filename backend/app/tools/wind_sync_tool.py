@@ -1,5 +1,3 @@
-import os
-import sys
 from datetime import datetime, timedelta
 from typing import Optional, Any, Callable, Union
 from pathlib import Path
@@ -8,6 +6,7 @@ import pandas as pd
 
 from app.runtime_paths import runtime_dir
 from app.tools.base import BaseTool, ToolResult
+from app.tools.wind_runtime import get_wind_client
 
 # 项目根目录与数据库路径 (wind_sync_tool.py 位于 backend/app/tools/，项目根目录需再向上两级)
 _DATA_DIR = runtime_dir("data")
@@ -36,13 +35,7 @@ WIND_TO_DB_INDICATOR = {
 
 def _ensure_wind():
     """确保 WindPy 已连接。"""
-    windpy_path = os.environ.get("WINDPY_PATH", r"C:\Wind\Wind.NET.Client\WindNET\x64")
-    if windpy_path not in sys.path:
-        sys.path.insert(0, windpy_path)
-    from WindPy import w
-    if not w.isconnected():
-        w.start()
-    return w
+    return get_wind_client()
 
 
 def _yesterday() -> str:

@@ -1,8 +1,66 @@
+import os
+import sys
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from app.tools.wind_tool import _wind_data_to_csv, WindWsdTool, WindWssTool, WindWsetTool, WindEdbTool, WindTdaysTool
+from app.tools.wind_runtime import WindRuntimeError, get_wind_client, reset_wind_runtime_for_tests
+
+
+class TestWindRuntime:
+    def teardown_method(self):
+        reset_wind_runtime_for_tests()
+        sys.modules.pop("WindPy", None)
+
+    def test_env_path_imports_with_wind_cwd(self, tmp_path, monkeypatch):
+        wind_dir = tmp_path / "WindNET" / "x64"
+        wind_dir.mkdir(parents=True)
+        (wind_dir / "WindPy.pth").write_text("dummy", encoding="utf-8")
+        (wind_dir / "WindPy.py").write_text(
+            "from pathlib import Path\n"
+            "if not Path('WindPy.pth').exists():\n"
+            "    raise RuntimeError('missing local WindPy.pth')\n"
+            "class Result:\n"
+            "    ErrorCode = 0\n"
+            "    Data = []\n"
+            "class Client:\n"
+            "    def __init__(self):\n"
+            "        self.connected = False\n"
+            "        self.started_cwd = ''\n"
+            "    def isconnected(self):\n"
+            "        return self.connected\n"
+            "    def start(self):\n"
+            "        self.started_cwd = str(Path.cwd())\n"
+            "        self.connected = True\n"
+            "        return Result()\n"
+            "w = Client()\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("WINDPY_PATH", str(wind_dir))
+        sys.modules.pop("WindPy", None)
+        reset_wind_runtime_for_tests()
+
+        client = get_wind_client()
+
+        assert client.isconnected()
+        assert os.path.normcase(client.started_cwd) == os.path.normcase(str(wind_dir))
+
+    def test_missing_windpy_error_contains_diagnostics(self, monkeypatch):
+        from app.tools import wind_runtime
+
+        monkeypatch.delenv("WINDPY_PATH", raising=False)
+        monkeypatch.delenv("WIND_HOME", raising=False)
+        monkeypatch.setattr(wind_runtime, "COMMON_WINDPY_DIRS", tuple())
+        monkeypatch.setattr(wind_runtime.importlib.util, "find_spec", lambda _name: None)
+        reset_wind_runtime_for_tests()
+
+        with pytest.raises(WindRuntimeError) as exc:
+            get_wind_client()
+
+        text = str(exc.value)
+        assert "Attempted WindPy paths" in text
+        assert "WINDPY_PATH" in text
 
 
 class TestWindDataToCsv:

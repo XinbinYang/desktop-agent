@@ -1,12 +1,8 @@
-import os
-import sys
 import asyncio
 import io
 from typing import Any, Dict, Optional
 from app.tools.base import BaseTool, ToolResult
-
-# WindPy 安装路径（随 Wind 终端安装）
-_WINDPY_PATH = os.environ.get("WINDPY_PATH", r"C:\Wind\Wind.NET.Client\WindNET\x64")
+from app.tools.wind_runtime import get_wind_client
 
 # 全局单例
 _wind_client = None
@@ -15,28 +11,19 @@ _wind_connected = False
 
 def _ensure_windpy_path():
     """确保 WindPy 所在目录在 Python 路径中。"""
-    if _WINDPY_PATH and _WINDPY_PATH not in sys.path:
-        sys.path.insert(0, _WINDPY_PATH)
+    # Kept for compatibility with tests/older imports. Discovery now lives in
+    # wind_runtime so all Wind callers share the same path and CWD handling.
+    return None
 
 
 def _get_wind():
     """获取已连接的 WindPy 实例（懒启动）。"""
     global _wind_client, _wind_connected
-    _ensure_windpy_path()
-
     if _wind_client is not None and _wind_connected:
         return _wind_client
-
-    from WindPy import w
-    _wind_client = w
-
-    if not w.isconnected():
-        r = w.start()
-        if r.ErrorCode != 0:
-            raise RuntimeError(f"Wind 连接失败: {r.Data}")
-
+    _wind_client = get_wind_client()
     _wind_connected = True
-    return w
+    return _wind_client
 
 
 def _wind_data_to_csv(wind_data, default_index_name: str = "") -> str:

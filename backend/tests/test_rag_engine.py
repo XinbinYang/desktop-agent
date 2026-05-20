@@ -7,7 +7,7 @@ import pytest
 
 from app.rag.splitter import recursive_split_text, split_document
 from app.rag.embedding import encode_texts, encode_query, get_embedding_dim
-from app.rag.engine import RAGEngine, DB_PATH
+from app.rag.engine import RAGEngine, DB_PATH, get_rag_status, has_indexed_docs
 
 
 class TestTextSplitter:
@@ -49,6 +49,38 @@ class TestEmbedding:
         assert len(emb) == get_embedding_dim()
         assert isinstance(emb, list)
         assert all(isinstance(x, float) for x in emb)
+
+
+class TestRAGStatus:
+    def test_has_indexed_docs_false_when_db_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("app.rag.engine.DB_PATH", tmp_path / "missing.db")
+
+        assert has_indexed_docs() is False
+
+    def test_has_indexed_docs_false_when_doc_table_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("app.rag.engine.DB_PATH", tmp_path / "empty.db")
+        (tmp_path / "empty.db").touch()
+
+        assert has_indexed_docs() is False
+
+    def test_get_rag_status_reports_missing_sqlite_vec(self, monkeypatch, tmp_path):
+        import app.rag.engine as engine_mod
+
+        monkeypatch.setattr("app.rag.engine.DB_PATH", tmp_path / "knowledge.db")
+        original_find_spec = engine_mod.importlib.util.find_spec
+
+        def fake_find_spec(name):
+            if name == "sqlite_vec":
+                return None
+            return original_find_spec(name)
+
+        monkeypatch.setattr(engine_mod.importlib.util, "find_spec", fake_find_spec)
+
+        status = get_rag_status()
+
+        assert status["status"] == "unavailable"
+        assert status["sqlite_vec_available"] is False
+        assert "sqlite-vec" in status["error"]
 
 
 class TestRAGEngine:

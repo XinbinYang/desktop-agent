@@ -24,7 +24,9 @@ export const ContextMeter: React.FC<ContextMeterProps> = ({ usage, onCompact, di
       : status === 'warning'
         ? 'text-warning border-warning/40 bg-warning/10'
         : 'text-success border-success/30 bg-success/10';
-  const transcriptNote = usage?.context_truncated
+  const summarized = Boolean(usage?.compaction_active);
+  const trimmed = Boolean(usage?.unsummarized_context_truncated ?? (usage?.context_truncated && !summarized));
+  const transcriptNote = summarized || trimmed
     ? `, provider window ${usage.context_message_count ?? '?'} of ${usage.transcript_message_count ?? '?'} messages`
     : '';
   const title = usage
@@ -41,7 +43,8 @@ export const ContextMeter: React.FC<ContextMeterProps> = ({ usage, onCompact, di
     >
       <Gauge className="w-3.5 h-3.5" />
       <span className="tabular-nums">{percent.toFixed(0)}%</span>
-      {usage?.context_truncated && <span className="text-current/75">trimmed</span>}
+      {summarized && <span className="text-current/75">summarized</span>}
+      {trimmed && <span className="text-current/75">trimmed</span>}
       <span className="hidden sm:inline text-current/75">{formatTokens(usage?.used_tokens)} / {formatTokens(usage?.model_context)}</span>
     </button>
   );

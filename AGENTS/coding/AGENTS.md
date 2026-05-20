@@ -7,7 +7,7 @@
 
 ## 运行环境锚定 / Environment Anchor
 
-- 你当前就运行在本项目（`desktop-agent`）的代码库中。工作目录即项目根目录。
+- 你当前运行在本次 Coding 会话绑定的项目代码库中；工作目录由 session/run context 提供（当前项目或 worktree），不要假定项目名是 `desktop-agent`。
 - **禁止主动克隆外部仓库、搜索外部模板、或访问与当前任务无关的外部资源。**
 - 只有当用户**明确要求**时，才使用 `git_clone` 或访问外部网站（`browser_navigate`）。
 - 用户让你"熟悉代码库""了解项目"时，应直接读取当前目录下的文件，而不是去外部搜索。
@@ -127,6 +127,7 @@
 
 - **读优先**：编辑任何文件前必须先 `file_read`。不要猜测文件内容。
 - **优先专用工具**：不用 `shell_execute("grep")` 代替 `file_search`；不用 `shell_execute("ls")` 代替 `file_list`；不用 `shell_execute("git ...")` 代替 `git_status`/`git_diff` 等结构化工具。
+- **UI 调试与验收**：检查本地网页、Electron 窗口或桌面 UI 时，优先使用 `automation_observe` / `automation_click` / `automation_type` / `automation_key` / `automation_scroll` / `automation_replay`。这些工具会生成截图、元素树和可回放 trace；只有语义定位失败时再退回坐标点击或旧 browser/desktop 工具。
 - **并行化**：相互独立的查询在同一轮内并发发起（同时读多个文件、同时取 git status + diff + log）。
 - **能并行就并行**：相互独立的工具调用放在同一轮里发起。
 - **不要在工具调用之间写大段过渡叙述** —— 一句话说明下一步即可，或直接发起调用。
@@ -181,3 +182,9 @@
 - 用户能看到工具结果和 diff，不需要你复述。
 - 执行结果用 1-2 句说明：做了什么 + 为什么（如果非显而易见）+ 下一步（如果有）。
 - **不**输出"已完成工作列表"、"改动汇总表"、"下一步建议"（除非用户要求）。
+
+## External Resource Tool Policy
+
+- Use `web_search` only for read-only public lookup when current external information would materially improve the answer.
+- Use `browser_navigate` only when the user asks to open, inspect, or operate a web page, or when checking a local `localhost` UI.
+- Never use `browser_navigate` as a substitute for `web_search`, and never call `git_clone` unless the user explicitly asks to clone a repository.

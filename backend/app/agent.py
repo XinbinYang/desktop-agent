@@ -8,6 +8,7 @@ import uuid
 import copy
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from app.config import load_config, get_provider_for_model, get_model_for_agent, get_thinking_intensity_for_agent
@@ -55,17 +56,25 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR = runtime_dir("sessions")
 SESSION_REGISTRY_PATH = runtime_file("session_registry.json")
 GLOBAL_PROJECT_KEY = "__global__"
+_SESSION_RECORD_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 
 # Internal: resume agent loop after user clicks Build (WebSocket `build_plan`).
 PLAN_CONTINUE_MARKER = "__plan_continue__"
 MAX_TASK_GUIDANCE_ITEMS = 20
 MAX_TASK_GUIDANCE_TEXT_CHARS = 8000
+COMPACTION_STATE_VERSION = 1
+COMPACTION_SOFT_PRESSURE = 0.78
+COMPACTION_HARD_PRESSURE = 0.90
+COMPACTION_RECENT_USER_TURNS = 4
+COMPACTION_MIN_NEW_USER_TURNS = 2
+COMPACTION_SUMMARY_MAX_CHARS = 6000
 
 _LOCAL_MESSAGE_META_KEYS: frozenset[str] = frozenset({
     "message_id",
     "turn_id",
     "created_at",
     "checkpoint_id",
+    "context_epoch",
 })
 
 _LLM_MESSAGE_KEYS: frozenset[str] = frozenset({
@@ -76,6 +85,8 @@ _LLM_MESSAGE_KEYS: frozenset[str] = frozenset({
     "tool_calls",
     "reasoning_content",
 })
+
+COMMAND_NOTICE_SOURCE = "command_notice"
 
 # Plan-mode planning phase: only these tools may be offered / executed until approved.
 READONLY_PLAN_TOOLS: frozenset[str] = frozenset({
@@ -126,11 +137,26 @@ def _project_key_for_path(project_path: str | None) -> str:
     return ProjectManager.history_key(project_path) or GLOBAL_PROJECT_KEY
 
 
+def _project_key_for_canonical_path(project_path: str | None) -> str:
+    if not project_path or project_path == GLOBAL_PROJECT_KEY:
+        return GLOBAL_PROJECT_KEY
+    return str(project_path).replace("\\", "/").rstrip("/").lower()
+
+
 def _canonical_project_path(project_path: str | None) -> str | None:
     if not project_path:
         return None
     canonical = ProjectManager.canonical_project_path(project_path)
     return canonical or None
+
+
+def _canonical_project_path_cached(project_path: str | None, cache: Dict[str, str | None]) -> str | None:
+    if not project_path:
+        return None
+    key = str(project_path)
+    if key not in cache:
+        cache[key] = _canonical_project_path(key)
+    return cache[key]
 
 
 def _normalize_project_key(project_path: str | None = None) -> str:
@@ -275,6 +301,52 @@ def _session_title_from_data(data: Dict[str, Any]) -> str:
     return ""
 
 
+def _session_record_from_path(path: Path, canonical_cache: Dict[str, str | None]) -> Optional[Dict[str, Any]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        _SESSION_RECORD_CACHE.pop(str(path), None)
+        return None
+
+    cache_key = str(path)
+    cached = _SESSION_RECORD_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return dict(cached[2])
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+
+        stored_agent_type = _resolve_stored_agent_type(data)
+        session_id = data.get("session_id", path.stem)
+        messages = data.get("messages", [])
+        plan_state = data.get("plan_state")
+        record_project_path = None if stored_agent_type == "personal" else _canonical_project_path_cached(data.get("project_path"), canonical_cache)
+        record = {
+            "id": session_id,
+            "title": _session_title_from_data(data),
+            "project_path": record_project_path,
+            "model_id": data.get("model_id", ""),
+            "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
+            "agent_type": stored_agent_type,
+            "message_count": len(messages) if isinstance(messages, list) else 0,
+            "updated_at": stat.st_mtime,
+            "archived_at": data.get("archived_at"),
+            "_plan_phase": str(plan_state.get("phase") or "") if isinstance(plan_state, dict) else "",
+        }
+        _SESSION_RECORD_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, dict(record))
+        return record
+    except Exception:
+        _SESSION_RECORD_CACHE.pop(cache_key, None)
+        return None
+
+
+def forget_session_record_cache(session_id: str) -> None:
+    _SESSION_RECORD_CACHE.pop(str(SESSIONS_DIR / f"{session_id}.json"), None)
+
+
 def _session_title_from_messages(messages: List[Dict[str, Any]], plan_state: PlanState) -> str:
     for msg in messages:
         if msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
@@ -307,11 +379,15 @@ def _session_record_matches(
 ) -> bool:
     live = _sessions.get(session_id)
     if live and live.agent_type == agent_type:
+        if agent_type == "personal":
+            return True
         return True if not project_path else _project_key_for_path(live.project_path) == _project_key_for_path(project_path)
 
     data = _load_session_data(session_id)
     if not data or _resolve_stored_agent_type(data) != agent_type:
         return False
+    if agent_type == "personal":
+        return True
     if project_path:
         stored = data.get("project_path")
         if _project_key_for_path(stored) != _project_key_for_path(project_path):
@@ -319,36 +395,27 @@ def _session_record_matches(
     return True
 
 
-def list_session_records(project_path: str = "", agent_type: str = "") -> List[Dict[str, Any]]:
+def list_session_records(project_path: str = "", agent_type: str = "", include_internal: bool = False) -> List[Dict[str, Any]]:
     registry = _load_session_registry()
     primary_id = registry.get("personal", {}).get("primary_session_id")
+    project_filter_key = _project_key_for_path(project_path) if project_path else ""
+    canonical_cache: Dict[str, str | None] = {}
     sessions: List[Dict[str, Any]] = []
     for path in SESSIONS_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            stored_agent_type = _resolve_stored_agent_type(data)
-            if agent_type and stored_agent_type != agent_type:
-                continue
-            sp = _canonical_project_path(data.get("project_path"))
-            if project_path and _project_key_for_path(sp) != _project_key_for_path(project_path):
-                continue
-            session_id = data.get("session_id", path.stem)
-            is_primary = stored_agent_type == "personal" and session_id == primary_id
-            sessions.append({
-                "id": session_id,
-                "title": _session_title_from_data(data),
-                "project_path": sp,
-                "model_id": data.get("model_id", ""),
-                "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
-                "agent_type": stored_agent_type,
-                "message_count": len(data.get("messages", [])),
-                "updated_at": path.stat().st_mtime,
-                "is_primary": is_primary,
-                "archived_at": data.get("archived_at"),
-            })
-        except Exception:
-            pass
+        record = _session_record_from_path(path, canonical_cache)
+        if not record:
+            continue
+        stored_agent_type = str(record.get("agent_type") or "")
+        if agent_type and stored_agent_type != agent_type:
+            continue
+        sp = record.get("project_path")
+        if project_filter_key and _project_key_for_canonical_path(sp) != project_filter_key:
+            continue
+        session_id = str(record.get("id") or path.stem)
+        record["is_primary"] = stored_agent_type == "personal" and session_id == primary_id
+        if not include_internal:
+            record.pop("_plan_phase", None)
+        sessions.append(record)
     return sorted(
         sessions,
         key=lambda s: (0 if s.get("is_primary") else 1, -float(s.get("updated_at", 0))),
@@ -503,6 +570,7 @@ class AgentSession:
         self.model_id = model_id
         self.router = ModelRouter(self.model_id)
         self.messages: List[Dict[str, Any]] = []
+        self.context_epoch = 0
         self.iteration = 0
         self.max_iterations = load_config().settings.max_iterations
         self.screenshot_on_step = load_config().settings.screenshot_on_step
@@ -514,6 +582,12 @@ class AgentSession:
         self._rag_cache_sources: List[Dict[str, Any]] = []
         self._rag_context_sources: List[Dict[str, Any]] = []
         self.dynamic_registry = DynamicToolRegistry()
+        # MCP tool refresh is deferred until the first run() call. Constructing
+        # a session no longer blocks the /api/sessions/resolve HTTP path on
+        # enumerating MCP servers + rebuilding the system prompt; the first
+        # turn pays that cost (and from then on the registry stays warm until
+        # something marks it dirty again, e.g. MCP server list changes).
+        self._mcp_tools_dirty = True
         self.chat_mode = "agent"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
@@ -521,6 +595,7 @@ class AgentSession:
         self._plan_exec_hint_sent = False
         self._repo_map_cache: Optional[Dict[str, Any]] = None
         self.compaction_summary: str = ""
+        self.compaction_state: Dict[str, Any] = self._default_compaction_state()
         self._last_usage: Dict[str, Any] = {}
         self._last_context_usage: Dict[str, Any] = {}
         self.team_id: str | None = None
@@ -540,6 +615,8 @@ class AgentSession:
     def agent_type(self, value: str) -> None:
         self._agent_type = value
         self._role_id = AgentManager.get_default_role(value)
+        if value == "personal":
+            self.project_path = None
 
     @property
     def role_id(self) -> str:
@@ -553,6 +630,8 @@ class AgentSession:
         mapped = AgentManager.get_agent_type_for_role(value)
         if mapped != self._agent_type:
             self._agent_type = mapped
+            if mapped == "personal":
+                self.project_path = None
 
     def _resolve_agent_model(self) -> str:
         """Get the effective model ID for the current agent type from config."""
@@ -575,9 +654,13 @@ class AgentSession:
             pass
         system_msg = f"You are powered by the model {model_name}.\n\n" + system_msg
 
-        # Prefer the project this session is bound to (per-session isolation);
-        # fall back to the global UI-selected project for unbound sessions.
-        project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
+        project = None
+        if self._agent_type == "coding":
+            # Coding sessions are project-bound. Prefer the per-session project
+            # binding; fall back to the global UI-selected project only for
+            # legacy/unbound Coding sessions.
+            project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
+
         if project:
             project_ctx = "\n\n## Current Project\n"
             project_ctx += f"- Name: {project['name']}\n"
@@ -587,6 +670,11 @@ class AgentSession:
             if project.get("git_remote"):
                 project_ctx += f"- Git remote: {project['git_remote']}\n"
             system_msg += project_ctx
+
+            try:
+                AgentManager.update_project_context(project)
+            except Exception as e:
+                logger.warning("Project context update failed: %s", e)
 
             # Inject project-level and user-level agent rules (.desktop-agent.md / AGENTS.md)
             branch = project.get("git_branch", "") if project else ""
@@ -599,58 +687,49 @@ class AgentSession:
             if memory_text:
                 system_msg += "\n\n" + memory_text
 
-            # Coding Agent: inject repo map and operating rules
-            if self._agent_type == "coding":
-                try:
-                    cfg = load_config()
-                    coding_cfg = cfg.coding_agent
-                    max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
-                    if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
-                        if self._repo_map_cache is None:
-                            self._repo_map_cache = build_repo_map(project["path"])
-                        repo_map = self._repo_map_cache
-                        system_msg += "\n\n## Coding Agent Context\n"
-                        system_msg += format_repo_map_summary(repo_map, max_chars=4500)
-                        system_msg += (
-                            "\n\n## Coding Agent Operating Rules\n"
-                            "- USER IS NON-PROGRAMMER: Treat the user's words as product intent, not an implementation spec. "
-                            "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
-                            "or destructive/security-sensitive choices.\n"
-                            "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
-                            f"use `dispatch_parallel` to launch at most {max_parallel_agents} `explorer` workers simultaneously — one per "
-                            "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
-                            "and reports back. Synthesize their reports before dispatching an architect. "
-                            f"Never request more than {max_parallel_agents} workers in a single `dispatch_parallel` call.\n"
-                            "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
-                            "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
-                            "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "
-                            "acceptance criteria, verification plan, recovery policy, and reporting target explicit. "
-                            "If any field is unclear, infer conservatively or ask.\n"
-                            "- GREEN CONTRACT: Treat completion as evidence, not prose. `verify_project` produces the "
-                            "current green level (`targeted_tests`, `workspace`, `lint`, `typecheck`, or `build`); "
-                            "do not merge/apply/close out broad changes on stale or partial evidence.\n"
-                            "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
-                            "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
-                            "- AUTONOMOUS CLOSEOUT: Complete the engineering loop yourself: implement, verify, review, fix failures, "
-                            "and re-run verification. Do not ask the user to choose test commands, files, branch strategy, or code structure.\n"
-                            "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
-                            "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
-                            "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
-                            "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
-                            "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks.\n"
-                            "- Windows: avoid Unix-only helpers (tail, head, grep, sed, awk); use PowerShell or `rg`.\n"
-                            "- Use project-relative paths. In worktree mode, tools operate inside the worktree.\n"
-                            "- Worker roles: explorer=parallel read-only area scan, architect=read-only plan, editor=minimal edits+verify, verifier=run tests+report, reviewer=diff review.\n"
-                        )
-                except Exception as e:
-                    logger.warning("Coding repo map injection failed: %s", e)
-
-            # Personal Agent: update PROJECT.md for Coding Agent reference
-            if self._agent_type == "personal":
-                try:
-                    AgentManager.update_project_context(project)
-                except Exception as e:
-                    logger.warning("Project context update failed: %s", e)
+            try:
+                cfg = load_config()
+                coding_cfg = cfg.coding_agent
+                max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
+                if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
+                    if self._repo_map_cache is None:
+                        self._repo_map_cache = build_repo_map(project["path"])
+                    repo_map = self._repo_map_cache
+                    system_msg += "\n\n## Coding Agent Context\n"
+                    system_msg += format_repo_map_summary(repo_map, max_chars=4500)
+                    system_msg += (
+                        "\n\n## Coding Agent Operating Rules\n"
+                        "- USER IS NON-PROGRAMMER: Treat the user's words as product intent, not an implementation spec. "
+                        "Make technical decisions yourself using existing project patterns. Ask only about user-visible behavior "
+                        "or destructive/security-sensitive choices.\n"
+                        "- PARALLEL EXPLORE FIRST: For any task touching 3+ files or an unfamiliar codebase, "
+                        f"use `dispatch_parallel` to launch at most {max_parallel_agents} `explorer` workers simultaneously — one per "
+                        "subsystem (e.g., API layer, core logic, frontend, tests). Each explorer reads its area "
+                        "and reports back. Synthesize their reports before dispatching an architect. "
+                        f"Never request more than {max_parallel_agents} workers in a single `dispatch_parallel` call.\n"
+                        "- SCALE TO TASK: Known 1-2 file fix → inline edits. Unknown scope / 3+ files → "
+                        "parallel explore → architect → editor(s). New feature / cross-module → full pipeline.\n"
+                        "- TASK PACKET: Before non-trivial work, make the objective, scope, allowed files/resources, "
+                        "acceptance criteria, verification plan, recovery policy, and reporting target explicit. "
+                        "If any field is unclear, infer conservatively or ask.\n"
+                        "- GREEN CONTRACT: Treat completion as evidence, not prose. `verify_project` produces the "
+                        "current green level (`targeted_tests`, `workspace`, `lint`, `typecheck`, or `build`); "
+                        "do not merge/apply/close out broad changes on stale or partial evidence.\n"
+                        "- EVIDENCE LEDGER: In final status, distinguish observed facts from assumptions. Include "
+                        "commands actually run, their exit result, known skipped checks, and unresolved blockers.\n"
+                        "- AUTONOMOUS CLOSEOUT: Complete the engineering loop yourself: implement, verify, review, fix failures, "
+                        "and re-run verification. Do not ask the user to choose test commands, files, branch strategy, or code structure.\n"
+                        "- VERIFY ALWAYS: After any file edit, run `verify_project` (tests + typecheck). Never claim completion without showing verification output.\n"
+                        "- REVIEW LAST: Call `run_review` before handing control back to user. Surface any blocking findings.\n"
+                        "- CHAIN CONTEXT: Pass architect/explorer output to editor via `prior_context` parameter in `dispatch_worker`.\n"
+                        "- For existing code edits, prefer `file_patch` with exact `old_text`; use `file_write` for new files or full replacement only.\n"
+                        "- When tests fail, fix the implementation first. Do not edit tests to make failures pass unless the user explicitly asks.\n"
+                        "- Windows: avoid Unix-only helpers (tail, head, grep, sed, awk); use PowerShell or `rg`.\n"
+                        "- Use project-relative paths. In worktree mode, tools operate inside the worktree.\n"
+                        "- Worker roles: explorer=parallel read-only area scan, architect=read-only plan, editor=minimal edits+verify, verifier=run tests+report, reviewer=diff review.\n"
+                    )
+            except Exception as e:
+                logger.warning("Coding repo map injection failed: %s", e)
 
         if self.chat_mode == "plan" and not self.plan_state.approved:
             try:
@@ -663,7 +742,10 @@ class AgentSession:
 
         if self._last_user_message:
             matched_skills = SkillManager.match_skills(
-                self._last_user_message, self.role_id, project is not None, agent_type=self._agent_type
+                self._last_user_message,
+                self.role_id,
+                self._agent_type == "coding" and project is not None,
+                agent_type=self._agent_type,
             )
             if matched_skills:
                 skill_prompt = SkillManager.build_skill_prompt(matched_skills)
@@ -686,13 +768,13 @@ class AgentSession:
             r"^(切换|switch|change)\s+(role|角色|model|模型)",
         ]
         try:
-            from app.rag.engine import get_rag_engine
+            from app.rag.engine import get_rag_engine, has_indexed_docs
             import re
             should_skip = any(
                 re.match(p, self._last_user_message.strip(), re.IGNORECASE)
                 for p in _RAG_SKIP_PATTERNS
             )
-            if not should_skip:
+            if not should_skip and has_indexed_docs():
                 rag = get_rag_engine()
                 docs = rag.list_docs()
                 if docs and self._last_user_message:
@@ -833,11 +915,15 @@ class AgentSession:
 
     def mark_applied_task_guidance_stale(self) -> List[TaskGuidanceItem]:
         stale: List[TaskGuidanceItem] = []
+        remaining: List[TaskGuidanceItem] = []
         for item in self.task_guidance_items:
             if item.status == "applied":
                 item.status = "stale"
                 stale.append(item)
+            else:
+                remaining.append(item)
         if stale:
+            self.task_guidance_items = remaining
             self._save()
         return stale
 
@@ -899,10 +985,18 @@ class AgentSession:
         return consumed_payload
 
     def _setup_system_prompt(self):
-        self.messages.append({"role": "system", "content": self._build_system_prompt()})
+        self.messages.append({
+            "role": "system",
+            "content": self._build_system_prompt(),
+            "context_epoch": self.context_epoch,
+        })
 
     def _refresh_system_prompt(self):
-        system_msg = {"role": "system", "content": self._build_system_prompt()}
+        system_msg = {
+            "role": "system",
+            "content": self._build_system_prompt(),
+            "context_epoch": self.context_epoch,
+        }
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = system_msg
         else:
@@ -935,9 +1029,9 @@ class AgentSession:
         *,
         original_input: str,
         resolved_input: str,
+        project_path: str,
         image_base64: Optional[str] = None,
     ) -> TaskPacket:
-        project_path = effective_project_path()
         task = mention.task.strip() or "Open or create a Coding Agent session."
         mode = "execute" if mention.mode == "execute" else "consult"
         context: Dict[str, Any] = {
@@ -1047,11 +1141,28 @@ class AgentSession:
             self._save()
             return
 
-        project_path = effective_project_path()
+        project_path = effective_project_path(allow_global=True)
+        if not project_path:
+            text = "需要先打开一个项目，或在任务里提供明确项目路径，然后我才能把项目代码任务交给 Coding Agent。"
+            assistant_msg = {"role": "assistant", "content": text}
+            self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+            self.messages.append(assistant_msg)
+            yield self._event("content", {"text": text}, outer_run_id)
+            yield self._event("status", {"status": "completed"}, outer_run_id)
+            yield self._event("run_completed", {
+                "status": "completed",
+                "summary": text,
+                "verification_passed": None,
+                "review_passed": None,
+            }, outer_run_id)
+            self._save()
+            return
+
         packet = self._collaboration_packet(
             mention,
             original_input=original_input,
             resolved_input=resolved_input,
+            project_path=project_path,
             image_base64=image_base64,
         )
         collab_run = collab_create_run(
@@ -1093,7 +1204,12 @@ class AgentSession:
         child_events: List[Dict[str, Any]] = []
         started_at = time.time()
         if packet.mode == "consult":
-            result, child_events = await run_consult_worker(packet, run_id=collab_run.run_id, task_id=task.task_id)
+            result, child_events = await run_consult_worker(
+                packet,
+                run_id=collab_run.run_id,
+                task_id=task.task_id,
+                project_path=project_path,
+            )
             for event in child_events:
                 yield event
         else:
@@ -1101,6 +1217,7 @@ class AgentSession:
                 packet,
                 session_id=self.session_id,
                 run_id=collab_run.run_id,
+                project_path=project_path,
             ):
                 child_events.append(event)
                 yield event
@@ -1181,11 +1298,92 @@ class AgentSession:
     ) -> Dict[str, Any]:
         message.setdefault("message_id", f"msg_{uuid.uuid4().hex[:16]}")
         message.setdefault("created_at", created_at or time.time())
+        message.setdefault("context_epoch", self.context_epoch)
         if turn_id:
             message.setdefault("turn_id", turn_id)
         if checkpoint_id:
             message.setdefault("checkpoint_id", checkpoint_id)
         return message
+
+    @staticmethod
+    def _message_context_epoch(message: Dict[str, Any]) -> int:
+        try:
+            return int(message.get("context_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_command_notice(message: Dict[str, Any]) -> bool:
+        return message.get("source") == COMMAND_NOTICE_SOURCE
+
+    @staticmethod
+    def _is_visible_transcript_message(message: Dict[str, Any]) -> bool:
+        if message.get("source") == "internal":
+            return False
+        if message.get("role") == "system":
+            return message.get("source") == COMMAND_NOTICE_SOURCE
+        return True
+
+    def _active_context_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        include_command_notices: bool = False,
+    ) -> List[Dict[str, Any]]:
+        source = self.messages if messages is None else messages
+        active: list[dict[str, Any]] = []
+        for index, msg in enumerate(source):
+            if msg.get("role") == "system" and not self._is_command_notice(msg):
+                if index == 0 or self._message_context_epoch(msg) == self.context_epoch:
+                    active.append(msg)
+                continue
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
+            if self._is_command_notice(msg) and not include_command_notices:
+                continue
+            active.append(msg)
+        return active
+
+    def _visible_transcript_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = self.messages if messages is None else messages
+        return [m for m in source if self._is_visible_transcript_message(m)]
+
+    def _active_visible_transcript_messages(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        return [
+            m
+            for m in self._visible_transcript_messages(messages)
+            if self._message_context_epoch(m) == self.context_epoch
+        ]
+
+    def heartbeat_transcript_messages(self) -> List[Dict[str, Any]]:
+        """Return the current visible user/assistant turn set for Personal heartbeat."""
+        self._ensure_message_metadata()
+        transcript: list[dict[str, Any]] = []
+        for msg in self.messages:
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
+            if msg.get("role") not in ("user", "assistant"):
+                continue
+            if msg.get("source") in ("internal", COMMAND_NOTICE_SOURCE):
+                continue
+            transcript.append(copy.deepcopy(msg))
+        return transcript
+
+    def _clear_personal_session_handoff(self) -> None:
+        if self._agent_type != "personal":
+            return
+        try:
+            handoff_path = AgentManager._personal_dir() / "session_handoff.md"
+            if handoff_path.exists():
+                handoff_path.unlink()
+        except OSError as exc:
+            logger.warning("Failed to clear Personal session handoff: %s", exc)
 
     def _ensure_message_metadata(self) -> None:
         current_turn = ""
@@ -1204,6 +1402,124 @@ class AgentSession:
                 )
             else:
                 self._stamp_message(msg)
+
+    @staticmethod
+    def _default_compaction_state() -> Dict[str, Any]:
+        return {
+            "version": COMPACTION_STATE_VERSION,
+            "compacted_through_checkpoint_id": "",
+            "compacted_through_message_id": "",
+            "compacted_turn_count": 0,
+            "last_compacted_at": "",
+            "last_auto_error": "",
+        }
+
+    def _normalize_compaction_state(self, raw: Any = None) -> Dict[str, Any]:
+        state = self._default_compaction_state()
+        if not isinstance(raw, dict):
+            return state
+
+        for key in (
+            "compacted_through_checkpoint_id",
+            "compacted_through_message_id",
+            "last_compacted_at",
+            "last_auto_error",
+        ):
+            value = raw.get(key)
+            if value is not None:
+                state[key] = str(value)
+
+        try:
+            state["compacted_turn_count"] = max(0, int(raw.get("compacted_turn_count") or 0))
+        except (TypeError, ValueError):
+            state["compacted_turn_count"] = 0
+        return state
+
+    def _reset_compaction_state(self) -> None:
+        self.compaction_summary = ""
+        self.compaction_state = self._default_compaction_state()
+
+    def _real_user_checkpoint_ids(self) -> List[str]:
+        self._ensure_message_metadata()
+        checkpoint_ids: list[str] = []
+        for msg in self.messages:
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
+            if msg.get("role") != "user" or msg.get("source") == "internal":
+                continue
+            checkpoint_id = msg.get("checkpoint_id")
+            if checkpoint_id and checkpoint_id not in checkpoint_ids:
+                checkpoint_ids.append(str(checkpoint_id))
+        return checkpoint_ids
+
+    def _real_user_turn_count(self) -> int:
+        return len(self._real_user_checkpoint_ids())
+
+    def _compacted_boundary_index(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        if not self.compaction_summary:
+            return None
+
+        state = self._normalize_compaction_state(self.compaction_state)
+        message_id = state.get("compacted_through_message_id") or ""
+        if message_id:
+            for index, msg in enumerate(messages):
+                if msg.get("message_id") == message_id:
+                    return index
+
+        checkpoint_id = state.get("compacted_through_checkpoint_id") or ""
+        if checkpoint_id:
+            boundary_index = -1
+            for index, msg in enumerate(messages):
+                if msg.get("checkpoint_id") == checkpoint_id:
+                    boundary_index = index
+            if boundary_index >= 0:
+                return boundary_index
+        return None
+
+    def _messages_after_compaction_boundary(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        boundary_index = self._compacted_boundary_index(messages)
+        if boundary_index is None:
+            return messages, 0
+
+        summarized_count = len([
+            msg
+            for index, msg in enumerate(messages)
+            if index <= boundary_index and msg.get("role") != "system"
+        ])
+        if not messages or messages[0].get("role") != "system":
+            return messages[boundary_index + 1:], summarized_count
+        return [messages[0]] + messages[boundary_index + 1:], summarized_count
+
+    def _auto_compaction_has_new_turns(self) -> bool:
+        if not self.compaction_summary:
+            return True
+        compacted_turn_count = int(
+            self._normalize_compaction_state(self.compaction_state).get("compacted_turn_count") or 0
+        )
+        if compacted_turn_count <= 0:
+            return True
+        return self._real_user_turn_count() - compacted_turn_count >= COMPACTION_MIN_NEW_USER_TURNS
+
+    def _auto_compaction_trigger(self, usage: Dict[str, Any]) -> str:
+        try:
+            context_tokens = float(usage.get("context_estimated_tokens") or usage.get("estimated_tokens") or 0)
+        except (TypeError, ValueError):
+            context_tokens = 0.0
+        pressure = context_tokens / max(1, self._model_input_token_budget())
+        hard_trimmed = bool(
+            usage.get("unsummarized_context_truncated")
+            or (usage.get("context_truncated") and not usage.get("compaction_active"))
+        )
+        if not hard_trimmed and pressure < COMPACTION_SOFT_PRESSURE:
+            return ""
+        if not self._auto_compaction_has_new_turns():
+            return ""
+        if hard_trimmed or pressure >= COMPACTION_HARD_PRESSURE:
+            return "hard"
+        return "soft"
 
     def _estimate_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
         total = 0
@@ -1250,20 +1566,21 @@ class AgentSession:
         """
         if messages is None:
             self._ensure_message_metadata()
-            source = self.messages
+            source = self._active_context_messages()
         else:
-            source = messages
+            source = self._active_context_messages(messages)
         source_copy = copy.deepcopy(source)
         budget = self._model_input_token_budget()
         source_copy = repair_tool_call_messages(source_copy)
-        if self._estimate_messages_tokens(source_copy) <= budget:
-            return source_copy
+        provider_source, _summarized_count = self._messages_after_compaction_boundary(source_copy)
+        if self._estimate_messages_tokens(provider_source) <= budget:
+            return provider_source
 
-        non_system_count = len([m for m in source_copy if m.get("role") != "system"])
+        non_system_count = len([m for m in provider_source if m.get("role") != "system"])
         low = 1
         high = max(1, non_system_count)
         best = trim_messages(
-            source_copy,
+            provider_source,
             1,
             build_system_prompt_fn=self._build_system_prompt,
             validate_tool_ids=True,
@@ -1271,7 +1588,7 @@ class AgentSession:
         while low <= high:
             mid = (low + high) // 2
             candidate = trim_messages(
-                source_copy,
+                provider_source,
                 mid,
                 build_system_prompt_fn=self._build_system_prompt,
                 validate_tool_ids=True,
@@ -1301,7 +1618,7 @@ class AgentSession:
 
     def _active_turn_metadata(self) -> tuple[str, str]:
         for msg in reversed(self.messages):
-            if msg.get("role") == "user":
+            if msg.get("role") == "user" and self._message_context_epoch(msg) == self.context_epoch:
                 turn_id = msg.get("turn_id") or f"turn_{uuid.uuid4().hex[:12]}"
                 checkpoint_id = msg.get("checkpoint_id") or f"chk_{uuid.uuid4().hex[:12]}"
                 self._stamp_message(msg, turn_id=turn_id, checkpoint_id=checkpoint_id)
@@ -1348,10 +1665,18 @@ class AgentSession:
             "tool_schemas": 0,
         }
 
-        full_context_messages = copy.deepcopy(self.messages)
+        active_messages = self._active_context_messages()
+        visible_messages = self._visible_transcript_messages()
+        active_visible_messages = self._active_visible_transcript_messages()
+        archived_message_count = max(0, len(visible_messages) - len(active_visible_messages))
+        full_context_messages = copy.deepcopy(active_messages)
         transcript_estimate = self._estimate_messages_tokens(full_context_messages)
+        provider_source, summarized_message_count = self._messages_after_compaction_boundary(
+            repair_tool_call_messages(copy.deepcopy(full_context_messages))
+        )
         context_messages = self._context_window_messages()
         context_estimate = self._estimate_messages_tokens(context_messages)
+        unsummarized_context_truncated = len(context_messages) < len(provider_source)
         for msg in context_messages:
             role = msg.get("role")
             content = msg.get("content")
@@ -1399,11 +1724,20 @@ class AgentSession:
             "source": "provider" if exact else "estimate",
             "status": status,
             "breakdown": breakdown,
-            "transcript_message_count": len([m for m in self.messages if m.get("role") != "system"]),
+            "transcript_message_count": len(visible_messages),
             "context_message_count": len([m for m in context_messages if m.get("role") != "system"]),
             "transcript_estimated_tokens": transcript_estimate,
             "context_estimated_tokens": context_estimate,
             "context_truncated": len(context_messages) < len(full_context_messages),
+            "compaction_active": bool(self.compaction_summary and summarized_message_count > 0),
+            "context_epoch": self.context_epoch,
+            "archived_message_count": archived_message_count,
+            "context_reset_active": archived_message_count > 0,
+            "compacted_through_checkpoint_id": (
+                self._normalize_compaction_state(self.compaction_state).get("compacted_through_checkpoint_id") or ""
+            ),
+            "summarized_message_count": summarized_message_count,
+            "unsummarized_context_truncated": unsummarized_context_truncated,
         }
         self._last_context_usage = payload
         return payload
@@ -1412,6 +1746,8 @@ class AgentSession:
         self._ensure_message_metadata()
         checkpoints: list[dict[str, Any]] = []
         for index, msg in enumerate(self.messages):
+            if self._message_context_epoch(msg) != self.context_epoch:
+                continue
             if msg.get("role") != "user":
                 continue
             if msg.get("source") == "internal":
@@ -1433,13 +1769,27 @@ class AgentSession:
         target_index = -1
         target: Dict[str, Any] | None = None
         for index, msg in enumerate(self.messages):
-            if msg.get("role") == "user" and msg.get("checkpoint_id") == checkpoint_id:
+            if (
+                self._message_context_epoch(msg) == self.context_epoch
+                and msg.get("role") == "user"
+                and msg.get("checkpoint_id") == checkpoint_id
+            ):
                 target_index = index
                 target = msg
                 break
         if target_index < 0 or target is None:
             return None
         self.messages = self.messages[:target_index + 1]
+        if self.compaction_summary:
+            state = self._normalize_compaction_state(self.compaction_state)
+            boundary_message_id = state.get("compacted_through_message_id") or ""
+            boundary_message_present = bool(boundary_message_id) and any(
+                msg.get("message_id") == boundary_message_id for msg in self.messages
+            )
+            if (boundary_message_id and not boundary_message_present) or (
+                not boundary_message_id and self._compacted_boundary_index(self.messages) is None
+            ):
+                self._reset_compaction_state()
         self.iteration = 0
         self._cancelled = False
         self._last_user_message = _text_from_content(target.get("content", ""))
@@ -1519,7 +1869,7 @@ class AgentSession:
         return True
 
     # Tools that can break out of the current project context.
-    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone", "browser_navigate", "web_search", "web_fetch"})
+    _CONTEXT_ESCAPE_TOOLS: frozenset[str] = frozenset({"git_clone"})
     _EXTERNAL_RESOURCE_KEYWORDS = [
         "clone", "github", "gitlab", "gitee", "bitbucket",
         "repo", "repository", "template", "模板",
@@ -1545,12 +1895,6 @@ class AgentSession:
             return True, ""
 
         user_lower = (user_input or "").lower()
-        # Localhost navigations are always allowed (common dev workflow)
-        if tool_name in {"browser_navigate", "web_fetch"}:
-            url = str(tool_args.get("url") or "").lower()
-            if "localhost" in url or "127.0.0.1" in url:
-                return True, ""
-
         # Check if user explicitly mentioned external resources
         has_external_intent = any(kw in user_lower for kw in self._EXTERNAL_RESOURCE_KEYWORDS)
         if not has_external_intent:
@@ -2125,6 +2469,9 @@ class AgentSession:
         self.iteration = 0
         self._cancelled = False
         self._repo_map_cache = None
+        # First-turn MCP refresh: defers all session-creation cost off the
+        # /api/sessions/resolve HTTP path. No-op once warmed.
+        self._ensure_mcp_tools_ready()
         run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
         ti = self.thinking_intensity
         coding_run = None
@@ -2208,10 +2555,6 @@ class AgentSession:
                 self._save()
                 return
 
-            # Resolve @mentions in user input (file/folder/git/knowledge context)
-            project_path = effective_project_path()
-            resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
-
             # Explicit delegation has priority over Personal's normal reasoning turn.
             settings = load_config().settings
             coding_mention = parse_coding_mention(user_input)
@@ -2221,6 +2564,8 @@ class AgentSession:
                 and getattr(settings, "collaboration_enabled", True)
                 and coding_mention is not None
             ):
+                delegation_project_path = effective_project_path(allow_global=True)
+                resolved_input = resolve_mentions(user_input, delegation_project_path) if delegation_project_path else user_input
                 self._last_user_message = user_input
                 async for event in self._handle_coding_mention(
                     coding_mention,
@@ -2234,7 +2579,14 @@ class AgentSession:
                 return
 
             # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
-            if self._agent_type == "personal" and project_path and self.chat_mode != "plan":
+            # Resolve @mentions in user input (file/folder/git/knowledge context).
+            # Personal has no implicit project binding; project mentions are only
+            # expanded for Coding turns or explicit Coding delegation above.
+            project_path = effective_project_path(allow_global=self._agent_type == "coding")
+            resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
+
+            delegation_project_path = effective_project_path(allow_global=True) if self._agent_type == "personal" else project_path
+            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
                         inferred_mode = classify_coding_intent(user_input)
@@ -2245,6 +2597,11 @@ class AgentSession:
                         )
                         if should_auto_delegate and getattr(settings, "collaboration_enabled", True):
                             self._dispatch_suggested_this_session = True
+                            delegation_resolved_input = (
+                                resolve_mentions(user_input, delegation_project_path)
+                                if delegation_project_path
+                                else user_input
+                            )
                             synthetic_mention = CodingMention(
                                 raw="@coding agent",
                                 task=user_input,
@@ -2254,7 +2611,7 @@ class AgentSession:
                             async for event in self._handle_coding_mention(
                                 synthetic_mention,
                                 original_input=user_input,
-                                resolved_input=resolved_input,
+                                resolved_input=delegation_resolved_input,
                                 image_base64=image_base64,
                                 outer_run_id=run_id,
                             ):
@@ -2338,7 +2695,7 @@ class AgentSession:
             skills_trace = SkillManager.explain_match_skills(
                 self._last_user_message,
                 self.role_id,
-                bool(effective_project_path()),
+                self._agent_type == "coding" and bool(effective_project_path(allow_global=False)),
                 agent_type=self._agent_type,
             )
             active_skills = [skill["id"] for skill in skills_trace["skills"]]
@@ -2403,13 +2760,18 @@ class AgentSession:
                 yield self._event("task_guidance_consumed", {"items": consumed_guidance}, run_id)
                 yield self._event("context_usage", self.context_usage(), run_id)
 
-            if not auto_compaction_attempted and not self.compaction_summary:
+            if not auto_compaction_attempted:
                 usage_before_call = self.context_usage()
-                if usage_before_call.get("context_truncated"):
+                auto_trigger = self._auto_compaction_trigger(usage_before_call)
+                if auto_trigger:
                     auto_compaction_attempted = True
                     compacted = await self.compact_context(
-                        focus="Automatic compaction before model call because the full session transcript exceeds the model context window.",
+                        focus=(
+                            "Automatic compaction before model call because context pressure "
+                            f"reached the {auto_trigger} threshold."
+                        ),
                         force=True,
+                        trigger=auto_trigger,
                     )
                     if compacted and not compacted.get("skipped"):
                         compacted["auto"] = True
@@ -2461,10 +2823,17 @@ class AgentSession:
             # Handle stream failure with non-streaming fallback
             if stream_error:
                 error_msg = stream_error.lower()
-                if "does not support tools" in error_msg or "tool" in error_msg.lower() or "tools" in error_msg.lower():
+                stream_failed_before_tokens = not streamed_reasoning_text and not streamed_content_text
+                retry_without_tools = (
+                    "does not support tools" in error_msg
+                    or "tool" in error_msg
+                    or "tools" in error_msg
+                )
+                if stream_failed_before_tokens or retry_without_tools:
                     try:
                         response = await self.router.chat_completion_non_stream(
                             messages=self._messages_for_llm(),
+                            tools=None if retry_without_tools else tool_schemas or None,
                             temperature=0.5,
                             max_tokens=completion_max_tokens,
                             thinking_intensity=ti,
@@ -2652,7 +3021,8 @@ class AgentSession:
 
                 # Auto-verification gate: block completion if files were edited without verify
                 if (
-                    effective_project_path()
+                    self._agent_type == "coding"
+                    and effective_project_path(allow_global=False)
                     and _files_modified
                     and not _verify_called
                     and not _verify_gate_fired
@@ -2687,7 +3057,7 @@ class AgentSession:
                 break
 
             tool_results = []
-            allowed_names = list_tool_names(self.dynamic_registry)
+            allowed_names = list_tool_names(self.dynamic_registry, agent_type=self._agent_type)
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
@@ -2765,6 +3135,8 @@ class AgentSession:
                     tool_name, tool_args, allowed_names, self.session_id,
                     run_id=run_id,
                     tool_call_id=tool_id,
+                    agent_type=self._agent_type,
+                    session_model_id=self.model_id,
                     get_tool_fn=lambda name: get_tool(name, self.dynamic_registry),
                 )
 
@@ -2790,6 +3162,46 @@ class AgentSession:
 
                 if tc_result.base64_image:
                     yield self._event("image", {"base64": tc_result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
+
+                if tc_result.metadata.get("automation_snapshot"):
+                    yield self._event(
+                        "automation_snapshot",
+                        {
+                            **tc_result.metadata["automation_snapshot"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_action"):
+                    yield self._event(
+                        "automation_action",
+                        {
+                            **tc_result.metadata["automation_action"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_trace"):
+                    yield self._event(
+                        "automation_trace",
+                        {
+                            **tc_result.metadata["automation_trace"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_replay_status"):
+                    yield self._event(
+                        "automation_replay_status",
+                        {
+                            **tc_result.metadata["automation_replay_status"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
 
                 if tc_result.metadata.get("file_edit"):
                     file_edit = dict(tc_result.metadata["file_edit"])
@@ -3095,7 +3507,11 @@ class AgentSession:
         return False
 
     def _should_screenshot(self) -> bool:
-        desktop_tools = ["mouse_click", "mouse_move", "type_text", "press_key", "scroll", "app_click"]
+        desktop_tools = [
+            "mouse_click", "mouse_move", "type_text", "press_key", "scroll", "app_click",
+            "automation_observe", "automation_click", "automation_type",
+            "automation_key", "automation_scroll", "automation_replay",
+        ]
         if self.messages:
             last = self.messages[-1]
             if last.get("role") == "assistant" and "tool_calls" in last:
@@ -3104,7 +3520,7 @@ class AgentSession:
                         return True
         return self.iteration % 5 == 0
 
-    async def compact_context(self, focus: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
+    async def compact_context(self, focus: str = "", force: bool = False, trigger: str = "manual") -> Optional[Dict[str, Any]]:
         """Compress older conversation turns into the session summary.
 
         The summary is injected into the rebuilt system prompt instead of being
@@ -3112,10 +3528,11 @@ class AgentSession:
         handling predictable while preserving recent turns verbatim.
         """
         COMPACTION_THRESHOLD = 15
-        RECENT_USER_TURNS = 3
 
         self._ensure_message_metadata()
-        before_count = len([m for m in self.messages if m.get("role") != "system"])
+        self.compaction_state = self._normalize_compaction_state(self.compaction_state)
+        active_messages = self._active_context_messages()
+        before_count = len([m for m in active_messages if m.get("role") != "system"])
         current_usage = self.context_usage()
         if not force and before_count < COMPACTION_THRESHOLD and current_usage["used_percent"] < 70:
             return {
@@ -3126,24 +3543,29 @@ class AgentSession:
                 "before_message_count": before_count,
                 "after_message_count": before_count,
                 "context_usage": current_usage,
+                "trigger": trigger,
+                "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+                "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
             }
 
-        history = [m for m in self.messages if m.get("role") != "system"]
-        real_user_checkpoint_ids: list[str] = []
-        for msg in history:
-            if msg.get("role") == "user" and msg.get("source") != "internal":
-                checkpoint_id = msg.get("checkpoint_id")
-                if checkpoint_id and checkpoint_id not in real_user_checkpoint_ids:
-                    real_user_checkpoint_ids.append(str(checkpoint_id))
-        recent_checkpoint_ids = set(real_user_checkpoint_ids[-RECENT_USER_TURNS:])
+        history = [m for m in active_messages if m.get("role") != "system"]
+        real_user_checkpoint_ids = self._real_user_checkpoint_ids()
+        recent_checkpoint_ids = set(real_user_checkpoint_ids[-COMPACTION_RECENT_USER_TURNS:])
         if not recent_checkpoint_ids and history:
             recent_checkpoint_ids = {str(history[-1].get("checkpoint_id") or "")}
 
-        recent: list[dict[str, Any]] = []
+        previous_boundary_index = self._compacted_boundary_index(active_messages)
+        if previous_boundary_index is None:
+            previous_boundary_index = -1
+
         to_summarize: list[dict[str, Any]] = []
-        for msg in history:
+        for index, msg in enumerate(active_messages):
+            if msg.get("role") == "system":
+                continue
+            if index <= previous_boundary_index:
+                continue
             if msg.get("checkpoint_id") in recent_checkpoint_ids:
-                recent.append(copy.deepcopy(msg))
+                continue
             else:
                 to_summarize.append(msg)
 
@@ -3156,6 +3578,9 @@ class AgentSession:
                 "before_message_count": before_count,
                 "after_message_count": before_count,
                 "context_usage": current_usage,
+                "trigger": trigger,
+                "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+                "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
             }
 
         conv_lines: list[str] = []
@@ -3175,7 +3600,11 @@ class AgentSession:
 
         prompt_parts = [
             "Summarize the older part of this Desktop Agent session for future continuation.",
-            "Preserve durable facts, user preferences, decisions, open tasks, plan/todo state, files touched, tool results, blockers, and warnings.",
+            (
+                "Preserve durable facts, user preferences, key decisions, current objective, "
+                "plan/todo state, file paths, files touched, tool results, unfinished tasks, "
+                "blockers, warnings, and the latest working state."
+            ),
             "Do not include filler or transcript-like detail. Use the same primary language as the conversation.",
         ]
         if focus:
@@ -3203,15 +3632,30 @@ class AgentSession:
             self._update_usage_from_response(response)
             summary = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not summary or len(summary) < 10:
+                if trigger != "manual":
+                    self.compaction_state["last_auto_error"] = "Compaction summary was empty or too short."
+                    self._save()
                 return None
         except Exception as e:
             logger.warning("Context compaction failed: %s", e)
+            if trigger != "manual":
+                self.compaction_state["last_auto_error"] = str(e)[:500]
+                self._save()
             return None
 
-        self.compaction_summary = summary[:6000]
+        last_summarized = to_summarize[-1]
+        self.compaction_summary = summary[:COMPACTION_SUMMARY_MAX_CHARS]
+        self.compaction_state.update({
+            "version": COMPACTION_STATE_VERSION,
+            "compacted_through_checkpoint_id": str(last_summarized.get("checkpoint_id") or ""),
+            "compacted_through_message_id": str(last_summarized.get("message_id") or ""),
+            "compacted_turn_count": len(real_user_checkpoint_ids),
+            "last_compacted_at": datetime.now(timezone.utc).isoformat(),
+            "last_auto_error": "",
+        })
         self._refresh_system_prompt()
         self._ensure_message_metadata()
-        after_count = len([m for m in self.messages if m.get("role") != "system"])
+        after_count = len([m for m in self._active_context_messages() if m.get("role") != "system"])
         usage = self.context_usage()
         logger.info(
             "Context compacted: transcript=%d context=%d",
@@ -3226,6 +3670,9 @@ class AgentSession:
             "before_message_count": before_count,
             "after_message_count": after_count,
             "context_usage": usage,
+            "trigger": trigger,
+            "compacted_through_checkpoint_id": self.compaction_state.get("compacted_through_checkpoint_id") or "",
+            "preserved_recent_turns": COMPACTION_RECENT_USER_TURNS,
         }
 
     def cancel(self):
@@ -3242,11 +3689,23 @@ class AgentSession:
     def retry_last(self) -> bool:
         for i in range(len(self.messages) - 1, -1, -1):
             msg = self.messages[i]
-            if msg.get("role") == "assistant":
+            if (
+                msg.get("role") == "assistant"
+                and self._message_context_epoch(msg) == self.context_epoch
+                and not self._is_command_notice(msg)
+            ):
                 self.messages = self.messages[:i]
                 self.iteration = 0
                 self._cancelled = False
-                active_user = next((m for m in reversed(self.messages) if m.get("role") == "user"), None)
+                active_user = next(
+                    (
+                        m
+                        for m in reversed(self.messages)
+                        if m.get("role") == "user"
+                        and self._message_context_epoch(m) == self.context_epoch
+                    ),
+                    None,
+                )
                 if active_user:
                     self._last_user_message = _text_from_content(active_user.get("content", ""))
                 self._refresh_system_prompt()
@@ -3254,11 +3713,105 @@ class AgentSession:
                 return True
         return False
 
-    def reset(self):
-        self.messages = []
+    def start_new_context(self, command: str = "reset") -> Dict[str, Any]:
+        """Start a fresh model context while preserving the visible transcript."""
+        command_name = "new" if str(command).lower() == "new" else "reset"
+        self._ensure_message_metadata()
+        previous_epoch = self.context_epoch
+        self.context_epoch += 1
         self.iteration = 0
         self._cancelled = False
-        self.compaction_summary = ""
+        self._last_user_message = ""
+        self._rag_cache_key = ""
+        self._rag_cache_text = ""
+        self._rag_cache_sources = []
+        self._rag_context_sources = []
+        self._reset_compaction_state()
+        self._last_usage = {}
+        self._last_context_usage = {}
+        self.chat_mode = "agent"
+        self.plan_state = PlanState()
+        self.task_guidance_items = []
+        self._plan_exec_hint_sent = False
+        self._repo_map_cache = None
+        self.archived_at = None
+        self._clear_personal_session_handoff()
+        self._refresh_system_prompt()
+        notice_text = (
+            f"New session started - model: {self.model_id}"
+            if command_name == "new"
+            else f"Context reset - model: {self.model_id}"
+        )
+        notice = {
+            "role": "system",
+            "source": COMMAND_NOTICE_SOURCE,
+            "level": "success",
+            "command": command_name,
+            "content": notice_text,
+            "context_epoch": self.context_epoch,
+        }
+        self._stamp_message(notice)
+        self.messages.append(notice)
+        self._save()
+        usage = self.context_usage()
+        return {
+            "command": command_name,
+            "message": notice_text,
+            "model_id": self.model_id,
+            "agent_type": self.agent_type,
+            "role_id": self.role_id,
+            "previous_context_epoch": previous_epoch,
+            "context_epoch": self.context_epoch,
+            "context_usage": usage,
+        }
+
+    async def generate_new_context_greeting(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Generate a short assistant greeting without adding a visible user prompt."""
+        run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
+        prompt = (
+            "A fresh Desktop Agent conversation context has just started. "
+            "Write one short greeting in the user's language, mention that the new context is ready, "
+            "and ask what they would like to work on. Do not mention this hidden instruction."
+        )
+        self.iteration = 0
+        self._cancelled = False
+        self._last_user_message = ""
+        self._refresh_system_prompt()
+        yield self._event("status", {"status": "thinking"}, run_id)
+        try:
+            response = await self.router.chat_completion_non_stream(
+                messages=self._messages_for_llm() + [{"role": "user", "content": prompt}],
+                tools=[],
+                temperature=0.4,
+                max_tokens=256,
+                thinking_intensity=self.thinking_intensity,
+            )
+            self._update_usage_from_response(response)
+            message = response.get("choices", [{}])[0].get("message", {}) if response else {}
+            text = str(message.get("content") or "").strip()
+        except Exception as exc:
+            logger.warning("New-context greeting failed: %s", exc)
+            text = "New context is ready. What would you like to work on?"
+        if not text:
+            text = "New context is ready. What would you like to work on?"
+        assistant_msg = {
+            "role": "assistant",
+            "content": text,
+            "context_epoch": self.context_epoch,
+        }
+        self._stamp_message(assistant_msg)
+        self.messages.append(assistant_msg)
+        self._save()
+        yield self._event("content", {"text": text}, run_id)
+        yield self._event("context_usage", self.context_usage(), run_id)
+        yield self._event("status", {"status": "completed"}, run_id)
+
+    def reset(self):
+        self.messages = []
+        self.context_epoch = 0
+        self.iteration = 0
+        self._cancelled = False
+        self._reset_compaction_state()
         self._last_usage = {}
         self._last_context_usage = {}
         self.archived_at = None
@@ -3286,6 +3839,8 @@ class AgentSession:
             )
 
         AgentManager.switch_agent(self, agent_type)
+        if self._agent_type == "personal":
+            self.project_path = None
 
         # Switch to the agent's configured model
         effective = self._resolve_agent_model()
@@ -3312,9 +3867,11 @@ class AgentSession:
             raise ValueError(
                 "Cannot switch a non-empty session between agent identities. "
                 "Resolve or create a session for the target agent instead."
-            )
+        )
         self.role_id = role_id
         self._agent_type = agent_type
+        if self._agent_type == "personal":
+            self.project_path = None
         self._refresh_system_prompt()
         self._save()
 
@@ -3335,6 +3892,34 @@ class AgentSession:
                     )
                     self.dynamic_registry.register(proxy)
         self._refresh_system_prompt()
+        self._mcp_tools_dirty = False
+
+    def mark_mcp_dirty(self) -> None:
+        """Defer MCP tool refresh to the next run() invocation.
+
+        Use this on hot paths (session creation, role switch, server list
+        invalidation) so HTTP responses don't block on enumerating MCP servers
+        or rebuilding the system prompt.
+        """
+        self._mcp_tools_dirty = True
+
+    def _ensure_mcp_tools_ready(self) -> None:
+        """Lazy entry point: refresh MCP tools iff marked dirty.
+
+        Called from run() before any tool schemas are read. Safe to call
+        repeatedly — the dirty flag is the gate. If the refresh fails the flag
+        stays set so the next turn retries instead of running with a stale
+        registry.
+        """
+        if not self._mcp_tools_dirty:
+            return
+        try:
+            self.refresh_mcp_tools()
+        except Exception:
+            # Keep the dirty flag set so we retry on the next turn rather than
+            # silently running with no MCP tools. We don't re-raise because the
+            # session can still serve native tools.
+            self._mcp_tools_dirty = True
 
     def _save(self):
         path = SESSIONS_DIR / f"{self.session_id}.json"
@@ -3351,7 +3936,7 @@ class AgentSession:
         if not title and self.plan_state.goal:
             title = self.plan_state.goal[:80]
 
-        stored_project_path = _canonical_project_path(self.project_path)
+        stored_project_path = None if self._agent_type == "personal" else _canonical_project_path(self.project_path)
         self.project_path = stored_project_path
 
         data = {
@@ -3360,6 +3945,7 @@ class AgentSession:
             "role_id": self.role_id,
             "agent_type": self._agent_type,
             "project_path": self.project_path,
+            "context_epoch": self.context_epoch,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
             "messages": self.messages,
@@ -3369,6 +3955,7 @@ class AgentSession:
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
             "compaction_summary": self.compaction_summary,
+            "compaction_state": self._normalize_compaction_state(self.compaction_state),
             "last_usage": self._last_usage,
             "last_context_usage": self._last_context_usage,
             "archived_at": self.archived_at,
@@ -3402,17 +3989,34 @@ class AgentSession:
                 role_id=stored_role_id,
                 agent_type=stored_agent_type,
             )
+            try:
+                session.context_epoch = max(0, int(data.get("context_epoch") or 0))
+            except (TypeError, ValueError):
+                session.context_epoch = 0
             session.messages = data.get("messages", [])
+            for msg in session.messages:
+                if isinstance(msg, dict):
+                    msg.setdefault("context_epoch", 0)
             session.iteration = 0
             archived_at = data.get("archived_at")
             session.archived_at = str(archived_at) if archived_at else None
-            session.compaction_summary = str(data.get("compaction_summary") or "")
+            stored_compaction_state = data.get("compaction_state")
+            if isinstance(stored_compaction_state, dict):
+                session.compaction_summary = str(data.get("compaction_summary") or "")
+                session.compaction_state = session._normalize_compaction_state(stored_compaction_state)
+            else:
+                session._reset_compaction_state()
             last_usage = data.get("last_usage")
             session._last_usage = last_usage if isinstance(last_usage, dict) else {}
             last_context_usage = data.get("last_context_usage")
             session._last_context_usage = last_context_usage if isinstance(last_context_usage, dict) else {}
             stored_project_path = data.get("project_path")
-            session.project_path = _canonical_project_path(stored_project_path) if isinstance(stored_project_path, str) and stored_project_path else None
+            cleared_personal_project_path = False
+            if session._agent_type == "personal":
+                cleared_personal_project_path = bool(stored_project_path)
+                session.project_path = None
+            else:
+                session.project_path = _canonical_project_path(stored_project_path) if isinstance(stored_project_path, str) and stored_project_path else None
 
             # Restore per-agent model and thinking intensity from persisted data
             stored_agent_models = data.get("agent_models")
@@ -3453,8 +4057,10 @@ class AgentSession:
             session._ensure_message_metadata()
             repaired_tool_calls = session._repair_incomplete_tool_call_history()
             session._refresh_system_prompt()
-            session.refresh_mcp_tools()
-            if repaired_tool_calls:
+            # Hot path: avoid blocking history-load on MCP server enumeration.
+            # First run() will pick up the registry refresh.
+            session.mark_mcp_dirty()
+            if repaired_tool_calls or cleared_personal_project_path:
                 session._save()
             return session
         except (OSError, json.JSONDecodeError):
@@ -3499,13 +4105,14 @@ class AgentSession:
 
     def to_snapshot(self) -> Dict[str, Any]:
         context_usage = self.context_usage()
-        transcript_message_count = len([m for m in self.messages if m.get("role") != "system"])
+        transcript_message_count = len(self._visible_transcript_messages())
         context_message_count = int(context_usage.get("context_message_count") or 0)
         return {
             "session_id": self.session_id,
             "model_id": self.model_id,
             "role_id": self.role_id,
             "agent_type": self._agent_type,
+            "context_epoch": self.context_epoch,
             "agent_models": self._agent_models,
             "agent_thinking": self._agent_thinking,
             # Internal synthetic messages (source=="internal") are LLM-only
@@ -3518,6 +4125,7 @@ class AgentSession:
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": self.active_task_guidance_items(),
             "compaction_summary": self.compaction_summary,
+            "compaction_state": self._normalize_compaction_state(self.compaction_state),
             "context_usage": context_usage,
             "checkpoints": self.build_checkpoints(),
             "transcript_message_count": transcript_message_count,
@@ -3564,10 +4172,15 @@ def get_or_create_session(
             loaded_from_disk = True
         else:
             _sessions[session_id] = AgentSession(model_id=model_id, session_id=session_id, role_id=role_id, agent_type=resolved_agent_type)
-            _sessions[session_id].refresh_mcp_tools()
+            # AgentSession.__init__ already marks tools dirty; first run() will
+            # populate the dynamic registry. This keeps /api/sessions/resolve
+            # responsive even when many MCP servers are registered.
 
     session = _sessions[session_id]
     changed = False
+    if session.agent_type == "personal" and session.project_path is not None:
+        session.project_path = None
+        changed = True
     if agent_type and session.agent_type != resolved_agent_type:
         if _session_has_history(session):
             raise ValueError(
@@ -3661,7 +4274,10 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
             agent_type="personal",
             preserve_existing_model=not created,
         )
-        if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
+        binding_changed = session.project_path is not None
+        if binding_changed:
+            session.project_path = None
+        if created or binding_changed or not (SESSIONS_DIR / f"{session_id}.json").exists():
             session._save()
 
         personal["primary_session_id"] = session.session_id
@@ -3704,10 +4320,16 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
 
 
 def refresh_all_sessions_mcp_tools():
-    """通知所有活跃会话刷新 MCP 工具。"""
+    """通知所有活跃会话刷新 MCP 工具。
+
+    Marks every live session dirty so the next run() rebuilds its dynamic
+    registry. We no longer refresh inline because some callers (e.g. MCP
+    server status webhooks) invoke this while holding event-loop locks; doing
+    the heavy work synchronously there has caused UI stalls.
+    """
     for session in _sessions.values():
         try:
-            session.refresh_mcp_tools()
+            session.mark_mcp_dirty()
         except Exception:
             pass
 

@@ -1,7 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, useImperativeHandle, forwardRef, useMemo } from 'react';
 import { ChatPanel } from '../ChatPanel';
 import { useChatSession } from '../../hooks/useChatSession';
-import { useLayoutState } from '../../hooks/useLayoutState';
 import type { WorkspaceView } from '../workspace/WorkspacePanel';
 import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSessionContext';
 import type {
@@ -25,6 +24,7 @@ interface SessionViewProps {
   model: string;
   agentType: AgentType;
   role: string;
+  assistantDisplayName?: string;
   teamId?: string;
   teamName?: string;
   isFocused: boolean;
@@ -36,6 +36,7 @@ interface SessionViewProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onRevealWorkspace?: () => void;
   onOpenPlanInWorkspace?: () => void;
   onProjectFileEdit?: (edit: FileEdit) => void;
 }
@@ -69,6 +70,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     model,
     agentType,
     role,
+    assistantDisplayName,
     teamId,
     teamName,
     isFocused,
@@ -80,18 +82,21 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     openRunWorktree,
     handleOpenFileFromPanel,
     handleOpenFileFromPanelWithLine,
+    onRevealWorkspace,
     onOpenPlanInWorkspace,
     onProjectFileEdit,
   },
   ref,
 ) {
-  const layout = useLayoutState();
-
   const {
     messages,
     toolCalls,
     fileEdits,
     runEvents,
+    automationSnapshots,
+    automationActions,
+    automationTraces,
+    automationReplayStatus,
     contextUsage,
     checkpoints,
     taskGuidanceItems,
@@ -104,6 +109,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     deleteTaskGuidance,
     clearTaskGuidance,
     clearSession,
+    resetContext,
     compactSession,
     loadCheckpoints,
     rewindToCheckpoint,
@@ -112,7 +118,6 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     switchModel,
     switchRole,
     executeToolDirect,
-    resetSession,
     addTerminalLog,
     onToolCallRef,
     onFileEditRef,
@@ -213,12 +218,12 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         return newGroups;
       });
 
-      layout.setRightZone('workspace');
+      onRevealWorkspace?.();
       if (options.groupId === 'secondary') {
         setActiveEditorGroup('secondary');
       }
     },
-    [layout],
+    [onRevealWorkspace],
   );
 
   const openPlanInEditor = useCallback(() => {
@@ -279,9 +284,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         };
 
         setArtifacts((prev) => [...prev, item]);
-        if (isFocused) {
-          layout.setRightZone('workspace');
-        }
+        if (isFocused) onRevealWorkspace?.();
       }
 
       if (tc.name === 'shell_execute') {
@@ -305,12 +308,10 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
             timestamp: Date.now(), sourceTool: 'shell_execute',
           }];
         });
-        if (isFocused) {
-          layout.setRightZone('workspace');
-        }
+        if (isFocused) onRevealWorkspace?.();
       }
     };
-  }, [onToolCallRef, isFocused, layout]);
+  }, [onToolCallRef, isFocused, onRevealWorkspace]);
 
   // ---- File edit → editor groups observer ----
 
@@ -420,11 +421,13 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
 
   // ---- Publish snapshot when focused ----
 
+  const sessionProjectPath = agentType === 'coding' ? currentProject?.path ?? null : null;
+
   const snapshot: SessionSnapshot | null = useMemo(() => {
     if (!isFocused) return null;
     return {
       sessionId,
-      projectPath: currentProject?.path ?? null,
+      projectPath: sessionProjectPath,
       agentType,
       isRunning,
       isConnected,
@@ -441,13 +444,19 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       fileEdits,
       toolCalls,
       runEvents,
+      automationSnapshots,
+      automationActions,
+      automationTraces,
+      automationReplayStatus,
     };
-  }, [isFocused, sessionId, currentProject?.path, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
-      contextUsage, checkpoints, suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents]);
+  }, [isFocused, sessionId, sessionProjectPath, agentType, isRunning, isConnected, chatMode, thinkingIntensity, planState,
+      contextUsage, checkpoints, suggestAgentSwitch, artifacts, editorGroups, activeEditorGroup, latestToolCall, fileEdits, toolCalls, runEvents,
+      automationSnapshots, automationActions, automationTraces, automationReplayStatus]);
 
   const actions: SessionActions = useMemo(() => ({
     sendMessage,
     clearSession,
+    resetContext,
     compactSession,
     loadCheckpoints,
     rewindToCheckpoint,
@@ -476,7 +485,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     handleOpenFileFromPanel,
     handleOpenFileFromPanelWithLine,
   }), [
-    sendMessage, clearSession, compactSession, loadCheckpoints, rewindToCheckpoint,
+    sendMessage, clearSession, resetContext, compactSession, loadCheckpoints, rewindToCheckpoint,
     stopRunning, retryLast, switchModel, switchRole, executeToolDirect, addTerminalLog,
     approvePlan, buildPlan, pauseBuild, endBuild, rejectPlan, updatePlanDecision, submitPlanDecisions,
     handleSelectFileInEditor, handleCloseFileInEditor, handleFileContentChange, handleSaveFile,
@@ -487,14 +496,6 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   useEffect(() => {
     onSnapshot(snapshot, actions);
   }, [snapshot, actions, onSnapshot]);
-
-  // ---- Cleanup ----
-
-  useEffect(() => {
-    return () => {
-      resetSession();
-    };
-  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="h-full min-h-0 flex flex-col" onClick={onFocus}>
@@ -538,9 +539,10 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         onSubmitPlanDecisions={submitPlanDecisions}
         onViewPlan={openPlanInEditor}
         onCommand={onCommand}
-        projectOpen={!!currentProject}
+        projectOpen={agentType === 'coding' && !!currentProject}
         agentType={agentType}
-        projectName={currentProject?.name}
+        assistantDisplayName={assistantDisplayName}
+        projectName={agentType === 'coding' ? currentProject?.name : undefined}
       />
     </div>
   );

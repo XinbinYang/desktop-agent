@@ -120,6 +120,58 @@ class TestAgentSession:
         assert "user turn 0" in remaining_text
         assert "user turn 5" in remaining_text
         assert result["context_usage"]["context_message_count"] <= result["after_message_count"]
+        assert result["preserved_recent_turns"] == 4
+        assert session.compaction_state["compacted_through_checkpoint_id"]
+        assert result["context_usage"]["compaction_active"] is True
+        assert result["context_usage"]["summarized_message_count"] > 0
+
+    @pytest.mark.asyncio
+    async def test_compact_context_merges_existing_summary_with_new_delta(self, session):
+        captured_summary_messages = []
+
+        async def fake_summary(*args, **kwargs):
+            messages = kwargs.get("messages") or args[0]
+            captured_summary_messages.append(messages)
+            return {"choices": [{"message": {"content": f"Summary v{len(captured_summary_messages)}"}}]}
+
+        for i in range(6):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session.router.chat_completion_non_stream = fake_summary
+
+        first = await session.compact_context(force=True)
+        for i in range(6, 8):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        second = await session.compact_context(force=True)
+
+        assert first is not None and first["skipped"] is False
+        assert second is not None and second["skipped"] is False
+        assert session.compaction_summary == "Summary v2"
+        assert session.compaction_state["compacted_turn_count"] == 8
+        second_prompt = captured_summary_messages[1][0]["content"]
+        assert "Previous compacted summary to merge" in second_prompt
+        assert "Summary v1" in second_prompt
+        assert "user turn 2" in second_prompt
+        assert "user turn 7" not in second_prompt
+
+    @pytest.mark.asyncio
+    async def test_compact_context_failure_preserves_existing_summary(self, session):
+        async def failing_summary(*args, **kwargs):
+            raise RuntimeError("summary model unavailable")
+
+        session.compaction_summary = "Existing summary"
+        session.compaction_state["compacted_turn_count"] = 4
+        for i in range(8):
+            session.messages.append({"role": "user", "content": f"user turn {i}", "source": "user"})
+            session.messages.append({"role": "assistant", "content": f"assistant turn {i}"})
+        session.router.chat_completion_non_stream = failing_summary
+
+        result = await session.compact_context(force=True, trigger="hard")
+
+        assert result is None
+        assert session.compaction_summary == "Existing summary"
+        assert "summary model unavailable" in session.compaction_state["last_auto_error"]
 
     def test_get_or_create_preserves_saved_session_model(self, tmp_path, monkeypatch):
         import app.agent as agent_module
@@ -204,6 +256,27 @@ class TestAgentSession:
         )
 
     @pytest.mark.asyncio
+    async def test_stream_error_before_tokens_uses_non_stream_fallback(self, session):
+        async def failing_stream(*args, **kwargs):
+            yield {"type": "error", "message": "DeepSeek stream failed: 400"}
+
+        async def non_stream_fallback(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Recovered from stream error"}}]}
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", failing_stream),
+            patch("app.agent.ModelRouter.chat_completion_non_stream", non_stream_fallback),
+        ):
+            events = []
+            async for event in session.run("hi"):
+                events.append(event)
+
+        streamed_text = "".join(e["data"]["text"] for e in events if e["type"] == "content")
+        assert streamed_text == "Recovered from stream error"
+        assert not any(e["type"] == "error" for e in events)
+        assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
+
+    @pytest.mark.asyncio
     async def test_run_with_tool_call(self, session):
         mock_response = {
             "choices": [{
@@ -232,6 +305,62 @@ class TestAgentSession:
             tool_call_events = [e for e in events if e["type"] == "tool_call"]
             assert len(tool_call_events) >= 1
             assert tool_call_events[0]["data"]["name"] == "get_screen_size"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_worker_inherits_active_session_model(self):
+        session = AgentSession(model_id="gpt-4o-mini", session_id="dispatch_model_session", agent_type="coding")
+        seen_worker_models = []
+
+        async def replacement_worker_run(self):
+            seen_worker_models.append(self.model_id)
+            yield {"type": "worker_done", "data": {
+                "worker_id": self.worker_id,
+                "status": "completed",
+                "result": "Worker completed.",
+                "iterations": 1,
+                "duration_ms": 10,
+            }}
+
+        worker_call_response = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_worker",
+                        "type": "function",
+                        "function": {
+                            "name": "dispatch_worker",
+                            "arguments": json.dumps({"task": "Inspect this", "profile": "explorer"}),
+                        },
+                    }],
+                }
+            }]
+        }
+        final_response = {
+            "choices": [{
+                "message": {
+                    "content": "Done.",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        streams = [_make_stream_mock(worker_call_response), _make_stream_mock(final_response)]
+
+        async def stream_sequence(*args, **kwargs):
+            stream = streams.pop(0)
+            async for event in stream(*args, **kwargs):
+                yield event
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence),
+            patch("app.worker.WorkerSession.run", new=replacement_worker_run),
+        ):
+            events = [event async for event in session.run("dispatch a worker")]
+
+        assert seen_worker_models == ["gpt-4o-mini"]
+        assert any(e["type"] == "tool_call" and e["data"]["name"] == "dispatch_worker" for e in events)
 
     @pytest.mark.asyncio
     async def test_run_with_file_write_emits_file_edit(self, session, temp_dir):
@@ -362,6 +491,16 @@ class TestAgentSession:
         assert "[TASK GUIDANCE]" in first_call_text
         assert "Prefer the smaller fix" in first_call_text
 
+    def test_stale_task_guidance_is_not_persisted_as_active(self, session):
+        item = session.queue_task_guidance("Turn this into a follow-up")
+        session.apply_task_guidance()
+
+        stale = session.mark_applied_task_guidance_stale()
+
+        assert stale[0].id == item.id
+        assert stale[0].status == "stale"
+        assert session.active_task_guidance_items() == []
+
     @pytest.mark.asyncio
     async def test_run_payload_keeps_prior_session_suggestion_when_context_fits(self, session):
         captured_messages = []
@@ -443,6 +582,59 @@ class TestAgentSession:
         first_call_text = "\n".join(str(msg.get("content", "")) for msg in captured_messages[0])
         assert "Conversation Summary" in first_call_text
         assert "Summary: old review context" in first_call_text
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compacts_at_soft_pressure_before_trimming(self, session):
+        captured_messages = []
+        run_input = "continue from the session"
+
+        async def fake_summary(*args, **kwargs):
+            return {"choices": [{"message": {"content": "Summary: proactive context continuity."}}]}
+
+        async def stream_with_capture(*args, **kwargs):
+            captured_messages.append(kwargs.get("messages") or args[0])
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Continued after proactive compaction.",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        session.router.chat_completion_non_stream = fake_summary
+        session._tool_schema_token_estimate = lambda: 0
+        for i in range(6):
+            session.messages.append({
+                "role": "user",
+                "content": f"older turn {i} " + ("context " * 80),
+                "source": "user",
+            })
+            session.messages.append({"role": "assistant", "content": "answer " + ("details " * 80)})
+        session._last_user_message = run_input
+        session._refresh_system_prompt()
+        session._ensure_message_metadata()
+        projected_messages = session.messages + [{"role": "user", "content": run_input, "source": "user"}]
+        projected_tokens = session._estimate_messages_tokens(projected_messages)
+        budget = max(projected_tokens + 1, int(projected_tokens / 0.80))
+        session._model_input_token_budget = lambda: budget
+        session._model_context_limit = lambda: budget * 2
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_with_capture):
+            events = []
+            async for event in session.run(run_input):
+                events.append(event)
+
+        compacted = next(e for e in events if e["type"] == "compacted")
+        assert compacted["data"].get("auto") is True
+        assert compacted["data"].get("trigger") == "soft"
+        assert compacted["data"].get("preserved_recent_turns") == 4
+        assert session.compaction_summary.startswith("Summary:")
+        assert captured_messages
 
     @pytest.mark.asyncio
     async def test_invalid_tool_arguments_are_reported_as_tool_result(self, session):
@@ -596,6 +788,57 @@ class TestAgentSession:
         assert snapshot["context_message_count"] == snapshot["transcript_message_count"]
         assert snapshot["context_truncated"] is False
 
+    def test_save_and_load_preserves_compaction_state(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+
+        session = AgentSession(model_id="gpt-4o", session_id="compacted_history")
+        session.messages.append({"role": "user", "content": "historical task", "source": "user"})
+        session.messages.append({"role": "assistant", "content": "historical answer"})
+        session._ensure_message_metadata()
+        boundary = session.messages[-1]
+        session.compaction_summary = "Summary: persisted context."
+        session.compaction_state.update({
+            "compacted_through_checkpoint_id": boundary["checkpoint_id"],
+            "compacted_through_message_id": boundary["message_id"],
+            "compacted_turn_count": 1,
+            "last_compacted_at": "2026-05-19T00:00:00+00:00",
+        })
+        session._save()
+
+        loaded = AgentSession.load("compacted_history")
+
+        assert loaded is not None
+        assert loaded.compaction_summary == "Summary: persisted context."
+        assert loaded.compaction_state["compacted_through_checkpoint_id"] == boundary["checkpoint_id"]
+        assert loaded.compaction_state["compacted_through_message_id"] == boundary["message_id"]
+        assert loaded.to_snapshot()["compaction_state"]["compacted_turn_count"] == 1
+
+    def test_load_old_session_without_compaction_state_is_uncompacted(self, tmp_path, monkeypatch):
+        import app.agent as agent_module
+
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", tmp_path)
+        agent_module._sessions.clear()
+        (tmp_path / "old_compaction.json").write_text(json.dumps({
+            "session_id": "old_compaction",
+            "model_id": "gpt-4o",
+            "role_id": "desktop-agent",
+            "messages": [
+                {"role": "system", "content": "old system"},
+                {"role": "user", "content": "old user", "source": "user"},
+            ],
+            "compaction_summary": "Legacy summary should not activate without state.",
+        }), encoding="utf-8")
+
+        loaded = AgentSession.load("old_compaction")
+
+        assert loaded is not None
+        assert loaded.compaction_summary == ""
+        assert loaded.compaction_state["compacted_turn_count"] == 0
+        assert loaded.context_usage()["compaction_active"] is False
+
     def test_refresh_mcp_tools_does_not_persist_transcript_side_effects(self, session, tmp_path, monkeypatch):
         import app.agent as agent_module
 
@@ -621,6 +864,91 @@ class TestAgentSession:
         assert session.iteration == 0
         assert len(session.messages) == 1
         assert session.messages[0]["role"] == "system"
+
+    def test_start_new_context_preserves_visible_transcript_but_resets_llm_context(self, session):
+        session.messages.append({"role": "user", "content": "old visible request", "source": "user"})
+        session.messages.append({"role": "assistant", "content": "old visible answer"})
+        session.plan_state.goal = "old plan"
+        session.task_guidance_items.append(MagicMock(status="queued", model_dump=lambda: {}))
+
+        result = session.start_new_context("reset")
+
+        assert result["context_epoch"] == 1
+        assert session.context_epoch == 1
+        assert session.model_id == "gpt-4o"
+        assert any(m.get("content") == "old visible request" for m in session.messages)
+        provider_text = "\n".join(str(m.get("content", "")) for m in session._messages_for_llm())
+        assert "old visible request" not in provider_text
+        assert "old visible answer" not in provider_text
+        assert session.plan_state.goal == ""
+        assert session.task_guidance_items == []
+
+    def test_start_new_context_clears_stale_handoff_before_prompt_refresh(self, tmp_path, monkeypatch):
+        from app.agents.manager import AgentManager
+
+        agents_root = tmp_path / "AGENTS"
+        personal_workspace = agents_root / "personal" / "WORKSPACE"
+        personal_workspace.mkdir(parents=True)
+        handoff_path = personal_workspace / "session_handoff.md"
+        handoff_path.write_text("old handoff leak", encoding="utf-8")
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
+
+        session = AgentSession(model_id="gpt-4o", session_id="handoff_reset_test")
+        assert "old handoff leak" in str(session.messages[0].get("content", ""))
+
+        session.start_new_context("reset")
+
+        provider_text = "\n".join(str(m.get("content", "")) for m in session._messages_for_llm())
+        assert "old handoff leak" not in provider_text
+        assert not handoff_path.exists()
+
+    def test_context_snapshot_keeps_old_messages_and_notice(self, session):
+        session.messages.append({"role": "user", "content": "before reset", "source": "user"})
+        session.start_new_context("new")
+
+        snap = session.to_snapshot()
+        visible_text = "\n".join(str(m.get("content", "")) for m in snap["messages"])
+
+        assert snap["context_epoch"] == 1
+        assert "before reset" in visible_text
+        assert "New session started - model: gpt-4o" in visible_text
+        assert snap["context_usage"]["context_epoch"] == 1
+        assert snap["context_usage"]["context_reset_active"] is True
+        assert snap["context_usage"]["archived_message_count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_ignores_archived_epoch_and_skips_assistant_only_context(self, tmp_path, monkeypatch):
+        from app.agents.heartbeat import HeartbeatEngine
+        from app.agents.manager import AgentManager
+
+        agents_root = tmp_path / "AGENTS"
+        monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
+        monkeypatch.setattr(HeartbeatEngine, "_store_auto_memory_items", classmethod(lambda cls, **kwargs: 0))
+        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls: False))
+
+        assistant_only = [
+            {"role": "user", "content": "archived user request", "context_epoch": 0},
+            {"role": "assistant", "content": "archived assistant answer", "context_epoch": 0},
+            {"role": "assistant", "content": "New context is ready. What shall we do next?", "context_epoch": 1},
+        ]
+        result = await HeartbeatEngine.on_session_end(assistant_only, "assistant_only_reset")
+        assert result["diary_written"] is False
+        assert result["handoff_written"] is False
+        assert not (agents_root / "personal" / "WORKSPACE" / "session_handoff.md").exists()
+
+        mixed_epochs = [
+            {"role": "user", "content": "archived user request", "context_epoch": 0},
+            {"role": "assistant", "content": "archived assistant answer", "context_epoch": 0},
+            {"role": "user", "content": "new user preference should be remembered", "context_epoch": 1},
+            {"role": "assistant", "content": "new assistant response for current context", "context_epoch": 1},
+        ]
+        result = await HeartbeatEngine.on_session_end(mixed_epochs, "mixed_epoch_reset")
+        assert result["handoff_written"] is True
+        handoff = (agents_root / "personal" / "WORKSPACE" / "session_handoff.md").read_text(encoding="utf-8")
+        assert "new user preference should be remembered" in handoff
+        assert "new assistant response for current context" in handoff
+        assert "archived user request" not in handoff
+        assert "archived assistant answer" not in handoff
 
     @pytest.mark.asyncio
     async def test_plan_mode_llm_calls_plan_ask_questions(self, session):

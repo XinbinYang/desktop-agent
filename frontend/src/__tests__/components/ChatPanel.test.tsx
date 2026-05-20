@@ -1,7 +1,9 @@
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { ChatPanel } from '../../components/ChatPanel'
-import type { ChatMessage, PlanState } from '../../types'
+import { PersonalChatSurface } from '../../components/chat/PersonalChatSurface'
+import { __resetSlashCommandCacheForTests } from '../../components/SlashCommandMenu'
+import type { ChatMessage, FileEdit, PlanState, ToolCall } from '../../types'
 
 vi.mock('react-virtuoso', () => {
   const Virtuoso = (props: any) => {
@@ -38,6 +40,15 @@ const idlePlanState: PlanState = {
 }
 
 describe('ChatPanel', () => {
+  beforeEach(() => {
+    __resetSlashCommandCacheForTests()
+    localStorage.removeItem('desktop-agent-personal-chat-v2')
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
   const defaultProps = {
     messages: [] as ChatMessage[],
     toolCalls: [],
@@ -76,6 +87,41 @@ describe('ChatPanel', () => {
     expect(within(welcome).getAllByText(/desktop-agent/).length).toBeGreaterThan(0)
   })
 
+  it('does not show current project state for Personal Agent', () => {
+    render(<ChatPanel {...defaultProps} agentType="personal" projectName="desktop-agent" />)
+    const welcome = screen.getByTestId('empty-chat-welcome')
+    expect(within(welcome).getByText('Personal Agent')).toBeInTheDocument()
+    expect(within(welcome).queryByText(/desktop-agent/)).not.toBeInTheDocument()
+  })
+
+  it('uses a custom Personal Agent name in the social chat surface', () => {
+    const messages: ChatMessage[] = [
+      { id: '2', role: 'assistant', content: 'Hi there', isTool: false, turnComplete: true },
+    ]
+    render(<ChatPanel {...defaultProps} messages={messages} agentType="personal" assistantDisplayName="镜与刃" />)
+    expect(screen.getByText('镜与刃')).toBeInTheDocument()
+    expect(screen.queryByText('Desktop Agent')).not.toBeInTheDocument()
+  })
+
+  it('does not expose project @mentions for Personal Agent', async () => {
+    render(
+      <ChatPanel
+        {...defaultProps}
+        agentType="personal"
+        projectOpen={true}
+        fileTree={[{ name: 'README.md', path: 'README.md', type: 'file', extension: 'md' }]}
+      />,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)'), {
+      target: { value: '@' },
+    })
+
+    expect(await screen.findByText('Coding Agent')).toBeInTheDocument()
+    expect(screen.queryByText('Git')).not.toBeInTheDocument()
+    expect(screen.queryByText('README.md')).not.toBeInTheDocument()
+  })
+
   it('uses the coding event timeline for Coding Agent sessions', () => {
     const messages: ChatMessage[] = [
       { id: '1', role: 'user', content: 'Inspect the app', isTool: false },
@@ -100,7 +146,265 @@ describe('ChatPanel', () => {
     expect(screen.queryByText('Summary')).not.toBeInTheDocument()
   })
 
-  it('uses the personal conversation timeline and folds adjacent tools', () => {
+  it('uses the personal social chat surface by default and folds adjacent tools', () => {
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      blocks: [
+        { type: 'tool_call', name: 'knowledge_search', args: { query: 'memory' }, result: 'one', status: 'success', toolCallId: 'k1', timestamp: 1 },
+        { type: 'tool_call', name: 'file_read', args: { path: 'notes.md' }, result: 'two', status: 'success', toolCallId: 'k2', timestamp: 2 },
+        { type: 'text', text: 'I found the note.', timestamp: 3 },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    expect(screen.getByTestId('personal-chat-v2')).toBeInTheDocument()
+    expect(screen.getByText(/我处理了 2 步/)).toBeInTheDocument()
+    expect(screen.getByText(/用了 2 个工具/)).toBeInTheDocument()
+    expect(screen.queryByText('Used 2 tools')).not.toBeInTheDocument()
+    expect(screen.queryByText('knowledge_search')).not.toBeInTheDocument()
+    expect(screen.getByText('I found the note.')).toBeInTheDocument()
+    fireEvent.click(screen.getByText(/我处理了 2 步/))
+    expect(screen.getByText('Used 2 tools')).toBeInTheDocument()
+  })
+
+  it('keeps Personal process summaries visually neutral when activities include errors', () => {
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: true,
+      blocks: [
+        {
+          type: 'tool_call',
+          name: 'web_search',
+          args: { query: 'macro data' },
+          result: '[ERROR] timeout',
+          status: 'error',
+          toolCallId: 'search-error',
+          timestamp: 1,
+        },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    const drawerButton = screen.getByTestId('personal-activity-drawer').querySelector('button')
+    expect(drawerButton).toHaveClass('border-border-subtle')
+    expect(drawerButton).toHaveClass('bg-surface/55')
+    expect(drawerButton).toHaveClass('text-fg-muted')
+    expect(drawerButton).not.toHaveClass('border-danger/25')
+    expect(drawerButton).not.toHaveClass('bg-danger/10')
+    expect(drawerButton).not.toHaveClass('text-danger')
+  })
+
+  it('collapses completed Personal activities into a process drawer', () => {
+    const timestamp = Date.UTC(2026, 4, 20, 10, 0, 0)
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: true,
+      blocks: [
+        {
+          type: 'thinking',
+          text: 'checking the local memory',
+          timestamp: timestamp + 5000,
+          startedAt: timestamp,
+          endedAt: timestamp + 5000,
+          complete: true,
+        },
+        {
+          type: 'file_edit',
+          timestamp: timestamp + 6000,
+          edit: {
+            path: 'src/example.ts',
+            operation: 'modify',
+            unified_diff: '--- a/src/example.ts\n+++ b/src/example.ts\n-old\n+new\n',
+            stats: { added: 1, removed: 1 },
+            truncated: false,
+            tool_call_id: 'edit-1',
+          },
+        },
+        { type: 'text', text: 'Done.', timestamp: timestamp + 7000 },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    expect(screen.getByText(/我处理了 2 步/)).toBeInTheDocument()
+    expect(screen.getByText(/思考 5 秒/)).toBeInTheDocument()
+    expect(screen.getByText(/修改 1 个文件/)).toBeInTheDocument()
+    expect(screen.queryByText('Thought for 5s')).not.toBeInTheDocument()
+    expect(screen.queryByText(/src\/example\.ts/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText(/我处理了 2 步/))
+
+    expect(screen.getByText('Thought for 5s')).toBeInTheDocument()
+    expect(screen.getByText(/modify src\/example\.ts/)).toBeInTheDocument()
+  })
+
+  it('keeps running Personal activities visible until the turn finishes', () => {
+    const timestamp = Date.UTC(2026, 4, 20, 10, 0, 0)
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: false,
+      blocks: [
+        { type: 'thinking', text: 'checking memory', timestamp: timestamp + 1000, complete: false },
+        {
+          type: 'tool_call',
+          name: 'knowledge_search',
+          args: { query: 'memory' },
+          status: 'running',
+          toolCallId: 'k1',
+          timestamp: timestamp + 2000,
+        },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} isRunning={true} />)
+
+    expect(screen.getByText(/正在处理 2 步/)).toBeInTheDocument()
+    expect(screen.getAllByText('Thinking').length).toBeGreaterThan(0)
+    expect(screen.getByText(/Using Search memory/)).toBeInTheDocument()
+  })
+
+  it('auto-expands hidden Personal activities when search matches them', () => {
+    const timestamp = Date.UTC(2026, 4, 20, 10, 0, 0)
+    const messages: ChatMessage[] = [{
+      id: '2',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: true,
+      blocks: [
+        {
+          type: 'file_edit',
+          timestamp,
+          edit: {
+            path: 'secret-notes.md',
+            operation: 'modify',
+            unified_diff: '--- a/secret-notes.md\n+++ b/secret-notes.md\n-old\n+new\n',
+            stats: { added: 1, removed: 1 },
+            truncated: false,
+            tool_call_id: 'edit-1',
+          },
+        },
+      ],
+    }]
+
+    render(
+      <PersonalChatSurface
+        messages={messages}
+        planState={idlePlanState}
+        searchQuery="secret-notes"
+        isRunning={false}
+        onOpenImage={vi.fn()}
+        emptyPlaceholder={<div />}
+        markdownTheme="light"
+      />,
+    )
+
+    const timeline = screen.getByTestId('personal-chat-v2')
+    expect(within(timeline).getByText(/我处理了 1 步/)).toBeInTheDocument()
+    expect(within(timeline).getByText(/modify secret-notes\.md/)).toBeInTheDocument()
+  })
+
+  it('filters Personal v2 after building the full conversation so fallback activity stays on its original turn', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'a-match',
+        role: 'assistant',
+        content: 'needle answer',
+        isTool: false,
+        turnComplete: true,
+      },
+      {
+        id: 'a-latest',
+        role: 'assistant',
+        content: 'ordinary latest answer',
+        isTool: false,
+        turnComplete: true,
+      },
+    ]
+    const toolCalls: ToolCall[] = [{
+      name: 'shell_execute',
+      args: { command: 'unrelated-command' },
+      result: 'unrelated result',
+      timestamp: Date.UTC(2026, 4, 20, 10, 0, 0),
+      toolCallId: 'tool-unrelated',
+    }]
+    const fileEdits: FileEdit[] = [{
+      path: 'unrelated.txt',
+      operation: 'modify',
+      unified_diff: '--- a/unrelated.txt\n+++ b/unrelated.txt\n-old\n+new\n',
+      stats: { added: 1, removed: 1 },
+      truncated: false,
+      timestamp: Date.UTC(2026, 4, 20, 10, 0, 1),
+    }]
+
+    render(
+      <PersonalChatSurface
+        messages={messages}
+        toolCalls={toolCalls}
+        fileEdits={fileEdits}
+        planState={idlePlanState}
+        searchQuery="needle"
+        isRunning={false}
+        onOpenImage={vi.fn()}
+        emptyPlaceholder={<div />}
+        markdownTheme="light"
+      />,
+    )
+
+    const timeline = screen.getByTestId('personal-chat-v2')
+    expect(within(timeline).getByText('needle answer')).toBeInTheDocument()
+    expect(within(timeline).queryByText('ordinary latest answer')).not.toBeInTheDocument()
+    expect(within(timeline).queryByText(/unrelated-command/)).not.toBeInTheDocument()
+    expect(within(timeline).queryByText(/unrelated\.txt/)).not.toBeInTheDocument()
+  })
+
+  it('does not show epoch time for Personal messages without real timestamps', () => {
+    const messages: ChatMessage[] = [{
+      id: 'timestamp-less-user',
+      role: 'user',
+      content: 'This should not inherit 1970 time',
+      isTool: false,
+    }]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    const timeline = screen.getByTestId('personal-chat-v2')
+    expect(within(timeline).getByText('This should not inherit 1970 time')).toBeInTheDocument()
+    expect(within(timeline).queryByText('08:00')).not.toBeInTheDocument()
+  })
+
+  it('bottom-aligns the Personal chat surface and opens at the latest message', () => {
+    const messages: ChatMessage[] = [
+      { id: 'u-old', role: 'user', content: 'old question', isTool: false },
+      { id: 'a-old', role: 'assistant', content: 'old answer', isTool: false, turnComplete: true },
+      { id: 'u-new', role: 'user', content: 'latest question', isTool: false },
+    ]
+
+    render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
+
+    expect((globalThis as any).__chatPanelVirtuosoProps.alignToBottom).toBe(true)
+    expect((globalThis as any).__chatPanelVirtuosoProps.initialTopMostItemIndex).toEqual({
+      index: 'LAST',
+      align: 'end',
+    })
+  })
+
+  it('can roll Personal Agent back to the legacy conversation timeline', () => {
+    localStorage.setItem('desktop-agent-personal-chat-v2', '0')
     const messages: ChatMessage[] = [{
       id: '2',
       role: 'assistant',
@@ -116,9 +420,7 @@ describe('ChatPanel', () => {
     render(<ChatPanel {...defaultProps} agentType="personal" messages={messages} />)
 
     expect(screen.getByTestId('personal-conversation-timeline')).toBeInTheDocument()
-    expect(screen.getByText('Used 2 tools')).toBeInTheDocument()
-    expect(screen.queryByText('knowledge_search')).not.toBeInTheDocument()
-    expect(screen.getByText('I found the note.')).toBeInTheDocument()
+    expect(screen.queryByTestId('personal-chat-v2')).not.toBeInTheDocument()
   })
 
   it('renders coding file edits as lightweight event rows', () => {
@@ -194,6 +496,21 @@ describe('ChatPanel', () => {
     expect(screen.getByText('Hello')).toBeInTheDocument()
   })
 
+  it('opens sent image attachments in a full-size preview', () => {
+    const messages: ChatMessage[] = [
+      { id: '1', role: 'user', content: 'Can you see this?', imageBase64: 'abc123', isTool: false },
+    ]
+    render(<ChatPanel {...defaultProps} messages={messages} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open attached image' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Image preview' })
+    expect(within(dialog).getByAltText('Open attached image')).toHaveAttribute('src', 'data:image/png;base64,abc123')
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByRole('dialog', { name: 'Image preview' })).not.toBeInTheDocument()
+  })
+
   it('renders assistant message', () => {
     const messages: ChatMessage[] = [
       { id: '2', role: 'assistant', content: 'Hi there', isTool: false },
@@ -250,6 +567,31 @@ describe('ChatPanel', () => {
   it('selects an open slash menu command without sending chat', async () => {
     const onSend = vi.fn()
     const onCommand = vi.fn()
+    const onDraftClear = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      json: async () => ({
+        commands: [
+          { name: 'help', description: 'Show help', args: '', category: 'general' },
+        ],
+      }),
+    })))
+
+    render(<ChatPanel {...defaultProps} onSend={onSend} onCommand={onCommand} onDraftClear={onDraftClear} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: '/' } })
+    await screen.findByText('/help')
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledWith('help', ''))
+    expect(onDraftClear).toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('can select a slash menu command more than once', async () => {
+    const onSend = vi.fn()
+    const onCommand = vi.fn()
     vi.stubGlobal('fetch', vi.fn(async () => ({
       json: async () => ({
         commands: [
@@ -266,8 +608,62 @@ describe('ChatPanel', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
 
     await waitFor(() => expect(onCommand).toHaveBeenCalledWith('help', ''))
+    fireEvent.change(input, { target: { value: '/' } })
+    await screen.findByText('/help')
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(2))
     expect(onSend).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
+  })
+
+  it('does not swallow direct slash commands when the menu has no matches', () => {
+    const onSend = vi.fn()
+    const onCommand = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      json: async () => ({ commands: [] }),
+    })))
+
+    render(<ChatPanel {...defaultProps} onSend={onSend} onCommand={onCommand} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: '/clear' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(onCommand).toHaveBeenCalledWith('clear', '')
+    expect(onSend).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('executes /reset from direct input instead of sending chat', () => {
+    const onSend = vi.fn()
+    const onCommand = vi.fn()
+    render(<ChatPanel {...defaultProps} onSend={onSend} onCommand={onCommand} />)
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: '/reset' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(onCommand).toHaveBeenCalledWith('reset', '')
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('renders command notices neutrally instead of as errors', () => {
+    localStorage.setItem('desktop-agent-personal-chat-v2', '0')
+    const messages: ChatMessage[] = [{
+      id: 'notice-1',
+      role: 'system',
+      source: 'command_notice',
+      noticeLevel: 'success',
+      content: 'New session started - model: gpt-4o',
+      isTool: false,
+    }]
+
+    render(<ChatPanel {...defaultProps} messages={messages} />)
+
+    const notice = screen.getByText('New session started - model: gpt-4o')
+    expect(notice).toBeInTheDocument()
+    expect(notice).toHaveClass('text-success')
   })
 
   it('executes /model from direct input instead of sending chat', () => {
@@ -296,9 +692,60 @@ describe('ChatPanel', () => {
     expect(onSend).not.toHaveBeenCalled()
   })
 
-  it('shows running indicator', () => {
-    render(<ChatPanel {...defaultProps} isRunning={true} />)
-    expect(screen.getByText('Agent is working...')).toBeInTheDocument()
+  it('shows inline running thinking activity', () => {
+    const messages: ChatMessage[] = [{
+      id: 'a-thinking',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: false,
+      blocks: [{ type: 'thinking', text: 'Waiting for model response...', timestamp: Date.now(), startedAt: Date.now() }],
+    }]
+    render(<ChatPanel {...defaultProps} messages={messages} isRunning={true} />)
+    expect(screen.getAllByText('Thinking').length).toBeGreaterThan(0)
+  })
+
+  it('uses the shared CSS spin animation for inline running activity', () => {
+    const messages: ChatMessage[] = [{
+      id: 'a-thinking',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: false,
+      blocks: [{ type: 'thinking', text: 'Waiting for model response...', timestamp: Date.now(), startedAt: Date.now() }],
+    }]
+    render(<ChatPanel {...defaultProps} messages={messages} isRunning={true} />)
+    const spinner = screen.getByTestId('agent-running-spinner')
+
+    expect(spinner).toHaveClass('agent-running-spinner')
+    expect(spinner).toHaveClass('animate-spin')
+    expect(spinner).not.toHaveAttribute('style')
+  })
+
+  it('tracks running tool activity inline without rendering a duplicate footer status', () => {
+    const messages: ChatMessage[] = [{
+      id: 'a-running-tool',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: false,
+      blocks: [
+        {
+          type: 'tool_call',
+          name: 'knowledge_search',
+          args: { query: 'tea' },
+          status: 'running',
+          toolCallId: 'search-1',
+          timestamp: 1,
+        },
+      ],
+    }]
+
+    render(<ChatPanel {...defaultProps} messages={messages} isRunning={true} />)
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.getByText('Using Search tea')).toBeInTheDocument()
+    expect(screen.getAllByTestId('agent-running-spinner')).toHaveLength(1)
   })
 
   it('Plan mode control marks aria-pressed when plan is selected', () => {
@@ -635,6 +1082,40 @@ describe('ChatPanel', () => {
     expect(onClearTaskGuidance).toHaveBeenCalled()
   })
 
+  it('hides task guidance queue when not running', () => {
+    render(
+      <ChatPanel
+        {...defaultProps}
+        isRunning={false}
+        taskGuidanceItems={[{
+          id: 'tg_1',
+          text: 'prefer the smaller fix',
+          status: 'queued',
+          created_at: 1,
+        }]}
+      />,
+    )
+
+    expect(screen.queryByText('任务引导队列 (1)')).not.toBeInTheDocument()
+  })
+
+  it('does not render stale task guidance as a queue item', () => {
+    render(
+      <ChatPanel
+        {...defaultProps}
+        isRunning={true}
+        taskGuidanceItems={[{
+          id: 'tg_1',
+          text: 'continue as a new question',
+          status: 'stale',
+          created_at: 1,
+        }]}
+      />,
+    )
+
+    expect(screen.queryByText('任务引导队列 (1)')).not.toBeInTheDocument()
+  })
+
   it('renders context meter and compacts on click', () => {
     const onCompact = vi.fn()
     render(
@@ -675,7 +1156,7 @@ describe('ChatPanel', () => {
     ]
     render(<ChatPanel {...defaultProps} messages={messages} />)
     // In-progress thinking stays out of the main reading path until opened.
-    const timeline = screen.getByTestId('personal-conversation-timeline')
+    const timeline = screen.getByTestId('personal-chat-v2')
     expect(within(timeline).getByText('Thinking')).toBeInTheDocument()
     expect(screen.queryByText('partial reasoning so far')).not.toBeInTheDocument()
     fireEvent.click(within(timeline).getByText('Thinking'))
@@ -705,8 +1186,11 @@ describe('ChatPanel', () => {
       },
     ]
     render(<ChatPanel {...defaultProps} messages={messages} />)
+    expect(screen.getByText(/我处理了 1 步/)).toBeInTheDocument()
+    expect(screen.getByText(/思考 5 秒/)).toBeInTheDocument()
+    expect(screen.queryByText('Thought for 5s')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText(/我处理了 1 步/))
     expect(screen.getByText('Thought for 5s')).toBeInTheDocument()
-    // Collapsed by default → reasoning text hidden until clicked.
     expect(screen.queryByText('the full reasoning trace')).not.toBeInTheDocument()
     fireEvent.click(screen.getByText('Thought for 5s'))
     expect(screen.getByText('the full reasoning trace')).toBeInTheDocument()
@@ -740,6 +1224,7 @@ describe('ChatPanel', () => {
   })
 
   it('restores the visible message range when a session panel remounts', () => {
+    localStorage.setItem('desktop-agent-personal-chat-v2', '0')
     const messages: ChatMessage[] = Array.from({ length: 12 }, (_, index) => ({
       id: `m-${index}`,
       role: index % 2 === 0 ? 'user' : 'assistant',
@@ -761,6 +1246,7 @@ describe('ChatPanel', () => {
   })
 
   it('clamps restored scroll index to projected timeline length', () => {
+    localStorage.setItem('desktop-agent-personal-chat-v2', '0')
     const manyMessages: ChatMessage[] = Array.from({ length: 12 }, (_, index) => ({
       id: `long-${index}`,
       role: 'assistant',

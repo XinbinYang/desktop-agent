@@ -151,6 +151,195 @@ describe('Sidebar', () => {
     expect(screen.getByText('Publish')).toBeInTheDocument()
   })
 
+  it('refreshes and highlights a newly reported skill draft', async () => {
+    let drafts: any[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/api/skills/drafts')) {
+        return {
+          ok: true,
+          json: async () => ({ drafts }),
+        }
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          skills: [{
+            id: 'using-superpowers',
+            name: 'using-superpowers',
+            description: 'Load relevant skills only when needed.',
+            source: 'superpowers',
+            enabledByAgent: { personal: true, coding: true },
+            recommendedFor: ['personal', 'coding'],
+            category: 'core',
+            trustLevel: 'local',
+          }],
+          preferences: { personal: { 'using-superpowers': true }, coding: { 'using-superpowers': true } },
+          defaults: { personal: {}, coding: {} },
+          presets: [],
+        }),
+      }
+    }))
+
+    const { rerender } = render(<Sidebar {...defaultProps} skillsRefreshToken={0} />)
+    await screen.findByText('Core')
+
+    drafts = [{
+      id: 'wind-data-reference-1',
+      draft_id: 'wind-data-reference-1',
+      skill_id: 'user:wind-data-reference',
+      name: 'wind-data-reference',
+      description: 'Use when querying WIND financial data.',
+      status: 'draft',
+      source: 'user',
+      scopes: ['personal'],
+      enabledByAgent: { personal: true, coding: false },
+      path: 'AGENTS/skills/.drafts/wind-data-reference-1',
+      validation: { passed: true, issues: [], warnings: [], risks: [] },
+    }]
+    rerender(
+      <Sidebar
+        {...defaultProps}
+        skillsRefreshToken={1}
+        highlightedSkillDraftId="wind-data-reference-1"
+      />
+    )
+
+    const draftName = await screen.findByText('wind-data-reference')
+    expect(draftName.closest('[data-highlighted="true"]')).toBeTruthy()
+  })
+
+  it('publishes a draft for the current agent and expands the user skills category', async () => {
+    let drafts: any[] = [{
+      id: 'wind-data-reference-1',
+      draft_id: 'wind-data-reference-1',
+      skill_id: 'user:wind-data-reference',
+      name: 'wind-data-reference',
+      description: 'Use when querying WIND financial data.',
+      status: 'draft',
+      source: 'user',
+      scopes: ['personal', 'coding'],
+      enabledByAgent: { personal: false, coding: true },
+      path: 'AGENTS/skills/.drafts/wind-data-reference-1',
+      validation: { passed: true, issues: [], warnings: [], risks: [] },
+    }]
+    let publishBody: any = null
+    const catalog = () => ({
+      skills: [
+        {
+          id: 'using-superpowers',
+          name: 'using-superpowers',
+          description: 'Load relevant skills only when needed.',
+          source: 'superpowers',
+          enabledByAgent: { personal: true, coding: true },
+          recommendedFor: ['personal', 'coding'],
+          category: 'core',
+          trustLevel: 'local',
+        },
+        ...(drafts.length === 0 ? [{
+          id: 'user:wind-data-reference',
+          name: 'wind-data-reference',
+          description: 'Use when querying WIND financial data.',
+          source: 'user',
+          enabledByAgent: { personal: false, coding: true },
+          recommendedFor: ['coding'],
+          category: 'user',
+          trustLevel: 'local',
+          status: 'published',
+          scopes: ['personal', 'coding'],
+          version: '1.0.0',
+        }] : []),
+      ],
+      preferences: {
+        personal: { 'using-superpowers': true, 'user:wind-data-reference': false },
+        coding: { 'using-superpowers': true, 'user:wind-data-reference': drafts.length === 0 },
+      },
+      defaults: { personal: {}, coding: {} },
+      presets: [],
+    })
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/skills/drafts')) {
+        return { ok: true, json: async () => ({ drafts }) }
+      }
+      if (url.includes('/api/skills/drafts/wind-data-reference-1/publish')) {
+        publishBody = JSON.parse(String(init?.body || '{}'))
+        drafts = []
+        return {
+          ok: true,
+          json: async () => ({
+            skill: { id: 'user:wind-data-reference', skill_id: 'user:wind-data-reference' },
+            ...catalog(),
+          }),
+        }
+      }
+      return { ok: true, json: async () => catalog() }
+    }))
+
+    render(<Sidebar {...defaultProps} activeAgent="coding" />)
+
+    fireEvent.click(await screen.findByText('Publish'))
+
+    await waitFor(() => {
+      expect(publishBody).toMatchObject({ enable_for: ['coding'], allow_risky: false })
+    })
+    expect(await screen.findByLabelText('Disable wind-data-reference for Coding Agent')).toBeInTheDocument()
+    expect(screen.getByText('wind-data-reference').closest('[data-highlighted="true"]')).toBeTruthy()
+  })
+
+  it('falls back to the first draft scope when publishing for an out-of-scope agent', async () => {
+    const draft = {
+      id: 'personal-report-1',
+      draft_id: 'personal-report-1',
+      skill_id: 'user:personal-report',
+      name: 'personal-report',
+      description: 'Use when writing personal reports.',
+      status: 'draft',
+      source: 'user',
+      scopes: ['personal'],
+      enabledByAgent: { personal: true, coding: false },
+      path: 'AGENTS/skills/.drafts/personal-report-1',
+      validation: { passed: true, issues: [], warnings: [], risks: [] },
+    }
+    let publishBody: any = null
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/skills/drafts')) {
+        return { ok: true, json: async () => ({ drafts: [draft] }) }
+      }
+      if (url.includes('/api/skills/drafts/personal-report-1/publish')) {
+        publishBody = JSON.parse(String(init?.body || '{}'))
+        return {
+          ok: true,
+          json: async () => ({
+            skill: { id: 'user:personal-report', skill_id: 'user:personal-report' },
+            skills: [],
+            preferences: { personal: {}, coding: {} },
+            defaults: { personal: {}, coding: {} },
+            presets: [],
+          }),
+        }
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          skills: [],
+          preferences: { personal: {}, coding: {} },
+          defaults: { personal: {}, coding: {} },
+          presets: [],
+        }),
+      }
+    }))
+
+    render(<Sidebar {...defaultProps} activeAgent="coding" />)
+
+    fireEvent.click(await screen.findByText('Publish'))
+
+    await waitFor(() => {
+      expect(publishBody).toMatchObject({ enable_for: ['personal'], allow_risky: false })
+    })
+  })
+
   it('shows settings content when activeSection is settings', () => {
     render(<Sidebar {...defaultProps} activeSection="settings" />)
     expect(screen.getByText('Active Agent')).toBeInTheDocument()
@@ -179,6 +368,24 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByText('Clear Session'))
 
     expect(onClear).toHaveBeenCalled()
+  })
+
+  it('opens Agent memory panel without direct tool invocation', () => {
+    const onOpenPersonalWorkspace = vi.fn()
+    const onExecuteTool = vi.fn()
+    render(
+      <Sidebar
+        {...defaultProps}
+        activeSection="personal"
+        onOpenPersonalWorkspace={onOpenPersonalWorkspace}
+        onExecuteTool={onExecuteTool}
+      />
+    )
+
+    fireEvent.click(screen.getByText('查看 Agent 记忆'))
+
+    expect(onOpenPersonalWorkspace).toHaveBeenCalledWith('memory')
+    expect(onExecuteTool).not.toHaveBeenCalled()
   })
 
   it('saves skill preference when toggling a skill', async () => {
