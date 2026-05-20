@@ -39,6 +39,10 @@ export const LearningsPanel: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full">
+      <div className="shrink-0 border-b border-border bg-surface-alt/50 px-3 py-2 text-[11px] leading-relaxed text-fg-muted">
+        学习记录由 Agent 自动维护，用来沉淀纠正、失败和能力缺口。这里以查看为主，用户不需要手动整理。
+      </div>
+
       {/* Sub-tabs */}
       <div className="flex border-b border-border shrink-0">
         {sections.map((s) => (
@@ -79,7 +83,7 @@ export const LearningsPanel: React.FC = () => {
             {/* Promotable learnings banner */}
             {data.promotable && data.promotable.length > 0 && (
               <div className="mb-3 p-2 rounded bg-yellow-500/10 border border-yellow-500/20">
-                <div className="text-[10px] font-medium text-yellow-400 mb-1">Ready for promotion to SOUL</div>
+                <div className="text-[10px] font-medium text-yellow-400 mb-1">可沉淀为长期偏好/规则</div>
                 {data.promotable.map((p, i) => (
                   <div key={i} className="text-[10px] text-fg-muted">
                     {p.discovery} (recurrence: {p.recurrence})

@@ -49,14 +49,6 @@ def _is_dangerous_command(cmd: str) -> bool:
 
 
 def _default_work_dir(agent_type: str = "") -> str:
-    try:
-        from app.coding_runs import get_run_context
-        ctx = get_run_context()
-        if ctx and ctx.active_path:
-            return ctx.active_path
-    except Exception:
-        pass
-
     if agent_type == "personal":
         try:
             from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir
@@ -65,6 +57,14 @@ def _default_work_dir(agent_type: str = "") -> str:
             return str(home)
         except Exception:
             pass
+
+    try:
+        from app.coding_runs import get_run_context
+        ctx = get_run_context()
+        if ctx and ctx.active_path:
+            return ctx.active_path
+    except Exception:
+        pass
 
     try:
         from app.coding_runs import effective_project_path
@@ -89,17 +89,19 @@ def _resolve_shell_cwd(cwd: str, agent_type: str = "") -> tuple[str, Optional[st
 
         raw = Path(cwd).expanduser()
         parts = raw.parts
-        if not raw.is_absolute() and parts and parts[0].lower() == "agents":
-            rest = Path(*parts[1:]) if len(parts) > 1 else Path(".")
-            resolved = (agents_dir() / rest).resolve()
-        else:
-            resolved = raw.resolve()
-
         agents_root = agents_dir().resolve()
         personal_root = agents_root / "personal"
         personal_workspace = personal_root / PERSONAL_WORKSPACE_DIRNAME
         shared_root = agents_root / "_shared"
         shared_workspace = shared_root / PERSONAL_WORKSPACE_DIRNAME
+
+        if not raw.is_absolute() and parts and parts[0].lower() == "agents":
+            rest = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+            resolved = (agents_root / rest).resolve()
+        elif not raw.is_absolute():
+            resolved = (personal_workspace / raw).resolve()
+        else:
+            resolved = raw.resolve()
 
         protected_personal = is_relative_to(resolved, personal_root) and not is_relative_to(resolved, personal_workspace)
         protected_shared = is_relative_to(resolved, shared_root) and not is_relative_to(resolved, shared_workspace)

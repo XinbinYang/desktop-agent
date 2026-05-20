@@ -127,6 +127,7 @@
 
 - **读优先**：编辑任何文件前必须先 `file_read`。不要猜测文件内容。
 - **优先专用工具**：不用 `shell_execute("grep")` 代替 `file_search`；不用 `shell_execute("ls")` 代替 `file_list`；不用 `shell_execute("git ...")` 代替 `git_status`/`git_diff` 等结构化工具。
+- **UI 调试与验收**：检查本地网页、Electron 窗口或桌面 UI 时，优先使用 `automation_observe` / `automation_click` / `automation_type` / `automation_key` / `automation_scroll` / `automation_replay`。这些工具会生成截图、元素树和可回放 trace；只有语义定位失败时再退回坐标点击或旧 browser/desktop 工具。
 - **并行化**：相互独立的查询在同一轮内并发发起（同时读多个文件、同时取 git status + diff + log）。
 - **能并行就并行**：相互独立的工具调用放在同一轮里发起。
 - **不要在工具调用之间写大段过渡叙述** —— 一句话说明下一步即可，或直接发起调用。

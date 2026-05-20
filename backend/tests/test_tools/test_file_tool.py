@@ -329,6 +329,36 @@ class TestFileSandbox:
         assert expected.read_text(encoding="utf-8") == "prefs ok"
         expected.unlink(missing_ok=True)
 
+    @pytest.mark.asyncio
+    async def test_personal_relative_write_defaults_to_runtime_workspace(self, write_tool):
+        from app.runtime_paths import personal_workspace_dir, repo_root
+
+        expected = personal_workspace_dir() / "ABOUT_ME.md"
+        repo_target = repo_root() / "ABOUT_ME.md"
+        expected.unlink(missing_ok=True)
+        repo_target.unlink(missing_ok=True)
+
+        result = await write_tool.execute(
+            path="ABOUT_ME.md",
+            content="personal home",
+            agent_type="personal",
+        )
+
+        assert result.error == ""
+        assert expected.read_text(encoding="utf-8") == "personal home"
+        assert not repo_target.exists()
+        expected.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_personal_project_relative_is_blocked(self, read_tool):
+        result = await read_tool.execute(
+            path="README.md",
+            project_relative=True,
+            agent_type="personal",
+        )
+
+        assert "Personal Agent is not bound to a project" in result.error
+
 
 class TestFileSandboxUnrestricted:
     """End-to-end path anchor tests with sandbox_mode=unrestricted.
@@ -377,4 +407,25 @@ class TestFileSandboxUnrestricted:
         wrong = Path("backend") / probe_rel
         assert not wrong.exists(), f"File incorrectly landed at {wrong}"
 
+        expected.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_personal_relative_write_defaults_to_runtime_workspace(self, write_tool):
+        from app.runtime_paths import personal_workspace_dir, repo_root
+
+        probe_rel = "__personal_unrestricted__.md"
+        expected = personal_workspace_dir() / probe_rel
+        repo_target = repo_root() / probe_rel
+        expected.unlink(missing_ok=True)
+        repo_target.unlink(missing_ok=True)
+
+        result = await write_tool.execute(
+            path=probe_rel,
+            content="personal unrestricted",
+            agent_type="personal",
+        )
+
+        assert result.error == ""
+        assert expected.read_text(encoding="utf-8") == "personal unrestricted"
+        assert not repo_target.exists()
         expected.unlink(missing_ok=True)

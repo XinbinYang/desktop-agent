@@ -3,6 +3,8 @@ import {
   ArrowDown,
   ArrowUp,
   Calendar,
+  ChevronDown,
+  ChevronRight,
   Database,
   Layers,
   Loader2,
@@ -111,6 +113,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
   const [triggeringDream, setTriggeringDream] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [memoryOsUnavailable, setMemoryOsUnavailable] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const fallbackStatus = useCallback((message: string) => {
     setMemoryOsUnavailable(message);
@@ -302,6 +305,9 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="shrink-0 border-b border-border p-2">
+        <div className="mb-2 rounded border border-border bg-surface-alt px-2 py-1.5 text-[11px] leading-relaxed text-fg-muted">
+          记忆由 Agent 自动维护。你只需要查看、纠正或删除不准确内容，底层维护操作已收进高级区。
+        </div>
         <div className="flex items-center gap-2">
           <div className="relative min-w-0 flex-1">
             <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-fg-muted" />
@@ -312,53 +318,69 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
               onKeyDown={(event) => {
                 if (event.key === 'Enter') void runSearch();
               }}
-              placeholder="Search personal memory"
+              placeholder="查找 Agent 记住的内容"
               className="h-8 w-full rounded border border-border bg-surface-alt pl-7 pr-2 text-xs text-fg outline-none focus:border-accent"
             />
           </div>
-          <select
-            value={memoryType}
-            onChange={(event) => setMemoryType(event.target.value as '' | MemoryType)}
-            className="h-8 rounded border border-border bg-surface-alt px-2 text-xs text-fg outline-none focus:border-accent"
-            aria-label="Memory type"
-          >
-            {MEMORY_TYPES.map((type) => <option key={type.id || 'all'} value={type.id}>{type.label}</option>)}
-          </select>
-          <select
-            value={tier}
-            onChange={(event) => setTier(event.target.value as '' | MemoryTier)}
-            className="h-8 rounded border border-border bg-surface-alt px-2 text-xs text-fg outline-none focus:border-accent"
-            aria-label="Memory tier"
-          >
-            {TIERS.map((item) => <option key={item.id || 'any'} value={item.id}>{item.label}</option>)}
-          </select>
           <button
             type="button"
             onClick={() => void runSearch()}
             className="flex h-8 items-center gap-1 rounded bg-accent px-2 text-xs text-fg-on-accent hover:brightness-110"
           >
             <Search className="h-3.5 w-3.5" />
-            Search
+            查找
           </button>
           <button
             type="button"
-            onClick={rebuild}
-            disabled={rebuilding}
-            title="Rebuild index"
-            className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-50"
+            onClick={() => setShowAdvanced((value) => !value)}
+            className="flex h-8 items-center gap-1 rounded border border-border px-2 text-xs text-fg-muted hover:bg-surface-hover hover:text-fg"
+            aria-expanded={showAdvanced}
           >
-            {rebuilding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-          </button>
-          <button
-            type="button"
-            onClick={triggerDream}
-            disabled={triggeringDream}
-            title="Trigger DREAM"
-            className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-50"
-          >
-            {triggeringDream ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+            {showAdvanced ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+            高级维护
           </button>
         </div>
+        {showAdvanced && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-border bg-surface-alt p-2">
+            <select
+              value={memoryType}
+              onChange={(event) => setMemoryType(event.target.value as '' | MemoryType)}
+              className="h-8 rounded border border-border bg-surface px-2 text-xs text-fg outline-none focus:border-accent"
+              aria-label="Memory type"
+            >
+              {MEMORY_TYPES.map((type) => <option key={type.id || 'all'} value={type.id}>{type.label}</option>)}
+            </select>
+            <select
+              value={tier}
+              onChange={(event) => setTier(event.target.value as '' | MemoryTier)}
+              className="h-8 rounded border border-border bg-surface px-2 text-xs text-fg outline-none focus:border-accent"
+              aria-label="Memory tier"
+            >
+              {TIERS.map((item) => <option key={item.id || 'any'} value={item.id}>{item.label}</option>)}
+            </select>
+            <button
+              type="button"
+              onClick={rebuild}
+              disabled={rebuilding}
+              title="Rebuild index"
+              className="flex h-8 items-center gap-1 rounded border border-border px-2 text-xs text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-50"
+            >
+              {rebuilding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              重建索引
+            </button>
+            <button
+              type="button"
+              onClick={triggerDream}
+              disabled={triggeringDream}
+              title="Trigger DREAM"
+              className="flex h-8 items-center gap-1 rounded border border-border px-2 text-xs text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-50"
+            >
+              {triggeringDream ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+              手动整理记忆
+            </button>
+            <span className="text-[10px] text-fg-muted">仅用于调试或修复索引；日常由 Agent 自动处理。</span>
+          </div>
+        )}
         {error && <div className="mt-2 rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger">{error}</div>}
         {memoryOsUnavailable && !error && (
           <div className="mt-2 rounded border border-border bg-surface-alt px-2 py-1 text-[11px] text-fg-muted">
@@ -372,7 +394,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
           <aside className="min-h-0 overflow-y-auto border-r border-border p-2">
             <div className="mb-3 flex items-center gap-1.5 text-xs font-medium text-fg">
               <Database className="h-3.5 w-3.5" />
-              Memory OS
+              Agent 记忆
             </div>
             <div className="space-y-1 text-[11px] text-fg-muted">
               <div className="flex items-center justify-between rounded bg-surface-alt px-2 py-1">
@@ -458,7 +480,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
               <div className="p-6 text-center text-xs text-fg-muted">
                 {memoryOsUnavailable
                   ? 'Memory OS is waiting for the updated backend. Legacy MEMORY.md and diaries remain available on the right.'
-                  : 'No indexed memories yet. Rebuild the index or trigger DREAM.'}
+                  : '还没有可查看的长期记忆。Agent 会在对话和自动整理后逐步写入。'}
               </div>
             ) : (
               <div className="divide-y divide-border">
@@ -495,69 +517,18 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
                   <div className="space-y-1 text-[11px] text-fg-muted">
                     <div className="flex justify-between gap-2"><span>Source</span><span className="truncate text-fg">{selected.source_ref}</span></div>
                     <div className="flex justify-between gap-2"><span>Updated</span><span className="text-fg">{formatTime(selected.updated_at)}</span></div>
-                    <div className="flex justify-between gap-2"><span>Confidence</span><span className="text-fg">{selected.confidence.toFixed(2)}</span></div>
                     <div className="flex justify-between gap-2"><span>Created by</span><span className="text-fg">{selected.created_by}</span></div>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-2">
-                  <select
-                    value={editType}
-                    onChange={(event) => setEditType(event.target.value as MemoryType)}
-                    className="h-8 rounded border border-border bg-surface-alt px-2 text-xs text-fg outline-none focus:border-accent"
-                    aria-label="Edit memory type"
-                  >
-                    {MEMORY_TYPES.filter((type) => type.id).map((type) => (
-                      <option key={type.id} value={type.id}>{type.label}</option>
-                    ))}
-                  </select>
-                  <select
-                    value={editTier}
-                    onChange={(event) => setEditTier(event.target.value as MemoryTier)}
-                    className="h-8 rounded border border-border bg-surface-alt px-2 text-xs text-fg outline-none focus:border-accent"
-                    aria-label="Edit memory tier"
-                  >
-                    {TIERS.filter((item) => item.id).map((item) => (
-                      <option key={item.id} value={item.id}>{item.label}</option>
-                    ))}
-                  </select>
+                <div>
+                  <div className="mb-1 text-[11px] uppercase tracking-wider text-fg-muted">Content</div>
+                  <div className="min-h-32 whitespace-pre-wrap rounded border border-border bg-surface-alt p-2 text-xs leading-relaxed text-fg">
+                    {selected.content}
+                  </div>
                 </div>
 
-                <textarea
-                  value={editContent}
-                  onChange={(event) => setEditContent(event.target.value)}
-                  className="min-h-40 w-full resize-y rounded border border-border bg-surface-alt p-2 text-xs text-fg outline-none focus:border-accent"
-                  aria-label="Memory content"
-                />
-
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void patchSelected({ content: editContent, memory_type: editType, tier: editTier })}
-                    disabled={saving}
-                    className="flex h-8 items-center gap-1 rounded bg-accent px-2 text-xs text-fg-on-accent hover:brightness-110 disabled:opacity-50"
-                  >
-                    {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                    Save
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => moveTier(-1)}
-                    disabled={saving || selected.tier === 'hot'}
-                    title="Promote tier"
-                    className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-40"
-                  >
-                    <ArrowUp className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => moveTier(1)}
-                    disabled={saving || selected.tier === 'archived'}
-                    title="Demote tier"
-                    className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-40"
-                  >
-                    <ArrowDown className="h-3.5 w-3.5" />
-                  </button>
                   <button
                     type="button"
                     onClick={deleteSelected}
@@ -568,6 +539,72 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
+
+                {showAdvanced && (
+                  <div className="space-y-2 rounded border border-border bg-surface-alt p-2">
+                    <div className="text-[11px] font-medium text-fg">高级字段</div>
+                    <div className="space-y-1 text-[11px] text-fg-muted">
+                      <div className="flex justify-between gap-2"><span>Confidence</span><span className="text-fg">{selected.confidence.toFixed(2)}</span></div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <select
+                        value={editType}
+                        onChange={(event) => setEditType(event.target.value as MemoryType)}
+                        className="h-8 rounded border border-border bg-surface px-2 text-xs text-fg outline-none focus:border-accent"
+                        aria-label="Edit memory type"
+                      >
+                        {MEMORY_TYPES.filter((type) => type.id).map((type) => (
+                          <option key={type.id} value={type.id}>{type.label}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={editTier}
+                        onChange={(event) => setEditTier(event.target.value as MemoryTier)}
+                        className="h-8 rounded border border-border bg-surface px-2 text-xs text-fg outline-none focus:border-accent"
+                        aria-label="Edit memory tier"
+                      >
+                        {TIERS.filter((item) => item.id).map((item) => (
+                          <option key={item.id} value={item.id}>{item.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <textarea
+                      value={editContent}
+                      onChange={(event) => setEditContent(event.target.value)}
+                      className="min-h-32 w-full resize-y rounded border border-border bg-surface p-2 text-xs text-fg outline-none focus:border-accent"
+                      aria-label="Memory content"
+                    />
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void patchSelected({ content: editContent, memory_type: editType, tier: editTier })}
+                        disabled={saving}
+                        className="flex h-8 items-center gap-1 rounded bg-accent px-2 text-xs text-fg-on-accent hover:brightness-110 disabled:opacity-50"
+                      >
+                        {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => moveTier(-1)}
+                        disabled={saving || selected.tier === 'hot'}
+                        title="Promote tier"
+                        className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-40"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => moveTier(1)}
+                        disabled={saving || selected.tier === 'archived'}
+                        title="Demote tier"
+                        className="flex h-8 w-8 items-center justify-center rounded border border-border text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-40"
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="space-y-3">

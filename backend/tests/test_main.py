@@ -169,6 +169,39 @@ class TestAPIRoutes:
         assert listed[0]["id"] == "session_personal_main"
         assert listed[0]["is_primary"] is True
 
+    def test_resolve_personal_ignores_and_clears_project_path(self, client, monkeypatch, tmp_path):
+        import app.agent as agent_module
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(agent_module, "SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(agent_module, "SESSION_REGISTRY_PATH", tmp_path / "session_registry.json")
+        agent_module._sessions.clear()
+
+        project = tmp_path / "opened-project"
+        project.mkdir()
+        legacy = {
+            "session_id": "session_personal_main",
+            "model_id": "gpt-4o",
+            "role_id": "desktop-agent",
+            "agent_type": "personal",
+            "project_path": str(project),
+            "messages": [{"role": "system", "content": "system"}],
+            "plan_state": {"phase": "idle"},
+        }
+        (sessions_dir / "session_personal_main.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+        resolved = client.post("/api/sessions/resolve", json={
+            "agent_type": "personal",
+            "policy": "canonical",
+            "project_path": str(project),
+        })
+
+        assert resolved.status_code == 200
+        assert resolved.json()["project_path"] is None
+        saved = json.loads((sessions_dir / "session_personal_main.json").read_text(encoding="utf-8"))
+        assert saved["project_path"] is None
+
     def test_resolve_coding_session_uses_last_or_create(self, client, monkeypatch, tmp_path):
         import app.agent as agent_module
 

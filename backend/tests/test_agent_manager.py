@@ -56,6 +56,31 @@ class TestAgentManagerPromptRendering:
         assert str(project) not in prompt
         assert "PROJECT_RULE_SENTINEL" not in prompt
 
+    def test_personal_tool_schema_excludes_direct_project_tools(self):
+        from app.tools import get_tool_schemas, list_tool_names
+
+        schema_names = {item["function"]["name"] for item in get_tool_schemas(agent_type="personal")}
+        allowed_names = set(list_tool_names(agent_type="personal"))
+
+        direct_project_tools = {
+            "repo_map",
+            "code_search",
+            "file_outline",
+            "verify_project",
+            "run_review",
+            "worktree_status",
+            "git_status",
+            "git_diff",
+            "git_commit",
+            "git_pull",
+            "git_push",
+            "git_branch",
+            "git_remote",
+        }
+        assert direct_project_tools.isdisjoint(schema_names)
+        assert direct_project_tools.isdisjoint(allowed_names)
+        assert {"consult_coding_agent", "delegate_to_coding_agent"}.issubset(schema_names)
+
     def test_coding_session_prompt_injects_bound_project(self, tmp_path, monkeypatch, isolate_projects):
         from app.agent import AgentSession
         from app.config import get_model_for_agent

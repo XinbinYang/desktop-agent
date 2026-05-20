@@ -320,10 +320,11 @@ def _session_record_from_path(path: Path, canonical_cache: Dict[str, str | None]
         session_id = data.get("session_id", path.stem)
         messages = data.get("messages", [])
         plan_state = data.get("plan_state")
+        record_project_path = None if stored_agent_type == "personal" else _canonical_project_path_cached(data.get("project_path"), canonical_cache)
         record = {
             "id": session_id,
             "title": _session_title_from_data(data),
-            "project_path": _canonical_project_path_cached(data.get("project_path"), canonical_cache),
+            "project_path": record_project_path,
             "model_id": data.get("model_id", ""),
             "role_id": data.get("role_id", AgentManager.get_default_role(stored_agent_type)),
             "agent_type": stored_agent_type,
@@ -375,11 +376,15 @@ def _session_record_matches(
 ) -> bool:
     live = _sessions.get(session_id)
     if live and live.agent_type == agent_type:
+        if agent_type == "personal":
+            return True
         return True if not project_path else _project_key_for_path(live.project_path) == _project_key_for_path(project_path)
 
     data = _load_session_data(session_id)
     if not data or _resolve_stored_agent_type(data) != agent_type:
         return False
+    if agent_type == "personal":
+        return True
     if project_path:
         stored = data.get("project_path")
         if _project_key_for_path(stored) != _project_key_for_path(project_path):
@@ -600,6 +605,8 @@ class AgentSession:
     def agent_type(self, value: str) -> None:
         self._agent_type = value
         self._role_id = AgentManager.get_default_role(value)
+        if value == "personal":
+            self.project_path = None
 
     @property
     def role_id(self) -> str:
@@ -613,6 +620,8 @@ class AgentSession:
         mapped = AgentManager.get_agent_type_for_role(value)
         if mapped != self._agent_type:
             self._agent_type = mapped
+            if mapped == "personal":
+                self.project_path = None
 
     def _resolve_agent_model(self) -> str:
         """Get the effective model ID for the current agent type from config."""
@@ -1110,7 +1119,7 @@ class AgentSession:
             self._save()
             return
 
-        project_path = effective_project_path()
+        project_path = effective_project_path(allow_global=True)
         if not project_path:
             text = "需要先打开一个项目，或在任务里提供明确项目路径，然后我才能把项目代码任务交给 Coding Agent。"
             assistant_msg = {"role": "assistant", "content": text}
@@ -2425,10 +2434,6 @@ class AgentSession:
                 self._save()
                 return
 
-            # Resolve @mentions in user input (file/folder/git/knowledge context)
-            project_path = effective_project_path()
-            resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
-
             # Explicit delegation has priority over Personal's normal reasoning turn.
             settings = load_config().settings
             coding_mention = parse_coding_mention(user_input)
@@ -2438,6 +2443,8 @@ class AgentSession:
                 and getattr(settings, "collaboration_enabled", True)
                 and coding_mention is not None
             ):
+                delegation_project_path = effective_project_path(allow_global=True)
+                resolved_input = resolve_mentions(user_input, delegation_project_path) if delegation_project_path else user_input
                 self._last_user_message = user_input
                 async for event in self._handle_coding_mention(
                     coding_mention,
@@ -2451,7 +2458,14 @@ class AgentSession:
                 return
 
             # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
-            if self._agent_type == "personal" and project_path and self.chat_mode != "plan":
+            # Resolve @mentions in user input (file/folder/git/knowledge context).
+            # Personal has no implicit project binding; project mentions are only
+            # expanded for Coding turns or explicit Coding delegation above.
+            project_path = effective_project_path(allow_global=self._agent_type == "coding")
+            resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
+
+            delegation_project_path = effective_project_path(allow_global=True) if self._agent_type == "personal" else project_path
+            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
                         inferred_mode = classify_coding_intent(user_input)
@@ -2462,6 +2476,11 @@ class AgentSession:
                         )
                         if should_auto_delegate and getattr(settings, "collaboration_enabled", True):
                             self._dispatch_suggested_this_session = True
+                            delegation_resolved_input = (
+                                resolve_mentions(user_input, delegation_project_path)
+                                if delegation_project_path
+                                else user_input
+                            )
                             synthetic_mention = CodingMention(
                                 raw="@coding agent",
                                 task=user_input,
@@ -2471,7 +2490,7 @@ class AgentSession:
                             async for event in self._handle_coding_mention(
                                 synthetic_mention,
                                 original_input=user_input,
-                                resolved_input=resolved_input,
+                                resolved_input=delegation_resolved_input,
                                 image_base64=image_base64,
                                 outer_run_id=run_id,
                             ):
@@ -2555,7 +2574,7 @@ class AgentSession:
             skills_trace = SkillManager.explain_match_skills(
                 self._last_user_message,
                 self.role_id,
-                bool(effective_project_path()),
+                self._agent_type == "coding" and bool(effective_project_path(allow_global=False)),
                 agent_type=self._agent_type,
             )
             active_skills = [skill["id"] for skill in skills_trace["skills"]]
@@ -2874,7 +2893,8 @@ class AgentSession:
 
                 # Auto-verification gate: block completion if files were edited without verify
                 if (
-                    effective_project_path()
+                    self._agent_type == "coding"
+                    and effective_project_path(allow_global=False)
                     and _files_modified
                     and not _verify_called
                     and not _verify_gate_fired
@@ -2909,7 +2929,7 @@ class AgentSession:
                 break
 
             tool_results = []
-            allowed_names = list_tool_names(self.dynamic_registry)
+            allowed_names = list_tool_names(self.dynamic_registry, agent_type=self._agent_type)
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
@@ -3014,6 +3034,46 @@ class AgentSession:
 
                 if tc_result.base64_image:
                     yield self._event("image", {"base64": tc_result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
+
+                if tc_result.metadata.get("automation_snapshot"):
+                    yield self._event(
+                        "automation_snapshot",
+                        {
+                            **tc_result.metadata["automation_snapshot"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_action"):
+                    yield self._event(
+                        "automation_action",
+                        {
+                            **tc_result.metadata["automation_action"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_trace"):
+                    yield self._event(
+                        "automation_trace",
+                        {
+                            **tc_result.metadata["automation_trace"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
+
+                if tc_result.metadata.get("automation_replay_status"):
+                    yield self._event(
+                        "automation_replay_status",
+                        {
+                            **tc_result.metadata["automation_replay_status"],
+                            "tool_call_id": tool_id,
+                        },
+                        run_id,
+                    )
 
                 if tc_result.metadata.get("file_edit"):
                     file_edit = dict(tc_result.metadata["file_edit"])
@@ -3319,7 +3379,11 @@ class AgentSession:
         return False
 
     def _should_screenshot(self) -> bool:
-        desktop_tools = ["mouse_click", "mouse_move", "type_text", "press_key", "scroll", "app_click"]
+        desktop_tools = [
+            "mouse_click", "mouse_move", "type_text", "press_key", "scroll", "app_click",
+            "automation_observe", "automation_click", "automation_type",
+            "automation_key", "automation_scroll", "automation_replay",
+        ]
         if self.messages:
             last = self.messages[-1]
             if last.get("role") == "assistant" and "tool_calls" in last:
@@ -3540,6 +3604,8 @@ class AgentSession:
             )
 
         AgentManager.switch_agent(self, agent_type)
+        if self._agent_type == "personal":
+            self.project_path = None
 
         # Switch to the agent's configured model
         effective = self._resolve_agent_model()
@@ -3566,9 +3632,11 @@ class AgentSession:
             raise ValueError(
                 "Cannot switch a non-empty session between agent identities. "
                 "Resolve or create a session for the target agent instead."
-            )
+        )
         self.role_id = role_id
         self._agent_type = agent_type
+        if self._agent_type == "personal":
+            self.project_path = None
         self._refresh_system_prompt()
         self._save()
 
@@ -3605,7 +3673,7 @@ class AgentSession:
         if not title and self.plan_state.goal:
             title = self.plan_state.goal[:80]
 
-        stored_project_path = _canonical_project_path(self.project_path)
+        stored_project_path = None if self._agent_type == "personal" else _canonical_project_path(self.project_path)
         self.project_path = stored_project_path
 
         data = {
@@ -3672,7 +3740,12 @@ class AgentSession:
             last_context_usage = data.get("last_context_usage")
             session._last_context_usage = last_context_usage if isinstance(last_context_usage, dict) else {}
             stored_project_path = data.get("project_path")
-            session.project_path = _canonical_project_path(stored_project_path) if isinstance(stored_project_path, str) and stored_project_path else None
+            cleared_personal_project_path = False
+            if session._agent_type == "personal":
+                cleared_personal_project_path = bool(stored_project_path)
+                session.project_path = None
+            else:
+                session.project_path = _canonical_project_path(stored_project_path) if isinstance(stored_project_path, str) and stored_project_path else None
 
             # Restore per-agent model and thinking intensity from persisted data
             stored_agent_models = data.get("agent_models")
@@ -3714,7 +3787,7 @@ class AgentSession:
             repaired_tool_calls = session._repair_incomplete_tool_call_history()
             session._refresh_system_prompt()
             session.refresh_mcp_tools()
-            if repaired_tool_calls:
+            if repaired_tool_calls or cleared_personal_project_path:
                 session._save()
             return session
         except (OSError, json.JSONDecodeError):
@@ -3829,6 +3902,9 @@ def get_or_create_session(
 
     session = _sessions[session_id]
     changed = False
+    if session.agent_type == "personal" and session.project_path is not None:
+        session.project_path = None
+        changed = True
     if agent_type and session.agent_type != resolved_agent_type:
         if _session_has_history(session):
             raise ValueError(
@@ -3922,7 +3998,10 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
             agent_type="personal",
             preserve_existing_model=not created,
         )
-        if created or not (SESSIONS_DIR / f"{session_id}.json").exists():
+        binding_changed = session.project_path is not None
+        if binding_changed:
+            session.project_path = None
+        if created or binding_changed or not (SESSIONS_DIR / f"{session_id}.json").exists():
             session._save()
 
         personal["primary_session_id"] = session.session_id

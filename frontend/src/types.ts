@@ -132,6 +132,81 @@ export interface ArtifactItem {
   sourceTool: string;
 }
 
+export interface AutomationBBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface AutomationElement {
+  id: string;
+  source: 'browser' | 'desktop' | string;
+  role: string;
+  name?: string;
+  text?: string;
+  selector?: string;
+  bbox: AutomationBBox;
+  confidence?: number;
+  attributes?: Record<string, any>;
+}
+
+export interface AutomationSnapshot {
+  snapshot_id: string;
+  session_id?: string;
+  source: 'browser' | 'desktop' | string;
+  timestamp: number;
+  title?: string;
+  url?: string;
+  viewport: { width: number; height: number };
+  screenshot?: {
+    base64?: string;
+    width?: number;
+    height?: number;
+    path?: string;
+  };
+  elements: AutomationElement[];
+  element_count?: number;
+  tool_call_id?: string;
+}
+
+export interface AutomationAction {
+  action_id: string;
+  type: 'click' | 'type' | 'key' | 'scroll' | string;
+  source: 'browser' | 'desktop' | string;
+  args?: Record<string, any>;
+  status: 'running' | 'success' | 'error' | string;
+  started_at?: number;
+  duration_ms?: number;
+  error?: string;
+  before_snapshot_id?: string;
+  after_snapshot_id?: string;
+  resolved_element?: AutomationElement | null;
+  locator_chain?: string[];
+  tool_call_id?: string;
+}
+
+export interface AutomationTrace {
+  trace_id: string;
+  session_id?: string;
+  source?: string;
+  actions: AutomationAction[];
+  created_at?: number;
+  updated_at?: number;
+  path?: string;
+  tool_call_id?: string;
+}
+
+export interface AutomationReplayStatus {
+  trace_id: string;
+  status: 'running' | 'completed' | 'error' | string;
+  from_step?: number;
+  to_step?: number;
+  events?: Array<{ step: number; status: string; output?: string }>;
+  error?: string;
+  tool_call_id?: string;
+}
+
 export interface WorkerEvent {
   workerId: string;
   type: 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done';
@@ -627,7 +702,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'automation_snapshot' | 'automation_action' | 'automation_trace' | 'automation_replay_status' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 

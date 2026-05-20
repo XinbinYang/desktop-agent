@@ -68,6 +68,7 @@ interface PaneRendererProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onRevealWorkspace?: () => void;
   onOpenPlanInWorkspace?: () => void;
   onProjectFileEdit?: (edit: FileEdit) => void;
 }
@@ -107,6 +108,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   openRunWorktree,
   handleOpenFileFromPanel,
   handleOpenFileFromPanelWithLine,
+  onRevealWorkspace,
   onOpenPlanInWorkspace,
   onProjectFileEdit,
 }) {
@@ -139,6 +141,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         openRunWorktree={openRunWorktree}
         handleOpenFileFromPanel={handleOpenFileFromPanel}
         handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+        onRevealWorkspace={onRevealWorkspace}
         onOpenPlanInWorkspace={onOpenPlanInWorkspace}
         onProjectFileEdit={onProjectFileEdit}
       />
@@ -188,12 +191,13 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               models={models}
               sessionMetaById={sessionMetaById}
               onModelChange={onModelChange}
-              onSnapshot={child.id === focusedLeafId ? onSnapshot : () => {}}
+              onSnapshot={onSnapshot}
               onCommand={onCommand}
               runAction={runAction}
               openRunWorktree={openRunWorktree}
               handleOpenFileFromPanel={handleOpenFileFromPanel}
               handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+              onRevealWorkspace={onRevealWorkspace}
               onOpenPlanInWorkspace={onOpenPlanInWorkspace}
               onProjectFileEdit={onProjectFileEdit}
             />
@@ -231,6 +235,7 @@ interface LeafPaneProps {
   openRunWorktree: (runId: string) => Promise<void>;
   handleOpenFileFromPanel: (path: string) => void;
   handleOpenFileFromPanelWithLine: (path: string, line?: number) => void;
+  onRevealWorkspace?: () => void;
   onOpenPlanInWorkspace?: () => void;
   onProjectFileEdit?: (edit: FileEdit) => void;
 }
@@ -262,6 +267,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   openRunWorktree,
   handleOpenFileFromPanel,
   handleOpenFileFromPanelWithLine,
+  onRevealWorkspace,
   onOpenPlanInWorkspace,
   onProjectFileEdit,
 }) {
@@ -594,6 +600,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
           openRunWorktree={openRunWorktree}
           handleOpenFileFromPanel={handleOpenFileFromPanel}
           handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+          onRevealWorkspace={onRevealWorkspace}
           onOpenPlanInWorkspace={onOpenPlanInWorkspace}
           onProjectFileEdit={onProjectFileEdit}
         />

@@ -92,6 +92,25 @@ describe('ChatPanel', () => {
     expect(within(welcome).queryByText(/desktop-agent/)).not.toBeInTheDocument()
   })
 
+  it('does not expose project @mentions for Personal Agent', async () => {
+    render(
+      <ChatPanel
+        {...defaultProps}
+        agentType="personal"
+        projectOpen={true}
+        fileTree={[{ name: 'README.md', path: 'README.md', type: 'file', extension: 'md' }]}
+      />,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)'), {
+      target: { value: '@' },
+    })
+
+    expect(await screen.findByText('Coding Agent')).toBeInTheDocument()
+    expect(screen.queryByText('Git')).not.toBeInTheDocument()
+    expect(screen.queryByText('README.md')).not.toBeInTheDocument()
+  })
+
   it('uses the coding event timeline for Coding Agent sessions', () => {
     const messages: ChatMessage[] = [
       { id: '1', role: 'user', content: 'Inspect the app', isTool: false },
@@ -208,6 +227,21 @@ describe('ChatPanel', () => {
     ]
     render(<ChatPanel {...defaultProps} messages={messages} />)
     expect(screen.getByText('Hello')).toBeInTheDocument()
+  })
+
+  it('opens sent image attachments in a full-size preview', () => {
+    const messages: ChatMessage[] = [
+      { id: '1', role: 'user', content: 'Can you see this?', imageBase64: 'abc123', isTool: false },
+    ]
+    render(<ChatPanel {...defaultProps} messages={messages} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open attached image' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Image preview' })
+    expect(within(dialog).getByAltText('attached')).toHaveAttribute('src', 'data:image/png;base64,abc123')
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByRole('dialog', { name: 'Image preview' })).not.toBeInTheDocument()
   })
 
   it('renders assistant message', () => {

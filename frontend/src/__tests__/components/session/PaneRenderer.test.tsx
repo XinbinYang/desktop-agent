@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { PaneRenderer } from '../../../components/session/PaneRenderer';
 import type { LeafNode, PaneNode } from '../../../components/session/PaneTypes';
@@ -10,6 +10,26 @@ vi.mock('../../../components/session/SessionView', async () => {
   return {
     SessionView: React.forwardRef((props: any, ref: any) => {
       React.useImperativeHandle(ref, () => ({}));
+      React.useEffect(() => {
+        if (!props.isFocused) return;
+        props.onSnapshot({
+          sessionId: props.sessionId,
+          projectPath: null,
+          agentType: props.agentType,
+          isRunning: false,
+          isConnected: false,
+          chatMode: 'agent',
+          thinkingIntensity: 'medium',
+          planState: { mode: 'agent', phase: 'idle', goal: '', draft: '', questions: [], todos: [], decisions: {}, approved: false },
+          artifacts: [],
+          editorGroups: [{ id: 'main', activeFileId: null, openFiles: [] }],
+          activeEditorGroup: 'main',
+          latestToolCall: null,
+          fileEdits: [],
+          toolCalls: [],
+          runEvents: [],
+        }, {});
+      }, [props.agentType, props.isFocused, props.onSnapshot, props.sessionId]);
       return (
         <div data-testid={`session-${props.sessionId}`} data-team-id={props.teamId || ''} onClick={props.onFocus}>
           {props.sessionId}
@@ -132,5 +152,34 @@ describe('PaneRenderer', () => {
     fireEvent.change(screen.getByLabelText('Pane model'), { target: { value: 'kimi-for-coding' } });
 
     expect(onModelChange).toHaveBeenCalledWith('a', 'kimi-for-coding');
+  });
+
+  it('forwards focused snapshots through nested split nodes', async () => {
+    const onSnapshot = vi.fn();
+    const nested: PaneNode = {
+      type: 'split',
+      id: 'root',
+      direction: 'horizontal',
+      children: [
+        leaf('a'),
+        {
+          type: 'split',
+          id: 'nested',
+          direction: 'vertical',
+          children: [leaf('b'), leaf('c')],
+          sizes: [50, 50],
+        },
+      ],
+      sizes: [50, 50],
+    };
+
+    renderPane(nested, { focusedLeafId: 'c', onSnapshot });
+
+    await waitFor(() => {
+      expect(onSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: 'session_c' }),
+        expect.anything(),
+      );
+    });
   });
 });

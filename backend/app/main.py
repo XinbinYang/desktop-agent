@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import inspect
 import json
 import os
 from contextlib import asynccontextmanager, suppress
@@ -1802,6 +1803,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                 tool = get_tool(tool_name)
                 try:
+                    tool_params = inspect.signature(tool.execute).parameters
+                    if "session_id" in tool_params and "session_id" not in tool_args:
+                        tool_args["session_id"] = session_id
                     result = await tool.execute(**tool_args)
                 except Exception as e:
                     failure = tool_failure_error(f"Tool execution failed: {e}", tool_name)
@@ -1814,6 +1818,27 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         }
                     })
                     continue
+                metadata = result.metadata or {}
+                if metadata.get("automation_snapshot"):
+                    await send_event({
+                        "type": "automation_snapshot",
+                        "data": metadata["automation_snapshot"],
+                    })
+                if metadata.get("automation_action"):
+                    await send_event({
+                        "type": "automation_action",
+                        "data": metadata["automation_action"],
+                    })
+                if metadata.get("automation_trace"):
+                    await send_event({
+                        "type": "automation_trace",
+                        "data": metadata["automation_trace"],
+                    })
+                if metadata.get("automation_replay_status"):
+                    await send_event({
+                        "type": "automation_replay_status",
+                        "data": metadata["automation_replay_status"],
+                    })
                 await send_event({
                     "type": "tool_result",
                     "data": {"name": tool_name, "args": tool_args, "output": result.output, "error": result.error, "image": result.base64_image}

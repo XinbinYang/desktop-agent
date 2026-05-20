@@ -7,6 +7,8 @@ import { cn } from './ui/cn';
 
 interface SkillsPanelProps {
   activeAgent: AgentType;
+  refreshToken?: number;
+  highlightedDraftId?: string | null;
 }
 
 interface SkillCategory {
@@ -152,7 +154,11 @@ function CategoryCheckbox({
   );
 }
 
-export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
+export const SkillsPanel: React.FC<SkillsPanelProps> = ({
+  activeAgent,
+  refreshToken = 0,
+  highlightedDraftId = null,
+}) => {
   const [skills, setSkills] = useState<SkillCatalogItem[]>([]);
   const [drafts, setDrafts] = useState<SkillDraftItem[]>([]);
   const [presets, setPresets] = useState<SkillPreset[]>([]);
@@ -160,6 +166,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [highlightedSkillId, setHighlightedSkillId] = useState<string | null>(null);
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>(() => loadExpandedCategories(activeAgent));
 
   const loadCatalog = useCallback(async (signal?: AbortSignal) => {
@@ -192,7 +199,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     const controller = new AbortController();
     void loadCatalog(controller.signal);
     return () => controller.abort();
-  }, [loadCatalog]);
+  }, [loadCatalog, refreshToken]);
 
   useEffect(() => {
     setExpandedCategories(loadExpandedCategories(activeAgent));
@@ -226,6 +233,15 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     () => presets.filter((preset) => (preset.agentTypes || []).includes(activeAgent)),
     [activeAgent, presets],
   );
+
+  const displayedDrafts = useMemo(() => {
+    if (!highlightedDraftId) return drafts;
+    return [...drafts].sort((a, b) => {
+      if (a.draft_id === highlightedDraftId) return -1;
+      if (b.draft_id === highlightedDraftId) return 1;
+      return 0;
+    });
+  }, [drafts, highlightedDraftId]);
 
   const savePreferences = async (next: SkillPreferences, previous: SkillPreferences, pending: string) => {
     setPreferences(next);
@@ -271,18 +287,31 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     setPendingKey(`draft:${draft.draft_id}:publish`);
     setError(null);
     try {
-      const enableFor = (draft.scopes || []).includes(activeAgent) ? [activeAgent] : ['personal'];
+      const scopedAgents = (draft.scopes || []).filter((scope): scope is AgentType => (
+        scope === 'personal' || scope === 'coding'
+      ));
+      const enableFor = scopedAgents.includes(activeAgent)
+        ? [activeAgent]
+        : [scopedAgents[0] || activeAgent];
       const response = await fetch(`${API_BASE}/api/skills/drafts/${encodeURIComponent(draft.draft_id)}/publish`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enable_for: enableFor, allow_risky: false }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = (await response.json()) as SkillCatalogResponse;
+      const data = (await response.json()) as SkillCatalogResponse & { skill?: { id?: string; skill_id?: string } };
+      const publishedSkillId = data.skill?.skill_id || data.skill?.id || draft.skill_id;
       setSkills(data.skills || []);
       setPresets(data.presets || []);
       setPreferences(normalizePreferences(data.preferences));
-      await loadCatalog();
+      setDrafts((previous) => previous.filter((item) => item.draft_id !== draft.draft_id));
+      setHighlightedSkillId(publishedSkillId || null);
+      setExpandedCategories((previous) => {
+        const next = { ...previous, user: true };
+        saveExpandedCategories(activeAgent, next);
+        return next;
+      });
+      void loadCatalog();
     } catch {
       setError('Skill draft was not published');
     } finally {
@@ -352,6 +381,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     const enabled = isEnabled(skill, preferences, activeAgent);
     const pending = pendingKey === skill.id || categoryPending;
     const archivePending = pendingKey === `archive:${skill.id}`;
+    const highlighted = skill.id === highlightedSkillId;
     const sourceLabel = skill.source === 'personal'
       ? 'Personal'
       : skill.source === 'superpowers'
@@ -365,8 +395,10 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
         key={skill.id}
         className={cn(
           'flex items-center gap-1.5 rounded border border-border bg-surface px-2 py-1.5 transition-colors',
-          enabled ? 'border-accent/25 bg-accent/5' : 'hover:bg-surface-hover'
+          enabled ? 'border-accent/25 bg-accent/5' : 'hover:bg-surface-hover',
+          highlighted && 'border-accent/60 bg-accent/10 ring-1 ring-accent/50'
         )}
+        data-highlighted={highlighted ? 'true' : undefined}
         title={skill.description || skill.name}
       >
         <label className="flex min-w-0 flex-1 items-center gap-2">
@@ -460,9 +492,17 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
     const validating = pendingKey === `draft:${draft.draft_id}:validate`;
     const publishing = pendingKey === `draft:${draft.draft_id}:publish`;
     const canPublish = validation.passed === true;
+    const highlighted = draft.draft_id === highlightedDraftId;
 
     return (
-      <div key={draft.draft_id} className="rounded border border-border bg-surface px-2 py-1.5">
+      <div
+        key={draft.draft_id}
+        className={cn(
+          'rounded border border-border bg-surface px-2 py-1.5 transition-colors',
+          highlighted && 'border-accent/60 bg-accent/10 ring-1 ring-accent/50'
+        )}
+        data-highlighted={highlighted ? 'true' : undefined}
+      >
         <div className="flex items-start gap-2">
           <span className="mt-0.5 shrink-0 text-accent">
             {canPublish ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
@@ -534,11 +574,11 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({ activeAgent }) => {
         </div>
       ) : (
         <>
-          {drafts.length > 0 && (
+          {displayedDrafts.length > 0 && (
             <div className="space-y-1 rounded border border-border bg-surface-alt p-1.5">
               <div className="px-1 text-[10px] font-medium text-fg-muted">Drafts awaiting review</div>
               <div className="space-y-1">
-                {drafts.map(renderDraft)}
+                {displayedDrafts.map(renderDraft)}
               </div>
             </div>
           )}

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X } from 'lucide-react';
+import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X, Maximize2 } from 'lucide-react';
 import { Virtuoso, VirtuosoHandle, type IndexLocationWithAlign, type ListRange, type StateSnapshot } from 'react-virtuoso';
 import { useTranslation } from 'react-i18next';
 import {
@@ -92,6 +92,12 @@ interface ChatPanelProps {
 }
 
 type OutputMode = 'concise' | 'balanced' | 'verbose';
+type SandboxMode = 'sandbox' | 'unrestricted';
+
+interface ImagePreviewState {
+  src: string;
+  alt: string;
+}
 
 interface ChatScrollMemory {
   atBottom?: boolean;
@@ -149,6 +155,38 @@ function getInitialNoiseFilter(): boolean {
     if (raw === '0') return false;
   } catch { /* ignore */ }
   return true;
+}
+
+let sandboxModeCache: SandboxMode | null = null;
+let sandboxModePromise: Promise<SandboxMode | null> | null = null;
+const sandboxModeSubscribers = new Set<(mode: SandboxMode) => void>();
+
+function publishSandboxMode(mode: SandboxMode) {
+  sandboxModeCache = mode;
+  for (const subscriber of Array.from(sandboxModeSubscribers)) {
+    subscriber(mode);
+  }
+}
+
+function loadSandboxModeOnce(): Promise<SandboxMode | null> {
+  if (sandboxModeCache) return Promise.resolve(sandboxModeCache);
+  if (!sandboxModePromise) {
+    sandboxModePromise = fetch(`${API_BASE}/api/settings`)
+      .then((res) => res.json())
+      .then((data) => {
+        const mode = data.settings?.sandbox_mode;
+        if (mode === 'sandbox' || mode === 'unrestricted') {
+          sandboxModeCache = mode;
+          return mode as SandboxMode;
+        }
+        return null;
+      })
+      .catch(() => null)
+      .finally(() => {
+        sandboxModePromise = null;
+      });
+  }
+  return sandboxModePromise;
 }
 
 function isNoisyToolBlock(block: Extract<AssistantBlock, { type: 'tool_call' }>): boolean {
@@ -1442,6 +1480,94 @@ const TimelineToolGroupRow = React.memo<{
 
 TimelineToolGroupRow.displayName = 'TimelineToolGroupRow';
 
+const imageDataUrl = (base64: string) => `data:image/png;base64,${base64}`;
+
+const ChatImageThumbnail = React.memo<{
+  base64: string;
+  alt: string;
+  ariaLabel: string;
+  onOpen: (preview: ImagePreviewState) => void;
+  buttonClassName?: string;
+  imageClassName?: string;
+}>(({
+  base64,
+  alt,
+  ariaLabel,
+  onOpen,
+  buttonClassName = 'mb-[var(--chat-space-sm)]',
+  imageClassName = 'max-w-full max-h-40',
+}) => {
+  const src = imageDataUrl(base64);
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen({ src, alt })}
+      className={`group/image relative block max-w-full cursor-zoom-in rounded border border-border-subtle bg-surface/35 p-0 leading-none overflow-hidden focus:outline-none focus:ring-2 focus:ring-accent/60 ${buttonClassName}`}
+      aria-label={ariaLabel}
+      title={ariaLabel}
+    >
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        draggable={false}
+        className={`${imageClassName} block rounded object-contain transition-transform duration-150 group-hover/image:scale-[1.01]`}
+      />
+      <span className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded bg-black/55 text-white opacity-0 transition-opacity group-hover/image:opacity-100 group-focus-visible/image:opacity-100">
+        <Maximize2 className="h-3.5 w-3.5" />
+      </span>
+    </button>
+  );
+});
+
+ChatImageThumbnail.displayName = 'ChatImageThumbnail';
+
+const ImagePreviewOverlay = React.memo<{
+  preview: ImagePreviewState | null;
+  onClose: () => void;
+}>(({ preview, onClose }) => {
+  useEffect(() => {
+    if (!preview) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [preview, onClose]);
+
+  if (!preview) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Image preview"
+      onClick={onClose}
+    >
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white hover:bg-black/70 focus:outline-none focus:ring-2 focus:ring-white/70"
+        aria-label="Close image preview"
+        title="Close image preview"
+      >
+        <X className="h-4 w-4" />
+      </button>
+      <div className="max-h-full max-w-full overflow-auto" onClick={(event) => event.stopPropagation()}>
+        <img
+          src={preview.src}
+          alt={preview.alt}
+          className="max-h-[92vh] max-w-[92vw] rounded-md object-contain shadow-2xl"
+        />
+      </div>
+    </div>
+  );
+});
+
+ImagePreviewOverlay.displayName = 'ImagePreviewOverlay';
+
 export const ChatPanel: React.FC<ChatPanelProps> = ({
   sessionId,
   messages,
@@ -1489,16 +1615,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 }) => {
   const planBlocksChatSend = (chatMode === 'plan' || planState.mode === 'plan') && planState.phase === 'awaiting_decision';
   const isPlanModeActive = chatMode === 'plan';
+  const mentionProjectOpen = agentType === 'coding' && projectOpen;
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
   const [attachedImage, setAttachedImage] = useState<string | null>(null);
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
-  const [sandboxMode, setSandboxMode] = useState<'sandbox' | 'unrestricted'>('sandbox');
+  const [sandboxMode, setSandboxMode] = useState<SandboxMode>(() => sandboxModeCache || 'sandbox');
   const [expandedToolDetails, setExpandedToolDetails] = useState<Record<string, boolean>>({});
   const [showAllToolDetails, setShowAllToolDetails] = useState<Record<string, boolean>>({});
   const [outputMode, setOutputMode] = useState<OutputMode>(getInitialOutputMode);
@@ -1510,6 +1638,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const showAtMenu = atQuery !== '';
 
   const density = outputMode === 'concise' ? 'compact' : outputMode === 'verbose' ? 'comfortable' : 'balanced';
+
+  const openImagePreview = useCallback((preview: ImagePreviewState) => {
+    setImagePreview(preview);
+  }, []);
+
+  const closeImagePreview = useCallback(() => {
+    setImagePreview(null);
+  }, []);
 
   useEffect(() => {
     try {
@@ -1525,15 +1661,22 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   // 加载当前权限模式
   useEffect(() => {
-    fetch(`${API_BASE}/api/settings`)
-      .then((res) => res.json())
-      .then((data) => {
-        const mode = data.settings?.sandbox_mode;
-        if (mode === 'sandbox' || mode === 'unrestricted') {
-          setSandboxMode(mode);
-        }
-      })
-      .catch(() => {});
+    let cancelled = false;
+    const subscriber = (mode: SandboxMode) => {
+      if (!cancelled) setSandboxMode(mode);
+    };
+    sandboxModeSubscribers.add(subscriber);
+    if (sandboxModeCache) {
+      setSandboxMode(sandboxModeCache);
+    } else {
+      void loadSandboxModeOnce().then((mode) => {
+        if (mode && !cancelled) setSandboxMode(mode);
+      });
+    }
+    return () => {
+      cancelled = true;
+      sandboxModeSubscribers.delete(subscriber);
+    };
   }, []);
 
   const toggleSandboxMode = async () => {
@@ -1549,7 +1692,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         body: JSON.stringify({ sandbox_mode: next }),
       });
       await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
-      setSandboxMode(next);
+      publishSandboxMode(next);
     } catch {
       // ignore
     }
@@ -1982,13 +2125,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         return <FileEditView key={`edit-${block.edit.tool_call_id || block.timestamp}`} edit={block.edit} compact />;
       case 'image':
         return (
-          <img
+          <ChatImageThumbnail
             key={`img-${block.timestamp}`}
-            src={`data:image/png;base64,${block.base64}`}
+            base64={block.base64}
             alt="tool screenshot"
-            loading="lazy"
-            decoding="async"
-            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+            ariaLabel="Open tool screenshot"
+            onOpen={openImagePreview}
           />
         );
       case 'plan_questions':
@@ -2021,7 +2163,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       default:
         return null;
     }
-  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents]);
+  }, [planState, onUpdatePlanDecision, onBuildPlan, onPauseBuild, onEndBuild, onViewPlan, markdownComponents, openImagePreview]);
 
   const lastAssistantMsgId = useMemo(() => {
     const lastMsg = messages[messages.length - 1];
@@ -2047,12 +2189,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               : 'bg-accent/15 text-fg rounded-lg px-[var(--chat-bubble-px)] py-[var(--chat-bubble-py)] ml-auto max-w-[85%] border border-accent/20 chat-text-sm'
           }`}>
             {event.imageBase64 && (
-              <img
-                src={`data:image/png;base64,${event.imageBase64}`}
+              <ChatImageThumbnail
+                base64={event.imageBase64}
                 alt="attached"
-                loading="lazy"
-                decoding="async"
-                className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+                ariaLabel="Open attached image"
+                onOpen={openImagePreview}
               />
             )}
             <div className="prose prose-sm chat-prose chat-prose-plain max-w-none">
@@ -2065,6 +2206,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         content = <TimelineThinkingRow event={event} />;
         break;
       case 'text_summary':
+        const streamingText = event.message?.turnComplete === false;
         content = (
           <div className="relative group py-[var(--chat-space-xs)] text-fg">
             {retryable && (
@@ -2078,11 +2220,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 <RotateCcw className="w-2.5 h-2.5 text-fg-secondary" />
               </button>
             )}
-            <div className="prose prose-sm chat-prose max-w-none">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownForMode}>
+            {streamingText ? (
+              <div className="chat-text-sm whitespace-pre-wrap leading-[var(--chat-line-height)] text-fg">
                 {event.text}
-              </ReactMarkdown>
-            </div>
+              </div>
+            ) : (
+              <div className="prose prose-sm chat-prose max-w-none">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownForMode}>
+                  {event.text}
+                </ReactMarkdown>
+              </div>
+            )}
           </div>
         );
         break;
@@ -2097,12 +2245,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         break;
       case 'image':
         content = (
-          <img
-            src={`data:image/png;base64,${event.base64}`}
+          <ChatImageThumbnail
+            base64={event.base64}
             alt="tool screenshot"
-            loading="lazy"
-            decoding="async"
-            className="max-w-full max-h-40 rounded mb-[var(--chat-space-sm)] object-contain"
+            ariaLabel="Open tool screenshot"
+            onOpen={openImagePreview}
           />
         );
         break;
@@ -2168,6 +2315,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     onViewPlan,
     onPauseBuild,
     onEndBuild,
+    openImagePreview,
   ]);
 
   const itemContent = useCallback((index: number) => {
@@ -2229,6 +2377,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   return (
     <div className="relative h-full min-h-0 flex flex-col overflow-hidden bg-app" data-density={density}>
+      <ImagePreviewOverlay preview={imagePreview} onClose={closeImagePreview} />
       {/* 搜索栏 */}
       {showSearch && (
         <div className="px-4 pt-3 pb-1 border-b border-border flex items-center gap-2">
@@ -2418,14 +2567,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         {attachedImage && (
           <div className="mb-2 flex items-center gap-2">
             <div className="relative inline-block">
-              <img
-                src={`data:image/png;base64,${attachedImage}`}
+              <ChatImageThumbnail
+                base64={attachedImage}
                 alt="preview"
-                className="h-16 rounded border border-border"
+                ariaLabel="Open attached image preview"
+                onOpen={openImagePreview}
+                buttonClassName=""
+                imageClassName="h-16 max-w-[12rem]"
               />
               <button
                 onClick={() => setAttachedImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-fg-on-danger text-xs flex items-center justify-center"
+                className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-danger rounded-full text-fg-on-danger flex items-center justify-center"
                 aria-label="Remove image"
               >
                 ×
@@ -2544,7 +2696,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 onSelect={(item) => handleAtMention(item)}
                 onClose={() => setAtQuery('')}
                 inputRef={textareaRef}
-                projectOpen={projectOpen}
+                projectOpen={mentionProjectOpen}
                 fileTree={fileTree}
               />
             )}

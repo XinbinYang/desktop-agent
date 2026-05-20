@@ -12,6 +12,7 @@ const FILES = [
 
 interface FileState {
   content: string;
+  originalContent: string;
   loading: boolean;
   saving: boolean;
   error: string | null;
@@ -37,13 +38,23 @@ export const SoulEditor: React.FC = () => {
   const [activeFile, setActiveFile] = useState('SOUL.md');
   const [files, setFiles] = useState<Record<string, FileState>>({});
 
-  const current = files[activeFile] || { content: '', loading: true, saving: false, error: null };
+  const current = files[activeFile] || { content: '', originalContent: '', loading: true, saving: false, error: null };
+  const hasUnsavedChanges = current.content !== current.originalContent;
 
   const fetchFile = useCallback(async (filename: string) => {
-    setFiles((prev) => ({ ...prev, [filename]: { ...prev[filename], loading: true, error: null } }));
+    setFiles((prev) => ({
+      ...prev,
+      [filename]: {
+        content: prev[filename]?.content || '',
+        originalContent: prev[filename]?.originalContent || '',
+        saving: prev[filename]?.saving || false,
+        loading: true,
+        error: null,
+      },
+    }));
     try {
       const content = await loadFile(filename);
-      setFiles((prev) => ({ ...prev, [filename]: { content, loading: false, saving: false, error: null } }));
+      setFiles((prev) => ({ ...prev, [filename]: { content, originalContent: content, loading: false, saving: false, error: null } }));
     } catch (err) {
       setFiles((prev) => ({ ...prev, [filename]: { ...prev[filename], loading: false, error: String(err) } }));
     }
@@ -56,10 +67,13 @@ export const SoulEditor: React.FC = () => {
   }, [activeFile, files, fetchFile]);
 
   const handleSave = useCallback(async () => {
+    if (!window.confirm('这些身份与偏好文件通常由 Agent 自动维护。确认要保存你的手动修正吗？')) {
+      return;
+    }
     setFiles((prev) => ({ ...prev, [activeFile]: { ...prev[activeFile], saving: true } }));
     try {
       await saveFile(activeFile, current.content);
-      setFiles((prev) => ({ ...prev, [activeFile]: { ...prev[activeFile], saving: false, error: null } }));
+      setFiles((prev) => ({ ...prev, [activeFile]: { ...prev[activeFile], originalContent: current.content, saving: false, error: null } }));
     } catch (err) {
       setFiles((prev) => ({ ...prev, [activeFile]: { ...prev[activeFile], saving: false, error: String(err) } }));
     }
@@ -74,9 +88,7 @@ export const SoulEditor: React.FC = () => {
       {/* Philosophy notice */}
       <div className="px-3 py-2 border-b border-border bg-surface-alt/50">
         <p className="text-[10px] text-fg-muted leading-relaxed">
-          Your Personal Agent maintains these files autonomously through daily interaction.
-          These editable files live in its WORKSPACE, separate from protected system rules.
-          You can view or override anything here at any time.
+          身份与偏好由 Agent 自动维护。你可以在这里查看并修正明显不准确的内容，保存会覆盖 Agent 的可变工作区文件。
         </p>
       </div>
 
@@ -104,6 +116,7 @@ export const SoulEditor: React.FC = () => {
       <div className="flex items-center justify-between px-2 py-1 border-b border-border shrink-0">
         <span className="text-[10px] text-fg-muted">
           {FILES.find((f) => f.name === activeFile)?.desc}
+          {hasUnsavedChanges ? ' · 未保存更改' : ''}
         </span>
         <div className="flex items-center gap-1">
           <button
@@ -120,14 +133,14 @@ export const SoulEditor: React.FC = () => {
             onClick={handleSave}
             disabled={current.loading || current.saving}
             className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-            title="Save (Ctrl+S)"
+            title="确认保存手动修正 (Ctrl+S)"
           >
             {current.saving ? (
               <Loader2 className="w-3 h-3 animate-spin" />
             ) : (
               <Save className="w-3 h-3" />
             )}
-            Save
+            保存修正
           </button>
         </div>
       </div>

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_PROVIDER_STATUSES = {429, 500, 502, 503, 504}
 KIMI_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
+KIMI_MESSAGE_SIZE_LIMIT_BYTES = 2 * 1024 * 1024
 THINKING_INTENSITIES = {"low", "medium", "high"}
 DEFAULT_THINKING_BUDGETS = {
     "low": 2048,
@@ -41,6 +42,39 @@ def _friendly_kimi_error(status_code: int, body: str) -> str:
             f"Raw response: {compact_body}"
         )
     return f"Kimi API request failed: {status_code} {compact_body}"
+
+
+def _kimi_message_size_bytes(payload: Dict[str, Any]) -> int:
+    try:
+        message_payload = {
+            "system": payload.get("system", ""),
+            "messages": payload.get("messages", []),
+        }
+        return len(json.dumps(message_payload, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _check_kimi_message_size(payload: Dict[str, Any]) -> None:
+    size = _kimi_message_size_bytes(payload)
+    if size > KIMI_MESSAGE_SIZE_LIMIT_BYTES:
+        raise ValueError(
+            "Kimi API request is too large: messages are "
+            f"{size} bytes, exceeding the 2 MB Kimi Code limit. "
+            "Please compact or start a new session before retrying."
+        )
+
+
+def _friendly_kimi_transport_error(exc: Exception, attempts: int, payload: Dict[str, Any]) -> str:
+    size = _kimi_message_size_bytes(payload)
+    return (
+        "Kimi API connection failed after "
+        f"{attempts} attempt(s): {type(exc).__name__}: {exc}. "
+        "The provider closed the connection before returning a response. "
+        "This is usually a transient Kimi Code gateway/backend issue; retry shortly. "
+        f"Request summary: messages={len(payload.get('messages', []))}, "
+        f"tools={len(payload.get('tools', []))}, message_bytes={size}."
+    )
 
 
 def _retry_delay_seconds(response: httpx.Response, attempt: int) -> float:
@@ -219,8 +253,6 @@ class ModelRouter:
                 has_reasoning = bool(str(message.get("reasoning_content") or "").strip())
                 if not has_text and not has_tool_calls and not has_reasoning:
                     continue
-            if "reasoning_content" in message:
-                message = {k: v for k, v in message.items() if k != "reasoning_content"}
             cleaned.append(message)
         return cleaned
 
@@ -241,6 +273,38 @@ class ModelRouter:
         if content:
             yield {"type": "text_delta", "text": content}
         yield {"type": "done", "response": response}
+
+    async def _kimi_post_json_with_retries(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        label: str,
+    ) -> httpx.Response:
+        _check_kimi_message_size(payload)
+        attempts = len(KIMI_RETRY_DELAYS_SECONDS) + 1
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await client.post(url, headers=headers, json=payload)
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt >= len(KIMI_RETRY_DELAYS_SECONDS):
+                    break
+                logger.warning(
+                    "Kimi %s transport failure, retrying: type=%s attempt=%s message=%s message_count=%s tool_count=%s message_bytes=%s",
+                    label,
+                    type(exc).__name__,
+                    attempt + 1,
+                    str(exc),
+                    len(payload.get("messages", [])),
+                    len(payload.get("tools", [])),
+                    _kimi_message_size_bytes(payload),
+                )
+                await asyncio.sleep(KIMI_RETRY_DELAYS_SECONDS[attempt])
+        assert last_exc is not None
+        raise RuntimeError(_friendly_kimi_transport_error(last_exc, attempts, payload)) from last_exc
 
     def _kimi_prefers_openai_compatible(self) -> bool:
         _name, provider = self._get_provider()
@@ -337,7 +401,13 @@ class ModelRouter:
                         "input": json.loads(func.get("arguments", "{}")),
                     })
                 if content_blocks:
-                    anthropic_messages.append({"role": "assistant", "content": content_blocks})
+                    assistant_message = {"role": "assistant", "content": content_blocks}
+                    reasoning = str(m.get("reasoning_content") or "")
+                    if reasoning.strip():
+                        # Kimi Code requires reasoning_content to be replayed on
+                        # assistant tool-call history when thinking is enabled.
+                        assistant_message["reasoning_content"] = reasoning
+                    anthropic_messages.append(assistant_message)
             elif role == "tool":
                 tool_result_blocks = []
                 max_tool_result_len = 8000
@@ -475,7 +545,13 @@ class ModelRouter:
 
         async with httpx.AsyncClient(timeout=120) as client:
             for attempt in range(len(KIMI_RETRY_DELAYS_SECONDS) + 1):
-                resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
+                resp = await self._kimi_post_json_with_retries(
+                    client,
+                    f"{api_base}/v1/messages",
+                    headers,
+                    payload,
+                    "Anthropic-compatible request",
+                )
                 if resp.status_code == 400 and tools:
                     resp_text = ""
                     try:
@@ -485,7 +561,13 @@ class ModelRouter:
                     if "thinking" in resp_text.lower():
                         logger.info("Kimi API rejected thinking+tools, retrying without thinking")
                         payload.pop("thinking", None)
-                        resp = await client.post(f"{api_base}/v1/messages", headers=headers, json=payload)
+                        resp = await self._kimi_post_json_with_retries(
+                            client,
+                            f"{api_base}/v1/messages",
+                            headers,
+                            payload,
+                            "Anthropic-compatible no-thinking retry",
+                        )
 
                 if _is_retryable_provider_status(resp.status_code) and attempt < len(KIMI_RETRY_DELAYS_SECONDS):
                     resp_text = ""
@@ -740,7 +822,13 @@ class ModelRouter:
 
         async with httpx.AsyncClient(timeout=120) as client:
             for attempt in range(len(KIMI_RETRY_DELAYS_SECONDS) + 1):
-                resp = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload)
+                resp = await self._kimi_post_json_with_retries(
+                    client,
+                    f"{api_base}/chat/completions",
+                    headers,
+                    payload,
+                    "OpenAI-compatible request",
+                )
                 if _is_retryable_provider_status(resp.status_code) and attempt < len(KIMI_RETRY_DELAYS_SECONDS):
                     body = ""
                     try:

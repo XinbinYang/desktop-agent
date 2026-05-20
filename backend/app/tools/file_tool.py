@@ -9,6 +9,7 @@ from app.runtime_paths import (
     PERSONAL_WORKSPACE_DIRNAME,
     SHARED_SYSTEM_FILES,
     agents_dir,
+    personal_workspace_dir,
     workspace_root,
 )
 from app.security import is_relative_to, resolve_under_base
@@ -76,8 +77,21 @@ def build_file_edit_metadata(path: Path, old_content: str, new_content: str, exi
     }
 
 
-def _get_base_path(project_relative: bool = False) -> tuple[Path, Optional[str]]:
+def _personal_project_relative_error() -> str:
+    return (
+        "Personal Agent is not bound to a project. Use AGENTS/personal/... for Personal workspace files, "
+        "or delegate project code work to Coding Agent."
+    )
+
+
+def _get_base_path(project_relative: bool = False, agent_type: str = "") -> tuple[Path, Optional[str]]:
     """Return (base_path, error_message). When error_message is set, base_path is the fallback."""
+    if agent_type == "personal":
+        home = personal_workspace_dir()
+        if project_relative:
+            return home, _personal_project_relative_error()
+        return home, None
+
     if project_relative:
         try:
             from app.coding_runs import get_run_context
@@ -198,20 +212,31 @@ def _validate_path(
     if agent_path is not None or agent_err:
         return agent_path or Path(path), agent_err
 
+    raw = Path(path)
+    if agent_type == "personal" and project_relative:
+        return personal_workspace_dir(), _personal_project_relative_error()
+
+    if agent_type == "personal" and not raw.is_absolute():
+        try:
+            resolved, err = resolve_under_base(path, personal_workspace_dir(), allow_relative=True)
+            return resolved, err
+        except (OSError, ValueError) as e:
+            return Path(path), f"Invalid path: {path} ({e})"
+
     if load_config().settings.sandbox_mode == "unrestricted":
         try:
-            candidate = Path(path)
+            candidate = raw
             if candidate.is_absolute():
                 return candidate.resolve(), None
             if project_relative:
-                base, base_err = _get_base_path(project_relative=True)
+                base, base_err = _get_base_path(project_relative=True, agent_type=agent_type)
                 if base_err:
                     return base, base_err
                 return (base / candidate).resolve(), None
             return (_PROJECT_ROOT / candidate).resolve(), None
         except (OSError, ValueError) as e:
             return Path(path), f"Invalid path: {path} ({e})"
-    base, base_err = _get_base_path(project_relative)
+    base, base_err = _get_base_path(project_relative, agent_type=agent_type)
     if base_err:
         return base, base_err
     p, err = resolve_under_base(path, base, allow_relative=project_relative)

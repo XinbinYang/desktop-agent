@@ -59,7 +59,7 @@ vi.mock('../components/session/SessionView', async () => {
       ;((globalThis as any).__desktopAgentOpenFiles ||= {})[props.sessionId] = openFile;
       React.useImperativeHandle(ref, () => ({ openFile, switchModel: vi.fn(), openRewind: vi.fn() }), [openFile]);
       React.useEffect(() => {
-        props.onSnapshot({
+        const emitSnapshot = (override: Record<string, any> = {}) => props.onSnapshot({
           sessionId: props.sessionId,
           agentType: props.agentType,
           isRunning: false,
@@ -76,7 +76,10 @@ vi.mock('../components/session/SessionView', async () => {
           fileEdits: [],
           toolCalls: [],
           runEvents: [],
+          ...override,
         }, actions);
+        ;(globalThis as any).__desktopAgentEmitSnapshot = emitSnapshot;
+        emitSnapshot((globalThis as any).__desktopAgentSessionSnapshotOverride || {});
       }, [props.sessionId, props.agentType, props.onSnapshot]);
       return <div data-testid={`session-${props.sessionId}`}>{props.sessionId}</div>;
     }),
@@ -92,6 +95,8 @@ describe('App', () => {
     localStorage.clear()
     delete (globalThis as any).__desktopAgentLastSessionViewProps
     delete (globalThis as any).__desktopAgentOpenFiles
+    delete (globalThis as any).__desktopAgentSessionSnapshotOverride
+    delete (globalThis as any).__desktopAgentEmitSnapshot
     delete (window as any).electronAPI
     // Reset fetch mock
     global.fetch = vi.fn(() =>
@@ -205,6 +210,107 @@ describe('App', () => {
     // Initially disconnected until WS connects
     expect(screen.getByText('○ Ready')).toBeInTheDocument()
   })
+  it('opens and refreshes the Skills panel when a skill draft is ready', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({
+      activeSection: 'workspace',
+      activeAgent: 'personal',
+      showTerminal: true,
+      rightZone: 'workspace',
+      rightPanelVisible: true,
+      sidebarCollapsed: true,
+      mainLayout: { center: 70, right: 30 },
+      terminalLayout: { conversation: 76, terminal: 24 },
+    }))
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/skills/drafts')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            drafts: [{
+              id: 'wind-data-reference-1',
+              draft_id: 'wind-data-reference-1',
+              skill_id: 'user:wind-data-reference',
+              name: 'wind-data-reference',
+              description: 'Use when querying WIND financial data.',
+              status: 'draft',
+              source: 'user',
+              scopes: ['coding'],
+              enabledByAgent: { personal: false, coding: true },
+              path: 'AGENTS/skills/.drafts/wind-data-reference-1',
+              validation: { passed: true, issues: [], warnings: [], risks: [] },
+            }],
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/skills')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            skills: [],
+            preferences: { personal: {}, coding: {} },
+            defaults: { personal: {}, coding: {} },
+            presets: [],
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
+        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      }
+      return Promise.resolve({ json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+
+    act(() => {
+      ;(globalThis as any).__desktopAgentEmitSnapshot?.({
+        agentType: 'coding',
+        runEvents: [{
+          id: 'skill-draft-event-1',
+          type: 'skill_draft_ready',
+          runId: 'run-1',
+          timestamp: Date.now(),
+          data: {
+            draft_id: 'wind-data-reference-1',
+            name: 'wind-data-reference',
+          },
+        }],
+      })
+    })
+
+    const draftName = await screen.findByText('wind-data-reference')
+    expect(draftName.closest('[data-highlighted="true"]')).toBeTruthy()
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout).toMatchObject({
+        activeSection: 'skills',
+        activeAgent: 'coding',
+        sidebarCollapsed: false,
+      })
+    })
+  })
+
   it('resolves a coding session when clicking Coding Agent', async () => {
     const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
       if (url.endsWith('/api/sessions/resolve')) {
@@ -266,6 +372,116 @@ describe('App', () => {
       })
     })
     expect(await screen.findByTitle('Coding Agent · Implement tabs')).toBeInTheDocument()
+  })
+
+  it('does not send project_path when resolving a Personal session', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({
+      activeSection: 'workspace',
+      activeAgent: 'coding',
+      showTerminal: true,
+      rightZone: 'workspace',
+      rightPanelVisible: true,
+      sidebarCollapsed: false,
+      mainLayout: { center: 70, right: 30 },
+      terminalLayout: { conversation: 76, terminal: 24 },
+    }))
+    localStorage.setItem('desktop-agent-pane-tree', JSON.stringify({
+      version: 2,
+      focusedLeafId: 'coding-leaf',
+      paneRoot: {
+        type: 'leaf',
+        id: 'coding-leaf',
+        pane: {
+          id: 'pane-coding',
+          sessionId: 'session_coding_existing',
+          model: 'gpt-4o',
+          agentType: 'coding',
+          role: 'code-expert',
+        },
+      },
+    }))
+    const project = { path: 'C:/repo', name: 'repo', git_branch: 'main' }
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
+      if (url.endsWith('/api/sessions/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            session_id: 'session_personal_main',
+            agent_type: 'personal',
+            role_id: 'desktop-agent',
+            model_id: 'gpt-4o',
+            title: '',
+            project_path: null,
+            created: false,
+            is_primary: true,
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(project) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve({ current_project_path: project.path, projects: [], standalone_sessions: [] }) }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          models: [{ id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 }],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByTestId('session-session_coding_existing')
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/refresh'))).toBe(true)
+    })
+    fireEvent.click(screen.getByLabelText('Personal Agent'))
+
+    await waitFor(() => {
+      const resolveCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/sessions/resolve'))
+      expect(resolveCall).toBeTruthy()
+      const body = JSON.parse(String(resolveCall?.[1]?.body))
+      expect(body).toMatchObject({ agent_type: 'personal', policy: 'canonical' })
+      expect(body).not.toHaveProperty('project_path')
+    })
+  })
+
+  it('sends current project_path when resolving a Coding session', async () => {
+    const fetchMock = mockProjectFileFetch('session_coding_project_bound')
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/refresh'))).toBe(true)
+    })
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+
+    await waitFor(() => {
+      const resolveCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/sessions/resolve'))
+      expect(resolveCall).toBeTruthy()
+      expect(JSON.parse(String(resolveCall?.[1]?.body))).toMatchObject({
+        agent_type: 'coding',
+        policy: 'last_or_create',
+        project_path: 'C:/repo',
+      })
+    })
   })
 
   it('does not unmount the current pane when switching to another agent', async () => {

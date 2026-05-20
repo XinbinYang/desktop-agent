@@ -92,6 +92,16 @@ class TestShellExecuteTool:
         expected = agents_dir() / "personal" / "WORKSPACE"
         assert _default_work_dir("personal") == str(expected)
 
+    def test_personal_relative_cwd_resolves_under_runtime_workspace(self):
+        from app.runtime_paths import agents_dir
+        from app.tools.shell_tool import _resolve_shell_cwd
+
+        expected = (agents_dir() / "personal" / "WORKSPACE" / "notes").resolve()
+        resolved, err = _resolve_shell_cwd("notes", "personal")
+
+        assert err is None
+        assert resolved == str(expected)
+
     @pytest.mark.asyncio
     async def test_personal_shell_rejects_protected_agent_cwd(self, tool):
         from app.runtime_paths import agents_dir

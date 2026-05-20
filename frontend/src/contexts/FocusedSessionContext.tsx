@@ -1,5 +1,23 @@
 import React, { createContext, useContext, useCallback, useRef } from 'react';
-import type { ChatMessage, ToolCall, FileEdit, RunEvent, ArtifactItem, EditorGroup, PlanState, PlanDecisionAnswer, ClientChatMode, ThinkingIntensity, AgentType, ContextUsage, ConversationCheckpoint } from '../types';
+import type {
+  ChatMessage,
+  ToolCall,
+  FileEdit,
+  RunEvent,
+  ArtifactItem,
+  EditorGroup,
+  PlanState,
+  PlanDecisionAnswer,
+  ClientChatMode,
+  ThinkingIntensity,
+  AgentType,
+  ContextUsage,
+  ConversationCheckpoint,
+  AutomationSnapshot,
+  AutomationAction,
+  AutomationTrace,
+  AutomationReplayStatus,
+} from '../types';
 
 // ---- Types ----
 
@@ -23,6 +41,10 @@ export interface SessionSnapshot {
   fileEdits: FileEdit[];
   toolCalls: ToolCall[];
   runEvents: RunEvent[];
+  automationSnapshots: AutomationSnapshot[];
+  automationActions: AutomationAction[];
+  automationTraces: AutomationTrace[];
+  automationReplayStatus: AutomationReplayStatus | null;
 }
 export interface SessionActions {
   sendMessage: (text: string, imageBase64?: string, overrides?: { chatMode?: ClientChatMode; thinkingIntensity?: ThinkingIntensity }) => void;

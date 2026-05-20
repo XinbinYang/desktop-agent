@@ -1,6 +1,15 @@
 import React from 'react';
 import { Code, Globe, Package } from 'lucide-react';
-import { OpenFile, EditorGroup, ArtifactItem, ToolCall } from '../../types';
+import {
+  OpenFile,
+  EditorGroup,
+  ArtifactItem,
+  ToolCall,
+  AutomationSnapshot,
+  AutomationAction,
+  AutomationTrace,
+  AutomationReplayStatus,
+} from '../../types';
 import { EditorPanel } from '../EditorPanel/EditorPanel';
 import { ArtifactPanel } from '../ArtifactPanel/ArtifactPanel';
 import { WorkspaceBrowser, type Annotation } from './WorkspaceBrowser';
@@ -26,6 +35,12 @@ interface WorkspacePanelProps {
   artifacts: ArtifactItem[];
   isRunning: boolean;
   latestToolCall: ToolCall | null;
+  automationSnapshots: AutomationSnapshot[];
+  automationActions: AutomationAction[];
+  automationTraces: AutomationTrace[];
+  automationReplayStatus: AutomationReplayStatus | null;
+  onAutomationObserve?: (source?: string) => void;
+  onAutomationReplay?: (traceId: string) => void;
   // Preview
   previewUrl?: string;
   onAnnotate?: (a: Annotation) => void;
@@ -56,6 +71,12 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   artifacts,
   isRunning,
   latestToolCall,
+  automationSnapshots,
+  automationActions,
+  automationTraces,
+  automationReplayStatus,
+  onAutomationObserve,
+  onAutomationReplay,
   // Preview
   previewUrl,
   onAnnotate,
@@ -105,7 +126,17 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
           <WorkspaceBrowser url={previewUrl} onAnnotate={onAnnotate} />
         )}
         {activeView === 'artifacts' && (
-          <ArtifactPanel artifacts={artifacts} isRunning={isRunning} latestToolCall={latestToolCall} />
+          <ArtifactPanel
+            artifacts={artifacts}
+            isRunning={isRunning}
+            latestToolCall={latestToolCall}
+            automationSnapshots={automationSnapshots}
+            automationActions={automationActions}
+            automationTraces={automationTraces}
+            automationReplayStatus={automationReplayStatus}
+            onAutomationObserve={onAutomationObserve}
+            onAutomationReplay={onAutomationReplay}
+          />
         )}
       </div>
     </div>

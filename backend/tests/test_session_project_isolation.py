@@ -27,6 +27,7 @@ def test_effective_path_falls_back_to_global_when_unbound(isolate_projects, tmp_
     proj.mkdir()
     ProjectManager._current_project = {"path": str(proj), "name": "global_proj"}
     assert effective_project_path() == str(proj)
+    assert effective_project_path(allow_global=False) == ""
 
 
 def test_session_binding_overrides_global(isolate_projects, tmp_path):

@@ -62,7 +62,7 @@ class SessionRuntime:
                 raise RuntimeError(f"Session {self.session_id} has been deleted")
             await self._cancel_locked(session, broadcast=False)
             self._loop = asyncio.get_running_loop()
-            self._task = asyncio.create_task(self._run(run_factory))
+            self._task = asyncio.create_task(self._run(session, run_factory))
 
     async def cancel(self, session: Optional[AgentSession] = None, *, broadcast: bool = True) -> None:
         async with self._lock:
@@ -99,13 +99,20 @@ class SessionRuntime:
         with suppress(asyncio.CancelledError):
             await task
 
-    async def _run(self, run_factory: RunFactory) -> None:
+    async def _run(self, session: AgentSession, run_factory: RunFactory) -> None:
         current_task = asyncio.current_task()
         token = set_worker_event_callback(self.publish)
         try:
             async for event in run_factory():
                 self.publish(event)
             self.publish({"type": "done"})
+            if session.agent_type == "personal":
+                try:
+                    from app.agents.heartbeat import HeartbeatEngine
+
+                    await HeartbeatEngine.on_session_end(session.messages, session.session_id)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -135,6 +135,7 @@
 ## 工具使用 / Tool Usage
 
 - **全部工具可用**：browser、desktop、file、shell、wind、knowledge 等。
+- **页面/桌面自动化**：需要观察、点击、输入、滚动或回放 UI 操作时，优先使用 `automation_observe` / `automation_click` / `automation_type` / `automation_key` / `automation_scroll` / `automation_replay`。这些工具会生成元素树、截图和 trace；只有语义定位失败时再退回 `mouse_click` 坐标操作。
 - **桌面操作**：优先使用 `ocr_click` 而非坐标点击。
 - **浏览器**：非 headless 模式，可实时观察操作过程。
 - **危险操作前确认**：删除文件、覆盖未提交修改、rm -rf 等，先问用户。

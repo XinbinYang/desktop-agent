@@ -47,6 +47,10 @@ export const HeartbeatConfig: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full p-4 space-y-4">
+      <div className="-mx-1 rounded border border-border bg-surface-alt px-3 py-2 text-[11px] leading-relaxed text-fg-muted">
+        自动维护由 Agent 在会话结束后运行。用户只需要查看状态，不需要配置或手动触发这些后台任务。
+      </div>
+
       {/* Mood dashboard */}
       <div>
         <div className="flex items-center gap-1.5 mb-3">
@@ -97,16 +101,16 @@ export const HeartbeatConfig: React.FC = () => {
           <span className="text-xs font-medium">HEARTBEAT</span>
         </div>
         <div className="text-[11px] text-fg-muted space-y-1">
-          <p>Heartbeat runs automatically after each session ends:</p>
+          <p>Heartbeat 会在每次会话结束后自动运行：</p>
           <ul className="list-disc list-inside space-y-0.5 ml-1">
-            <li>Writes daily diary entries</li>
-            <li>Scans for pending todos</li>
-            <li>Updates mood based on conversation sentiment</li>
-            <li>Checks if DREAM should be triggered</li>
-            <li>Cleans expired memories (90+ days)</li>
+            <li>写入日记摘要</li>
+            <li>扫描未完成事项</li>
+            <li>根据对话更新状态</li>
+            <li>判断是否需要触发记忆整理</li>
+            <li>清理过期记忆</li>
           </ul>
-          <p className="mt-2 text-[10px]">DREAM triggers when: diary {'>'} 5KB or {'≥'} 5 sessions since last consolidation.</p>
-          <p className="text-[10px]">SELF-EVOLUTION triggers when: {'≥'} 15 tasks complete or {'≥'} 5 user feedback items.</p>
+          <p className="mt-2 text-[10px]">记忆整理触发条件：上次整理后日记 {'>'} 5KB，或累计 {'≥'} 5 次会话。</p>
+          <p className="text-[10px]">能力进化触发条件：累计 {'≥'} 15 个任务，或 {'≥'} 5 条用户反馈。</p>
         </div>
       </div>
     </div>

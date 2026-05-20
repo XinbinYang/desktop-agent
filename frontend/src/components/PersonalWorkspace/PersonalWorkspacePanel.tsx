@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
-import { Brain, FileText, Zap, Activity, Moon } from 'lucide-react';
+import { Brain, FileText, Zap, Activity, Moon, Bot } from 'lucide-react';
 import { cn } from '../ui/cn';
+import type { ArtifactItem, AutomationAction, AutomationReplayStatus, AutomationSnapshot, AutomationTrace, ToolCall } from '../../types';
+import { ArtifactPanel } from '../ArtifactPanel/ArtifactPanel';
 import { SoulEditor } from './SoulEditor';
 import { MemoryManager } from './MemoryManager';
 import { HeartbeatConfig } from './HeartbeatConfig';
@@ -8,27 +10,46 @@ import { LearningsPanel } from './LearningsPanel';
 import { EvolutionPanel } from './EvolutionPanel';
 import { DreamsViewer } from './DreamsViewer';
 
-export type PersonalWorkspaceTab = 'memory' | 'persona' | 'learnings' | 'heartbeat' | 'evolution' | 'dreams';
+export type PersonalWorkspaceTab = 'memory' | 'persona' | 'learnings' | 'heartbeat' | 'evolution' | 'dreams' | 'automation';
 
 const TABS: { id: PersonalWorkspaceTab; icon: React.FC<{ className?: string }>; label: string }[] = [
-  { id: 'persona', icon: FileText, label: '人格' },
-  { id: 'memory', icon: Brain, label: 'Memory OS' },
-  { id: 'learnings', icon: Zap, label: '学习' },
-  { id: 'heartbeat', icon: Activity, label: '心跳' },
-  { id: 'dreams', icon: Moon, label: '梦境' },
-  { id: 'evolution', icon: Zap, label: '进化' },
+  { id: 'persona', icon: FileText, label: '身份与偏好' },
+  { id: 'memory', icon: Brain, label: '记忆' },
+  { id: 'learnings', icon: Zap, label: '学习记录' },
+  { id: 'heartbeat', icon: Activity, label: '自动维护' },
+  { id: 'dreams', icon: Moon, label: '记忆整理' },
+  { id: 'evolution', icon: Zap, label: '能力进化' },
+  { id: 'automation', icon: Bot, label: '自动化' },
 ];
 
 interface PersonalWorkspacePanelProps {
   className?: string;
   activeTabHint?: PersonalWorkspaceTab;
   focusSignal?: number;
+  artifacts?: ArtifactItem[];
+  isRunning?: boolean;
+  latestToolCall?: ToolCall | null;
+  automationSnapshots?: AutomationSnapshot[];
+  automationActions?: AutomationAction[];
+  automationTraces?: AutomationTrace[];
+  automationReplayStatus?: AutomationReplayStatus | null;
+  onAutomationObserve?: (source?: string) => void;
+  onAutomationReplay?: (traceId: string) => void;
 }
 
 export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
   className,
   activeTabHint,
   focusSignal = 0,
+  artifacts = [],
+  isRunning = false,
+  latestToolCall = null,
+  automationSnapshots = [],
+  automationActions = [],
+  automationTraces = [],
+  automationReplayStatus = null,
+  onAutomationObserve,
+  onAutomationReplay,
 }) => {
   const [activeTab, setActiveTab] = useState<PersonalWorkspaceTab>(activeTabHint || 'persona');
 
@@ -64,6 +85,19 @@ export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
         {activeTab === 'heartbeat' && <HeartbeatConfig />}
         {activeTab === 'dreams' && <DreamsViewer />}
         {activeTab === 'evolution' && <EvolutionPanel />}
+        {activeTab === 'automation' && (
+          <ArtifactPanel
+            artifacts={artifacts}
+            isRunning={isRunning}
+            latestToolCall={latestToolCall}
+            automationSnapshots={automationSnapshots}
+            automationActions={automationActions}
+            automationTraces={automationTraces}
+            automationReplayStatus={automationReplayStatus}
+            onAutomationObserve={onAutomationObserve}
+            onAutomationReplay={onAutomationReplay}
+          />
+        )}
       </div>
     </div>
   );

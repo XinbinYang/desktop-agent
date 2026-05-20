@@ -88,6 +88,8 @@ interface SplitPaneOptions {
 }
 
 const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
+const SESSION_HISTORY_POLL_MS = 5000;
+const SPLIT_RESIZE_COMMIT_MS = 80;
 
 function clampSidebarWidth(width: number): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
@@ -383,6 +385,8 @@ export default function App() {
 
   const [focusedSnapshot, setFocusedSnapshot] = useState<SessionSnapshot | null>(null);
   const [focusedActions, setFocusedActions] = useState<SessionActions>(NOOP_ACTIONS);
+  const [skillsRefreshToken, setSkillsRefreshToken] = useState(0);
+  const [highlightedSkillDraftId, setHighlightedSkillDraftId] = useState<string | null>(null);
   // Per-agent "is any session running" — drives the persistent spinner on the
   // ActivityBar agent buttons so a backgrounded agent's work stays visible.
   // Server truth (session-history poll) plus the focused pane's live snapshot.
@@ -420,8 +424,61 @@ export default function App() {
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
   const projectRefreshTimerRef = useRef<number | null>(null);
+  const splitResizeTimersRef = useRef<Record<string, number>>({});
+  const pendingSplitSizesRef = useRef<Record<string, number[]>>({});
   const pendingProjectFileOpenRef = useRef<PendingProjectFileOpen | null>(null);
   const manualProjectLockLeafRef = useRef<string | null>(null);
+  const handledSkillDraftEventsRef = useRef<Set<string>>(new Set());
+  const initializedSkillDraftSessionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!focusedSnapshot) return;
+    const eventKeyFor = (event: NonNullable<SessionSnapshot['runEvents']>[number]) => (
+      event.id || `${event.runId || ''}:${event.data?.draft_id || event.data?.id || ''}:${event.timestamp}`
+    );
+    const draftEvents = (focusedSnapshot.runEvents || [])
+      .filter((event) => event.type === 'skill_draft_ready');
+
+    if (initializedSkillDraftSessionRef.current !== focusedSnapshot.sessionId) {
+      initializedSkillDraftSessionRef.current = focusedSnapshot.sessionId;
+      for (const event of draftEvents) {
+        handledSkillDraftEventsRef.current.add(eventKeyFor(event));
+      }
+      return;
+    }
+
+    const latestDraftEvent = [...draftEvents]
+      .reverse()
+      .find((event) => !handledSkillDraftEventsRef.current.has(eventKeyFor(event)));
+    const draftId = String(
+      latestDraftEvent?.data?.draft_id ||
+      latestDraftEvent?.data?.id ||
+      '',
+    );
+    if (!latestDraftEvent || !draftId) return;
+
+    const eventKey = eventKeyFor(latestDraftEvent);
+    if (handledSkillDraftEventsRef.current.has(eventKey)) return;
+    handledSkillDraftEventsRef.current.add(eventKey);
+    if (handledSkillDraftEventsRef.current.size > 100) {
+      handledSkillDraftEventsRef.current = new Set([...handledSkillDraftEventsRef.current].slice(-50));
+    }
+
+    setHighlightedSkillDraftId(draftId);
+    setSkillsRefreshToken((value) => value + 1);
+    if (focusedSnapshot?.agentType) {
+      layout.setActiveAgent(focusedSnapshot.agentType);
+    }
+    layout.setSidebarCollapsed(false);
+    layout.setActiveSection('skills');
+  }, [
+    focusedSnapshot?.agentType,
+    focusedSnapshot?.runEvents,
+    focusedSnapshot?.sessionId,
+    layout.setActiveAgent,
+    layout.setActiveSection,
+    layout.setSidebarCollapsed,
+  ]);
 
   const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -561,7 +618,7 @@ export default function App() {
     if (layout.activeSection !== 'workspace' && !sessionHistoryHasRunning && !hasMultiplePanes) return;
     const timer = window.setInterval(() => {
       loadSessions(currentProject?.path ?? null);
-    }, 2000);
+    }, SESSION_HISTORY_POLL_MS);
     return () => window.clearInterval(timer);
   }, [currentProject?.path, layout.activeSection, loadSessions, sessionHistoryHasRunning, paneRoot]);
 
@@ -808,7 +865,7 @@ export default function App() {
     policy: 'canonical' | 'last_or_create' | 'new',
     projectPathOverride?: string | null,
   ): Promise<ResolvedSession> => {
-    const projectPath = projectPathOverride ?? currentProject?.path;
+    const projectPath = agentType === 'coding' ? (projectPathOverride ?? currentProject?.path) : null;
     const res = await fetch(`${API_BASE}/api/sessions/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1610,6 +1667,10 @@ export default function App() {
     handleOpenFileFromPanel(path);
   }, [handleOpenFileFromPanel]);
 
+  const handleRevealWorkspaceZone = useCallback(() => {
+    layout.setRightZone('workspace');
+  }, [layout.setRightZone]);
+
   const handleOpenPlanInWorkspace = useCallback(() => {
     revealWorkspaceEditor();
   }, [revealWorkspaceEditor]);
@@ -2052,7 +2113,23 @@ export default function App() {
   }, [agentModel, layout.activeAgent, paneRoot, stopSessionById]);
 
   const handleSplitResize = useCallback((splitId: string, sizes: number[]) => {
-    setPaneRoot((prev) => updateSplitSizes(prev, splitId, sizes));
+    pendingSplitSizesRef.current[splitId] = sizes;
+    if (splitResizeTimersRef.current[splitId]) return;
+    splitResizeTimersRef.current[splitId] = window.setTimeout(() => {
+      const pending = pendingSplitSizesRef.current[splitId];
+      delete pendingSplitSizesRef.current[splitId];
+      delete splitResizeTimersRef.current[splitId];
+      if (!pending) return;
+      setPaneRoot((prev) => updateSplitSizes(prev, splitId, pending));
+    }, SPLIT_RESIZE_COMMIT_MS);
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of Object.values(splitResizeTimersRef.current)) {
+      window.clearTimeout(timer);
+    }
+    splitResizeTimersRef.current = {};
+    pendingSplitSizesRef.current = {};
   }, []);
 
   // ---- Team callbacks ----
@@ -2156,6 +2233,10 @@ export default function App() {
   const rpEdits = focusedSnapshot?.fileEdits ?? [];
   const rpRuns = focusedSnapshot?.runEvents ?? [];
   const rpArtifacts = focusedSnapshot?.artifacts ?? [];
+  const rpAutomationSnapshots = focusedSnapshot?.automationSnapshots ?? [];
+  const rpAutomationActions = focusedSnapshot?.automationActions ?? [];
+  const rpAutomationTraces = focusedSnapshot?.automationTraces ?? [];
+  const rpAutomationReplayStatus = focusedSnapshot?.automationReplayStatus ?? null;
   const rpIsRunning = focusedSnapshot?.isRunning ?? false;
   const rpLatestToolCall = focusedSnapshot?.latestToolCall ?? null;
   const rpEditorGroups = focusedSnapshot?.editorGroups ?? [{ id: 'main', activeFileId: null, openFiles: [] }];
@@ -2239,6 +2320,8 @@ export default function App() {
                 onClear={focusedActions.clearSession}
                 onExecuteTool={focusedActions.executeToolDirect}
                 isConnected={isConnected}
+                skillsRefreshToken={skillsRefreshToken}
+                highlightedSkillDraftId={highlightedSkillDraftId}
                 sessionHistory={sessionHistory}
                 sessions={sessions}
                 currentSession={focusedSessionId}
@@ -2421,6 +2504,7 @@ export default function App() {
                     openRunWorktree={openRunWorktree}
                     handleOpenFileFromPanel={handleOpenFileFromPanel}
                     handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+                    onRevealWorkspace={handleRevealWorkspaceZone}
                     onOpenPlanInWorkspace={handleOpenPlanInWorkspace}
                     onProjectFileEdit={scheduleProjectRefresh}
                   />
@@ -2513,6 +2597,19 @@ export default function App() {
                   <PersonalWorkspacePanel
                     activeTabHint={personalWorkspaceTab}
                     focusSignal={personalWorkspaceFocusSignal}
+                    artifacts={rpArtifacts}
+                    isRunning={rpIsRunning}
+                    latestToolCall={rpLatestToolCall}
+                    automationSnapshots={rpAutomationSnapshots}
+                    automationActions={rpAutomationActions}
+                    automationTraces={rpAutomationTraces}
+                    automationReplayStatus={rpAutomationReplayStatus}
+                    onAutomationObserve={(source = 'auto') => {
+                      focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                    }}
+                    onAutomationReplay={(traceId) => {
+                      focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                    }}
                   />
                 )}
                 {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
@@ -2535,6 +2632,16 @@ export default function App() {
                         artifacts={rpArtifacts}
                         isRunning={rpIsRunning}
                         latestToolCall={rpLatestToolCall}
+                        automationSnapshots={rpAutomationSnapshots}
+                        automationActions={rpAutomationActions}
+                        automationTraces={rpAutomationTraces}
+                        automationReplayStatus={rpAutomationReplayStatus}
+                        onAutomationObserve={(source = 'auto') => {
+                          focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                        }}
+                        onAutomationReplay={(traceId) => {
+                          focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                        }}
                         previewUrl={previewUrl}
                         onAnnotate={(a) => {
                           const msg = `[标注] [${a.url || '预览页面'}] 区域(${a.rect.x}%,${a.rect.y}%,${a.rect.w}%x${a.rect.h}%): ${a.note}`;
