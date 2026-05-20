@@ -135,6 +135,39 @@ async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_personal_explicit_coding_mention_uses_mentioned_project_path(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
+    from app import agent as agent_module
+    from app.agent import AgentSession
+    from app.config import get_model_for_agent
+
+    project = tmp_path / "external-project"
+    project.mkdir()
+    seen = {}
+
+    async def fake_consult_worker(packet, *, run_id, task_id, project_path=""):
+        seen["project_path"] = project_path
+        return ResultPacket(status="pass", summary="External diagnosis.\nACCEPTANCE: PASS"), []
+
+    monkeypatch.setattr(agent_module, "run_consult_worker", fake_consult_worker)
+    session = AgentSession(
+        model_id=get_model_for_agent("personal"),
+        session_id="test_collab_external_path",
+        agent_type="personal",
+    )
+    session._save = lambda: None  # type: ignore[method-assign]
+
+    message = f'@coding agent inspect "{project}"'
+    events = [event async for event in session.run(message)]
+
+    assert any(event["type"] == "collaboration_run_created" for event in events)
+    assert any(
+        event["type"] == "content" and "External diagnosis" in event["data"].get("text", "")
+        for event in events
+    )
+    assert seen["project_path"] == str(project.resolve())
+
+
+@pytest.mark.asyncio
 async def test_personal_explicit_coding_mention_without_project_blocks(monkeypatch, isolated_collaboration_db, isolate_projects):
     from app import agent as agent_module
     from app.agent import AgentSession
@@ -155,6 +188,35 @@ async def test_personal_explicit_coding_mention_without_project_blocks(monkeypat
 
     assert not any(event["type"] == "collaboration_run_created" for event in events)
     assert any(
-        event["type"] == "content" and "需要先打开一个项目" in event["data"].get("text", "")
+        event["type"] == "content" and "target project path" in event["data"].get("text", "")
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_consult_coding_tool_project_path_overrides_current_project(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
+    from app.project_manager import ProjectManager
+    import app.tools.collaboration_tool as collaboration_tool
+    from app.tools.collaboration_tool import ConsultCodingAgentTool
+
+    current = tmp_path / "current-project"
+    target = tmp_path / "target-project"
+    current.mkdir()
+    target.mkdir()
+    ProjectManager.open_project(str(current))
+    seen = {}
+
+    async def fake_consult_worker(packet, *, run_id, task_id, project_path=""):
+        seen["project_path"] = project_path
+        return ResultPacket(status="pass", summary="Override diagnosis.\nACCEPTANCE: PASS"), []
+
+    monkeypatch.setattr(collaboration_tool, "run_consult_worker", fake_consult_worker)
+
+    result = await ConsultCodingAgentTool().execute(
+        goal="inspect config",
+        project_path=str(target),
+        session_id="tool_override",
+    )
+
+    assert not result.error
+    assert seen["project_path"] == str(target.resolve())

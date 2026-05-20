@@ -290,18 +290,37 @@ function sanitizeThinkingPlaceholders(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * Seal the most recent still-open thinking block (frontend-derived
- * completion). Called before appending any non-thinking block and on every
- * turn-ending event, so the live thinking window auto-collapses into a
- * "Thought for Ns" summary and its timer freezes.
+ * Seal every still-open thinking block across all assistant messages
+ * (frontend-derived completion). Called before appending any non-thinking
+ * block and on every turn-ending event, so the live thinking windows
+ * auto-collapse into "Thought for Ns" summaries and their timers freeze.
+ *
+ * A single turn can produce multiple thinking blocks (one per
+ * reason/tool/reason iteration); a naive seal-the-latest would leave earlier
+ * thinking chips stuck on `status: 'running'`, which keeps the activity
+ * drawer summary showing "正在处理 …" forever.
  */
+export function __completeOpenThinkingForTests(messages: ChatMessage[]): ChatMessage[] {
+  return completeOpenThinking(messages);
+}
+
 function completeOpenThinking(messages: ChatMessage[]): ChatMessage[] {
-  const result = mergeBlock(
-    messages,
-    (b) => b.type === 'thinking' && !(b as { complete?: boolean }).complete,
-    (b) => ({ ...b, complete: true, endedAt: Date.now() } as AssistantBlock),
-  );
-  return result ?? messages;
+  const now = Date.now();
+  let changed = false;
+  const updated = messages.map((msg) => {
+    if (msg.role !== 'assistant' || !msg.blocks) return msg;
+    let blocksChanged = false;
+    const blocks = msg.blocks.map((block) => {
+      if (block.type !== 'thinking') return block;
+      if ((block as { complete?: boolean }).complete) return block;
+      blocksChanged = true;
+      return { ...block, complete: true, endedAt: now } as AssistantBlock;
+    });
+    if (!blocksChanged) return msg;
+    changed = true;
+    return { ...msg, blocks };
+  });
+  return changed ? updated : messages;
 }
 
 function isDispatchTool(name?: string): boolean {

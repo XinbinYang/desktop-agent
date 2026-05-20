@@ -94,6 +94,18 @@ describe('useWebSocket', () => {
     expect(MockWebSocket).not.toHaveBeenCalled()
   })
 
+  it('does not open an unauthenticated WebSocket while auth status is unknown', async () => {
+    vi.mocked(global.fetch).mockRejectedValue(new Error('backend still starting'))
+    const onMessage = vi.fn()
+
+    renderHook(() => useWebSocket('test-session', onMessage))
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalled()
+    })
+    expect(MockWebSocket).not.toHaveBeenCalled()
+  })
+
   it('sets isConnected to true on open', async () => {
     const onMessage = vi.fn()
     const { result } = renderHook(() => useWebSocket('test-session', onMessage))

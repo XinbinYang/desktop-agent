@@ -104,8 +104,8 @@ async def run_execute_agent_events(
         session_id=f"{session_id}_coding_delegate_{run_id[-6:]}",
         role_id=AgentManager.get_default_role("coding"),
         agent_type="coding",
+        project_path=project_path or None,
     )
-    coding_session.project_path = project_path or None
     # Keep delegated specialist sessions out of the user's visible session list.
     coding_session._save = lambda: None  # type: ignore[method-assign]
     async for event in coding_session.run(_task_text(packet), None, chat_mode="agent"):

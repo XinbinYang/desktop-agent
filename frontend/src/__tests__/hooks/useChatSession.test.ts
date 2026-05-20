@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
-import { useChatSession } from '../../hooks/useChatSession'
-import type { WS_EVENT } from '../../types'
+import { useChatSession, __completeOpenThinkingForTests } from '../../hooks/useChatSession'
+import type { ChatMessage, WS_EVENT } from '../../types'
 import { loadSession, deleteSessionData } from '../../lib/db'
 
 // Mock useWebSocket
@@ -1593,5 +1593,48 @@ describe('useChatSession', () => {
     expect(result.current.chatMode).toBe('plan')
     expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
     localStorage.setItem('desktop-agent-chat-mode', 'agent')
+  })
+})
+
+describe('completeOpenThinking', () => {
+  it('seals every open thinking block across all assistant messages, not just the last', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: '',
+        isTool: false,
+        turnComplete: false,
+        blocks: [
+          { type: 'thinking', text: 'first thought', timestamp: 1, startedAt: 1 },
+          { type: 'tool_call', name: 'list', args: {}, result: 'ok', status: 'success', toolCallId: 'c1', timestamp: 2 },
+          { type: 'thinking', text: 'second thought', timestamp: 3, startedAt: 3 },
+          { type: 'thinking', text: 'third thought', timestamp: 4, startedAt: 4 },
+        ],
+      },
+    ]
+
+    const updated = __completeOpenThinkingForTests(messages)
+    const thinkingBlocks = (updated[0].blocks || []).filter((b) => b.type === 'thinking') as Array<{ complete?: boolean; endedAt?: number }>
+    expect(thinkingBlocks).toHaveLength(3)
+    expect(thinkingBlocks.every((b) => b.complete === true)).toBe(true)
+    expect(thinkingBlocks.every((b) => typeof b.endedAt === 'number')).toBe(true)
+  })
+
+  it('leaves already-complete thinking blocks untouched and returns the same reference when nothing changes', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: 'done',
+        isTool: false,
+        turnComplete: true,
+        blocks: [
+          { type: 'thinking', text: 'thought', timestamp: 1, startedAt: 1, endedAt: 5, complete: true },
+        ],
+      },
+    ]
+    const updated = __completeOpenThinkingForTests(messages)
+    expect(updated).toBe(messages)
   })
 })

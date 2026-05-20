@@ -186,6 +186,8 @@ class AgentManager:
             "and final user-facing summary.\n"
             "- Coding Agent is an engineering specialist. Use `consult_coding_agent` for read-only diagnosis "
             "and `delegate_to_coding_agent` for implementation, verification, or code review tasks.\n"
+            "- Coding delegation is task-scoped. Pass `project_path` or mention an absolute local project "
+            "directory when the target is not the current UI project.\n"
             "- If the user explicitly writes `@coding agent`, prioritize delegation for that turn. "
             "Do not reinterpret it as a normal mention or a page switch.\n"
             "- For ordinary code-intent messages, suggest or use Coding Agent according to collaboration settings. "
@@ -296,6 +298,8 @@ class AgentManager:
             "for a scoped summary instead of reading Personal Agent private memory directly.\n"
             "- Respect the task packet: mode, constraints, allowed tools, acceptance criteria, and owner. "
             "For consult mode, stay read-only. For execute mode, implement only the requested scope.\n"
+            "- Treat the current task target injected by the host as the authoritative project. It may differ "
+            "from the UI-selected project and from any historical PROJECT.md seed file.\n"
             "- Return evidence: changed files, verification commands, review findings, blockers, and "
             "ACCEPTANCE: PASS or ACCEPTANCE: FAIL."
         )
@@ -305,12 +309,7 @@ class AgentManager:
         if soul:
             parts.append(soul)
 
-        # 3. Project context
-        project_md = cls._load_workspace_file("coding", "PROJECT.md")
-        if project_md:
-            parts.append(project_md)
-
-        # 4. Shared preferences
+        # 3. Shared preferences
         shared_prefs = cls._load_workspace_file("_shared", "user_preferences.md")
         if shared_prefs:
             parts.append(shared_prefs)
@@ -319,12 +318,12 @@ class AgentManager:
         if cross_agent_memory:
             parts.append("## Cross-Agent Memory\n" + _truncate(cross_agent_memory, 3000))
 
-        # 5. Shared base rules
+        # 4. Shared base rules
         base_rules = cls._load_workspace_file("_shared", "base_rules.md")
         if base_rules:
             parts.append(base_rules)
 
-        # 6. Tools (filtered for coding)
+        # 5. Tools (filtered for coding)
         parts.append(tools_desc)
 
         return "\n\n".join(p for p in parts if p)

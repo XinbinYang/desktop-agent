@@ -53,6 +53,7 @@ class TestAgentManagerPromptRendering:
         prompt = session._build_system_prompt()
 
         assert "## Current Project" not in prompt
+        assert "## Current Task Target" not in prompt
         assert str(project) not in prompt
         assert "PROJECT_RULE_SENTINEL" not in prompt
 
@@ -90,6 +91,7 @@ class TestAgentManagerPromptRendering:
         (agents_root / "_shared").mkdir(parents=True)
         (agents_root / "coding" / "AGENTS.md").write_text("Coding Agent rules", encoding="utf-8")
         (agents_root / "coding" / "SOUL.md").write_text("Coding Agent soul", encoding="utf-8")
+        (agents_root / "coding" / "PROJECT.md").write_text("STALE_PROJECT_SENTINEL", encoding="utf-8")
         (agents_root / "_shared" / "base_rules.md").write_text("Shared rules", encoding="utf-8")
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
 
@@ -101,8 +103,9 @@ class TestAgentManagerPromptRendering:
         session._last_user_message = "inspect project"
         prompt = session._build_system_prompt()
 
-        assert "## Current Project" in prompt
+        assert "## Current Task Target" in prompt
         assert str(project) in prompt
+        assert "STALE_PROJECT_SENTINEL" not in prompt
 
     def test_missing_workspace_file_does_not_crash(self, monkeypatch, tmp_path):
         """If a workspace file is missing, rendering must not crash."""

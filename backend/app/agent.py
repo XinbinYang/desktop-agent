@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import ntpath
@@ -35,6 +36,7 @@ from app.collaboration.manager import (
 )
 from app.collaboration.models import ResultPacket, TaskPacket
 from app.collaboration.parser import CodingMention, classify_coding_intent, parse_coding_mention
+from app.collaboration.targeting import resolve_collaboration_target
 from app.models import ModelRouter
 from app.memory import build_memory_prompt
 from app.project_manager import ProjectManager
@@ -623,7 +625,14 @@ def _completion_quality_payload(
 class AgentSession:
     MAX_HISTORY_MESSAGES = 20
 
-    def __init__(self, model_id: str, session_id: str = "default", role_id: str = "desktop-agent", agent_type: str | None = None):
+    def __init__(
+        self,
+        model_id: str,
+        session_id: str = "default",
+        role_id: str = "desktop-agent",
+        agent_type: str | None = None,
+        project_path: str | None = None,
+    ):
         self.session_id = session_id
         # agent_type is the new primary field; role_id kept for backward compat
         self._agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
@@ -679,7 +688,9 @@ class AgentSession:
         # Project this session is bound to. Set at resolve time and persisted.
         # Authoritative for this session's execution — independent of the
         # global ProjectManager.get_current() (which is now UI-only).
-        self.project_path: str | None = None
+        self.project_path: str | None = (
+            _canonical_project_path(project_path) if self._agent_type == "coding" and project_path else None
+        )
         self._setup_system_prompt()
 
     @property
@@ -737,7 +748,7 @@ class AgentSession:
             project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
 
         if project:
-            project_ctx = "\n\n## Current Project\n"
+            project_ctx = "\n\n## Current Task Target\n"
             project_ctx += f"- Name: {project['name']}\n"
             project_ctx += f"- Path: {project['path']}\n"
             if project.get("git_branch"):
@@ -1113,6 +1124,7 @@ class AgentSession:
             "requested_via": mention.raw,
             "original_message": original_input,
             "project_path": project_path,
+            "target_project_path": project_path,
             "personal_ownership": "Personal Agent owns the final user-facing answer.",
         }
         if resolved_input and resolved_input != original_input:
@@ -1213,12 +1225,13 @@ class AgentSession:
                 "verification_passed": None,
                 "review_passed": None,
             }, outer_run_id)
-            self._save()
+            await asyncio.sleep(0)
+            await self._save_async()
             return
 
-        project_path = effective_project_path(allow_global=True)
-        if not project_path:
-            text = "需要先打开一个项目，或在任务里提供明确项目路径，然后我才能把项目代码任务交给 Coding Agent。"
+        target = resolve_collaboration_target(user_message=original_input, allow_global=True)
+        if not target.ok:
+            text = target.error
             assistant_msg = {"role": "assistant", "content": text}
             self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
             self.messages.append(assistant_msg)
@@ -1230,8 +1243,12 @@ class AgentSession:
                 "verification_passed": None,
                 "review_passed": None,
             }, outer_run_id)
-            self._save()
+            await asyncio.sleep(0)
+            await self._save_async()
             return
+        project_path = target.project_path
+        if resolved_input == original_input:
+            resolved_input = resolve_mentions(original_input, project_path)
 
         packet = self._collaboration_packet(
             mention,
@@ -1361,7 +1378,8 @@ class AgentSession:
             "collaboration_run_id": collab_run.run_id,
             "collaboration_task_id": task.task_id,
         }, outer_run_id)
-        self._save()
+        await asyncio.sleep(0)
+        await self._save_async()
 
     def _stamp_message(
         self,
@@ -2610,7 +2628,7 @@ class AgentSession:
                 session_project_token = None
 
         if self._repair_incomplete_tool_call_history():
-            self._save()
+            await self._save_async()
 
         if user_input and not is_plan_continue:
             if self.chat_mode == "plan" and self.plan_state.phase == "awaiting_decision":
@@ -2627,7 +2645,8 @@ class AgentSession:
                     "review_passed": None,
                 }, run_id)
                 close_coding_run("completed", "Plan mode is awaiting decisions.")
-                self._save()
+                await asyncio.sleep(0)
+                await self._save_async()
                 return
 
             # Explicit delegation has priority over Personal's normal reasoning turn.
@@ -2639,13 +2658,11 @@ class AgentSession:
                 and getattr(settings, "collaboration_enabled", True)
                 and coding_mention is not None
             ):
-                delegation_project_path = effective_project_path(allow_global=True)
-                resolved_input = resolve_mentions(user_input, delegation_project_path) if delegation_project_path else user_input
                 self._last_user_message = user_input
                 async for event in self._handle_coding_mention(
                     coding_mention,
                     original_input=user_input,
-                    resolved_input=resolved_input,
+                    resolved_input=user_input,
                     image_base64=image_base64,
                     outer_run_id=run_id,
                 ):
@@ -2660,7 +2677,10 @@ class AgentSession:
             project_path = effective_project_path(allow_global=self._agent_type == "coding")
             resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
 
-            delegation_project_path = effective_project_path(allow_global=True) if self._agent_type == "personal" else project_path
+            delegation_project_path = project_path
+            if self._agent_type == "personal":
+                delegation_target = resolve_collaboration_target(user_message=user_input, allow_global=True)
+                delegation_project_path = delegation_target.project_path if delegation_target.ok else ""
             if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
@@ -3087,7 +3107,7 @@ class AgentSession:
                             "pending_clarification": self.plan_state.pending_clarification,
                         }, run_id)
                         yield self._event("plan_status", self._plan_event_payload(), run_id)
-                        self._save()
+                        await self._save_async()
                         yield self._event("context_usage", self.context_usage(), run_id)
                         yield self._event("status", {"status": "completed"}, run_id)
                         plan_turn_done = True
@@ -3125,7 +3145,7 @@ class AgentSession:
                 if self._has_applied_task_guidance():
                     yield self._event("status", {"status": "thinking"}, run_id)
                     continue
-                self._save()
+                await self._save_async()
                 yield self._event("status", {"status": "completed"}, run_id)
                 finished = True
                 break
@@ -3347,7 +3367,7 @@ class AgentSession:
                     # card ticks item-by-item (do not batch / wait for turn end).
                     self._apply_todo_updates(tc_result.metadata.get("payload") or {})
                     self._auto_advance_pending_todos()
-                    self._save()
+                    await self._save_async()
                     yield self._event("todo_update", {
                         "todos": [t.model_dump() for t in self.plan_state.todos],
                     }, run_id)
@@ -3360,7 +3380,7 @@ class AgentSession:
                         )
                     ):
                         self.plan_state.transition_to("completed")
-                        self._save()
+                        await self._save_async()
                         yield self._event("plan_status", self._plan_event_payload(), run_id)
                     # NOTE: deliberately NOT setting plan_turn_done — execution
                     # must continue to the next todo within the same run.
@@ -3413,7 +3433,7 @@ class AgentSession:
                     checkpoint_id=active_checkpoint_id,
                 )
             self.messages.extend(tool_results)
-            self._save()
+            await self._save_async()
             yield self._event("context_usage", self.context_usage(), run_id)
             yield self._event("status", {"status": "thinking"}, run_id)
 
@@ -3467,8 +3487,9 @@ class AgentSession:
             "summary": completion_summary,
             **completion_quality,
         }, run_id)
+        await asyncio.sleep(0)
         close_coding_run(completion_status, completion_summary, completion_quality)
-        self._save()
+        await self._save_async()
 
     def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "", tool_error: str = "") -> bool:
         """Best-effort todo progression after worker dispatch tools (plan execution). Returns True if todos changed."""
@@ -3708,13 +3729,13 @@ class AgentSession:
             if not summary or len(summary) < 10:
                 if trigger != "manual":
                     self.compaction_state["last_auto_error"] = "Compaction summary was empty or too short."
-                    self._save()
+                    await self._save_async()
                 return None
         except Exception as e:
             logger.warning("Context compaction failed: %s", e)
             if trigger != "manual":
                 self.compaction_state["last_auto_error"] = str(e)[:500]
-                self._save()
+                await self._save_async()
             return None
 
         last_summarized = to_summarize[-1]
@@ -3736,7 +3757,7 @@ class AgentSession:
             before_count,
             usage.get("context_message_count", after_count),
         )
-        self._save()
+        await self._save_async()
         return {
             "skipped": False,
             "summary": self.compaction_summary,
@@ -3875,7 +3896,7 @@ class AgentSession:
         }
         self._stamp_message(assistant_msg)
         self.messages.append(assistant_msg)
-        self._save()
+        await self._save_async()
         yield self._event("content", {"text": text}, run_id)
         yield self._event("context_usage", self.context_usage(), run_id)
         yield self._event("status", {"status": "completed"}, run_id)
@@ -3995,10 +4016,9 @@ class AgentSession:
             # session can still serve native tools.
             self._mcp_tools_dirty = True
 
-    def _save(self):
+    def _build_save_payload(self) -> Tuple[Dict[str, Any], Path]:
         path = SESSIONS_DIR / f"{self.session_id}.json"
         self._ensure_message_metadata()
-        # Extract title from first user message
         title = ""
         for m in self.messages:
             if m.get("role") == "user" and m.get("source") != "internal":
@@ -4013,6 +4033,10 @@ class AgentSession:
         stored_project_path = None if self._agent_type == "personal" else _canonical_project_path(self.project_path)
         self.project_path = stored_project_path
 
+        # Shallow-copy mutable containers so a concurrently-running next turn
+        # (started after this turn's `done` event but before _save_async completes
+        # in its worker thread) cannot mutate the structures while json.dumps
+        # iterates them. Individual message dicts are stable once appended.
         data = {
             "session_id": self.session_id,
             "model_id": self.model_id,
@@ -4020,9 +4044,9 @@ class AgentSession:
             "agent_type": self._agent_type,
             "project_path": self.project_path,
             "context_epoch": self.context_epoch,
-            "agent_models": self._agent_models,
-            "agent_thinking": self._agent_thinking,
-            "messages": self.messages,
+            "agent_models": dict(self._agent_models),
+            "agent_thinking": dict(self._agent_thinking),
+            "messages": list(self.messages),
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
             "thinking_intensity": self.thinking_intensity,
@@ -4030,18 +4054,33 @@ class AgentSession:
             "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
             "compaction_summary": self.compaction_summary,
             "compaction_state": self._normalize_compaction_state(self.compaction_state),
-            "last_usage": self._last_usage,
-            "last_context_usage": self._last_context_usage,
+            "last_usage": dict(self._last_usage) if isinstance(self._last_usage, dict) else self._last_usage,
+            "last_context_usage": dict(self._last_context_usage) if isinstance(self._last_context_usage, dict) else self._last_context_usage,
             "archived_at": self.archived_at,
             "title": title,
             "project_path": stored_project_path,
         }
+        return data, path
+
+    @staticmethod
+    def _write_save_payload(data: Dict[str, Any], path: Path) -> None:
         try:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, path)
         except OSError:
             pass
+
+    def _save(self):
+        # Synchronous path retained for non-coroutine callers (startup, migrations).
+        # In async contexts inside run(), prefer _save_async to avoid blocking the
+        # event loop while serializing/writing potentially large session JSON.
+        data, path = self._build_save_payload()
+        self._write_save_payload(data, path)
+
+    async def _save_async(self) -> None:
+        data, path = self._build_save_payload()
+        await asyncio.to_thread(self._write_save_payload, data, path)
 
     @classmethod
     def load(cls, session_id: str) -> Optional["AgentSession"]:

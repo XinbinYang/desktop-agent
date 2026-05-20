@@ -422,14 +422,20 @@ const PersonalActivityDrawer: React.FC<{
   turnComplete?: boolean;
   searchQuery?: string;
   projectPath?: string | null;
-}> = ({ activities, turnComplete, searchQuery = '', projectPath }) => {
+  isLatest?: boolean;
+  isRunning?: boolean;
+}> = ({ activities, turnComplete, searchQuery = '', projectPath, isLatest = false, isRunning = false }) => {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
   const query = searchQuery.trim().toLowerCase();
   const hasRunning = activities.some((activity) => activity.status === 'running');
-  const defaultOpen = hasRunning || turnComplete === false;
+  // "正在处理…" should only show on the latest assistant turn AND while the
+  // global isRunning flag is true. Past turns always read as "我处理了…"
+  // even if a stale activity chip never got its terminal status.
+  const activeRunning = isLatest && isRunning && (hasRunning || turnComplete === false);
+  const defaultOpen = activeRunning;
   const forceOpenForSearch = !!query && activities.some((activity) => activityMatchesSearch(activity, query));
   const open = forceOpenForSearch || (manualOpen ?? defaultOpen);
-  const summary = summarizeActivities(activities, hasRunning || turnComplete === false);
+  const summary = summarizeActivities(activities, activeRunning);
 
   if (activities.length === 0) return null;
 
@@ -502,6 +508,8 @@ const PersonalMessageItem: React.FC<{
             turnComplete={item.turnComplete}
             searchQuery={searchQuery}
             projectPath={projectPath}
+            isLatest={isLastAssistant}
+            isRunning={isRunning}
           />
         )}
       </div>
