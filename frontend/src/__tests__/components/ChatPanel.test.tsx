@@ -384,6 +384,47 @@ describe('ChatPanel', () => {
     expect(within(timeline).getByText(/modify secret-notes\.md/)).toBeInTheDocument()
   })
 
+  it('renders Personal assistant URL images and opens preview', () => {
+    const onOpenImage = vi.fn()
+    const messages: ChatMessage[] = [{
+      id: 'a-image',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      turnComplete: true,
+      blocks: [{
+        type: 'image',
+        image: {
+          url: '/preview/session-1/chart.png',
+          title: 'Equity curve',
+          mimeType: 'image/png',
+        },
+        url: '/preview/session-1/chart.png',
+        title: 'Equity curve',
+        mimeType: 'image/png',
+        timestamp: Date.UTC(2026, 4, 20, 10, 0, 0),
+      }],
+    }]
+
+    render(
+      <PersonalChatSurface
+        messages={messages}
+        planState={idlePlanState}
+        isRunning={false}
+        onOpenImage={onOpenImage}
+        emptyPlaceholder={<div />}
+        markdownTheme="light"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open assistant image' }))
+
+    expect(onOpenImage).toHaveBeenCalledWith({
+      src: 'http://127.0.0.1:8765/preview/session-1/chart.png',
+      alt: 'Equity curve',
+    })
+  })
+
   it('filters Personal v2 after building the full conversation so fallback activity stays on its original turn', () => {
     const messages: ChatMessage[] = [
       {
@@ -464,6 +505,41 @@ describe('ChatPanel', () => {
 
     expect((globalThis as any).__chatPanelVirtuosoProps.alignToBottom).toBe(true)
     expect((globalThis as any).__chatPanelVirtuosoProps.initialTopMostItemIndex).toEqual({
+      index: 'LAST',
+      align: 'end',
+    })
+  })
+
+  it('keeps Personal sessions at the latest message when switching into Plan mode', () => {
+    const messages: ChatMessage[] = [
+      { id: 'u-plan-old', role: 'user', content: 'old question', isTool: false },
+      { id: 'a-plan-old', role: 'assistant', content: 'old answer', isTool: false, turnComplete: true },
+      { id: 'u-plan-new', role: 'user', content: 'latest question', isTool: false },
+    ]
+
+    const { rerender } = render(
+      <ChatPanel
+        {...defaultProps}
+        sessionId="personal-plan-mode-switch-bottom"
+        agentType="personal"
+        messages={messages}
+        chatMode="agent"
+      />,
+    )
+
+    rerender(
+      <ChatPanel
+        {...defaultProps}
+        sessionId="personal-plan-mode-switch-bottom"
+        agentType="personal"
+        messages={messages}
+        chatMode="plan"
+      />,
+    )
+
+    const props = (globalThis as any).__chatPanelVirtuosoProps
+    expect(props.data[0].kind).toBe('user')
+    expect(props.initialTopMostItemIndex).toEqual({
       index: 'LAST',
       align: 'end',
     })
@@ -768,6 +844,7 @@ describe('ChatPanel', () => {
       blocks: [{ type: 'thinking', text: 'Waiting for model response...', timestamp: Date.now(), startedAt: Date.now() }],
     }]
     render(<ChatPanel {...defaultProps} messages={messages} isRunning={true} />)
+    expect(screen.getByTestId('personal-chat-v2')).toBeInTheDocument()
     expect(screen.getAllByText('Thinking').length).toBeGreaterThan(0)
   })
 
@@ -1186,7 +1263,30 @@ describe('ChatPanel', () => {
     fireEvent.change(input, { target: { value: 'prefer the smaller fix' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
-    expect(onQueueTaskGuidance).toHaveBeenCalledWith('prefer the smaller fix', undefined)
+    expect(onQueueTaskGuidance).toHaveBeenCalledWith('prefer the smaller fix', undefined, { applyNow: false })
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onStop).not.toHaveBeenCalled()
+  })
+
+  it('submits task guidance immediately without stopping while running', () => {
+    const onSend = vi.fn()
+    const onStop = vi.fn()
+    const onQueueTaskGuidance = vi.fn()
+    render(
+      <ChatPanel
+        {...defaultProps}
+        isRunning={true}
+        onSend={onSend}
+        onStop={onStop}
+        onQueueTaskGuidance={onQueueTaskGuidance}
+      />,
+    )
+
+    const input = screen.getByPlaceholderText('Type a message... (Shift+Enter for new line)')
+    fireEvent.change(input, { target: { value: 'read this before the next step' } })
+    fireEvent.click(screen.getByLabelText('Submit task guidance now'))
+
+    expect(onQueueTaskGuidance).toHaveBeenCalledWith('read this before the next step', undefined, { applyNow: true })
     expect(onSend).not.toHaveBeenCalled()
     expect(onStop).not.toHaveBeenCalled()
   })
@@ -1211,8 +1311,8 @@ describe('ChatPanel', () => {
       />,
     )
 
-    expect(screen.getByText('任务引导队列 (1)')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('任务引导'))
+    expect(screen.getByText('任务引导 (1)')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('提交排队项'))
     expect(onApplyTaskGuidance).toHaveBeenCalled()
     fireEvent.click(screen.getByLabelText('Remove guidance'))
     expect(onDeleteTaskGuidance).toHaveBeenCalledWith('tg_1')
@@ -1234,7 +1334,7 @@ describe('ChatPanel', () => {
       />,
     )
 
-    expect(screen.queryByText('任务引导队列 (1)')).not.toBeInTheDocument()
+    expect(screen.queryByText('任务引导 (1)')).not.toBeInTheDocument()
   })
 
   it('does not render stale task guidance as a queue item', () => {
@@ -1251,7 +1351,7 @@ describe('ChatPanel', () => {
       />,
     )
 
-    expect(screen.queryByText('任务引导队列 (1)')).not.toBeInTheDocument()
+    expect(screen.queryByText('任务引导 (1)')).not.toBeInTheDocument()
   })
 
   it('renders context meter and compacts on click', () => {
@@ -1292,7 +1392,10 @@ describe('ChatPanel', () => {
         ],
       },
     ]
-    render(<ChatPanel {...defaultProps} messages={messages} />)
+    // Activity drawer auto-opens only on the latest assistant turn while
+    // the agent is actively running. We pass isRunning=true to simulate
+    // the live mid-turn state this test exercises.
+    render(<ChatPanel {...defaultProps} messages={messages} isRunning={true} />)
     // In-progress thinking stays out of the main reading path until opened.
     const timeline = screen.getByTestId('personal-chat-v2')
     expect(within(timeline).getByText('Thinking')).toBeInTheDocument()
@@ -1381,6 +1484,19 @@ describe('ChatPanel', () => {
       align: 'start',
     })
     expect((globalThis as any).__chatPanelVirtuosoProps.restoreStateFrom).toBeUndefined()
+  })
+
+  it('uses stable timeline event ids for Virtuoso item keys', () => {
+    const messages: ChatMessage[] = [
+      { id: 'user-stable-key', role: 'user', content: 'hello', isTool: false },
+      { id: 'assistant-stable-key', role: 'assistant', content: 'hi', isTool: false, turnComplete: true },
+    ]
+
+    render(<ChatPanel {...defaultProps} agentType="coding" messages={messages} />)
+
+    const props = (globalThis as any).__chatPanelVirtuosoProps
+    expect(props.computeItemKey(0, props.data[0])).toBe(props.data[0].id)
+    expect(props.computeItemKey(1, props.data[1])).toBe(props.data[1].id)
   })
 
   it('clamps restored scroll index to projected timeline length', () => {

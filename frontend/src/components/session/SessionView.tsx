@@ -13,11 +13,53 @@ import type {
   ClientChatMode,
   ThinkingIntensity,
   AgentType,
+  ArtifactPayload,
 } from '../../types';
 import { API_BASE } from '../../config';
 import { getLangFromFilename } from '../../lib/language';
+import { normalizeArtifactPayloads } from '../../lib/imageAttachments';
 
 // ---- Types ----
+
+function previewUrl(url?: string): string | undefined {
+  if (!url) return undefined;
+  if (url.startsWith('/')) return `${API_BASE}${url}`;
+  return url;
+}
+
+function artifactPayloadToItem(payload: ArtifactPayload, sourceTool: string): ArtifactItem | null {
+  const allowedTypes: ArtifactItem['type'][] = ['web', 'image', 'data', 'code', 'terminal', 'video', 'office', 'office_package'];
+  if (!allowedTypes.includes(payload.type as ArtifactItem['type'])) return null;
+  const title = payload.title || payload.path?.split(/[\\/]/).pop() || 'Artifact';
+  return {
+    id: payload.id || `artifact_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+    type: payload.type as ArtifactItem['type'],
+    title,
+    content: payload.content,
+    url: previewUrl(payload.url),
+    base64: payload.base64,
+    mimeType: payload.mimeType || payload.mime_type,
+    path: payload.path,
+    caption: payload.caption,
+    timestamp: payload.timestamp || Date.now(),
+    sourceTool: payload.sourceTool || payload.source_tool || payload.source || sourceTool,
+    size: payload.size,
+    kind: payload.kind,
+    files: payload.files,
+    previews: payload.previews,
+    qaSummary: payload.qa_summary,
+    engine: payload.engine,
+    officeManifestId: payload.office_manifest_id,
+    manifestPath: payload.manifest_path,
+    manifestUrl: payload.manifest_url,
+    viewerManifestUrl: payload.viewer_manifest_url,
+    sha256: payload.sha256,
+    renderIssues: payload.render_issues,
+    availableActions: payload.available_actions,
+    workbook: payload.workbook,
+    presentation: payload.presentation,
+  };
+}
 
 interface SessionViewProps {
   sessionId: string;
@@ -46,7 +88,7 @@ export interface SessionViewHandle {
     relativePath: string,
     content: string,
     language: string,
-    options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> & { groupId?: EditorGroup['id'] },
+    options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned' | 'viewerType' | 'artifact' | 'absolutePath' | 'mimeType' | 'size' | 'binaryReason'>> & { groupId?: EditorGroup['id'] },
   ) => void;
   switchModel: (modelId: string) => void;
   openRewind: () => void;
@@ -131,9 +173,13 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
     thinkingIntensity,
     setThinkingIntensity,
     planState,
+    collaborationState,
     approvePlan,
     buildPlan,
     pauseBuild,
+    pauseCollaboration,
+    cancelCollaboration,
+    answerCollaborationClarification,
     endBuild,
     rejectPlan,
     updatePlanDecision,
@@ -165,8 +211,9 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       relativePath: string,
       content: string,
       language: string,
-      options: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned'>> & { groupId?: EditorGroup['id'] } = {},
+      options: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned' | 'viewerType' | 'artifact' | 'absolutePath' | 'mimeType' | 'size' | 'binaryReason'>> & { groupId?: EditorGroup['id'] } = {},
     ) => {
+      const { groupId, ...fileOptions } = options;
       const normalizedPath = relativePath.replace(/\\/g, '/');
       const openFile: OpenFile = {
         id: generateId(),
@@ -175,13 +222,12 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         content,
         language,
         isModified: false,
-        source: options.source || 'project',
-        readOnly: options.readOnly,
-        isPinned: options.isPinned,
+        ...fileOptions,
+        source: fileOptions.source || 'project',
       };
 
       setEditorGroups((prev) => {
-        const targetGroupId: EditorGroup['id'] = options.groupId === 'secondary' ? 'secondary' : 'main';
+        const targetGroupId: EditorGroup['id'] = groupId === 'secondary' ? 'secondary' : 'main';
         let groups = prev;
         if (targetGroupId === 'secondary' && !groups.some((group) => group.id === 'secondary')) {
           groups = [...groups, { id: 'secondary', activeFileId: null, openFiles: [] }];
@@ -219,7 +265,7 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
       });
 
       onRevealWorkspace?.();
-      if (options.groupId === 'secondary') {
+      if (groupId === 'secondary') {
         setActiveEditorGroup('secondary');
       }
     },
@@ -248,6 +294,25 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
   useEffect(() => {
     onToolCallRef.current = (tc: ToolCall) => {
       setLatestToolCall(tc);
+      const payloadArtifacts = normalizeArtifactPayloads(tc.artifacts);
+      if (payloadArtifacts.length > 0) {
+        const items = payloadArtifacts
+          .map((payload) => artifactPayloadToItem(payload, tc.name))
+          .filter((item): item is ArtifactItem => Boolean(item));
+        if (items.length > 0) {
+          setArtifacts((prev) => {
+            const seen = new Set(prev.map((item) => item.id || item.url || item.path || item.title));
+            const additions = items.filter((item) => {
+              const key = item.id || item.url || item.path || item.title;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+            return additions.length > 0 ? [...prev, ...additions] : prev;
+          });
+          if (isFocused) onRevealWorkspace?.();
+        }
+      }
 
       if (tc.name === 'file_write') {
         const path: string = tc.args?.path || '';
@@ -275,6 +340,9 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
           content = tc.result || '';
         } else if (['mp4', 'webm', 'mov'].includes(ext || '')) {
           type = 'video';
+          url = `${API_BASE}/preview/${filename}`;
+        } else if (['xlsx', 'xls', 'pptx', 'ppt'].includes(ext || '')) {
+          type = 'office';
           url = `${API_BASE}/preview/${filename}`;
         }
 
@@ -530,10 +598,14 @@ export const SessionView = forwardRef<SessionViewHandle, SessionViewProps>(funct
         thinkingIntensity={thinkingIntensity}
         onThinkingIntensityChange={setThinkingIntensity}
         planState={planState}
+        collaborationState={collaborationState}
         onApprovePlan={approvePlan}
         onBuildPlan={buildPlan}
         onPauseBuild={pauseBuild}
         onEndBuild={endBuild}
+        onPauseCollaboration={pauseCollaboration}
+        onCancelCollaboration={cancelCollaboration}
+        onAnswerCollaborationClarification={answerCollaborationClarification}
         onRejectPlan={rejectPlan}
         onUpdatePlanDecision={updatePlanDecision}
         onSubmitPlanDecisions={submitPlanDecisions}

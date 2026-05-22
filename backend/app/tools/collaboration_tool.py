@@ -1,20 +1,57 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import sqlite3
+import time
+import uuid
+from typing import Any, Dict, List, Optional
 
 from app.collaboration.executor import (
+    record_delegated_child_event,
     result_from_execute_events,
     run_consult_worker,
+    run_critic_loop_events,
     run_execute_agent_events,
+    run_plan_then_execute_events,
+    run_verify_only_events,
 )
 from app.coding_runs import effective_project_path
 from app.collaboration.manager import add_task, complete_run, create_run, list_events, update_task
-from app.collaboration.models import TaskPacket
+from app.collaboration.models import ResultPacket, TaskPacket
 from app.collaboration.targeting import resolve_collaboration_target
+from app.runtime_paths import runtime_file
 from app.tools.base import BaseTool, ToolResult
 
 def _event_payloads(run_id: str) -> List[Dict[str, Any]]:
     return [event.model_dump() for event in list_events(run_id)]
+
+
+def _format_result_output(result: ResultPacket, *, run_id: str) -> str:
+    lines = [
+        f"Collaboration run: {run_id}",
+        f"Status: {result.status}",
+        "",
+        result.summary or result.details or "(no summary)",
+    ]
+    if result.changed_files:
+        lines.extend(["", "Changed files:", *[f"- {path}" for path in result.changed_files[:20]]])
+    if result.tests_run:
+        lines.extend(["", "Verification:", *[f"- {item}" for item in result.tests_run[:10]]])
+    elif result.verification_passed is False:
+        lines.extend(["", "Verification:", "- Required verification did not pass."])
+    if result.review_passed is not None:
+        lines.extend(["", "Review:", f"- {'Passed' if result.review_passed else 'Failed or blocked'}"])
+    if result.artifacts:
+        lines.extend([
+            "",
+            "Artifacts:",
+            *[
+                f"- {artifact.title or artifact.id}: {artifact.path or artifact.url or artifact.id}"
+                for artifact in result.artifacts[:10]
+            ],
+        ])
+    if result.blockers:
+        lines.extend(["", "Blockers:", *[f"- {item}" for item in result.blockers[:10]]])
+    return "\n".join(lines).strip()
 
 
 class ConsultCodingAgentTool(BaseTool):
@@ -78,16 +115,18 @@ class ConsultCodingAgentTool(BaseTool):
         )
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
-        result, _worker_events = await run_consult_worker(
+        result, worker_events = await run_consult_worker(
             packet,
             run_id=collab.run_id,
             task_id=task.task_id,
             project_path=resolved_project_path,
         )
+        for event in worker_events:
+            record_delegated_child_event(collab.run_id, task.task_id, event)
         update_task(task.task_id, status="completed" if result.status == "pass" else "failed", result=result)
         complete_run(collab.run_id, "completed" if result.status == "pass" else "failed", result.summary)
         return ToolResult(
-            output=result.summary or result.details,
+            output=_format_result_output(result, run_id=collab.run_id),
             metadata={
                 "collaboration_run_id": collab.run_id,
                 "collaboration_task_id": task.task_id,
@@ -118,6 +157,11 @@ class DelegateToCodingAgentTool(BaseTool):
                 "items": {"type": "string"},
                 "description": "Boundaries and forbidden actions.",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["execute", "plan_then_execute", "critic", "verify_only"],
+                "description": "Execution workflow. Defaults to execute.",
+            },
         },
         "required": ["goal"],
     }
@@ -129,10 +173,13 @@ class DelegateToCodingAgentTool(BaseTool):
         context: Dict[str, Any] | None = None,
         acceptance_criteria: List[str] | None = None,
         constraints: List[str] | None = None,
+        mode: str = "execute",
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
     ) -> ToolResult:
+        if mode not in {"execute", "plan_then_execute", "critic", "verify_only"}:
+            mode = "execute"
         target = resolve_collaboration_target(
             project_path=project_path,
             context=context,
@@ -145,12 +192,12 @@ class DelegateToCodingAgentTool(BaseTool):
         collab = create_run(
             session_id=session_id or "default",
             goal=goal,
-            mode="execute",
+            mode=mode,
             project_path=resolved_project_path,
         )
         packet = TaskPacket(
             goal=goal,
-            mode="execute",
+            mode=mode,  # type: ignore[arg-type]
             user_intent=goal,
             context={**(context or {}), "project_path": resolved_project_path, "target_source": target.source},
             acceptance_criteria=acceptance_criteria or ["Implementation satisfies the user goal.", "Verification evidence is reported."],
@@ -159,18 +206,51 @@ class DelegateToCodingAgentTool(BaseTool):
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
         events: List[Dict[str, Any]] = []
-        async for event in run_execute_agent_events(
-            packet,
-            session_id=session_id or "default",
-            run_id=collab.run_id,
-            project_path=resolved_project_path,
-        ):
+        if mode == "plan_then_execute":
+            iterator = run_plan_then_execute_events(
+                packet,
+                session_id=session_id or "default",
+                run_id=collab.run_id,
+                task_id=task.task_id,
+                project_path=resolved_project_path,
+            )
+        elif mode == "critic":
+            iterator = run_critic_loop_events(
+                packet,
+                session_id=session_id or "default",
+                run_id=collab.run_id,
+                task_id=task.task_id,
+                project_path=resolved_project_path,
+            )
+        elif mode == "verify_only":
+            iterator = run_verify_only_events(
+                packet,
+                run_id=collab.run_id,
+                task_id=task.task_id,
+                project_path=resolved_project_path,
+            )
+        else:
+            iterator = run_execute_agent_events(
+                packet,
+                session_id=session_id or "default",
+                run_id=collab.run_id,
+                task_id=task.task_id,
+                project_path=resolved_project_path,
+        )
+        async for event in iterator:
             events.append(event)
+            record_delegated_child_event(collab.run_id, task.task_id, event)
         result = result_from_execute_events(events)
-        update_task(task.task_id, status="completed" if result.status == "pass" else "failed", result=result)
-        complete_run(collab.run_id, "completed" if result.status == "pass" else "failed", result.summary)
+        task_status = "completed" if result.status == "pass" else ("blocked" if result.status == "blocked" else "failed")
+        update_task(task.task_id, status=task_status, result=result)
+        complete_run(
+            collab.run_id,
+            "completed" if result.status == "pass" else "failed",
+            result.summary,
+            artifacts=result.artifacts,
+        )
         return ToolResult(
-            output=result.summary or result.details,
+            output=_format_result_output(result, run_id=collab.run_id),
             metadata={
                 "collaboration_run_id": collab.run_id,
                 "collaboration_task_id": task.task_id,
@@ -203,4 +283,157 @@ class RequestPersonalContextTool(BaseTool):
             f"Shared user preferences:\n{prefs or '(none)'}\n\n"
             f"Cross-agent memory:\n{cross or '(none)'}"
         )
+        return ToolResult(output=output)
+
+
+class RequestPersonalClarificationTool(BaseTool):
+    name = "request_personal_clarification"
+    description = (
+        "Ask the Personal Agent for a mid-task decision when a delegated Coding Agent "
+        "is blocked by product intent, user preference, or a non-obvious tradeoff. "
+        "Use this instead of guessing on user-visible behavior or risky choices."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The concise question the Personal Agent should answer.",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional concrete choices, with your recommended choice first when possible.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Brief technical context and why this cannot be safely inferred.",
+            },
+            "recommendation": {
+                "type": "string",
+                "description": "Optional recommended answer and rationale.",
+            },
+        },
+        "required": ["question"],
+    }
+
+    async def execute(
+        self,
+        question: str,
+        options: List[str] | None = None,
+        context: str = "",
+        recommendation: str = "",
+        run_id: str = "",
+        tool_call_id: str = "",
+    ) -> ToolResult:
+        clean_options = [str(item).strip() for item in (options or []) if str(item).strip()]
+        request_id = f"clar_{uuid.uuid4().hex[:12]}"
+        payload = {
+            "request_id": request_id,
+            "question": str(question or "").strip(),
+            "options": clean_options[:8],
+            "context": str(context or "").strip()[:4000],
+            "recommendation": str(recommendation or "").strip()[:2000],
+            "agent_run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "created_at": time.time(),
+        }
+        lines = [
+            "[WAITING_FOR_PERSONAL_CLARIFICATION]",
+            f"request_id: {request_id}",
+            f"question: {payload['question']}",
+        ]
+        if clean_options:
+            lines.append("options:")
+            lines.extend(f"- {item}" for item in clean_options[:8])
+        if recommendation:
+            lines.append(f"recommendation: {payload['recommendation']}")
+        return ToolResult(
+            output="\n".join(lines),
+            metadata={"collaboration_clarification_request": payload},
+        )
+
+
+class CollabHistorySearchTool(BaseTool):
+    name = "collab_history_search"
+    description = (
+        "Search past collaboration runs with the Coding Agent. "
+        "Returns compact RecapSummaries of matching runs so Personal Agent can recall what was done."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Keywords to match against run goals and summaries.",
+            },
+            "last_n": {
+                "type": "integer",
+                "description": "Maximum number of runs to return (default 10).",
+            },
+            "status_filter": {
+                "type": "string",
+                "enum": ["completed", "failed", "cancelled", "any"],
+                "description": "Filter by run status (default 'any').",
+            },
+        },
+        "required": ["query"],
+    }
+
+    async def execute(
+        self,
+        query: str,
+        last_n: int = 10,
+        status_filter: Optional[str] = None,
+        session_id: str = "",
+        run_id: str = "",
+        tool_call_id: str = "",
+    ) -> ToolResult:
+        from app.collaboration.recap import recap_from_events
+
+        db_path = runtime_file("data", "collaboration_runs.db")
+        if not db_path.exists():
+            return ToolResult(output="No collaboration history found.")
+
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+
+            sql = "SELECT * FROM collaboration_runs WHERE 1=1"
+            params: list = []
+
+            if status_filter and status_filter != "any":
+                sql += " AND status = ?"
+                params.append(status_filter)
+
+            if query:
+                sql += " AND (goal LIKE ? OR summary LIKE ?)"
+                like = f"%{query}%"
+                params.extend([like, like])
+
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(max(1, min(last_n, 50)))
+
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+        except Exception as exc:
+            return ToolResult(error=f"Database error: {exc}")
+
+        if not rows:
+            return ToolResult(output=f"No collaboration runs found matching '{query}'.")
+
+        parts: List[str] = []
+        for row in rows:
+            run_id_row = row["run_id"]
+            goal = row["goal"] or ""
+            status = row["status"]
+            summary = row["summary"] or ""
+
+            # Build a minimal recap without hitting the DB again (use stored summary)
+            line = f"[{run_id_row}] {status.upper()} — {goal[:80]}"
+            if summary:
+                line += f"\n  摘要: {summary[:120]}"
+            parts.append(line)
+
+        output = f"找到 {len(parts)} 条协作记录（查询: '{query}'）:\n\n" + "\n\n".join(parts)
         return ToolResult(output=output)

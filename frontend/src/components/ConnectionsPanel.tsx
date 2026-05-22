@@ -15,6 +15,27 @@ function fmtUptime(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+function errorDetailMessage(detail: any, fallback: string): string {
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return detail;
+  if (typeof detail.message === 'string') return detail.message;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return fallback;
+  }
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export function ConnectionsPanel() {
   const [connectors, setConnectors] = useState<ConnectorInfo[]>([]);
   const [operatingId, setOperatingId] = useState<string | null>(null);
@@ -46,10 +67,14 @@ export function ConnectionsPanel() {
       const res = await fetch(`${API_BASE}/api/connectors/${name}/start`, { method: 'POST' });
       if (!res.ok) {
         const detail = await res.json();
-        setError(detail.detail || `启动失败: ${name}`);
+        setError(errorDetailMessage(detail.detail, `启动失败: ${name}`));
       }
       await loadConnectors();
     } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        setError(`保存超时：后端 ${API_BASE} 当前无响应，请稍后重试或重启后端。`);
+        return false;
+      }
       setError(`启动失败: ${err.message || err}`);
     } finally {
       setOperatingId(null);
@@ -76,7 +101,7 @@ export function ConnectionsPanel() {
       const res = await fetch(`${API_BASE}/api/connectors/${name}/restart`, { method: 'POST' });
       if (!res.ok) {
         const detail = await res.json();
-        setError(detail.detail || `重启失败: ${name}`);
+        setError(errorDetailMessage(detail.detail, `重启失败: ${name}`));
       }
       await loadConnectors();
     } catch (err: any) {
@@ -107,7 +132,12 @@ export function ConnectionsPanel() {
     const props = schema?.properties || {};
 
     for (const key of Object.keys(props)) {
-      fields[key] = c.config?.[key] ?? props[key]?.default ?? (props[key]?.type === 'boolean' ? false : '');
+      const stored = c.config?.[key];
+      if (props[key]?.sensitive && stored && typeof stored === 'object') {
+        fields[key] = '';
+      } else {
+        fields[key] = stored ?? props[key]?.default ?? (props[key]?.type === 'boolean' ? false : '');
+      }
       showValue[key] = !props[key]?.sensitive;
     }
 
@@ -128,41 +158,61 @@ export function ConnectionsPanel() {
     setEditing({ ...editing, showValue: { ...editing.showValue, [key]: !editing.showValue[key] } });
   };
 
-  const handleSave = async () => {
-    if (!editing) return;
-    setOperatingId(editing.connectorName);
+  const saveConnectorConfig = async (edit: EditState, closeOnSuccess: boolean) => {
+    setOperatingId(edit.connectorName);
     setError(null);
     try {
-      await fetch(`${API_BASE}/api/connectors/${editing.connectorName}`, {
+      const res = await fetchWithTimeout(`${API_BASE}/api/connectors/${edit.connectorName}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: editing.fields }),
+        body: JSON.stringify({ config: edit.fields }),
       });
-      setEditing(null);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(errorDetailMessage(data.detail, `Save failed: ${edit.connectorName}`));
+      }
+      if (closeOnSuccess) {
+        setEditing(null);
+      }
       await loadConnectors();
+      return true;
     } catch (err: any) {
       setError(`保存失败: ${err.message || err}`);
+      return false;
     } finally {
       setOperatingId(null);
     }
   };
 
+  const handleSave = async () => {
+    if (!editing) return;
+    await saveConnectorConfig(editing, true);
+  };
+
   const handleTestMessage = async (name: string) => {
+    if (editing?.connectorName === name) {
+      const saved = await saveConnectorConfig(editing, false);
+      if (!saved) return;
+    }
     setTestingId(name);
     setError(null);
     setTestStatus((prev) => ({ ...prev, [name]: '' }));
     try {
-      const res = await fetch(`${API_BASE}/api/connectors/${name}/test-message`, {
+      const res = await fetchWithTimeout(`${API_BASE}/api/connectors/${name}/test-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: 'Desktop Agent connector test message.' }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.detail || 'Test message failed');
+        throw new Error(errorDetailMessage(data.detail, 'Test message failed'));
       }
       setTestStatus((prev) => ({ ...prev, [name]: 'Test message sent' }));
     } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        setError(`Test message failed: 后端 ${API_BASE} 当前无响应，请稍后重试或重启后端。`);
+        return;
+      }
       setError(`Test message failed: ${err.message || err}`);
     } finally {
       setTestingId(null);
@@ -295,6 +345,11 @@ export function ConnectionsPanel() {
                       {c.status_message}
                     </p>
                   )}
+                  {!c.status_message && c.last_error && (
+                    <p className="text-[10px] mt-0.5 truncate text-danger" title={c.last_error}>
+                      {c.last_error}
+                    </p>
+                  )}
 
                   {/* Edit area */}
                   {editing?.connectorName === c.name && c.config_schema?.properties ? (
@@ -302,6 +357,8 @@ export function ConnectionsPanel() {
                       {Object.entries(c.config_schema.properties).map(([key, prop]: [string, any]) => {
                         const isSensitive = prop.sensitive;
                         const show = editing.showValue[key] ?? !isSensitive;
+                        const stored = c.config?.[key];
+                        const masked = isSensitive && stored && typeof stored === 'object' ? stored.masked : '';
                         const enumOptions = Array.isArray(prop.enum) ? prop.enum : [];
                         const enumLabels = prop.enumLabels || {};
                         const isBoolean = prop.type === 'boolean';
@@ -338,7 +395,7 @@ export function ConnectionsPanel() {
                                   type={show ? 'text' : 'password'}
                                   value={String(editing.fields[key] || '')}
                                   onChange={(e) => updateField(key, e.target.value)}
-                                  placeholder={prop.description || `输入 ${prop.label || key}...`}
+                                  placeholder={masked || prop.description || `输入 ${prop.label || key}...`}
                                   className="flex-1 text-xs bg-surface border border-border rounded px-2 py-1 outline-none text-fg focus:border-accent focus:ring-1 focus:ring-accent/30"
                                 />
                               )}

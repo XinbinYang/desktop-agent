@@ -58,6 +58,7 @@ function renderPane(node: PaneNode, overrides: Partial<React.ComponentProps<type
     node,
     focusedLeafId: 'a',
     onFocus: vi.fn(),
+    onMinimizePane: vi.fn(),
     onClosePane: vi.fn(),
     onSplit: vi.fn(),
     onMoveSession: vi.fn(),
@@ -110,6 +111,18 @@ describe('PaneRenderer', () => {
     expect(onSplit).toHaveBeenCalledWith('a', 'horizontal', { placement: 'after', agentType: 'coding' });
   });
 
+  it('minimizes a pane without closing it', () => {
+    const onMinimizePane = vi.fn();
+    const onClosePane = vi.fn();
+
+    renderPane(leaf('a'), { onMinimizePane, onClosePane });
+
+    fireEvent.click(screen.getByLabelText('Minimize pane'));
+
+    expect(onMinimizePane).toHaveBeenCalledWith('a');
+    expect(onClosePane).not.toHaveBeenCalled();
+  });
+
   it('starts pane drags from the drag handle and includes session metadata', () => {
     renderPane(leaf('a', 'pane-a', 'session-a'));
     const dataTransfer = {
@@ -148,6 +161,14 @@ describe('PaneRenderer', () => {
     expect(screen.getByText('Personal Agent')).toBeInTheDocument();
     expect(screen.getByText('Planning work')).toBeInTheDocument();
     expect(screen.getByDisplayValue('GPT Test')).toBeInTheDocument();
+  });
+
+  it('uses flatter chrome when rendered inside the floating chat dock', () => {
+    renderPane(leaf('a', 'pane-a', 'session-a'), { chrome: 'floating' });
+
+    const paneShell = screen.getByTestId('session-session-a').parentElement?.parentElement;
+    expect(paneShell?.className).toContain('bg-transparent');
+    expect(paneShell?.className).not.toContain('border rounded');
   });
 
   it('uses the Personal identity profile name instead of the selected role name', () => {

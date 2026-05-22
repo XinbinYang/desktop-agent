@@ -13,8 +13,9 @@ const connectorResponse = {
       enabled: false,
       uptime_seconds: 0,
       config: {
-        bot_token: 'masked',
+        bot_token: { configured: true, masked: 'disc...1234' },
         target_agent: 'personal',
+        tool_visibility: 'silent',
         notifications_enabled: false,
         notification_channel_id: '123',
       },
@@ -35,6 +36,16 @@ const connectorResponse = {
               coding: 'Coding Agent',
             },
             default: 'personal',
+          },
+          tool_visibility: {
+            type: 'string',
+            label: 'Tool Visibility',
+            enum: ['silent', 'debug'],
+            enumLabels: {
+              silent: 'Silent (final replies only)',
+              debug: 'Debug (show tool cards)',
+            },
+            default: 'silent',
           },
           notifications_enabled: {
             type: 'boolean',
@@ -85,9 +96,14 @@ describe('ConnectionsPanel', () => {
     expect(await screen.findByText('Discord')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('Configure connector'));
 
-    const select = container.querySelector('select');
+    const selects = container.querySelectorAll('select');
+    const select = selects[0];
     expect(select).not.toBeNull();
     expect(select?.value).toBe('personal');
+    expect(selects[1]?.value).toBe('silent');
+    const sensitiveInput = container.querySelector('input[type="password"]') as HTMLInputElement | null;
+    expect(sensitiveInput?.value).toBe('');
+    expect(sensitiveInput?.placeholder).toBe('disc...1234');
 
     fireEvent.change(select!, { target: { value: 'coding' } });
     fireEvent.click(screen.getByTitle('Save connector config'));
@@ -108,10 +124,12 @@ describe('ConnectionsPanel', () => {
   });
 
   it('sends a connector test message from the edit form', async () => {
-    render(<ConnectionsPanel />);
+    const { container } = render(<ConnectionsPanel />);
 
     expect(await screen.findByText('Discord')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('Configure connector'));
+    const channelInput = screen.getByDisplayValue('123');
+    fireEvent.change(channelInput, { target: { value: '456' } });
     fireEvent.click(screen.getByText('Test message'));
 
     await waitFor(() => {
@@ -120,5 +138,19 @@ describe('ConnectionsPanel', () => {
         expect.objectContaining({ method: 'POST' }),
       );
     });
+    const putCallIndex = fetchMock.mock.calls.findIndex(([, init]) => init?.method === 'PUT');
+    const postCallIndex = fetchMock.mock.calls.findIndex(
+      ([url, init]) => String(url).endsWith('/test-message') && init?.method === 'POST',
+    );
+    expect(putCallIndex).toBeGreaterThanOrEqual(0);
+    expect(postCallIndex).toBeGreaterThan(putCallIndex);
+    const putCall = fetchMock.mock.calls[putCallIndex];
+    expect(JSON.parse(String(putCall?.[1]?.body))).toMatchObject({
+      config: {
+        bot_token: '',
+        notification_channel_id: '456',
+      },
+    });
+    expect(container.querySelector('select')?.value).toBe('personal');
   });
 });

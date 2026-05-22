@@ -54,6 +54,8 @@ class MemoryPatchRequest(BaseModel):
     tier: Optional[str] = None
     confidence: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
+    canonical_key: Optional[str] = None
+    superseded_by: Optional[str] = None
 
 
 @router.get("")
@@ -196,6 +198,12 @@ async def rebuild_memory_index():
     return _memory_os().rebuild_from_workspace()
 
 
+@router.post("/personal/memory/repair")
+async def repair_memory_state():
+    """Back up and compact duplicated Personal memory maintenance artifacts."""
+    return _memory_os().repair_runtime_state()
+
+
 @router.patch("/personal/memory/items/{item_id}")
 async def patch_memory_item(item_id: str, req: MemoryPatchRequest):
     """Edit a Memory OS item and write an audit record."""
@@ -275,7 +283,7 @@ async def get_dreams():
 @router.post("/personal/dream/trigger")
 async def trigger_dream():
     """Manually trigger a DREAM consolidation cycle."""
-    result = await DreamEngine.run()
+    result = await DreamEngine.run(force=True)
     return result
 
 

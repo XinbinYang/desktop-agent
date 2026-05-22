@@ -1,4 +1,5 @@
 import React from 'react';
+import { File as FileGlyph, FileCode, FileImage, FileSpreadsheet, FileWarning, Presentation } from 'lucide-react';
 import { OpenFile } from '../../types';
 
 interface EditorTabBarProps {
@@ -50,7 +51,7 @@ export const EditorTabBar: React.FC<EditorTabBarProps> = ({
             title={file.path}
           >
             {/* 文件类型图标 */}
-            <FileIcon lang={file.language} />
+            <FileIcon file={file} />
             
             {/* 文件名 */}
             <span className="truncate flex-1">{file.name}</span>
@@ -91,7 +92,19 @@ export const EditorTabBar: React.FC<EditorTabBarProps> = ({
   );
 };
 
-function FileIcon({ lang }: { lang: string }) {
+function FileIcon({ file }: { file: OpenFile }) {
+  if (file.viewerType === 'office') {
+    const OfficeIcon = file.language === 'ppt' ? Presentation : FileSpreadsheet;
+    return <OfficeIcon className="w-3.5 h-3.5 shrink-0 text-emerald-500" />;
+  }
+  if (file.viewerType === 'image') {
+    return <FileImage className="w-3.5 h-3.5 shrink-0 text-sky-500" />;
+  }
+  if (file.viewerType === 'binary') {
+    return <FileWarning className="w-3.5 h-3.5 shrink-0 text-amber-500" />;
+  }
+
+  const lang = file.language;
   // 根据语言返回颜色
   const colorMap: Record<string, string> = {
     python: 'text-yellow-400',
@@ -114,9 +127,6 @@ function FileIcon({ lang }: { lang: string }) {
   };
   const color = colorMap[lang] || 'text-fg-secondary';
 
-  return (
-    <svg className={`w-3.5 h-3.5 shrink-0 ${color}`} fill="currentColor" viewBox="0 0 20 20">
-      <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd" />
-    </svg>
-  );
+  const CodeLikeIcon = color === 'text-fg-secondary' ? FileGlyph : FileCode;
+  return <CodeLikeIcon className={`w-3.5 h-3.5 shrink-0 ${color}`} />;
 }

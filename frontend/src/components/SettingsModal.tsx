@@ -45,6 +45,16 @@ function providerInitial(name: string): string {
   return name.charAt(0).toUpperCase();
 }
 
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 function getProviderIcon(name: string): React.ReactNode {
   const color = providerColor(name);
   const initial = providerInitial(name);
@@ -340,7 +350,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await fetchSettings();
       onSettingsChanged();
     } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        setError(`保存超时：后端 ${API_BASE} 当前无响应，请稍后重试或重启后端。`);
+      } else {
       setError(e.message || '保存失败');
+      }
     } finally {
       setSaving(false);
     }
@@ -501,7 +515,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         if (!ok) { setSaving(false); return; }
       }
       if (generalForm) {
-        await fetch(`${API_BASE}/api/settings`, {
+        await fetchWithTimeout(`${API_BASE}/api/settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(generalSettingsPayload(generalForm)),
@@ -510,10 +524,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (webSearchForm) {
         await saveWebSearchForm();
       }
-      await fetch(`${API_BASE}/api/config/reload`, { method: 'POST' });
+      await fetchWithTimeout(`${API_BASE}/api/config/reload`, { method: 'POST' });
       onSettingsChanged();
       onClose();
     } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        setError(`保存超时：后端 ${API_BASE} 当前无响应，请稍后重试或重启后端。`);
+        return;
+      }
       setError(e.message || '保存失败');
     } finally {
       setSaving(false);
@@ -842,7 +860,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </select>
                 </div>
                 <div>
-                  <label className="text-xs text-fg-secondary block mb-1">最大并行子 Agent 数</label>
+                  <label className="text-xs text-fg-secondary block mb-1">Coding auto delegation</label>
+                  <select
+                    value={generalForm.auto_delegate_coding || 'policy_v2'}
+                    onChange={(e) =>
+                      setGeneralForm({
+                        ...generalForm,
+                        auto_delegate_coding: e.target.value,
+                      })}
+                    className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
+                  >
+                    <option value="policy_v2">Smart auto delegation</option>
+                    <option value="suggest">Suggest only</option>
+                    <option value="always_for_code">Simple auto rules</option>
+                    <option value="safe_only">Safe consult only</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-fg-secondary block mb-1">Max parallel sub-agents</label>
                   <input
                     type="number"
                     min={1}

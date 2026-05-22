@@ -24,6 +24,22 @@ from app.tools.wind_tool import (
 from app.tools.backtest_tool import (
     StrategyListTool, BacktestRunTool, BacktestReportTool
 )
+from app.tools.artifact_tool import ImagePublishTool, OfficePublishTool
+from app.tools.office_tool import (
+    ExcelCreateTool,
+    ExcelEditTool,
+    ExcelInspectTool,
+    ExcelRenderTool,
+    ExcelValidateTool,
+    OfficePackageCreateTool,
+    OfficePackagePublishTool,
+    OfficePackageQATool,
+    PptCreateTool,
+    PptEditTool,
+    PptInspectTool,
+    PptRenderTool,
+    PptValidateTool,
+)
 from app.tools.wind_sync_tool import WindSyncTool
 from app.tools.git_tool import (
     GitCloneTool, GitStatusTool, GitDiffTool, GitCommitTool,
@@ -62,8 +78,10 @@ from app.tools.memory_tool import (
     MemoryRebuildTool,
 )
 from app.tools.collaboration_tool import (
+    CollabHistorySearchTool,
     ConsultCodingAgentTool,
     DelegateToCodingAgentTool,
+    RequestPersonalClarificationTool,
     RequestPersonalContextTool,
 )
 from app.tools.skill_tool import (
@@ -73,6 +91,14 @@ from app.tools.skill_tool import (
     SkillPublishTool,
     SkillReadTool,
     SkillValidateTool,
+)
+from app.tools.connector_tool import (
+    ConnectorDoctorTool,
+    ConnectorStartTool,
+    ConnectorStatusTool,
+    ConnectorStopTool,
+    ConnectorTestTool,
+    ConnectorUpdateTool,
 )
 
 # 全局工具注册表
@@ -120,6 +146,21 @@ ALL_TOOLS: list[BaseTool] = [
     StrategyListTool(),
     BacktestRunTool(),
     BacktestReportTool(),
+    ImagePublishTool(),
+    OfficePublishTool(),
+    ExcelInspectTool(),
+    ExcelCreateTool(),
+    ExcelEditTool(),
+    ExcelValidateTool(),
+    ExcelRenderTool(),
+    PptInspectTool(),
+    PptCreateTool(),
+    PptEditTool(),
+    PptValidateTool(),
+    PptRenderTool(),
+    OfficePackageCreateTool(),
+    OfficePackageQATool(),
+    OfficePackagePublishTool(),
     # WIND 数据同步工具
     WindSyncTool(),
     # Git 工具
@@ -176,12 +217,20 @@ ALL_TOOLS: list[BaseTool] = [
     ConsultCodingAgentTool(),
     DelegateToCodingAgentTool(),
     RequestPersonalContextTool(),
+    RequestPersonalClarificationTool(),
+    CollabHistorySearchTool(),
     SkillDraftSaveTool(),
     SkillValidateTool(),
     SkillPublishTool(),
     SkillListTool(),
     SkillReadTool(),
     SkillArchiveTool(),
+    ConnectorStatusTool(),
+    ConnectorUpdateTool(),
+    ConnectorStartTool(),
+    ConnectorStopTool(),
+    ConnectorTestTool(),
+    ConnectorDoctorTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
@@ -203,7 +252,7 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     # Worker dispatch
     "dispatch_worker", "dispatch_parallel",
     # Collaboration
-    "request_personal_context",
+    "request_personal_context", "request_personal_clarification",
     # Skill authoring
     "skill_draft_save", "skill_validate", "skill_publish",
     "skill_list", "skill_read", "skill_archive",
@@ -218,6 +267,10 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     # Screenshot / browser (for debugging UI)
     "screenshot", "browser_navigate", "browser_screenshot",
     "get_screen_size",
+    "image_publish",
+    "office_publish", "excel_inspect", "excel_create", "excel_edit", "excel_validate", "excel_render",
+    "ppt_inspect", "ppt_create", "ppt_edit", "ppt_validate", "ppt_render",
+    "office_package_create", "office_package_qa", "office_package_publish",
     # OCR (for reading error dialogs, etc.)
     "ocr_read", "ocr_click", "ocr_find",
     # Unified browser/desktop automation
@@ -235,7 +288,10 @@ PERSONAL_AGENT_TOOLS: frozenset[str] = frozenset({
     "press_key", "scroll", "get_screen_size",
     "app_open", "app_list_windows", "app_find_window", "app_click", "app_type",
     "wind_wsd", "wind_wss", "wind_wset", "wind_edb", "wind_tdays", "wind_sync",
-    "strategy_list", "backtest_run", "backtest_report",
+    "strategy_list", "backtest_run", "backtest_report", "image_publish",
+    "office_publish", "excel_inspect", "excel_create", "excel_edit", "excel_validate", "excel_render",
+    "ppt_inspect", "ppt_create", "ppt_edit", "ppt_validate", "ppt_render",
+    "office_package_create", "office_package_qa", "office_package_publish",
     "knowledge_index", "knowledge_search", "knowledge_list", "knowledge_clear",
     "workflow_record", "workflow_stop", "workflow_list", "workflow_run",
     "consult_coding_agent", "delegate_to_coding_agent",
@@ -247,6 +303,8 @@ PERSONAL_AGENT_TOOLS: frozenset[str] = frozenset({
     "memory_rebuild", "memory_handoff_write", "memory_list",
     "skill_draft_save", "skill_validate", "skill_publish",
     "skill_list", "skill_read", "skill_archive",
+    "connector_status", "connector_update", "connector_start",
+    "connector_stop", "connector_test", "connector_doctor",
 })
 
 
@@ -301,16 +359,35 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     "WIND 金融数据": ["wind_wsd", "wind_wss", "wind_wset", "wind_edb", "wind_tdays", "wind_sync"],
     "策略回测": ["strategy_list", "backtest_run", "backtest_report"],
     "工作流": ["workflow_record", "workflow_stop", "workflow_list", "workflow_run"],
+    "Artifacts": [
+        "image_publish", "office_publish",
+        "excel_inspect", "excel_create", "excel_edit", "excel_validate", "excel_render",
+        "ppt_inspect", "ppt_create", "ppt_edit", "ppt_validate", "ppt_render",
+        "office_package_create", "office_package_qa", "office_package_publish",
+    ],
     "Coding Agent": [
         "repo_map", "code_search", "file_outline",
         "verify_project", "run_review", "worktree_status",
     ],
     "Worker 派发": ["dispatch_worker", "dispatch_parallel"],
-    "Agent Collaboration": ["consult_coding_agent", "delegate_to_coding_agent", "request_personal_context"],
+    "Agent Collaboration": [
+        "consult_coding_agent",
+        "delegate_to_coding_agent",
+        "request_personal_context",
+        "request_personal_clarification",
+    ],
     "Plan Mode": ["plan_ask_questions", "plan_write_draft", "plan_update_todos"],
     "Skill Authoring": [
         "skill_draft_save", "skill_validate", "skill_publish",
         "skill_list", "skill_read", "skill_archive",
+    ],
+    "Platform Connectors": [
+        "connector_status",
+        "connector_update",
+        "connector_start",
+        "connector_stop",
+        "connector_test",
+        "connector_doctor",
     ],
     "记忆管理": [
         "memory_search",
@@ -430,3 +507,14 @@ def get_static_tool(name: str) -> BaseTool:
 
 def list_static_tool_names() -> list[str]:
     return list(TOOLS_BY_NAME.keys())
+
+
+def filter_tools_by_packet(agent_type: str, allowed_tools: list[str]) -> frozenset[str]:
+    """Intersect *agent_type*'s base tool set with *allowed_tools*.
+
+    When *allowed_tools* is empty, returns the full base set (no filtering).
+    """
+    base = _filter_tools_by_agent(agent_type)
+    if not allowed_tools or base is None:
+        return base or frozenset()
+    return base & frozenset(allowed_tools)

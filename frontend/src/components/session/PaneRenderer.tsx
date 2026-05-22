@@ -1,6 +1,6 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { Panel, Group, Separator } from 'react-resizable-panels';
-import { X, Plus, GripVertical, Users, UserPlus, Loader2 } from 'lucide-react';
+import { X, Plus, GripVertical, Users, UserPlus, Loader2, Minus } from 'lucide-react';
 import { SessionView, type SessionViewHandle } from './SessionView';
 import type { PaneNode, SessionPane, SplitNode } from './PaneTypes';
 import type { SessionSnapshot, SessionActions } from '../../contexts/FocusedSessionContext';
@@ -46,6 +46,7 @@ interface PaneRendererProps {
   node: PaneNode;
   focusedLeafId: string | null;
   onFocus: (leafId: string) => void;
+  onMinimizePane: (leafId: string) => void;
   onClosePane: (leafId: string) => void;
   onSplit: (leafId: string, direction: 'horizontal' | 'vertical', options?: SplitPaneOptions) => void;
   onMoveSession: (fromLeafId: string, toLeafId: string) => void;
@@ -73,6 +74,7 @@ interface PaneRendererProps {
   onRevealWorkspace?: () => void;
   onOpenPlanInWorkspace?: () => void;
   onProjectFileEdit?: (edit: FileEdit) => void;
+  chrome?: 'default' | 'floating';
 }
 
 const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
@@ -88,6 +90,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   node,
   focusedLeafId,
   onFocus,
+  onMinimizePane,
   onClosePane,
   onSplit,
   onMoveSession,
@@ -115,6 +118,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
   onRevealWorkspace,
   onOpenPlanInWorkspace,
   onProjectFileEdit,
+  chrome = 'default',
 }) {
   if (node.type === 'leaf') {
     return (
@@ -124,6 +128,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         isFocused={node.id === focusedLeafId}
         team={getTeamForPane(teams, node.pane.id)}
         onFocus={() => onFocus(node.id)}
+        onMinimize={() => onMinimizePane(node.id)}
         onClose={() => onClosePane(node.id)}
         onSplit={onSplit}
         onMoveSession={onMoveSession}
@@ -150,6 +155,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
         onRevealWorkspace={onRevealWorkspace}
         onOpenPlanInWorkspace={onOpenPlanInWorkspace}
         onProjectFileEdit={onProjectFileEdit}
+        chrome={chrome}
       />
     );
   }
@@ -176,11 +182,16 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               }
             />
           )}
-          <Panel id={child.id} defaultSize={`${node.sizes[index] ?? 100 / node.children.length}%`} minSize="220px">
+          <Panel
+            id={child.id}
+            defaultSize={`${node.sizes[index] ?? 100 / node.children.length}%`}
+            minSize={chrome === 'floating' && node.direction === 'horizontal' ? '360px' : '220px'}
+          >
             <PaneRenderer
               node={child}
               focusedLeafId={focusedLeafId}
               onFocus={onFocus}
+              onMinimizePane={onMinimizePane}
               onClosePane={onClosePane}
               onSplit={onSplit}
               onMoveSession={onMoveSession}
@@ -208,6 +219,7 @@ export const PaneRenderer: React.FC<PaneRendererProps> = React.memo(function Pan
               onRevealWorkspace={onRevealWorkspace}
               onOpenPlanInWorkspace={onOpenPlanInWorkspace}
               onProjectFileEdit={onProjectFileEdit}
+              chrome={chrome}
             />
           </Panel>
         </React.Fragment>
@@ -222,6 +234,7 @@ interface LeafPaneProps {
   isFocused: boolean;
   team?: Team;
   onFocus: () => void;
+  onMinimize: () => void;
   onClose: () => void;
   onSplit: (leafId: string, direction: 'horizontal' | 'vertical', options?: SplitPaneOptions) => void;
   onMoveSession: (fromLeafId: string, toLeafId: string) => void;
@@ -248,6 +261,7 @@ interface LeafPaneProps {
   onRevealWorkspace?: () => void;
   onOpenPlanInWorkspace?: () => void;
   onProjectFileEdit?: (edit: FileEdit) => void;
+  chrome?: 'default' | 'floating';
 }
 
 const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
@@ -256,6 +270,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   isFocused,
   team,
   onFocus,
+  onMinimize,
   onClose,
   onSplit,
   onMoveSession,
@@ -282,6 +297,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   onRevealWorkspace,
   onOpenPlanInWorkspace,
   onProjectFileEdit,
+  chrome = 'default',
 }) {
   const [indicator, setIndicator] = useState<DropIndicator | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -432,14 +448,19 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   const modelOptions = modelLabel && !models.some((model) => model.id === modelLabel)
     ? [{ id: modelLabel, name: modelLabel, provider: '', vision: false, context: 0 }, ...models]
     : models;
+  const floatingChrome = chrome === 'floating';
 
   return (
     <div
       ref={containerRef}
-      className={`h-full flex flex-col border rounded relative ${
-        !team && (isFocused ? 'border-accent/40' : dragOver ? 'border-accent/70 bg-accent/5' : 'border-border')
+      className={`h-full flex flex-col relative ${
+        floatingChrome
+          ? `${dragOver ? 'bg-accent/5' : 'bg-transparent'}`
+          : `border rounded ${
+              !team && (isFocused ? 'border-accent/40' : dragOver ? 'border-accent/70 bg-accent/5' : 'border-border')
+            }`
       } transition-colors`}
-      style={team ? { borderColor, borderWidth: 2 } : undefined}
+      style={!floatingChrome && team ? { borderColor, borderWidth: 2 } : undefined}
       onClick={onFocus}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -463,8 +484,12 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
       )}
 
       <div
-        className={`h-7 flex items-center shrink-0 border-b px-1 gap-0.5 ${team ? '' : 'rounded-t'} ${
-          isFocused ? 'bg-surface-alt border-accent/20' : 'bg-surface border-border'
+        className={`h-7 flex items-center shrink-0 border-b px-1 gap-0.5 ${
+          floatingChrome ? '' : team ? '' : 'rounded-t'
+        } ${
+          floatingChrome
+            ? isFocused ? 'bg-surface-alt/75 border-accent/20' : 'bg-surface/70 border-border-subtle'
+            : isFocused ? 'bg-surface-alt border-accent/20' : 'bg-surface border-border'
         } ${dragOver ? 'bg-accent/5' : ''}`}
         onContextMenu={handleContextMenu}
       >
@@ -514,6 +539,16 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => { event.stopPropagation(); onMinimize(); }}
+          className="p-0.5 text-fg-muted hover:text-fg hover:bg-surface-hover rounded shrink-0"
+          title="Minimize pane"
+          aria-label="Minimize pane"
+        >
+          <Minus className="w-3 h-3" />
+        </button>
         <button
           type="button"
           onPointerDown={(event) => event.stopPropagation()}

@@ -31,6 +31,14 @@ def test_parse_coding_mention_modes():
     assert execute.task == "fix this bug"
     assert execute.mode == "execute"
 
+    verify = parse_coding_mention("@coding agent run tests")
+    assert verify is not None
+    assert verify.mode == "verify_only"
+
+    planned = parse_coding_mention("@coding agent plan then execute this refactor")
+    assert planned is not None
+    assert planned.mode == "plan_then_execute"
+
     handoff = parse_coding_mention("@coding agent")
     assert handoff is not None
     assert handoff.task == ""
@@ -68,9 +76,31 @@ def test_collaboration_run_task_lifecycle(isolated_collaboration_db):
     ]
 
 
+def test_collaboration_manager_accepts_extended_modes(isolated_collaboration_db):
+    for mode in ("plan_then_execute", "critic", "verify_only"):
+        run = manager.create_run(session_id=f"s_{mode}", goal="extended", mode=mode)
+        task = manager.add_task(run.run_id, TaskPacket(goal="extended", mode=mode))
+        assert run.mode == mode
+        assert task.mode == mode
+
+
 def test_cancel_run_marks_pending_tasks_cancelled(isolated_collaboration_db):
     run = manager.create_run(session_id="s1", goal="fix styling", mode="execute")
     task = manager.add_task(run.run_id, TaskPacket(goal="fix styling", mode="execute"))
+
+    cancelled = manager.cancel_run(run.run_id)
+
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    stored_task = manager.get_task(task.task_id)
+    assert stored_task is not None
+    assert stored_task.status == "cancelled"
+
+
+def test_cancel_run_marks_waiting_clarification_tasks_cancelled(isolated_collaboration_db):
+    run = manager.create_run(session_id="s1", goal="choose implementation", mode="execute")
+    task = manager.add_task(run.run_id, TaskPacket(goal="choose implementation", mode="execute"))
+    manager.update_task(task.task_id, status="waiting_clarification")
 
     cancelled = manager.cancel_run(run.run_id)
 

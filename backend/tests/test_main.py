@@ -696,6 +696,90 @@ class TestWebSocket:
             snapshot = client.get(f"/api/sessions/{sid}").json()
             assert snapshot["task_guidance_items"] == []
 
+    def test_websocket_queue_task_guidance_without_apply_now_only_queues(self, client, monkeypatch):
+        """queue_task_guidance can stage guidance without submitting it to the live run."""
+        from unittest.mock import patch
+        from app.agent import AgentSession
+
+        apply_calls = []
+        original_apply = AgentSession.apply_task_guidance
+
+        def spy_apply(self):
+            apply_calls.append(True)
+            return original_apply(self)
+
+        monkeypatch.setattr(AgentSession, "apply_task_guidance", spy_apply)
+
+        async def slow_stream(*args, **kwargs):
+            await asyncio.sleep(5)
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Long task done",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", slow_stream):
+            sid = f"test_guidance_queue_only_ws_{uuid.uuid4().hex}"
+            with client.websocket_connect(f"/ws/{sid}") as ws:
+                ws.send_json({"type": "chat", "text": "long task", "model_id": "gpt-4o"})
+                receive_until(ws, "status")
+                ws.send_json({
+                    "type": "queue_task_guidance",
+                    "text": "stage this guidance",
+                    "apply_now": False,
+                })
+                queued = receive_until(ws, "task_guidance_queued")
+                assert queued["data"]["item"]["text"] == "stage this guidance"
+                assert queued["data"]["item"]["status"] == "queued"
+                assert apply_calls == []
+                ws.send_json({"type": "stop"})
+                receive_until(ws, "interrupted")
+
+    def test_websocket_queue_task_guidance_apply_now_submits(self, client):
+        """queue_task_guidance with apply_now submits queued guidance to the next model boundary."""
+        from unittest.mock import patch
+
+        async def slow_stream(*args, **kwargs):
+            await asyncio.sleep(5)
+            yield {
+                "type": "done",
+                "response": {
+                    "choices": [{
+                        "message": {
+                            "content": "Long task done",
+                            "role": "assistant",
+                            "tool_calls": None,
+                        }
+                    }]
+                },
+            }
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", slow_stream):
+            sid = f"test_guidance_apply_now_ws_{uuid.uuid4().hex}"
+            with client.websocket_connect(f"/ws/{sid}") as ws:
+                ws.send_json({"type": "chat", "text": "long task", "model_id": "gpt-4o"})
+                receive_until(ws, "status")
+                ws.send_json({
+                    "type": "queue_task_guidance",
+                    "text": "submit this guidance",
+                    "apply_now": True,
+                })
+                queued = receive_until(ws, "task_guidance_queued")
+                assert queued["data"]["item"]["text"] == "submit this guidance"
+                assert queued["data"]["item"]["status"] == "queued"
+                applied = receive_until(ws, "task_guidance_applied")
+                assert applied["data"]["items"][0]["text"] == "submit this guidance"
+                assert applied["data"]["items"][0]["status"] == "applied"
+                ws.send_json({"type": "stop"})
+                receive_until(ws, "interrupted")
+
     def test_websocket_chat_after_done_starts_new_turn(self, client, monkeypatch):
         """A chat sent after done is a normal new turn, not task guidance."""
         from app.agent import AgentSession
@@ -1445,6 +1529,63 @@ class TestProjectAPI:
         assert read_response.json()["content"] == "hello"
 
         escape_response = client.get("/api/file/read", params={"path": str(sibling / "secret.txt")})
+        assert escape_response.status_code == 200
+        assert "error" in escape_response.json()
+
+    def test_file_open_returns_typed_payloads(self, client, temp_dir):
+        """Project file open API routes text, Office, images, and binary files."""
+        from openpyxl import Workbook
+
+        proj_dir = temp_dir / "openproj"
+        sibling = temp_dir / "openproj_evil"
+        proj_dir.mkdir()
+        sibling.mkdir()
+        client.post("/api/projects/open", json={"path": str(proj_dir)})
+
+        (proj_dir / "notes.txt").write_text("hello", encoding="utf-8")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Data"
+        sheet.append(["Metric", "Value"])
+        sheet.append(["Revenue", 120])
+        workbook.save(proj_dir / "report.xlsx")
+        (proj_dir / "chart.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02"
+            b"\x00\x00\x00\x90wS\xde"
+        )
+        (proj_dir / "payload.bin").write_bytes(b"\x00\x01\x02binary")
+        (sibling / "secret.txt").write_text("secret", encoding="utf-8")
+
+        text_response = client.get("/api/file/open", params={"path": str(proj_dir / "notes.txt"), "session_id": "test-open"})
+        assert text_response.status_code == 200
+        assert text_response.json()["kind"] == "text"
+        assert text_response.json()["content"] == "hello"
+
+        office_response = client.get("/api/file/open", params={"path": str(proj_dir / "report.xlsx"), "session_id": "test-open"})
+        assert office_response.status_code == 200
+        office_payload = office_response.json()
+        assert office_payload["kind"] == "office"
+        assert office_payload["artifact"]["type"] == "office"
+        assert office_payload["artifact"]["workbook"]["sheets"][0]["name"] == "Data"
+        assert office_payload["artifact"]["manifest_url"].endswith(f"/{office_payload['artifact']['id']}/manifest")
+        assert "content" not in office_payload
+
+        image_response = client.get("/api/file/open", params={"path": str(proj_dir / "chart.png"), "session_id": "test-open"})
+        assert image_response.status_code == 200
+        image_payload = image_response.json()
+        assert image_payload["kind"] == "image"
+        assert image_payload["artifact"]["type"] == "image"
+        assert "content" not in image_payload
+
+        binary_response = client.get("/api/file/open", params={"path": str(proj_dir / "payload.bin"), "session_id": "test-open"})
+        assert binary_response.status_code == 200
+        binary_payload = binary_response.json()
+        assert binary_payload["kind"] == "binary"
+        assert binary_payload["mime_type"] == "application/octet-stream"
+        assert "content" not in binary_payload
+
+        escape_response = client.get("/api/file/open", params={"path": str(sibling / "secret.txt"), "session_id": "test-open"})
         assert escape_response.status_code == 200
         assert "error" in escape_response.json()
 

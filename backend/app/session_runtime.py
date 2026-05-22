@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 RunFactory = Callable[[], AsyncIterator[Dict[str, Any]]]
 
+# Bounded per-subscriber event buffer. A slow or stalled WebSocket client must
+# not let undelivered events (which can carry full tool output) pile up without
+# limit; publish() drops the oldest event when a queue is full.
+SUBSCRIBER_QUEUE_MAXSIZE = 200
+
 
 class SessionRuntime:
     """Owns the live background run for one chat session.
@@ -64,7 +69,7 @@ class SessionRuntime:
         return self._deleted
 
     def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
-        queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
+        queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_MAXSIZE)
         self._subscribers.add(queue)
         return queue
 
@@ -231,6 +236,7 @@ class SessionRuntime:
                 await HeartbeatEngine.on_session_end(
                     session.heartbeat_transcript_messages(),
                     session.session_id,
+                    agent_type=session.agent_type,
                 )
             except Exception:
                 pass

@@ -3,6 +3,7 @@ import base64
 import hashlib
 import inspect
 import json
+import mimetypes
 import os
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -111,10 +112,24 @@ async def lifespan(app: FastAPI):
     connector_manager.register(FeishuConnector())
     print(f"[Desktop Agent] Registered connectors: {[c['name'] for c in connector_manager.list_connectors()]}")
     # Restore enabled connectors from saved config
-    await connector_manager.start_enabled()
+    connector_start_task = asyncio.create_task(connector_manager.start_enabled())
+
+    def _log_connector_start_failure(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        with suppress(Exception):
+            exc = task.exception()
+            if exc:
+                print(f"[Desktop Agent] Connector auto-start failed: {exc}")
+
+    connector_start_task.add_done_callback(_log_connector_start_failure)
 
     yield
     print("[Desktop Agent] Backend shutting down...")
+    if not connector_start_task.done():
+        connector_start_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await connector_start_task
     get_plugin_manager().unload_all()
     await connector_manager.shutdown()
     await get_mcp_manager().disconnect_all()
@@ -183,6 +198,7 @@ from app.routes.runs import router as runs_router
 from app.routes.agents import router as agents_router
 from app.routes.connectors import router as connectors_router
 from app.routes.collaboration import router as collaboration_router
+from app.routes.office import router as office_router
 
 app.include_router(settings_router)
 app.include_router(projects_router)
@@ -192,6 +208,7 @@ app.include_router(runs_router)
 app.include_router(agents_router)
 app.include_router(connectors_router)
 app.include_router(collaboration_router)
+app.include_router(office_router)
 
 
 # ====== REST API ======
@@ -264,6 +281,16 @@ async def _delete_session_cleanup(session_id: str, session: Optional["AgentSessi
         await close_browser_session(session_id)
     except Exception as exc:
         print(f"[Session] Browser cleanup failed for {session_id}: {exc}")
+    try:
+        from app import artifact_store
+        artifact_store.delete_session_artifacts(session_id)
+    except Exception as exc:
+        print(f"[Session] artifact cleanup failed for {session_id}: {exc}")
+    try:
+        archive_path = SESSIONS_DIR / f"{session_id}.archive.jsonl"
+        archive_path.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"[Session] archive cleanup failed for {session_id}: {exc}")
 
 
 def _session_activity_state(session_id: str, is_running: bool, plan_phase: Optional[str] = None) -> str:
@@ -598,6 +625,26 @@ def get_session_context(session_id: str):
     return session.context_usage()
 
 
+@app.get("/api/sessions/{session_id}/artifacts/{artifact_id}")
+def get_session_artifact(session_id: str, artifact_id: str):
+    """Serve an externalized tool artifact (screenshot/chart) by id.
+
+    Large base64 payloads are spilled to disk instead of being kept inline in
+    the transcript; the UI references them through this endpoint and the
+    browser lazy-loads + caches them so they never re-enter the JS heap.
+    """
+    from app import artifact_store
+    loaded = artifact_store.load(session_id, artifact_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    data, mime = loaded
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
 @app.get("/api/sessions/{session_id}/runtime")
 def get_session_runtime_status(session_id: str):
     """Return live runtime state for one session without touching other sessions."""
@@ -754,6 +801,140 @@ def transcribe_info():
 
 # ====== æ–‡ä»¶è¯»å– API ======
 
+EDITOR_TEXT_SIZE_LIMIT = 10 * 1024 * 1024
+PROJECT_OFFICE_EXTENSIONS = {".xlsx", ".xls", ".pptx", ".ppt"}
+PROJECT_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+PROJECT_KNOWN_BINARY_EXTENSIONS = {
+    ".pdf", ".zip", ".7z", ".rar", ".gz", ".tar",
+    ".exe", ".dll", ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+    ".mp3", ".mp4", ".m4a", ".mov", ".avi", ".webm", ".wav",
+    ".ttf", ".otf", ".woff", ".woff2",
+}
+PROJECT_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".py", ".js", ".jsx", ".ts", ".tsx",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".css", ".scss", ".html", ".htm", ".xml", ".svg", ".csv", ".tsv",
+    ".sql", ".sh", ".bash", ".ps1", ".bat", ".cmd", ".java", ".c", ".h",
+    ".cpp", ".hpp", ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt",
+    ".dockerfile", ".gitignore", ".env", ".log",
+}
+
+
+def _mime_for_project_file(path: Path) -> str:
+    mime_type, _encoding = mimetypes.guess_type(path.name)
+    if path.suffix.lower() == ".svg":
+        return "image/svg+xml"
+    return mime_type or "application/octet-stream"
+
+
+def _looks_like_binary(data: bytes) -> bool:
+    if not data:
+        return False
+    if b"\x00" in data:
+        return True
+    control_bytes = sum(1 for byte in data if byte < 32 and byte not in {9, 10, 12, 13})
+    return control_bytes / max(len(data), 1) > 0.08
+
+
+def _binary_open_payload(p: Path, *, size: int, reason: str) -> dict[str, Any]:
+    return {
+        "kind": "binary",
+        "path": str(p),
+        "name": p.name,
+        "size": size,
+        "mime_type": _mime_for_project_file(p),
+        "reason": reason,
+    }
+
+
+async def _read_project_text_file(p: Path) -> str:
+    async with aiofiles.open(p, "r", encoding="utf-8", errors="replace") as f:
+        return await f.read()
+
+
+@app.get("/api/file/open")
+async def open_file_api(path: str, session_id: str = "project-file") -> dict[str, Any]:
+    """Open a project file for the workspace editor without forcing binary data through text."""
+    p, err = resolve_current_project_file(path)
+    if err:
+        return {"error": err}
+    assert p is not None
+
+    if not p.exists():
+        return {"error": f"File does not exist: {path}"}
+    if not p.is_file():
+        return {"error": f"Path is not a file: {path}"}
+
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return {"error": f"File read error: {e}"}
+
+    suffix = p.suffix.lower()
+    session = session_id or "project-file"
+
+    if suffix in PROJECT_OFFICE_EXTENSIONS:
+        try:
+            from app.tools.artifact_tool import publish_file_artifact
+
+            artifact, artifact_error = publish_file_artifact(
+                str(p),
+                session_id=session,
+                title=p.name,
+                source_tool="project_file_open",
+                artifact_type="office",
+                agent_type="coding",
+            )
+        except Exception as e:
+            artifact, artifact_error = None, str(e)
+        manifest_error = artifact.get("office_manifest_error") if isinstance(artifact, dict) else None
+        if artifact and not manifest_error:
+            return {"kind": "office", "artifact": artifact, "path": str(p), "size": size}
+        reason = artifact_error or manifest_error or "Office preview metadata is unavailable for this file."
+        return _binary_open_payload(p, size=size, reason=reason)
+
+    if suffix in PROJECT_IMAGE_EXTENSIONS:
+        try:
+            from app.tools.artifact_tool import publish_file_artifact
+
+            artifact, artifact_error = publish_file_artifact(
+                str(p),
+                session_id=session,
+                title=p.name,
+                source_tool="project_file_open",
+                artifact_type="image",
+                agent_type="coding",
+            )
+        except Exception as e:
+            artifact, artifact_error = None, str(e)
+        if artifact:
+            return {"kind": "image", "artifact": artifact, "path": str(p), "size": size}
+        return _binary_open_payload(p, size=size, reason=artifact_error or "Image preview is unavailable for this file.")
+
+    if suffix in PROJECT_KNOWN_BINARY_EXTENSIONS:
+        return _binary_open_payload(p, size=size, reason="This file type cannot be edited as text.")
+
+    if size > EDITOR_TEXT_SIZE_LIMIT:
+        return _binary_open_payload(p, size=size, reason=f"File is too large for the text editor ({size} bytes).")
+
+    try:
+        with p.open("rb") as f:
+            head = f.read(4096)
+    except OSError as e:
+        return {"error": f"File read error: {e}"}
+
+    mime_type = _mime_for_project_file(p)
+    text_like = suffix in PROJECT_TEXT_EXTENSIONS or mime_type.startswith("text/")
+    if not text_like and _looks_like_binary(head):
+        return _binary_open_payload(p, size=size, reason="Binary content cannot be edited in the code editor.")
+
+    try:
+        content = await _read_project_text_file(p)
+        return {"kind": "text", "content": content, "path": str(p), "size": size}
+    except OSError as e:
+        return {"error": f"File read error: {e}"}
+
+
 @app.get("/api/file/read")
 async def read_file_api(path: str):
     """è¯»å–æ–‡ä»¶å†…å®¹ï¼Œç”¨äºŽç¼–è¾‘å™¨é¢„è§ˆã€‚path ä¸ºç»å¯¹è·¯å¾„ã€‚"""
@@ -769,7 +950,7 @@ async def read_file_api(path: str):
 
     # å®‰å…¨é™åˆ¶ï¼šé¿å…è¯»å–è¶…å¤§æ–‡ä»¶
     size = p.stat().st_size
-    if size > 10 * 1024 * 1024:  # 10MB
+    if size > EDITOR_TEXT_SIZE_LIMIT:  # 10MB
         return {"error": f"æ–‡ä»¶è¿‡å¤§ ({size} bytes)ï¼Œæ‹’ç»è¯»å–"}
 
     try:
@@ -1399,6 +1580,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "queue_task_guidance":
                 session = get_or_create_session(session_id, current_model, current_role_id, agent_type=current_agent_type)
+                apply_now = msg.get("apply_now") is True
                 try:
                     item = session.queue_task_guidance(
                         str(msg.get("text") or ""),
@@ -1406,7 +1588,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         item_id=msg.get("guidance_id") or msg.get("id"),
                     )
                     accepts_guidance = runtime.accepts_task_guidance
-                    applied = session.apply_task_guidance() if accepts_guidance else []
                 except ValueError as exc:
                     await send_event({"type": "error", "data": validation_error(str(exc))})
                     continue
@@ -1430,6 +1611,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         "items": session.active_task_guidance_items(),
                     },
                 })
+                applied = session.apply_task_guidance() if apply_now else []
                 if applied:
                     await send_event({
                         "type": "task_guidance_applied",
@@ -1520,6 +1702,66 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     continue
                 for event in list_collaboration_events(collab_run_id):
                     await send_event(_collaboration_ws_event(event))
+
+            elif msg_type == "collab_directive":
+                collab_run_id = str(msg.get("run_id") or "").strip()
+                text = str(msg.get("text") or msg.get("directive") or "").strip()
+                if not collab_run_id or not text:
+                    await send_event({"type": "error", "data": validation_error("collab_directive requires run_id and text")})
+                    continue
+                from app.collaboration.bus import inject_directive
+                await inject_directive(collab_run_id, text)
+                await send_event({"type": "collab_directive_ack", "data": {"run_id": collab_run_id}})
+
+            elif msg_type == "collab_clarification_answer":
+                collab_run_id = str(msg.get("run_id") or msg.get("collaboration_run_id") or "").strip()
+                answer = str(msg.get("answer") or msg.get("text") or "").strip()
+                request_id = str(msg.get("request_id") or "").strip()
+                if not collab_run_id or not answer:
+                    await send_event({
+                        "type": "error",
+                        "data": validation_error("collab_clarification_answer requires run_id and answer"),
+                    })
+                    continue
+                from app.collaboration.bus import submit_clarification_answer
+
+                payload = await submit_clarification_answer(
+                    collab_run_id,
+                    answer,
+                    request_id=request_id,
+                    answered_by="personal",
+                )
+                await send_event({"type": "collaboration_clarification_answer", "data": payload})
+
+            elif msg_type == "collab_pause":
+                collab_run_id = str(msg.get("run_id") or "").strip()
+                if not collab_run_id:
+                    await send_event({"type": "error", "data": validation_error("collab_pause requires run_id")})
+                    continue
+                from app.collaboration.state_machine import CollaborationStateMachine
+                sm = CollaborationStateMachine(collab_run_id)
+                if not sm.can_pause():
+                    await send_event({"type": "error", "data": validation_error(f"Cannot pause from phase '{sm.phase()}'")})
+                    continue
+                sm.transition("paused", note="user-initiated pause")
+                await send_event({"type": "collab_pause_ack", "data": {"run_id": collab_run_id}})
+                # Also cancel the runtime task so the agent stops mid-turn
+                if runtime.is_running:
+                    await runtime.cancel(session, broadcast=False)
+
+            elif msg_type == "collab_resume":
+                collab_run_id = str(msg.get("run_id") or "").strip()
+                if not collab_run_id:
+                    await send_event({"type": "error", "data": validation_error("collab_resume requires run_id")})
+                    continue
+                from app.collaboration.state_machine import CollaborationStateMachine
+                sm = CollaborationStateMachine(collab_run_id)
+                try:
+                    sm.resume()
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
+                await send_event({"type": "collab_resume_ack", "data": {"run_id": collab_run_id}})
 
             elif msg_type == "handoff_agent":
                 target_agent = str(msg.get("agent_type") or msg.get("to") or "coding").strip().lower()
@@ -1962,7 +2204,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
                 await send_event({
                     "type": "tool_result",
-                    "data": {"name": tool_name, "args": tool_args, "output": result.output, "error": result.error, "image": result.base64_image}
+                    "data": {
+                        "name": tool_name,
+                        "args": tool_args,
+                        "output": result.output,
+                        "error": result.error,
+                        "image": result.base64_image,
+                        "artifacts": metadata.get("artifacts") or [],
+                    }
                 })
 
     except WebSocketDisconnect:
@@ -1975,6 +2224,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     HeartbeatEngine.on_session_end(
                         session.heartbeat_transcript_messages(),
                         session_id,
+                        agent_type=getattr(session, "agent_type", current_agent_type),
                     )
                 )
             except Exception:

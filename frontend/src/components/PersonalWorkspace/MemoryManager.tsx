@@ -12,6 +12,7 @@ import {
   Save,
   Search,
   Trash2,
+  Wrench,
   Zap,
 } from 'lucide-react';
 import { API_BASE } from '../../config';
@@ -49,6 +50,13 @@ interface MemoryStatus {
   vector_error?: string;
   embedding_model?: string;
   db_size_mb?: number;
+  last_heartbeat_at?: string;
+  last_dream_at?: string;
+  maintenance_lock_active?: boolean;
+  duplicate_source_refs?: Array<{ source_ref: string; count: number }>;
+  repair_recommended?: boolean;
+  pending_diary_kb?: number;
+  forgotten_log_size_mb?: number;
 }
 
 interface DiaryEntry {
@@ -111,6 +119,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
   const [saving, setSaving] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
   const [triggeringDream, setTriggeringDream] = useState(false);
+  const [repairing, setRepairing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [memoryOsUnavailable, setMemoryOsUnavailable] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -250,6 +259,21 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
     }
   }, [refreshAll]);
 
+  const repairMemory = useCallback(async () => {
+    if (!window.confirm('Back up and repair duplicated memory maintenance artifacts?')) return;
+    setRepairing(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/agents/personal/memory/repair`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Repair failed: ${res.status}`);
+      await refreshAll();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setRepairing(false);
+    }
+  }, [refreshAll]);
+
   const patchSelected = useCallback(async (updates: Partial<MemoryItem>) => {
     if (!selected) return;
     setSaving(true);
@@ -378,7 +402,49 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ focusSignal = 0 })
               {triggeringDream ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
               手动整理记忆
             </button>
+            <button
+              type="button"
+              onClick={repairMemory}
+              disabled={repairing}
+              title="Repair memory pollution"
+              className="flex h-8 items-center gap-1 rounded border border-danger/40 px-2 text-xs text-danger hover:bg-danger/10 disabled:opacity-50"
+            >
+              {repairing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
+              修复记忆污染
+            </button>
             <span className="text-[10px] text-fg-muted">仅用于调试或修复索引；日常由 Agent 自动处理。</span>
+            <div className="grid w-full grid-cols-2 gap-2 pt-1 text-[10px] text-fg-muted md:grid-cols-4">
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Last HEARTBEAT</div>
+                <div className="truncate text-fg">{status?.last_heartbeat_at || 'Never'}</div>
+              </div>
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Last DREAM</div>
+                <div className="truncate text-fg">{status?.last_dream_at || 'Never'}</div>
+              </div>
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Pending diary</div>
+                <div className="text-fg">{(status?.pending_diary_kb ?? 0).toFixed(1)} KB</div>
+              </div>
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Forgotten log</div>
+                <div className={status?.repair_recommended ? 'text-danger' : 'text-fg'}>
+                  {(status?.forgotten_log_size_mb ?? 0).toFixed(2)} MB
+                </div>
+              </div>
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Duplicate refs</div>
+                <div className={status?.duplicate_source_refs?.length ? 'text-danger' : 'text-fg'}>
+                  {status?.duplicate_source_refs?.length || 0}
+                </div>
+              </div>
+              <div className="rounded border border-border bg-surface px-2 py-1">
+                <div>Maintenance</div>
+                <div className={status?.maintenance_lock_active ? 'text-accent' : 'text-fg'}>
+                  {status?.maintenance_lock_active ? 'running' : 'idle'}
+                </div>
+              </div>
+            </div>
           </div>
         )}
         {error && <div className="mt-2 rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger">{error}</div>}

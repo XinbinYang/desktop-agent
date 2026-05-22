@@ -9,6 +9,10 @@ export const DEFAULT_TERMINAL_LAYOUT: PanelLayout = { conversation: 76, terminal
 export const DEFAULT_SIDEBAR_WIDTH = 224;
 export const MIN_SIDEBAR_WIDTH = 184;
 export const MAX_SIDEBAR_WIDTH = 420;
+export const DEFAULT_CHAT_OVERLAY_WIDTH = 560;
+export const MIN_CHAT_OVERLAY_WIDTH = 380;
+export const MAX_CHAT_OVERLAY_WIDTH = 2400;
+const CHAT_OVERLAY_VIEWPORT_GUTTER = 48;
 
 const REQUIRED_MAIN_KEYS = Object.keys(DEFAULT_MAIN_LAYOUT);
 const REQUIRED_TERMINAL_KEYS = Object.keys(DEFAULT_TERMINAL_LAYOUT);
@@ -51,6 +55,7 @@ interface LayoutState {
   rightPanelVisible: boolean;
   sidebarCollapsed: boolean;
   sidebarWidth: number;
+  chatOverlayWidth: number;
   mainLayout: PanelLayout;
   terminalLayout: PanelLayout;
 }
@@ -89,6 +94,16 @@ function normalizeSidebarWidth(value: unknown): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
 }
 
+function normalizeChatOverlayWidth(value: unknown): number {
+  const width = Number(value);
+  if (!Number.isFinite(width)) return DEFAULT_CHAT_OVERLAY_WIDTH;
+  const viewportLimit =
+    typeof window === 'undefined'
+      ? MAX_CHAT_OVERLAY_WIDTH
+      : Math.max(MIN_CHAT_OVERLAY_WIDTH, window.innerWidth - CHAT_OVERLAY_VIEWPORT_GUTTER);
+  return Math.min(viewportLimit, Math.max(MIN_CHAT_OVERLAY_WIDTH, width));
+}
+
 function loadLayout(): LayoutState {
   try {
     const raw = localStorage.getItem('desktop-agent-layout');
@@ -102,6 +117,7 @@ function loadLayout(): LayoutState {
         rightPanelVisible: parsed.rightPanelVisible ?? true,
         sidebarCollapsed: parsed.sidebarCollapsed ?? false,
         sidebarWidth: normalizeSidebarWidth(parsed.sidebarWidth),
+        chatOverlayWidth: normalizeChatOverlayWidth(parsed.chatOverlayWidth),
         mainLayout: normalizeLayout(parsed.mainLayout, DEFAULT_MAIN_LAYOUT, REQUIRED_MAIN_KEYS),
         terminalLayout: normalizeLayout(parsed.terminalLayout, DEFAULT_TERMINAL_LAYOUT, REQUIRED_TERMINAL_KEYS),
       };
@@ -115,6 +131,7 @@ function loadLayout(): LayoutState {
     rightPanelVisible: true,
     sidebarCollapsed: false,
     sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+    chatOverlayWidth: DEFAULT_CHAT_OVERLAY_WIDTH,
     mainLayout: DEFAULT_MAIN_LAYOUT,
     terminalLayout: DEFAULT_TERMINAL_LAYOUT,
   };
@@ -169,6 +186,10 @@ export function useLayoutState() {
     setState((state) => ({ ...state, sidebarWidth: normalizeSidebarWidth(value) }));
   }, []);
 
+  const setChatOverlayWidth = useCallback((value: number) => {
+    setState((state) => ({ ...state, chatOverlayWidth: normalizeChatOverlayWidth(value) }));
+  }, []);
+
   const setMainLayout = useCallback((layout: PanelLayout) => {
     setState((state) => ({
       ...state,
@@ -192,6 +213,7 @@ export function useLayoutState() {
       rightPanelVisible: true,
       sidebarCollapsed: false,
       sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+      chatOverlayWidth: DEFAULT_CHAT_OVERLAY_WIDTH,
       mainLayout: DEFAULT_MAIN_LAYOUT,
       terminalLayout: DEFAULT_TERMINAL_LAYOUT,
     });
@@ -209,6 +231,7 @@ export function useLayoutState() {
     setSidebarCollapsed,
     toggleSidebar,
     setSidebarWidth,
+    setChatOverlayWidth,
     setMainLayout,
     setTerminalLayout,
     resetLayout,

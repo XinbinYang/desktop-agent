@@ -450,6 +450,8 @@ class WorkerSession:
         parent_tool_call_id: str = "",
         agent_type: str = "coding",
         active_skill_ids: Optional[List[str]] = None,
+        tool_allowlist: Optional[List[str]] = None,
+        team_role: str = "",
     ):
         self.worker_id = worker_id
         self.task = task
@@ -458,6 +460,8 @@ class WorkerSession:
         self.agent_type = agent_type if agent_type in ("coding", "personal") else "coding"
         self.run_id = run_id
         self.parent_tool_call_id = parent_tool_call_id
+        self.tool_allowlist: Optional[frozenset] = frozenset(tool_allowlist) if tool_allowlist else None
+        self.team_role = team_role
         self.router = ModelRouter(model_id)
         self.messages: List[Dict[str, Any]] = []
         self.iteration = 0
@@ -565,6 +569,8 @@ class WorkerSession:
             "parent_tool_call_id": self.parent_tool_call_id,
             "timestamp": time.time(),
         }
+        if self.team_role:
+            event_data["team_role"] = self.team_role
         if self.run_id:
             try:
                 from app.coding_runs import record_event
@@ -603,6 +609,25 @@ class WorkerSession:
                 return
 
             self.iteration += 1
+
+            if self.run_id:
+                try:
+                    from app.collaboration.bus import poll_directive
+
+                    directive = await poll_directive(self.run_id)
+                except Exception:
+                    directive = None
+                if directive:
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[COLLABORATION DIRECTIVE]\n"
+                            "The Personal Agent/user sent this while you were working. "
+                            "Treat it as high-priority guidance for the current delegated task.\n\n"
+                            f"{directive}"
+                        ),
+                    })
+                    yield self._worker_event("collab_directive_applied", {"directive": directive})
 
             try:
                 response = await self.router.chat_completion_non_stream(
@@ -665,6 +690,30 @@ class WorkerSession:
                 return
 
             tool_results = []
+            # 工具白名单过滤：allowlist 非空时，跳过不在白名单内的工具调用
+            if self.tool_allowlist is not None:
+                filtered = []
+                for tc in tool_calls:
+                    name = tc.get("function", {}).get("name", "")
+                    if name in self.tool_allowlist:
+                        filtered.append(tc)
+                    else:
+                        tool_id = tc.get("id", "")
+                        msg = f"Tool '{name}' is not in the allowed tool list for this task."
+                        yield self._worker_event("worker_tool_call", {
+                            "name": name,
+                            "args": {},
+                            "result": msg,
+                            "duration_ms": 0,
+                            "tool_call_id": tool_id,
+                        })
+                        tool_results.append({
+                            "tool_call_id": tool_id,
+                            "role": "tool",
+                            "name": name,
+                            "content": msg,
+                        })
+                tool_calls = filtered
             from app.tools import get_static_tool
             for tc in tool_calls:
                 func = tc.get("function", {})

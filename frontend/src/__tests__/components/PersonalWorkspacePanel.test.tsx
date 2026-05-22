@@ -46,6 +46,13 @@ function setupPersonalFetch() {
         counts_by_tier: { hot: 1 },
         pending_candidates: 0,
         vector_available: true,
+        last_heartbeat_at: '2026-05-20T21:00:00',
+        last_dream_at: '2026-05-20T21:30:00',
+        maintenance_lock_active: false,
+        duplicate_source_refs: [{ source_ref: 'session_end:test:handoff', count: 3 }],
+        repair_recommended: true,
+        pending_diary_kb: 42.5,
+        forgotten_log_size_mb: 13.1,
       });
     }
 
@@ -71,6 +78,10 @@ function setupPersonalFetch() {
 
     if (textUrl.endsWith('/api/agents/personal/memory/rebuild')) {
       return mockFetchResponse({ indexed: 1 });
+    }
+
+    if (textUrl.endsWith('/api/agents/personal/memory/repair')) {
+      return mockFetchResponse({ status: 'ok', backup_dir: 'archive' });
     }
 
     if (textUrl.endsWith('/api/agents/personal/dream/trigger')) {
@@ -132,6 +143,7 @@ describe('MemoryManager', () => {
     expect(screen.getByTitle('Delete memory')).toBeInTheDocument();
     expect(screen.queryByTitle('Rebuild index')).not.toBeInTheDocument();
     expect(screen.queryByTitle('Trigger DREAM')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Repair memory pollution')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Edit memory type')).not.toBeInTheDocument();
     expect(screen.queryByText('Confidence')).not.toBeInTheDocument();
     expect(screen.queryByText('Save')).not.toBeInTheDocument();
@@ -145,6 +157,9 @@ describe('MemoryManager', () => {
 
     expect(screen.getByTitle('Rebuild index')).toBeInTheDocument();
     expect(screen.getByTitle('Trigger DREAM')).toBeInTheDocument();
+    expect(screen.getByTitle('Repair memory pollution')).toBeInTheDocument();
+    expect(screen.getByText('Duplicate refs')).toBeInTheDocument();
+    expect(screen.getByText('Forgotten log')).toBeInTheDocument();
     expect(screen.getByLabelText('Edit memory type')).toBeInTheDocument();
     expect(screen.getByLabelText('Edit memory tier')).toBeInTheDocument();
     expect(screen.getByText('Confidence')).toBeInTheDocument();
@@ -161,6 +176,22 @@ describe('MemoryManager', () => {
       expect(window.confirm).toHaveBeenCalledWith('Delete this memory item from active recall?');
       expect(fetchMock.mock.calls.some(([url, init]) => (
         String(url).includes('/api/agents/personal/memory/items/mem-1') && init?.method === 'DELETE'
+      ))).toBe(true);
+    });
+  });
+
+  it('runs memory repair from advanced maintenance with confirmation', async () => {
+    const fetchMock = setupPersonalFetch();
+    render(<MemoryManager />);
+
+    expect(await screen.findByPlaceholderText('查找 Agent 记住的内容')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('高级维护'));
+    fireEvent.click(screen.getByTitle('Repair memory pollution'));
+
+    await waitFor(() => {
+      expect(window.confirm).toHaveBeenCalledWith('Back up and repair duplicated memory maintenance artifacts?');
+      expect(fetchMock.mock.calls.some(([url, init]) => (
+        String(url).endsWith('/api/agents/personal/memory/repair') && init?.method === 'POST'
       ))).toBe(true);
     });
   });

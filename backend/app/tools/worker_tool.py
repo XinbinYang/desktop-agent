@@ -15,6 +15,17 @@ _worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]
 )
 _active_workers: Dict[str, Dict[str, tuple[WorkerSession, Optional[Callable[[Dict[str, Any]], Any]]]]] = {}
 
+# Map worker profile names to team_role labels for frontend visibility.
+PROFILE_TO_ROLE: dict[str, str] = {
+    "explorer": "explorer",
+    "architect": "architect",
+    "code": "editor",
+    "code-expert": "editor",
+    "tdd-worker": "editor",
+    "debugger": "verifier",
+    "code-reviewer": "reviewer",
+}
+
 
 def set_worker_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
     return _worker_event_callback_var.set(cb)
@@ -161,6 +172,7 @@ class DispatchWorkerTool(BaseTool):
             full_task = f"## Prior Work Context\n{prior_context[:3000]}\n\n## Your Task\n{task}"
 
         worker_id = f"worker_{uuid.uuid4().hex[:8]}"
+        team_role = PROFILE_TO_ROLE.get(profile, "")
         worker = WorkerSession(
             worker_id=worker_id,
             task=full_task,
@@ -170,6 +182,7 @@ class DispatchWorkerTool(BaseTool):
             run_id=run_id,
             parent_tool_call_id=tool_call_id,
             agent_type=agent_type,
+            team_role=team_role,
         )
 
         started_at = time.time()
@@ -178,6 +191,10 @@ class DispatchWorkerTool(BaseTool):
         final_status = "failed"
         final_iterations = 0
 
+        _emit_worker_event({
+            "type": "team_progress",
+            "data": {"team_role": team_role, "phase": "running", "summary": f"Worker started ({profile})"},
+        })
         _register_worker(session_id, worker)
         try:
             async for event in worker.run():
@@ -190,6 +207,12 @@ class DispatchWorkerTool(BaseTool):
                     final_iterations = data.get("iterations", worker.iteration)
         finally:
             _unregister_worker(session_id, worker.worker_id)
+
+        team_status = "done" if final_status == "completed" else "failed"
+        _emit_worker_event({
+            "type": "team_progress",
+            "data": {"team_role": team_role, "phase": team_status, "summary": f"Worker finished ({final_status})"},
+        })
 
         duration_ms = round((time.time() - started_at) * 1000)
 
@@ -338,6 +361,7 @@ class DispatchParallelTool(BaseTool):
                 run_id=run_id,
                 parent_tool_call_id=tool_call_id,
                 agent_type=agent_type,
+                team_role=PROFILE_TO_ROLE.get(profile_name, ""),
             )
             events: List[Dict[str, Any]] = []
             final = ""

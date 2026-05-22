@@ -1,0 +1,40 @@
+{
+  "basic": {
+    "goal": "Fix the login bug in auth.py",
+    "mode": "execute",
+    "user_intent": "Fix login bug",
+    "constraints": ["Do not modify tests"],
+    "acceptance_criteria": ["Login works", "No regressions"],
+    "context": {"project_path": "/tmp/project"},
+    "allowed_tools": []
+  },
+  "consult": {
+    "goal": "Diagnose why tests are failing",
+    "mode": "consult",
+    "user_intent": "Diagnose test failures",
+    "constraints": ["Read-only"],
+    "acceptance_criteria": ["Provide root cause"],
+    "context": {},
+    "allowed_tools": ["file_read", "git_diff"]
+  },
+  "with_budget": {
+    "goal": "Refactor the auth module",
+    "mode": "execute",
+    "user_intent": "Refactor auth",
+    "constraints": [],
+    "acceptance_criteria": [],
+    "context": {},
+    "allowed_tools": [],
+    "budget": {
+      "max_iterations": 15,
+      "max_seconds": 300,
+      "max_input_tokens": 100000,
+      "on_exceed": "ask_user"
+    },
+    "invariants": [
+      {"description": "Do not modify .env files", "detector": null}
+    ],
+    "prior_attempts": ["Tried renaming module, caused import errors"],
+    "correlation_key": "refactor-auth-2025"
+  }
+}

@@ -22,7 +22,14 @@ from app.runtime_paths import runtime_file
 
 DB_PATH = runtime_file("data", "collaboration_runs.db")
 _conn_local = threading.local()
-_VALID_TASK_MODES = {"consult", "execute", "handoff"}
+_VALID_TASK_MODES = {
+    "consult",
+    "execute",
+    "handoff",
+    "plan_then_execute",
+    "critic",
+    "verify_only",
+}
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -94,6 +101,28 @@ def _loads(data: str, fallback: Any) -> Any:
         return fallback
 
 
+def _transition_phase_best_effort(run_id: str, phase: str, note: str = "") -> None:
+    try:
+        from app.collaboration.state_machine import CollaborationStateMachine
+
+        sm = CollaborationStateMachine(run_id)
+        current = sm.phase()
+        if current == phase:
+            return
+        if current == "pending" and phase not in {"analyzing", "failed"}:
+            sm.transition("analyzing", note="collaboration run started")
+            current = sm.phase()
+        if phase == "completed" and current in {"executing", "awaiting_user"}:
+            if current == "awaiting_user":
+                sm.transition("executing", note="resuming to complete")
+            sm.transition("verifying", note="finalizing collaboration run")
+            sm.transition("completed", note=note)
+            return
+        sm.transition(phase, note=note)
+    except Exception:
+        return
+
+
 def create_run(
     *,
     session_id: str,
@@ -141,6 +170,7 @@ def create_run(
         ),
     )
     conn.commit()
+    _transition_phase_best_effort(run.run_id, "analyzing", "collaboration run created")
     record_event(run.run_id, "collaboration_run_created", run.model_dump())
     return run
 
@@ -254,6 +284,12 @@ def update_task(
     conn.commit()
     updated = get_task(task_id)
     if updated:
+        if status == "running":
+            _transition_phase_best_effort(updated.run_id, "executing", "task running")
+        elif status == "waiting_clarification":
+            _transition_phase_best_effort(updated.run_id, "awaiting_user", "waiting for clarification")
+        elif status in {"failed", "blocked", "cancelled"}:
+            _transition_phase_best_effort(updated.run_id, "failed", f"task {status}")
         record_event(updated.run_id, event_type, updated.model_dump(), task_id)
     return updated
 
@@ -287,6 +323,10 @@ def complete_run(
     conn.commit()
     updated = get_run(run_id)
     if updated:
+        if status == "completed":
+            _transition_phase_best_effort(run_id, "completed", "collaboration run completed")
+        elif status in {"failed", "cancelled"}:
+            _transition_phase_best_effort(run_id, "failed", f"collaboration run {status}")
         record_event(run_id, "collaboration_run_completed", updated.model_dump())
     return updated
 
@@ -297,7 +337,7 @@ def cancel_run(run_id: str) -> Optional[CollaborationRun]:
         return None
     for task_id in run.task_ids:
         task = get_task(task_id)
-        if task and task.status in {"pending", "running"}:
+        if task and task.status in {"pending", "running", "waiting_clarification"}:
             update_task(task_id, status="cancelled")
     return complete_run(run_id, "cancelled", "Collaboration run cancelled")
 

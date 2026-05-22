@@ -26,6 +26,8 @@ _WRAPPED_PATH_RE = re.compile(r"[`\"']([^`\"']+)[`\"']")
 _WINDOWS_PATH_RE = re.compile(r"(?i)\b[a-z]:[\\/][^\r\n`\"'<>|]+")
 _POSIX_PATH_RE = re.compile(r"(?<!\w)/(?:[^\s`\"'<>|]+/?)+")
 _TRAILING_CHARS = " \t\r\n.,;:)]}" + "\uFF0C\u3002\uFF1B\uFF1A\u3001\uFF09\u3011"
+_MAX_MENTIONED_PATH_CHARS = 1024
+_MAX_PREFIX_PROBES = 80
 
 
 @dataclass(frozen=True)
@@ -40,7 +42,24 @@ class CollaborationTarget:
 
 
 def _clean_candidate(value: str) -> str:
-    return str(value or "").strip().strip("`\"'").rstrip(_TRAILING_CHARS)
+    cleaned = str(value or "").strip().strip("`\"'").rstrip(_TRAILING_CHARS)
+    if len(cleaned) > _MAX_MENTIONED_PATH_CHARS:
+        cleaned = cleaned[:_MAX_MENTIONED_PATH_CHARS].rstrip(_TRAILING_CHARS)
+    return cleaned
+
+
+def _is_network_path(raw: str, path: Path) -> bool:
+    """True for UNC / network paths (``\\\\host\\share`` or ``//host/share``).
+
+    On Windows, ``Path.exists()``/``.is_dir()``/``.resolve()`` on a UNC path
+    issue a blocking SMB call that can hang the asyncio event loop for minutes.
+    URL authorities like ``//example.com`` extracted from message text are the
+    common trigger; a coding-agent project directory is always local.
+    """
+    if raw.startswith(("\\\\", "//")):
+        return True
+    drive = path.drive
+    return drive.startswith("\\\\") or drive.startswith("//")
 
 
 def _normalize_existing_project_path(value: Any) -> str:
@@ -51,10 +70,12 @@ def _normalize_existing_project_path(value: Any) -> str:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             return ""
+        if _is_network_path(raw, candidate):
+            return ""
+        if not candidate.exists() or not candidate.is_dir():
+            return ""
         resolved = candidate.resolve()
     except (OSError, RuntimeError, ValueError):
-        return ""
-    if not resolved.exists() or not resolved.is_dir():
         return ""
     canonical = ProjectManager.canonical_project_path(resolved)
     try:
@@ -89,13 +110,25 @@ def _existing_absolute_prefix(raw_value: str) -> str:
     raw = _clean_candidate(raw_value)
     if not raw:
         return ""
-    direct = _normalize_existing_project_path(raw)
-    if direct:
-        return direct
-    for end in range(len(raw) - 1, 2, -1):
+
+    boundary_ends: list[int] = [len(raw)]
+    text_boundary_ends = [
+        idx for idx, char in enumerate(raw)
+        if char.isspace() or char in _TRAILING_CHARS
+    ]
+    path_boundary_ends = [
+        idx for idx, char in enumerate(raw)
+        if char in "\\/"
+    ]
+    boundary_ends.extend(text_boundary_ends[: _MAX_PREFIX_PROBES // 2])
+    boundary_ends.extend(reversed(path_boundary_ends[-(_MAX_PREFIX_PROBES // 2):]))
+
+    seen: set[str] = set()
+    for end in boundary_ends:
         prefix = raw[:end].rstrip(_TRAILING_CHARS)
-        if not prefix:
+        if not prefix or prefix in seen:
             continue
+        seen.add(prefix)
         path = _normalize_existing_project_path(prefix)
         if path:
             return path

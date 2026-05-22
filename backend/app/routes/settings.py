@@ -28,6 +28,7 @@ class SettingsUpdateRequest(BaseModel):
     thinking_intensity_default: Optional[str] = None
     thinking_policy_by_provider: Optional[dict[str, dict[str, Any]]] = None
     collaboration_mode: Optional[str] = None
+    auto_delegate_coding: Optional[str] = None
     max_parallel_agents: Optional[int] = None
     review_gate_enabled: Optional[bool] = None
     coding_agent: Optional[dict[str, Any]] = None

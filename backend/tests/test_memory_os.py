@@ -35,6 +35,58 @@ def test_memory_os_search_patch_delete(memory_os):
     assert memory_os.search("pytest") == []
 
 
+def test_memory_os_dedupe_key_updates_existing_item(memory_os):
+    first = memory_os.upsert_item(
+        content="Session handoff version one.",
+        memory_type="working",
+        source="heartbeat",
+        source_ref="session_end:test:handoff",
+        tier="hot",
+        dedupe_key="heartbeat:test:handoff",
+    )
+    second = memory_os.upsert_item(
+        content="Session handoff version two.",
+        memory_type="working",
+        source="heartbeat",
+        source_ref="session_end:test:handoff",
+        tier="hot",
+        dedupe_key="heartbeat:test:handoff",
+    )
+
+    assert second["id"] == first["id"]
+    assert memory_os.status()["total_items"] == 1
+    assert memory_os.search("version two", memory_type="working")[0]["content"] == "Session handoff version two."
+
+
+def test_memory_os_canonical_key_archives_older_active_fact(memory_os):
+    first = memory_os.upsert_item(
+        content="User prefers verbose memory reports.",
+        memory_type="semantic",
+        source="test",
+        source_ref="test:canonical:1",
+        tier="hot",
+        confidence=0.8,
+        canonical_key="preference:memory-report-style",
+    )
+    second = memory_os.upsert_item(
+        content="User prefers concise memory reports.",
+        memory_type="semantic",
+        source="test",
+        source_ref="test:canonical:2",
+        tier="hot",
+        confidence=0.92,
+        canonical_key="preference:memory-report-style",
+    )
+
+    older = memory_os.get_item(first["id"])
+    assert older is not None
+    assert older["tier"] == "archived"
+    assert older["superseded_by"] == second["id"]
+
+    results = memory_os.search("memory reports", memory_type="semantic", limit=5)
+    assert results[0]["id"] == second["id"]
+
+
 def test_memory_os_rebuild_from_runtime_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr("app.agents.memory_os._sqlite_vec_available", lambda: False)
     monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
@@ -57,6 +109,59 @@ def test_memory_os_rebuild_from_runtime_workspace(tmp_path, monkeypatch):
     assert engine.status()["total_items"] >= 2
     assert engine.search("audit trails", memory_type="episodic")
     assert engine.search("concise", memory_type="semantic")[0]["tier"] == "hot"
+
+
+def test_memory_os_rebuild_preserves_non_indexer_items(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.agents.memory_os._sqlite_vec_available", lambda: False)
+    monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
+    personal_dir = AgentManager._personal_dir()
+    (personal_dir / "MEMORY.md").write_text("- [HOT] User prefers durable memory hygiene.\n", encoding="utf-8")
+    engine = MemoryOS(tmp_path / "memory_os.db")
+    heartbeat_item = engine.upsert_item(
+        content="Heartbeat-created handoff must survive rebuild.",
+        memory_type="working",
+        source="heartbeat",
+        source_ref="session_end:test:handoff",
+        created_by="heartbeat",
+        dedupe_key="heartbeat:test:handoff",
+    )
+
+    engine.rebuild_from_workspace()
+
+    assert engine.get_item(heartbeat_item["id"]) is not None
+    assert engine.search("durable memory hygiene", memory_type="semantic")
+
+
+def test_memory_os_repair_compacts_large_diary_and_forgotten_log(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.agents.memory_os._sqlite_vec_available", lambda: False)
+    monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
+    personal_dir = AgentManager._personal_dir()
+    memory_dir = AgentManager._memory_dir()
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    diary = memory_dir / "2026-05-22.md"
+    repeated = "\n".join(
+        f"## 10:{idx:02d}\n\n## Session Summary\n\n- User: è¯·è®°ä½ï¼šç¬¬ {idx} æ¬¡é‡å¤è®°å¿†ã€‚\n- Assistant: å·²è®°å½•ã€‚"
+        for idx in range(700)
+    )
+    diary.write_text(f"# 2026-05-22\n\n{repeated}", encoding="utf-8")
+    forgotten = personal_dir / "forgotten.log"
+    forgotten.write_text(
+        "\n".join(
+            f"[2026-05-22T10:{idx % 60:02d}] REASON: score 0.77 < 0.8 | ENTRY: noisy candidate {idx}"
+            for idx in range(5000)
+        ),
+        encoding="utf-8",
+    )
+
+    engine = MemoryOS(tmp_path / "memory_os.db")
+    before_diary = diary.stat().st_size
+    before_forgotten = forgotten.stat().st_size
+    result = engine.repair_runtime_state()
+
+    assert result["diaries"]["files"] == 1
+    assert diary.stat().st_size < before_diary
+    assert forgotten.stat().st_size < before_forgotten
+    assert (personal_dir / ".memory-maintenance-v2").exists()
 
 
 def test_memory_os_api_routes(tmp_path, monkeypatch, client):

@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
+  collectMinimizedLeafNodes,
   deserializePaneTree,
   findLeafById,
   findLeafByPaneId,
+  findFirstVisibleLeafId,
   normalizeSizes,
   removeLeaf,
   replaceNode,
   resetSplitSizes,
+  setLeafMinimized,
   updateSplitSizes,
+  visiblePaneTree,
   type LeafNode,
   type PaneNode,
 } from '../../../components/session/PaneTypes';
@@ -134,11 +138,80 @@ describe('PaneTypes', () => {
 
     const result = deserializePaneTree(raw);
 
-    expect(result?.version).toBe(2);
+    expect(result?.version).toBe(3);
     expect(result?.focusedLeafId).toBe('a');
     expect(result?.paneRoot.type).toBe('split');
     if (result?.paneRoot.type === 'split') {
       expect(result.paneRoot.sizes).toEqual([50, 50]);
     }
+  });
+
+  it('preserves minimized pane state during serialization migration', () => {
+    const raw = JSON.stringify({
+      version: 2,
+      focusedLeafId: 'b',
+      paneRoot: {
+        type: 'split',
+        id: 'root',
+        direction: 'horizontal',
+        children: [
+          leaf('a'),
+          { ...leaf('b'), pane: { ...leaf('b').pane, isMinimized: true } },
+        ],
+        sizes: [40, 60],
+      },
+    });
+
+    const result = deserializePaneTree(raw);
+
+    expect(result?.version).toBe(3);
+    expect(result?.focusedLeafId).toBe('a');
+    expect(findLeafById(result!.paneRoot, 'b')?.pane.isMinimized).toBe(true);
+  });
+
+  it('builds a visible tree that hides minimized leaves without mutating the source tree', () => {
+    const root: PaneNode = {
+      type: 'split',
+      id: 'root',
+      direction: 'horizontal',
+      children: [
+        leaf('a'),
+        {
+          type: 'split',
+          id: 'nested',
+          direction: 'vertical',
+          children: [leaf('b'), leaf('c')],
+          sizes: [30, 70],
+        },
+      ],
+      sizes: [45, 55],
+    };
+
+    const minimized = setLeafMinimized(root, 'b', true);
+    const visible = visiblePaneTree(minimized);
+
+    expect(findLeafById(minimized, 'b')?.pane.isMinimized).toBe(true);
+    expect(collectMinimizedLeafNodes(minimized).map((entry) => entry.leafId)).toEqual(['b']);
+    expect(findLeafById(visible!, 'b')).toBeNull();
+    expect(findLeafById(visible!, 'a')).not.toBeNull();
+    expect(findLeafById(visible!, 'c')).not.toBeNull();
+    expect(findLeafById(minimized, 'b')).not.toBeNull();
+    expect(findFirstVisibleLeafId(minimized)).toBe('a');
+  });
+
+  it('returns null when all leaves are minimized', () => {
+    const root: PaneNode = {
+      type: 'split',
+      id: 'root',
+      direction: 'horizontal',
+      children: [
+        { ...leaf('a'), pane: { ...leaf('a').pane, isMinimized: true } },
+        { ...leaf('b'), pane: { ...leaf('b').pane, isMinimized: true } },
+      ],
+      sizes: [50, 50],
+    };
+
+    expect(visiblePaneTree(root)).toBeNull();
+    expect(findFirstVisibleLeafId(root)).toBeNull();
   });
 });

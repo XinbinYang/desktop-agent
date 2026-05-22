@@ -1,9 +1,10 @@
 import json
 import logging
 import os
+import asyncio
 from typing import Any, Dict, List, Optional
 
-from app.connectors.base import ConnectorConfig, PlatformConnector
+from app.connectors.base import ConnectorConfig, PlatformConnector, mask_secret
 from app.runtime_paths import runtime_dir
 
 logger = logging.getLogger(__name__)
@@ -75,11 +76,15 @@ class ConnectorManager:
         if name not in self._configs:
             return False
         existing = self._configs[name]
-        existing.config = config_data
-        existing.enabled = config_data.get("enabled", existing.enabled)
+        connector = self._connectors.get(name)
+        if connector:
+            existing.config = connector.merge_config_update(config_data, existing.config)
+        else:
+            existing.config = dict(config_data)
+        existing.enabled = bool(config_data.get("enabled", existing.enabled))
         self._save_configs()
-        if name in self._connectors:
-            self._connectors[name].update_config(existing)
+        if connector:
+            connector.update_config(existing)
         return True
 
     async def start(self, name: str) -> bool:
@@ -96,6 +101,8 @@ class ConnectorManager:
             self._startup_failures.pop(name, None)
             return True
         except Exception as e:
+            if hasattr(connector, "_record_error"):
+                connector._record_error(f"Failed to start connector: {e}")
             logger.error("[ConnectorManager] Failed to start %s: %s", name, e)
             return False
 
@@ -157,21 +164,46 @@ class ConnectorManager:
             status = connector.status if connector else "stopped"
             status_msg = ""
             uptime = 0.0
+            last_error = ""
+            recent_events: list[Dict[str, Any]] = []
+            config_payload = cfg.config
             if connector:
                 status_msg = connector.status_message
                 uptime = connector.uptime_seconds
+                last_error = connector.last_error
+                recent_events = connector.recent_events
+                config_payload = connector.public_config()
             result.append({
                 "name": name,
                 "display_name": cfg.display_name,
                 "description": cfg.description,
                 "status": status,
                 "status_message": status_msg,
+                "last_error": last_error,
+                "recent_events": recent_events,
                 "enabled": cfg.enabled,
                 "uptime_seconds": uptime,
-                "config": cfg.config,
+                "config": config_payload,
                 "config_schema": connector.get_config_schema() if connector else {},
             })
         return result
+
+    def validate_config(self, name: str, config_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        connector = self._connectors.get(name)
+        if not connector:
+            raise KeyError(name)
+        existing = self._configs.get(name)
+        base = existing.config if existing else connector.config.config
+        merged = connector.merge_config_update(config_data or {}, base) if config_data is not None else base
+        missing = connector.validate_config(merged)
+        return {
+            "valid": not missing,
+            "missing_required": missing,
+            "config": connector.public_config() if config_data is None else {
+                key: (mask_secret(value) if key in connector.sensitive_fields() else value)
+                for key, value in merged.items()
+            },
+        }
 
     async def check_health(self, name: Optional[str] = None) -> Dict[str, Any]:
         """Health check for a specific or all connectors."""
@@ -190,6 +222,26 @@ class ConnectorManager:
                 results[n] = {"healthy": False, "details": str(e)}
         return results
 
+    async def doctor(self, name: Optional[str] = None) -> Dict[str, Any]:
+        if name:
+            connector = self._connectors.get(name)
+            if not connector:
+                raise KeyError(name)
+            return await connector.doctor()
+
+        results = {}
+        for n, connector in self._connectors.items():
+            try:
+                results[n] = await connector.doctor()
+            except Exception as e:
+                results[n] = {
+                    "name": n,
+                    "status": "error",
+                    "last_error": str(e),
+                    "recommendations": [str(e)],
+                }
+        return results
+
     async def send_test_message(self, name: str, message: str) -> Dict[str, Any]:
         connector = self._connectors.get(name)
         if not connector:
@@ -203,9 +255,6 @@ class ConnectorManager:
             except Exception as e:
                 logger.warning("[ConnectorManager] Error stopping %s during shutdown: %s", name, e)
         self._connectors.clear()
-
-
-import asyncio
 
 _connector_manager: Optional[ConnectorManager] = None
 

@@ -81,7 +81,7 @@ class Settings(BaseModel):
     max_parallel_agents: int = 3
     collaboration_enabled: bool = True
     default_collaboration_mode: str = "hybrid"
-    auto_delegate_coding: str = "suggest"
+    auto_delegate_coding: str = "policy_v2"
     review_gate_enabled: bool = True
     auto_approve_rules: List[AutoApproveRule] = []
 
@@ -214,6 +214,18 @@ def get_provider_for_model(model_id: str) -> Optional[tuple[str, ProviderConfig]
             if m.id == model_id:
                 return name, provider
     return None
+
+def model_supports_vision(model_id: str) -> bool:
+    """Return True only if the given model id is configured as vision-capable."""
+    if not model_id:
+        return False
+    cfg = load_config()
+    for provider in cfg.providers.values():
+        for m in provider.models:
+            if m.id == model_id:
+                return bool(m.vision)
+    return False
+
 
 def list_all_models() -> List[dict]:
     cfg = load_config()

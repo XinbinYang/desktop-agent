@@ -779,6 +779,38 @@ class AgentManager:
             return None
 
     @classmethod
+    def upsert_diary_entry(cls, content: str, *, marker_id: str, heading: str = "Session Delta") -> Optional[str]:
+        """Insert or replace a marked diary section in today's diary file."""
+        marker_id = re.sub(r"[^A-Za-z0-9_.:-]", "-", str(marker_id or "").strip())[:120]
+        if not marker_id or not str(content or "").strip():
+            return None
+        today = datetime.now().strftime("%Y-%m-%d")
+        diary_path = cls._memory_dir() / f"{today}.md"
+        timestamp = datetime.now().strftime("%H:%M")
+        start = f"<!-- memory-ingestion:{marker_id}:start -->"
+        end = f"<!-- memory-ingestion:{marker_id}:end -->"
+        section = f"{start}\n## {timestamp} - {heading}\n\n{content.strip()}\n{end}\n"
+        pattern = re.compile(
+            rf"{re.escape(start)}.*?{re.escape(end)}\s*",
+            re.DOTALL,
+        )
+        try:
+            diary_path.parent.mkdir(parents=True, exist_ok=True)
+            if diary_path.exists():
+                existing = diary_path.read_text(encoding="utf-8")
+                if pattern.search(existing):
+                    next_text = pattern.sub(section, existing).rstrip() + "\n"
+                else:
+                    next_text = existing.rstrip() + "\n\n" + section
+            else:
+                next_text = f"# {today}\n\n{section}"
+            diary_path.write_text(next_text, encoding="utf-8")
+            return str(diary_path)
+        except OSError as e:
+            logger.warning("Failed to upsert diary entry: %s", e)
+            return None
+
+    @classmethod
     def _load_recent_diaries(cls, days: int = 3) -> str:
         """Load diary entries from the last N days."""
         mem_dir = cls._memory_dir()
@@ -862,6 +894,34 @@ class AgentManager:
             logger.warning("Failed to update mood: %s", e)
             return False
 
+    @classmethod
+    def _dedupe_current_memory_entries(cls, existing: str, new_entries: List[str], today: str) -> List[str]:
+        header = "## 当前记忆"
+        lines: List[str] = []
+        if header in existing:
+            _, _, after = existing.partition(header)
+            for line in after.splitlines():
+                clean = line.strip()
+                if clean.startswith("- ["):
+                    lines.append(clean)
+        for entry in new_entries:
+            content = re.sub(r"\s+", " ", str(entry or "").strip())
+            if content:
+                lines.insert(0, f"- [HOT] [{today}] {content}")
+
+        seen: set[str] = set()
+        deduped: List[str] = []
+        entry_re = re.compile(r"^\s*-\s+\[(?:HOT|WARM|COLD|archived|ARCHIVED)\]\s+(?:\[\d{4}-\d{2}-\d{2}\]\s+)?(?P<body>.*)$")
+        for line in lines:
+            match = entry_re.match(line)
+            body = match.group("body").strip() if match else line.strip()
+            key = re.sub(r"\s+", " ", body).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(line)
+        return deduped
+
     # ──────────────────────────────────────────────
     # MEMORY.md with attention tiers
     # ──────────────────────────────────────────────
@@ -902,21 +962,17 @@ class AgentManager:
             if mem_path.exists():
                 existing = mem_path.read_text(encoding="utf-8")
 
-            # Build new memory section
             now = datetime.now().isoformat()
-            new_entries = "\n".join(f"- [HOT] [{now[:10]}] {e}" for e in entries)
+            current_entries = cls._dedupe_current_memory_entries(existing, entries, now[:10])
+            rendered_entries = "\n".join(current_entries[:200])
+            header = "## 当前记忆"
 
             if existing:
-                # Insert after the "## 当前记忆" header or at end
-                if "## 当前记忆" in existing:
-                    before, _, after = existing.partition("## 当前记忆")
-                    after_lines = after.split("\n")
-                    # Insert after header
-                    insert_pos = 1  # after the header line
-                    after_lines[insert_pos:insert_pos] = ["", new_entries]
-                    new_content = before + "## 当前记忆" + "\n".join(after_lines)
+                if header in existing:
+                    before, _, _ = existing.partition(header)
+                    new_content = before.rstrip() + "\n\n" + header + "\n\n" + rendered_entries + "\n"
                 else:
-                    new_content = existing.rstrip() + "\n\n## 当前记忆\n\n" + new_entries + "\n"
+                    new_content = existing.rstrip() + "\n\n" + header + "\n\n" + rendered_entries + "\n"
             else:
                 frontmatter = (
                     "---\n"
@@ -925,29 +981,7 @@ class AgentManager:
                     "max_lines: 200\n"
                     "---\n\n"
                 )
-                new_content = frontmatter + "# MEMORY.md — 长期精选记忆\n\n## 当前记忆\n\n" + new_entries + "\n"
-
-            # Enforce size limit
-            encoded = new_content.encode("utf-8")
-            if len(encoded) > 8 * 1024:
-                # LRU evict oldest entries
-                lines = new_content.split("\n")
-                kept: List[str] = []
-                kept_size = 0
-                # Always keep frontmatter and headers
-                in_frontmatter = True
-                for line in lines:
-                    line_bytes = (line + "\n").encode("utf-8")
-                    if in_frontmatter:
-                        kept.append(line)
-                        if line.strip() == "---" and len(kept) > 1:
-                            in_frontmatter = False
-                    elif kept_size + len(line_bytes) < 7 * 1024:
-                        kept.append(line)
-                        kept_size += len(line_bytes)
-                    else:
-                        break
-                new_content = "\n".join(kept)
+                new_content = frontmatter + "# MEMORY.md — 长期精选记忆\n\n" + header + "\n\n" + rendered_entries + "\n"
 
             mem_path.parent.mkdir(parents=True, exist_ok=True)
             mem_path.write_text(new_content, encoding="utf-8")

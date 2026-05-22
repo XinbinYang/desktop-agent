@@ -9,6 +9,7 @@ export interface SessionPane {
   role?: string;
   title?: string;
   isPrimary?: boolean;
+  isMinimized?: boolean;
   teamId?: string;
   // Project this pane's session is bound to. Drives the Workspace file-tree
   // zone when this pane is focused. null/undefined for project-less sessions
@@ -79,6 +80,14 @@ export function collectLeaves(root: PaneNode): SessionPane[] {
 export function collectLeafNodes(root: PaneNode): LeafEntry[] {
   if (root.type === 'leaf') return [{ leafId: root.id, node: root, pane: root.pane }];
   return root.children.flatMap(collectLeafNodes);
+}
+
+export function collectVisibleLeafNodes(root: PaneNode): LeafEntry[] {
+  return collectLeafNodes(root).filter((entry) => !entry.pane.isMinimized);
+}
+
+export function collectMinimizedLeafNodes(root: PaneNode): LeafEntry[] {
+  return collectLeafNodes(root).filter((entry) => !!entry.pane.isMinimized);
 }
 
 /** Find the parent of a node. Returns [parent, index] or null. */
@@ -205,6 +214,59 @@ export function findFirstLeafId(node: PaneNode): string | null {
   return null;
 }
 
+export function findFirstVisibleLeafId(node: PaneNode): string | null {
+  if (node.type === 'leaf') return node.pane.isMinimized ? null : node.id;
+  for (const child of node.children) {
+    const id = findFirstVisibleLeafId(child);
+    if (id) return id;
+  }
+  return null;
+}
+
+export function setLeafMinimized(root: PaneNode, leafId: string, isMinimized: boolean): PaneNode {
+  if (root.type === 'leaf') {
+    if (root.id !== leafId) return root;
+    return {
+      ...root,
+      pane: {
+        ...root.pane,
+        isMinimized,
+      },
+    };
+  }
+
+  return {
+    ...root,
+    children: root.children.map((child) => setLeafMinimized(child, leafId, isMinimized)),
+  };
+}
+
+export function visiblePaneTree(root: PaneNode): PaneNode | null {
+  if (root.type === 'leaf') {
+    return root.pane.isMinimized ? null : root;
+  }
+
+  const baseSizes = normalizeSizes(root.children.length, root.sizes);
+  const children: PaneNode[] = [];
+  const sizes: number[] = [];
+
+  root.children.forEach((child, index) => {
+    const visibleChild = visiblePaneTree(child);
+    if (!visibleChild) return;
+    children.push(visibleChild);
+    sizes.push(baseSizes[index]);
+  });
+
+  if (children.length === 0) return null;
+  if (children.length === 1) return children[0];
+
+  return {
+    ...root,
+    children,
+    sizes: normalizeSizes(children.length, sizes),
+  };
+}
+
 export function updateSplitSizes(root: PaneNode, splitId: string, sizes: number[]): PaneNode {
   if (root.type === 'leaf') return root;
   if (root.id === splitId) {
@@ -250,7 +312,9 @@ export function normalizePaneTree(node: unknown): PaneNode | null {
         role: typeof pane.role === 'string' ? pane.role : roleForAgent(agentType),
         ...(typeof pane.title === 'string' && pane.title ? { title: pane.title } : {}),
         ...(typeof pane.isPrimary === 'boolean' ? { isPrimary: pane.isPrimary } : {}),
+        ...(typeof pane.isMinimized === 'boolean' ? { isMinimized: pane.isMinimized } : {}),
         ...(typeof pane.teamId === 'string' && pane.teamId ? { teamId: pane.teamId } : {}),
+        ...(typeof pane.projectPath === 'string' || pane.projectPath === null ? { projectPath: pane.projectPath } : {}),
       },
     };
   }
@@ -277,7 +341,7 @@ export function normalizePaneTree(node: unknown): PaneNode | null {
   return null;
 }
 
-const PANE_TREE_VERSION = 2;
+const PANE_TREE_VERSION = 3;
 
 export interface PersistedPaneTree {
   version: number;
@@ -297,14 +361,16 @@ export function serializePaneTree(paneRoot: PaneNode, focusedLeafId: string): st
 export function deserializePaneTree(raw: string): PersistedPaneTree | null {
   try {
     const data = JSON.parse(raw);
-    if (!data || (data.version !== 1 && data.version !== PANE_TREE_VERSION) || !data.paneRoot) return null;
+    if (!data || (![1, 2, PANE_TREE_VERSION].includes(data.version)) || !data.paneRoot) return null;
 
     const paneRoot = normalizePaneTree(data.paneRoot);
     if (!paneRoot) return null;
 
-    const focusedLeafId = typeof data.focusedLeafId === 'string' && findLeafById(paneRoot, data.focusedLeafId)
+    const focusedLeaf =
+      typeof data.focusedLeafId === 'string' ? findLeafById(paneRoot, data.focusedLeafId) : null;
+    const focusedLeafId = focusedLeaf && !focusedLeaf.pane.isMinimized
       ? data.focusedLeafId
-      : findFirstLeafId(paneRoot);
+      : findFirstVisibleLeafId(paneRoot) ?? findFirstLeafId(paneRoot);
     if (!focusedLeafId) return null;
 
     _nodeCounter = Math.max(_nodeCounter, countNodes(paneRoot));

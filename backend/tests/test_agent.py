@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pytest
 from unittest.mock import patch, MagicMock
@@ -9,6 +10,7 @@ from app.agent import (
     _completion_quality_payload,
     _shell_command_looks_like_verification,
 )
+from app.message_utils import ToolCallResult
 from .conftest import _make_stream_mock
 
 
@@ -210,6 +212,47 @@ class TestAgentSession:
             assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
             assert all("run_id" in e["data"] for e in events if "data" in e)
             assert all("timestamp" in e["data"] for e in events if "data" in e)
+
+    @pytest.mark.asyncio
+    async def test_final_answer_completion_events_do_not_wait_for_save(self, session, monkeypatch):
+        mock_response = {
+            "choices": [{
+                "message": {
+                    "content": "Hello user",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        events = asyncio.Queue()
+        save_started = asyncio.Event()
+        release_save = asyncio.Event()
+
+        async def slow_save():
+            save_started.set()
+            await release_save.wait()
+
+        async def collect_events():
+            async for event in session.run("hi"):
+                await events.put(event)
+
+        monkeypatch.setattr(session, "_save_async", slow_save)
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
+            task = asyncio.create_task(collect_events())
+            seen = []
+            try:
+                while "run_completed" not in seen:
+                    event = await asyncio.wait_for(events.get(), timeout=0.5)
+                    seen.append(event["type"])
+
+                assert "content" in seen
+                assert "status" in seen
+                assert "run_completed" in seen
+                await asyncio.wait_for(save_started.wait(), timeout=0.5)
+                assert not task.done()
+            finally:
+                release_save.set()
+                await asyncio.wait_for(task, timeout=1)
 
     @pytest.mark.asyncio
     async def test_empty_stream_response_uses_non_stream_fallback(self, session):
@@ -702,6 +745,75 @@ class TestAgentSession:
             for e in events
         )
 
+    @pytest.mark.asyncio
+    async def test_tool_artifacts_emit_image_event_and_persist_ui_artifacts(self, session):
+        session.max_iterations = 2
+        artifact = {
+            "id": "chart-1",
+            "type": "image",
+            "title": "Equity curve",
+            "url": "/preview/test_session/chart.png",
+            "mime_type": "image/png",
+        }
+        tool_response = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_chart",
+                        "type": "function",
+                        "function": {
+                            "name": "get_screen_size",
+                            "arguments": "{}",
+                        },
+                    }],
+                }
+            }]
+        }
+        final_response = {
+            "choices": [{
+                "message": {
+                    "content": "Chart published.",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        responses = [tool_response, final_response]
+
+        async def stream_sequence(*args, **kwargs):
+            response = responses.pop(0)
+            content = response["choices"][0]["message"].get("content") or ""
+            if content:
+                yield {"type": "text_delta", "text": content}
+            yield {"type": "done", "response": response}
+
+        async def fake_execute_tool(*args, **kwargs):
+            return ToolCallResult(
+                tool_name="get_screen_size",
+                tool_args={},
+                tool_call_id="call_chart",
+                result_text="published",
+                duration_ms=3,
+                metadata={"artifacts": [artifact]},
+            )
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence), \
+             patch("app.agent.execute_tool", fake_execute_tool):
+            events = []
+            async for event in session.run("make a chart"):
+                events.append(event)
+
+        image_events = [e for e in events if e["type"] == "image"]
+        assert image_events
+        assert image_events[0]["data"]["url"] == artifact["url"]
+        tool_event = next(e for e in events if e["type"] == "tool_call" and e["data"].get("tool_call_id") == "call_chart")
+        assert tool_event["data"]["artifacts"][0]["url"] == artifact["url"]
+        tool_msg = next(m for m in session.messages if m.get("role") == "tool" and m.get("tool_call_id") == "call_chart")
+        assert tool_msg["ui_artifacts"][0]["url"] == artifact["url"]
+        assert all("ui_artifacts" not in msg for msg in session._messages_for_llm())
+
     def test_trim_drops_orphan_tool_messages(self, session):
         session.messages.extend([
             {"role": "tool", "tool_call_id": "orphan", "name": "x", "content": "bad"},
@@ -924,7 +1036,7 @@ class TestAgentSession:
         agents_root = tmp_path / "AGENTS"
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
         monkeypatch.setattr(HeartbeatEngine, "_store_auto_memory_items", classmethod(lambda cls, **kwargs: 0))
-        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls: False))
+        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls, **kwargs: False))
 
         assistant_only = [
             {"role": "user", "content": "archived user request", "context_epoch": 0},

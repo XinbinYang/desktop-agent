@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { Panel, Group, Separator } from 'react-resizable-panels';
 import type { GroupImperativeHandle, PanelImperativeHandle } from 'react-resizable-panels';
@@ -6,38 +6,41 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import { Sidebar } from './components/Sidebar';
 import type { ProjectHistoryAction } from './components/SessionHistoryPanel';
-import { SessionView, type SessionViewHandle } from './components/session/SessionView';
+import type { SessionViewHandle } from './components/session/SessionView';
 import { PaneRenderer } from './components/session/PaneRenderer';
-import type { LeafNode, PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
+import type { LeafEntry, LeafNode, PaneNode, SessionPane, SplitNode } from './components/session/PaneTypes';
 import {
   nextNodeId,
   collectLeaves,
   collectLeafNodes,
+  collectMinimizedLeafNodes,
   findLeafById,
   findLeafByPaneId,
   findFirstLeafId,
+  findFirstVisibleLeafId,
   replaceNode,
   removeLeaf,
   serializePaneTree,
   deserializePaneTree,
+  setLeafMinimized,
   updateSplitSizes,
+  visiblePaneTree,
   resetSplitSizes,
 } from './components/session/PaneTypes';
 import { TerminalPanel } from './components/TerminalPanel';
-import { WorkspacePanel, type WorkspaceView } from './components/workspace/WorkspacePanel';
-import { ActivityPanel } from './components/activity/ActivityPanel';
-import { PersonalWorkspacePanel, type PersonalWorkspaceTab } from './components/PersonalWorkspace/PersonalWorkspacePanel';
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
-import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
+import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type ArtifactItem, type ArtifactPayload, type OpenFile, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
 import { API_BASE } from './config';
 import { deleteDraft, deleteSessionData } from './lib/db';
 import {
-  DEFAULT_MAIN_LAYOUT,
   DEFAULT_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
+  DEFAULT_CHAT_OVERLAY_WIDTH,
+  MAX_CHAT_OVERLAY_WIDTH,
+  MIN_CHAT_OVERLAY_WIDTH,
   DEFAULT_TERMINAL_LAYOUT,
   useLayoutState,
   type PanelLayout,
@@ -54,17 +57,39 @@ import {
   type AgentProfileMap,
   type RoleDisplayNameMap,
 } from './lib/agentProfiles';
-import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity } from 'lucide-react';
+import { Settings, ChevronDown, ChevronUp, ChevronLeft, Monitor, Activity, GripVertical, Loader2, X } from 'lucide-react';
 import type { Team } from './lib/teamStore';
 import { loadTeams, saveTeams, createTeam, addPaneToTeam, removePaneFromTeam } from './lib/teamStore';
-import { ProjectModal } from './components/ProjectModal';
-import { ProjectRenameDialog } from './components/ProjectRenameDialog';
-import { ProjectHistoryConfirmDialog } from './components/ProjectHistoryConfirmDialog';
-import { SessionDeleteConfirmDialog } from './components/SessionDeleteConfirmDialog';
-import { SettingsModal } from './components/SettingsModal';
 import { ActivityBar } from './components/ActivityBar';
 import { WindowControls } from './components/WindowControls';
 import type { FileTreeAction } from './components/FileTree';
+import type { WorkspaceView } from './components/workspace/WorkspacePanel';
+import type { PersonalWorkspaceTab } from './components/PersonalWorkspace/PersonalWorkspacePanel';
+
+const WorkspacePanel = React.lazy(() =>
+  import('./components/workspace/WorkspacePanel').then((mod) => ({ default: mod.WorkspacePanel })),
+);
+const ActivityPanel = React.lazy(() =>
+  import('./components/activity/ActivityPanel').then((mod) => ({ default: mod.ActivityPanel })),
+);
+const PersonalWorkspacePanel = React.lazy(() =>
+  import('./components/PersonalWorkspace/PersonalWorkspacePanel').then((mod) => ({ default: mod.PersonalWorkspacePanel })),
+);
+const ProjectModal = React.lazy(() =>
+  import('./components/ProjectModal').then((mod) => ({ default: mod.ProjectModal })),
+);
+const ProjectRenameDialog = React.lazy(() =>
+  import('./components/ProjectRenameDialog').then((mod) => ({ default: mod.ProjectRenameDialog })),
+);
+const ProjectHistoryConfirmDialog = React.lazy(() =>
+  import('./components/ProjectHistoryConfirmDialog').then((mod) => ({ default: mod.ProjectHistoryConfirmDialog })),
+);
+const SessionDeleteConfirmDialog = React.lazy(() =>
+  import('./components/SessionDeleteConfirmDialog').then((mod) => ({ default: mod.SessionDeleteConfirmDialog })),
+);
+const SettingsModal = React.lazy(() =>
+  import('./components/SettingsModal').then((mod) => ({ default: mod.SettingsModal })),
+);
 
 type SessionListItem = SessionHistoryItem;
 
@@ -85,6 +110,7 @@ interface PendingProjectFileOpen {
   content: string;
   language: string;
   openToSide?: boolean;
+  options?: Partial<Pick<OpenFile, 'readOnly' | 'source' | 'isPinned' | 'viewerType' | 'artifact' | 'absolutePath' | 'mimeType' | 'size' | 'binaryReason'>>;
 }
 
 type SplitPlacement = 'before' | 'after';
@@ -100,9 +126,30 @@ interface SplitPaneOptions {
 const RESIZE_TARGET_MINIMUM_SIZE = { fine: 4, coarse: 34 } as const;
 const SESSION_HISTORY_POLL_MS = 5000;
 const SPLIT_RESIZE_COMMIT_MS = 80;
+const CHAT_OVERLAY_EDGE_GUTTER = 24;
+const CHAT_OVERLAY_SPLIT_GAP = 8;
+const RIGHT_PANEL_MIN_CONTENT_WIDTH = 520;
 
 function clampSidebarWidth(width: number): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+}
+
+function clampChatOverlayWidth(width: number, availableWidth?: number, reserveRightPanel = false): number {
+  return Math.min(getChatOverlayMaxWidth(availableWidth, reserveRightPanel), Math.max(MIN_CHAT_OVERLAY_WIDTH, width));
+}
+
+function getChatOverlayMaxWidth(availableWidth?: number, reserveRightPanel = false): number {
+  const usableWidth =
+    typeof availableWidth === 'number' && Number.isFinite(availableWidth) && availableWidth > 0
+      ? availableWidth
+      : typeof window === 'undefined'
+        ? MAX_CHAT_OVERLAY_WIDTH
+        : window.innerWidth;
+  const edgeMax = usableWidth - CHAT_OVERLAY_EDGE_GUTTER;
+  const reservedMax = reserveRightPanel
+    ? usableWidth - RIGHT_PANEL_MIN_CONTENT_WIDTH - CHAT_OVERLAY_SPLIT_GAP
+    : edgeMax;
+  return Math.max(MIN_CHAT_OVERLAY_WIDTH, Math.min(edgeMax, reservedMax));
 }
 
 function providerNeedsSetup(provider: SettingsResponse['providers'][string] | undefined): boolean {
@@ -139,6 +186,39 @@ function defaultProviderNeedsSetup(settings: SettingsResponse | null): boolean {
 
 function normalizePath(path: string): string {
   return path.replace(/\\/g, '/').toLowerCase();
+}
+
+function projectArtifactToItem(raw: ArtifactPayload | ArtifactItem | undefined, fallbackTitle: string): ArtifactItem | undefined {
+  if (!raw) return undefined;
+  const artifact = raw as ArtifactPayload & ArtifactItem & Record<string, any>;
+  return {
+    id: artifact.id || `project_artifact_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    type: (artifact.type || 'code') as ArtifactItem['type'],
+    title: artifact.title || fallbackTitle,
+    content: artifact.content,
+    url: artifact.url,
+    base64: artifact.base64,
+    mimeType: artifact.mimeType || artifact.mime_type,
+    path: artifact.path,
+    caption: artifact.caption,
+    timestamp: artifact.timestamp || Date.now(),
+    sourceTool: artifact.sourceTool || artifact.source_tool || artifact.source || 'project_file_open',
+    size: artifact.size,
+    kind: artifact.kind,
+    files: artifact.files,
+    previews: artifact.previews,
+    qaSummary: artifact.qaSummary || artifact.qa_summary,
+    engine: artifact.engine,
+    officeManifestId: artifact.officeManifestId || artifact.office_manifest_id,
+    manifestPath: artifact.manifestPath || artifact.manifest_path,
+    manifestUrl: artifact.manifestUrl || artifact.manifest_url,
+    viewerManifestUrl: artifact.viewerManifestUrl || artifact.viewer_manifest_url,
+    sha256: artifact.sha256,
+    renderIssues: artifact.renderIssues || artifact.render_issues,
+    availableActions: artifact.availableActions || artifact.available_actions,
+    workbook: artifact.workbook,
+    presentation: artifact.presentation,
+  };
 }
 
 const PANE_TREE_STORAGE_KEY = 'desktop-agent-pane-tree';
@@ -178,10 +258,10 @@ function loadPersistedPaneTree(activeAgent: AgentType): { paneRoot: PaneNode; fo
     if (!raw) throw new Error('no persisted tree');
     const data = deserializePaneTree(raw);
     if (!data) throw new Error('deserialize failed');
-    // Validate: focusedLeafId should exist in tree
+    // Validate: focusedLeafId should exist and prefer a visible pane.
     const leaf = findLeafById(data.paneRoot, data.focusedLeafId);
-    if (!leaf) {
-      data.focusedLeafId = findFirstLeafId(data.paneRoot) ?? data.focusedLeafId;
+    if (!leaf || leaf.pane.isMinimized) {
+      data.focusedLeafId = findFirstVisibleLeafId(data.paneRoot) ?? findFirstLeafId(data.paneRoot) ?? data.focusedLeafId;
     }
     return { paneRoot: data.paneRoot, focusedLeafId: data.focusedLeafId };
   } catch {
@@ -225,6 +305,147 @@ function sessionTitleForDisplay(
 function sessionModelForPane(pane: SessionPane | null | undefined, meta?: SessionListItem): string {
   return pane?.model || meta?.model_id || '';
 }
+
+interface MinimizedPaneTrayProps {
+  entries: LeafEntry[];
+  sessionMetaById: Record<string, SessionListItem>;
+  agentProfiles: AgentProfileMap;
+  roleDisplayNames: RoleDisplayNameMap;
+  onRestore: (leafId: string) => void;
+  onClose: (leafId: string) => void;
+}
+
+const MinimizedPaneTray: React.FC<MinimizedPaneTrayProps> = ({
+  entries,
+  sessionMetaById,
+  agentProfiles,
+  roleDisplayNames,
+  onRestore,
+  onClose,
+}) => {
+  if (entries.length === 0) return null;
+
+  return (
+    <div
+      className="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-t border-border bg-surface/95 px-1.5 py-1"
+      data-testid="minimized-pane-tray"
+      aria-label="Minimized session panes"
+    >
+      {entries.map((entry) => {
+        const meta = sessionMetaById[entry.pane.sessionId];
+        const title = sessionTitleForDisplay(entry.pane, meta, agentProfiles, roleDisplayNames);
+        const running = !!meta?.is_running;
+        return (
+          <div
+            key={entry.leafId}
+            className="flex h-6 max-w-[220px] shrink-0 items-center rounded border border-border bg-surface-alt text-[10px] text-fg-secondary"
+          >
+            <button
+              type="button"
+              onClick={() => onRestore(entry.leafId)}
+              className="flex h-full min-w-0 items-center gap-1 px-2 hover:text-fg"
+              title={`Restore ${title}`}
+              aria-label={`Restore pane ${title}`}
+            >
+              {running && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-success" aria-label={`${title} running`} />}
+              <span className="truncate">{title}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onClose(entry.leafId)}
+              className="flex h-full w-6 shrink-0 items-center justify-center rounded-r text-fg-muted hover:bg-surface-hover hover:text-fg"
+              title={`Close ${title}`}
+              aria-label={`Close minimized pane ${title}`}
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+interface RunningPaneCloseTarget {
+  leafId: string;
+  title: string;
+}
+
+interface RunningPaneCloseDialogProps {
+  target: RunningPaneCloseTarget | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+const RunningPaneCloseDialog: React.FC<RunningPaneCloseDialogProps> = ({
+  target,
+  onCancel,
+  onConfirm,
+}) => {
+  useEffect(() => {
+    if (!target) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onCancel, target]);
+
+  if (!target) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4 backdrop-blur-[1px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="close-running-pane-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+    >
+      <div className="w-[440px] max-w-[92vw] rounded-xl border border-border bg-surface px-5 py-5 shadow-2xl">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 id="close-running-pane-title" className="text-base font-semibold text-fg">
+              Stop running session?
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-fg-muted">
+              Closing this pane will stop the running Agent task. Use minimize to hide it without interrupting work.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded p-1 text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg"
+            aria-label="Cancel close running pane"
+            title="Cancel"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="mt-4 truncate rounded border border-border bg-surface-alt px-3 py-2 text-xs text-fg-secondary" title={target.title}>
+          {target.title}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-border bg-surface px-3 py-1.5 text-sm text-fg-secondary transition-colors hover:bg-surface-hover hover:text-fg"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="rounded bg-danger px-3 py-1.5 text-sm font-medium text-fg-on-danger transition-colors hover:bg-danger/85"
+          >
+            Stop and close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 function flattenSessionHistory(history: SessionHistoryResponse | null): SessionListItem[] {
   if (!history) return [];
@@ -428,11 +649,21 @@ export default function App() {
   const [deleteSessionTarget, setDeleteSessionTarget] = useState<SessionHistoryItem | null>(null);
   const [deleteSessionError, setDeleteSessionError] = useState('');
   const [isDeletingSession, setIsDeletingSession] = useState(false);
+  const [closePaneTarget, setClosePaneTarget] = useState<RunningPaneCloseTarget | null>(null);
   const [isRefreshingProject, setIsRefreshingProject] = useState(false);
 
   const layout = useLayoutState();
   const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
+  const [chatOverlayDragWidth, setChatOverlayDragWidth] = useState<number | null>(null);
+  const workbenchRef = useRef<HTMLDivElement>(null);
   const sidebarWidth = sidebarDragWidth ?? layout.sidebarWidth;
+  const chatOverlayAvailableWidth = workbenchRef.current?.clientWidth;
+  const chatOverlayMaxWidth = getChatOverlayMaxWidth(chatOverlayAvailableWidth, layout.rightPanelVisible);
+  const chatOverlayWidth = chatOverlayDragWidth ?? clampChatOverlayWidth(
+    layout.chatOverlayWidth,
+    chatOverlayAvailableWidth,
+    layout.rightPanelVisible,
+  );
   const openPersonalWorkspace = useCallback((tab: PersonalWorkspaceTab = 'persona') => {
     setPersonalWorkspaceTab(tab);
     setPersonalWorkspaceFocusSignal((value) => value + 1);
@@ -445,6 +676,8 @@ export default function App() {
     for (const session of sessions) map[session.id] = session;
     return map;
   }, [sessions]);
+  const visiblePaneRoot = React.useMemo(() => visiblePaneTree(paneRoot), [paneRoot]);
+  const minimizedPaneEntries = React.useMemo(() => collectMinimizedLeafNodes(paneRoot), [paneRoot]);
   const focusedLeaf = React.useMemo(() => findLeafById(paneRoot, focusedLeafId), [paneRoot, focusedLeafId]);
   const focusedPane = focusedLeaf?.pane ?? null;
   const focusedSessionMeta = focusedPane ? sessionMetaById[focusedPane.sessionId] : undefined;
@@ -495,9 +728,7 @@ export default function App() {
   const newSessionRef = useRef<() => void>(() => {});
   const lastFocusedLeafByAgent = useRef<Partial<Record<AgentType, string>>>({});
   const didPromptModelSetup = React.useRef(false);
-  const mainGroupRef = useRef<GroupImperativeHandle>(null);
   const centerGroupRef = useRef<GroupImperativeHandle>(null);
-  const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const terminalPanelRef = useRef<PanelImperativeHandle>(null);
   const projectRefreshTimerRef = useRef<number | null>(null);
   const splitResizeTimersRef = useRef<Record<string, number>>({});
@@ -613,15 +844,55 @@ export default function App() {
     layout.setSidebarWidth(layout.sidebarWidth + delta);
   }, [layout]);
 
-  useEffect(() => {
-    const panel = rightPanelRef.current;
-    if (!panel) return;
-    if (layout.rightPanelVisible && panel.isCollapsed()) {
-      panel.expand();
-    } else if (!layout.rightPanelVisible && !panel.isCollapsed()) {
-      panel.collapse();
+  const handleChatOverlayResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const availableWidth = workbenchRef.current?.clientWidth;
+    const startWidth = clampChatOverlayWidth(chatOverlayWidth, availableWidth, layout.rightPanelVisible);
+    let latestWidth = startWidth;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      latestWidth = clampChatOverlayWidth(startWidth + moveEvent.clientX - startX, availableWidth, layout.rightPanelVisible);
+      setChatOverlayDragWidth(latestWidth);
+    };
+
+    const finishResize = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', finishResize);
+      window.removeEventListener('pointercancel', finishResize);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      setChatOverlayDragWidth(null);
+      layout.setChatOverlayWidth(latestWidth);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', finishResize);
+    window.addEventListener('pointercancel', finishResize);
+  }, [chatOverlayWidth, layout]);
+
+  const handleChatOverlayResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home') return;
+    event.preventDefault();
+    if (event.key === 'Home') {
+      layout.setChatOverlayWidth(DEFAULT_CHAT_OVERLAY_WIDTH);
+      return;
     }
-  }, [layout.rightPanelVisible]);
+    const delta = event.key === 'ArrowRight' ? 24 : -24;
+    layout.setChatOverlayWidth(clampChatOverlayWidth(layout.chatOverlayWidth + delta, workbenchRef.current?.clientWidth, layout.rightPanelVisible));
+  }, [layout]);
+
+  const expandChatOverlayForHorizontalPanes = useCallback((paneCount: number) => {
+    if (paneCount < 2) return;
+    const desiredWidth = (paneCount * DEFAULT_CHAT_OVERLAY_WIDTH) + ((paneCount - 1) * CHAT_OVERLAY_SPLIT_GAP);
+    const nextWidth = Math.max(layout.chatOverlayWidth, desiredWidth);
+    layout.setChatOverlayWidth(clampChatOverlayWidth(nextWidth, workbenchRef.current?.clientWidth, layout.rightPanelVisible));
+  }, [layout]);
 
   useEffect(() => {
     const panel = terminalPanelRef.current;
@@ -1063,6 +1334,9 @@ export default function App() {
       : leaves.find((entry) => entry.pane.agentType === agentType)?.node || null;
 
     if (openLeaf) {
+      if (openLeaf.pane.isMinimized) {
+        setPaneRoot((prev) => setLeafMinimized(prev, openLeaf.id, false));
+      }
       setFocusedLeafId(openLeaf.id);
       lastFocusedLeafByAgent.current[agentType] = openLeaf.id;
       return openLeaf.pane.sessionId;
@@ -1098,12 +1372,13 @@ export default function App() {
       };
       return replaceNode(prev, targetLeafId, split);
     });
+    expandChatOverlayForHorizontalPanes(collectLeafNodes(paneRoot).length + 1);
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
     loadSessions(currentProject?.path ?? null);
     addTerminalLog(`[系统] 已切换到 ${displayNameForAgent(agentType, agentProfiles)}`);
     return resolved.session_id;
-  }, [addTerminalLog, agentModel, agentModels, agentProfiles, currentProject?.path, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
+  }, [addTerminalLog, agentModel, agentModels, agentProfiles, currentProject?.path, expandChatOverlayForHorizontalPanes, focusedLeafId, layout, loadSessions, paneRoot, resolveAgentSessionClient]);
 
   const handleAgentNavigate = useCallback(async (agentType: AgentType) => {
     await openAgentSessionInPane(agentType, agentType === 'personal' ? 'canonical' : 'last_or_create');
@@ -1576,16 +1851,18 @@ export default function App() {
     layout.setRightPanelVisible(true);
     layout.setRightZone('workspace');
     setWorkspaceView('editor');
-    requestAnimationFrame(() => {
-      rightPanelRef.current?.expand?.();
-    });
   }, [layout]);
 
   const openProjectFileInSession = useCallback((sessionId: string, file: PendingProjectFileOpen) => {
     const handle = sessionViewRefs.current.get(sessionId);
     if (!handle) return false;
-    if (file.openToSide) {
-      handle.openFile(file.path, file.content, file.language, { groupId: 'secondary' });
+    const editorOptions = {
+      ...(file.options || {}),
+      ...(file.openToSide ? { groupId: 'secondary' as const } : {}),
+    };
+    const hasEditorOptions = Object.keys(editorOptions).length > 0;
+    if (file.openToSide || hasEditorOptions) {
+      handle.openFile(file.path, file.content, file.language, editorOptions);
     } else {
       handle.openFile(file.path, file.content, file.language);
     }
@@ -1614,29 +1891,55 @@ export default function App() {
   const handleSelectFile = useCallback(async (path: string, type: 'file' | 'dir', options: { openToSide?: boolean } = {}) => {
     if (type !== 'file' || !currentProject) return;
     try {
+      const sessionId = await ensureCodingSessionForProject();
       const filePath = currentProject.path.replace(/\\/g, '/') + '/' + path;
-      const res = await fetch(`${API_BASE}/api/file/read?path=${encodeURIComponent(filePath)}`);
+      const res = await fetch(`${API_BASE}/api/file/open?path=${encodeURIComponent(filePath)}&session_id=${encodeURIComponent(sessionId)}`);
       if (!res.ok) {
-        addTerminalLog(`[Project] Failed to read file: ${path}`);
+        addTerminalLog(`[Project] Failed to open file: ${path}`);
         return;
       }
       const data = await res.json();
       if (data.error) {
-        addTerminalLog(`[Project] Read failed: ${data.error}`);
+        addTerminalLog(`[Project] Open failed: ${data.error}`);
         return;
       }
-      const content = data.content ?? '';
       const name = path.split('/').pop() || path;
-      const language = getLangFromFilename(name);
-      const sessionId = await ensureCodingSessionForProject();
-      const pending: PendingProjectFileOpen = { sessionId, path, content, language, openToSide: options.openToSide };
+      const kind = (['office', 'image', 'binary', 'text'].includes(data.kind) ? data.kind : 'text') as NonNullable<OpenFile['viewerType']>;
+      const artifact = projectArtifactToItem(data.artifact, name);
+      const content = kind === 'text' ? data.content ?? '' : '';
+      const language = kind === 'text'
+        ? getLangFromFilename(name)
+        : kind === 'office'
+          ? artifact?.kind || 'office'
+          : kind === 'image'
+            ? 'image'
+            : 'binary';
+      const fileOptions: PendingProjectFileOpen['options'] = kind === 'text'
+        ? undefined
+        : {
+            viewerType: kind,
+            readOnly: true,
+            artifact,
+            absolutePath: data.path,
+            mimeType: data.mime_type || artifact?.mimeType,
+            size: data.size || artifact?.size,
+            binaryReason: data.reason,
+          };
+      const pending: PendingProjectFileOpen = {
+        sessionId,
+        path,
+        content,
+        language,
+        openToSide: options.openToSide,
+        options: fileOptions,
+      };
       if (!openProjectFileInSession(sessionId, pending)) {
         pendingProjectFileOpenRef.current = pending;
         revealWorkspaceEditor();
       }
     } catch (err) {
-      console.error('[App] Read file error:', err);
-      addTerminalLog(`[Project] Read file error: ${err}`);
+      console.error('[App] Open file error:', err);
+      addTerminalLog(`[Project] Open file error: ${err}`);
     }
   }, [addTerminalLog, currentProject, ensureCodingSessionForProject, openProjectFileInSession, revealWorkspaceEditor]);
 
@@ -1910,6 +2213,9 @@ export default function App() {
 
     const existing = collectLeafNodes(paneRoot).find((entry) => entry.pane.sessionId === newSessionId);
     if (existing) {
+      if (existing.pane.isMinimized) {
+        setPaneRoot((prev) => setLeafMinimized(prev, existing.leafId, false));
+      }
       setFocusedLeafId(existing.leafId);
       lastFocusedLeafByAgent.current[existing.pane.agentType] = existing.leafId;
       layout.setActiveAgent(existing.pane.agentType);
@@ -1938,11 +2244,12 @@ export default function App() {
       };
       return replaceNode(prev, targetLeafId, split);
     });
+    expandChatOverlayForHorizontalPanes(collectLeafNodes(paneRoot).length + 1);
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[targetAgent] = newLeaf.id;
     layout.setActiveAgent(targetAgent);
     layout.setActiveSection(targetAgent === 'personal' ? 'personal' : 'workspace');
-  }, [agentModel, agentModels, focusedLeafId, layout, paneRoot, sessions]);
+  }, [agentModel, agentModels, expandChatOverlayForHorizontalPanes, focusedLeafId, layout, paneRoot, sessions]);
 
   const stopSessionById = useCallback((sessionId: string) => {
     if (!sessionId) return;
@@ -2017,6 +2324,7 @@ export default function App() {
       };
       return replaceNode(prev, targetLeafId, split);
     });
+    expandChatOverlayForHorizontalPanes(collectLeafNodes(paneRoot).length + 1);
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current.coding = newLeaf.id;
     layout.setActiveAgent(agentType);
@@ -2026,9 +2334,11 @@ export default function App() {
     agentModel,
     agentModels.coding,
     currentProject?.path,
+    expandChatOverlayForHorizontalPanes,
     focusedLeafId,
     layout,
     loadSessions,
+    paneRoot,
     resolveAgentSessionClient,
   ]);
 
@@ -2161,6 +2471,9 @@ export default function App() {
     if (requestedAgent === 'personal') {
       const existingPersonal = collectLeafNodes(paneRoot).find((entry) => entry.pane.agentType === 'personal');
       if (existingPersonal) {
+        if (existingPersonal.pane.isMinimized) {
+          setPaneRoot((prev) => setLeafMinimized(prev, existingPersonal.leafId, false));
+        }
         setFocusedLeafId(existingPersonal.leafId);
         return;
       }
@@ -2202,9 +2515,12 @@ export default function App() {
       };
       return replaceNode(prev, leafId, split);
     });
+    if (direction === 'horizontal') {
+      expandChatOverlayForHorizontalPanes(collectLeafNodes(paneRoot).length + 1);
+    }
     setFocusedLeafId(newLeaf.id);
     lastFocusedLeafByAgent.current[agentType] = newLeaf.id;
-  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, loadSessions, paneRoot, resolveAgentSessionClient]);
+  }, [addTerminalLog, agentModel, agentModels, currentProject?.path, expandChatOverlayForHorizontalPanes, loadSessions, paneRoot, resolveAgentSessionClient]);
 
   // Move a session from one leaf to another (drag to center of pane)
   const handleMoveSession = useCallback((fromLeafId: string, toLeafId: string) => {
@@ -2262,10 +2578,14 @@ export default function App() {
     loadSessions(currentProject?.path ?? null);
   }, [currentProject?.path, focusedActions, focusedLeafId, layout, loadSessions, paneRoot]);
 
-  // Close a leaf pane
-  const handleClosePane = useCallback((leafId: string) => {
+  const isPaneSessionRunning = useCallback((pane: SessionPane): boolean => {
+    return !!sessionMetaById[pane.sessionId]?.is_running ||
+      (focusedSnapshot?.sessionId === pane.sessionId && !!focusedSnapshot.isRunning);
+  }, [focusedSnapshot?.isRunning, focusedSnapshot?.sessionId, sessionMetaById]);
+
+  const closePaneNow = useCallback((leafId: string, stopRunning = false) => {
     const closingLeaf = findLeafById(paneRoot, leafId);
-    if (closingLeaf) {
+    if (stopRunning && closingLeaf) {
       stopSessionById(closingLeaf.pane.sessionId);
     }
 
@@ -2285,7 +2605,18 @@ export default function App() {
 
       const result = removeLeaf(prev, leafId);
       if (!result) return prev;
-      if (result.focusId) setFocusedLeafId(result.focusId);
+      const currentFocusedLeaf = focusedLeafId === leafId ? null : findLeafById(result.root, focusedLeafId);
+      const nextFocusId = currentFocusedLeaf && !currentFocusedLeaf.pane.isMinimized
+        ? focusedLeafId
+        : findFirstVisibleLeafId(result.root) ?? result.focusId ?? findFirstLeafId(result.root);
+      if (nextFocusId) {
+        setFocusedLeafId(nextFocusId);
+        const nextFocusLeaf = findLeafById(result.root, nextFocusId);
+        if (nextFocusLeaf && !nextFocusLeaf.pane.isMinimized) {
+          lastFocusedLeafByAgent.current[nextFocusLeaf.pane.agentType] = nextFocusId;
+          layout.setActiveAgent(nextFocusLeaf.pane.agentType);
+        }
+      }
       if (result.removedPane) {
         sessionViewRefs.current.delete(result.removedPane.sessionId);
         setTeams((teams) => {
@@ -2296,7 +2627,67 @@ export default function App() {
       }
       return result.root;
     });
-  }, [agentModel, layout.activeAgent, paneRoot, stopSessionById]);
+  }, [agentModel, focusedLeafId, layout, paneRoot, stopSessionById]);
+
+  const handleClosePane = useCallback((leafId: string) => {
+    const leaf = findLeafById(paneRoot, leafId);
+    if (!leaf) return;
+    if (isPaneSessionRunning(leaf.pane)) {
+      const meta = sessionMetaById[leaf.pane.sessionId];
+      setClosePaneTarget({
+        leafId,
+        title: sessionTitleForDisplay(leaf.pane, meta, agentProfiles, roleDisplayNames),
+      });
+      return;
+    }
+    closePaneNow(leafId, false);
+  }, [agentProfiles, closePaneNow, isPaneSessionRunning, paneRoot, roleDisplayNames, sessionMetaById]);
+
+  const handleConfirmClosePane = useCallback(() => {
+    if (!closePaneTarget) return;
+    const leafId = closePaneTarget.leafId;
+    setClosePaneTarget(null);
+    closePaneNow(leafId, true);
+  }, [closePaneNow, closePaneTarget]);
+
+  const handleCancelClosePane = useCallback(() => {
+    setClosePaneTarget(null);
+  }, []);
+
+  const handleMinimizePane = useCallback((leafId: string) => {
+    setPaneRoot((prev) => {
+      const target = findLeafById(prev, leafId);
+      if (!target) return prev;
+      const next = setLeafMinimized(prev, leafId, true);
+      const focusedStillVisible = focusedLeafId !== leafId
+        ? findLeafById(next, focusedLeafId)
+        : null;
+      if (!focusedStillVisible || focusedStillVisible.pane.isMinimized) {
+        const nextFocusId = findFirstVisibleLeafId(next) ?? leafId;
+        setFocusedLeafId(nextFocusId);
+        const nextFocusLeaf = findLeafById(next, nextFocusId);
+        if (nextFocusLeaf && !nextFocusLeaf.pane.isMinimized) {
+          lastFocusedLeafByAgent.current[nextFocusLeaf.pane.agentType] = nextFocusId;
+          layout.setActiveAgent(nextFocusLeaf.pane.agentType);
+        }
+      }
+      return next;
+    });
+  }, [focusedLeafId, layout]);
+
+  const handleRestorePane = useCallback((leafId: string) => {
+    setPaneRoot((prev) => {
+      const next = setLeafMinimized(prev, leafId, false);
+      const restoredLeaf = findLeafById(next, leafId);
+      if (restoredLeaf) {
+        setFocusedLeafId(leafId);
+        lastFocusedLeafByAgent.current[restoredLeaf.pane.agentType] = leafId;
+        layout.setActiveAgent(restoredLeaf.pane.agentType);
+        layout.setActiveSection(restoredLeaf.pane.agentType === 'personal' ? 'personal' : 'workspace');
+      }
+      return next;
+    });
+  }, [layout]);
 
   const handleSplitResize = useCallback((splitId: string, sizes: number[]) => {
     pendingSplitSizesRef.current[splitId] = sizes;
@@ -2393,12 +2784,6 @@ export default function App() {
     layout.toggleTerminal();
   }, [layout]);
 
-  const handleMainLayoutChanged = useCallback((next: PanelLayout) => {
-    if ((next.center ?? 0) > 1 && (next.right ?? 0) > 1) {
-      layout.setMainLayout(next);
-    }
-  }, [layout]);
-
   const handleTerminalLayoutChanged = useCallback((next: PanelLayout) => {
     if ((next.conversation ?? 0) > 1 && (next.terminal ?? 0) > 1) {
       layout.setTerminalLayout(next);
@@ -2407,26 +2792,34 @@ export default function App() {
 
   const handleResetLayout = useCallback(() => {
     layout.resetLayout();
-    mainGroupRef.current?.setLayout(DEFAULT_MAIN_LAYOUT);
     centerGroupRef.current?.setLayout(DEFAULT_TERMINAL_LAYOUT);
-    rightPanelRef.current?.expand();
     terminalPanelRef.current?.expand();
     setPaneRoot((prev) => resetSplitSizes(prev));
   }, [layout]);
 
   // ---- Derived: right panel props from focused snapshot ----
-  const rpTools = focusedSnapshot?.toolCalls ?? [];
-  const rpEdits = focusedSnapshot?.fileEdits ?? [];
-  const rpRuns = focusedSnapshot?.runEvents ?? [];
-  const rpArtifacts = focusedSnapshot?.artifacts ?? [];
-  const rpAutomationSnapshots = focusedSnapshot?.automationSnapshots ?? [];
-  const rpAutomationActions = focusedSnapshot?.automationActions ?? [];
-  const rpAutomationTraces = focusedSnapshot?.automationTraces ?? [];
+  // useMemo stabilises references so React.memo'd panels skip renders when their
+  // specific slice hasn't changed (e.g. only isRunning flipped, not toolCalls).
+  const rpTools = useMemo(() => focusedSnapshot?.toolCalls ?? [], [focusedSnapshot?.toolCalls]);
+  const rpEdits = useMemo(() => focusedSnapshot?.fileEdits ?? [], [focusedSnapshot?.fileEdits]);
+  const rpRuns = useMemo(() => focusedSnapshot?.runEvents ?? [], [focusedSnapshot?.runEvents]);
+  const rpArtifacts = useMemo(() => focusedSnapshot?.artifacts ?? [], [focusedSnapshot?.artifacts]);
+  const rpAutomationSnapshots = useMemo(() => focusedSnapshot?.automationSnapshots ?? [], [focusedSnapshot?.automationSnapshots]);
+  const rpAutomationActions = useMemo(() => focusedSnapshot?.automationActions ?? [], [focusedSnapshot?.automationActions]);
+  const rpAutomationTraces = useMemo(() => focusedSnapshot?.automationTraces ?? [], [focusedSnapshot?.automationTraces]);
   const rpAutomationReplayStatus = focusedSnapshot?.automationReplayStatus ?? null;
   const rpIsRunning = focusedSnapshot?.isRunning ?? false;
   const rpLatestToolCall = focusedSnapshot?.latestToolCall ?? null;
-  const rpEditorGroups = focusedSnapshot?.editorGroups ?? [{ id: 'main', activeFileId: null, openFiles: [] }];
+  const rpEditorGroups = useMemo(
+    () => focusedSnapshot?.editorGroups ?? [{ id: 'main', activeFileId: null, openFiles: [] }],
+    [focusedSnapshot?.editorGroups],
+  );
   const rpActiveEditorGroup = focusedSnapshot?.activeEditorGroup ?? 'main';
+
+  // Stable action callbacks for ActivityPanel — avoids inline arrow re-creation each render.
+  const handleApplyRun = useCallback((runId: string) => focusedActions.runAction(runId, 'apply'), [focusedActions]);
+  const handleMergeRun = useCallback((runId: string) => focusedActions.runAction(runId, 'merge'), [focusedActions]);
+  const handleDiscardRun = useCallback((runId: string) => focusedActions.runAction(runId, 'discard'), [focusedActions]);
 
   // ---- Render ----
   const isConnected = focusedSnapshot?.isConnected ?? false;
@@ -2553,7 +2946,9 @@ export default function App() {
             >
               <div className="h-full w-px bg-border transition-colors group-hover:bg-accent/60" />
             </div>
-            <ProjectModal
+            <React.Suspense fallback={null}>
+              {showProjectModal && (
+                <ProjectModal
               isOpen={showProjectModal}
               onClose={() => setShowProjectModal(false)}
               onProjectCreated={async (project) => {
@@ -2565,64 +2960,82 @@ export default function App() {
                 setShowProjectModal(false);
                 addTerminalLog(`[系统] 已创建项目: ${project.name}`);
               }}
-            />
-            <ProjectRenameDialog
+                />
+              )}
+              {renameProjectTarget && (
+                <ProjectRenameDialog
               isOpen={!!renameProjectTarget}
-              initialName={renameProjectTarget?.display_name || renameProjectTarget?.name || ''}
-              projectPath={renameProjectTarget?.path}
+              initialName={renameProjectTarget.display_name || renameProjectTarget.name || ''}
+              projectPath={renameProjectTarget.path}
               loading={isRenamingProject}
               error={renameProjectError}
               onClose={closeProjectRenameDialog}
               onSubmit={submitProjectRename}
-            />
-            <ProjectHistoryConfirmDialog
+                />
+              )}
+              {confirmProjectAction && (
+                <ProjectHistoryConfirmDialog
               isOpen={!!confirmProjectAction}
-              action={confirmProjectAction?.action || 'archive'}
-              project={confirmProjectAction?.project || null}
+              action={confirmProjectAction.action || 'archive'}
+              project={confirmProjectAction.project || null}
               loading={isConfirmingProjectAction}
               error={confirmProjectError}
               onClose={closeProjectHistoryConfirm}
               onConfirm={submitProjectHistoryConfirm}
-            />
-            <SessionDeleteConfirmDialog
+                />
+              )}
+              {deleteSessionTarget && (
+                <SessionDeleteConfirmDialog
               isOpen={!!deleteSessionTarget}
               session={deleteSessionTarget}
               loading={isDeletingSession}
               error={deleteSessionError}
               onClose={closeSessionDeleteDialog}
               onConfirm={submitSessionDelete}
-            />
+                />
+              )}
+            </React.Suspense>
           </>
         )}
 
-        <SettingsModal
-          isOpen={showSettings}
-          onClose={() => setShowSettings(false)}
-          models={models}
-          currentModel={focusedModel}
-          onSettingsChanged={async () => {
-            try {
-              const res = await fetch(`${API_BASE}/api/models`);
-              const data = await res.json();
-              const modelsList = data.models || [];
-              setModels(modelsList);
-
-              // Re-fetch per-agent model settings
-              try {
-                const settingsRes = await fetch(`${API_BASE}/api/settings`);
-                const settingsData = await settingsRes.json();
-                setAgentModels({
-                  personal: settingsData.personal_agent?.model || '',
-                  coding: settingsData.coding_agent?.model || '',
-                });
-              } catch {
-                setAgentModels({ personal: '', coding: '' });
-              }
-            } catch (err) {
-              console.error('[App] Failed to refresh models after settings change:', err);
-            }
-          }}
+        <RunningPaneCloseDialog
+          target={closePaneTarget}
+          onCancel={handleCancelClosePane}
+          onConfirm={handleConfirmClosePane}
         />
+
+        <React.Suspense fallback={null}>
+          {showSettings && (
+            <SettingsModal
+              isOpen={showSettings}
+              onClose={() => setShowSettings(false)}
+              models={models}
+              currentModel={focusedModel}
+              onSettingsChanged={async () => {
+                try {
+                  const res = await fetch(`${API_BASE}/api/models`);
+                  const data = await res.json();
+                  const modelsList = data.models || [];
+                  setModels(modelsList);
+
+                  // Re-fetch per-agent model settings
+                  try {
+                    const settingsRes = await fetch(`${API_BASE}/api/settings`);
+                    const settingsData = await settingsRes.json();
+                    setAgentModels({
+                      personal: settingsData.personal_agent?.model || '',
+                      coding: settingsData.coding_agent?.model || '',
+                    });
+                  } catch {
+                    setAgentModels({ personal: '', coding: '' });
+                  }
+                } catch (err) {
+                  console.error('[App] Failed to refresh models after settings change:', err);
+                }
+              }}
+            />
+          )}
+        </React.Suspense>
 
         <SwitchAgentModal
           isOpen={!!switchSuggestion}
@@ -2644,19 +3057,8 @@ export default function App() {
         />
 
         {/* Center + right panel — horizontal Group */}
-        <Group
-          id="desktop-agent-main-layout"
-          groupRef={mainGroupRef}
-          orientation="horizontal"
-          defaultLayout={layout.mainLayout}
-          onLayoutChanged={handleMainLayoutChanged}
-          className="flex-1 min-w-0"
-          resizeTargetMinimumSize={RESIZE_TARGET_MINIMUM_SIZE}
-        >
-          {/* Center area */}
-          <Panel id="center" minSize="360px">
-            <div className="flex flex-col h-full">
-              {/* Vertical Group: Pane tree + Terminal */}
+        <div ref={workbenchRef} className="relative flex-1 min-w-0 overflow-hidden bg-app" data-testid="floating-workbench">
+          <div className="flex flex-col h-full">
               <Group
                 id="desktop-agent-center-layout"
                 groupRef={centerGroupRef}
@@ -2667,38 +3069,234 @@ export default function App() {
                 resizeTargetMinimumSize={RESIZE_TARGET_MINIMUM_SIZE}
               >
                 <Panel id="conversation" minSize="280px">
-                  <PaneRenderer
-                    node={paneRoot}
-                    focusedLeafId={focusedLeafId}
-                    onFocus={handleFocusLeaf}
-                    onClosePane={handleClosePane}
-                    onSplit={handleSplitPane}
-                    onMoveSession={handleMoveSession}
-                    onSplitResize={handleSplitResize}
-                    teams={teams}
-                    onJoinTeam={handleJoinTeam}
-                    onCreateTeam={handleCreateTeam}
-                    onLeaveTeam={handleLeaveTeam}
-                    sessionViewRefs={sessionViewRefs}
-                    currentProject={currentProject}
-                    currentModel={focusedModel}
-                    currentAgentType={focusedAgentType}
-                    currentRole={roleForAgent(focusedAgentType)}
-                    models={models}
-                    agentProfiles={agentProfiles}
-                    roleDisplayNames={roleDisplayNames}
-                    sessionMetaById={sessionMetaById}
-                    onModelChange={handlePaneModelChange}
-                    onSnapshot={handleSessionSnapshot}
-                    onCommand={handleSlashCommand}
-                    runAction={runAction}
-                    openRunWorktree={openRunWorktree}
-                    handleOpenFileFromPanel={handleOpenFileFromPanel}
-                    handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
-                    onRevealWorkspace={handleRevealWorkspaceZone}
-                    onOpenPlanInWorkspace={handleOpenPlanInWorkspace}
-                    onProjectFileEdit={scheduleProjectRefresh}
-                  />
+                  <div className="relative h-full overflow-hidden">
+                    <div
+                      className="absolute inset-0 min-w-0 bg-app"
+                      style={{ paddingLeft: layout.rightPanelVisible ? chatOverlayWidth + 16 : 0 }}
+                      data-testid="workbench-background"
+                    >
+                      {layout.rightPanelVisible ? (
+                        <div className="flex h-full min-w-0 flex-col border-l border-border bg-surface/95 shadow-inner">
+                          <div className="flex border-b border-border shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => layout.setRightZone('workspace')}
+                              data-testid="workbench-zone-workspace"
+                              className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
+                                layout.rightZone === 'workspace' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                              }`}
+                            >
+                              <Monitor className="w-3.5 h-3.5" />
+                              工作区
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => layout.setRightZone('activity')}
+                              data-testid="workbench-zone-activity"
+                              className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
+                                layout.rightZone === 'activity' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
+                              }`}
+                            >
+                              <Activity className="w-3.5 h-3.5" />
+                              活动
+                            </button>
+                          </div>
+                          <div className="flex-1 min-h-0 overflow-hidden">
+                            <React.Suspense fallback={<div className="h-full flex items-center justify-center text-xs text-fg-muted">Loading panel...</div>}>
+                              {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
+                                <PersonalWorkspacePanel
+                                  profile={agentProfiles.personal}
+                                  onProfileChanged={(profile) => {
+                                    setAgentProfiles((prev) => ({ ...prev, personal: profile }));
+                                    void loadAgentProfiles();
+                                  }}
+                                  activeTabHint={personalWorkspaceTab}
+                                  focusSignal={personalWorkspaceFocusSignal}
+                                  artifacts={rpArtifacts}
+                                  isRunning={rpIsRunning}
+                                  latestToolCall={rpLatestToolCall}
+                                  automationSnapshots={rpAutomationSnapshots}
+                                  automationActions={rpAutomationActions}
+                                  automationTraces={rpAutomationTraces}
+                                  automationReplayStatus={rpAutomationReplayStatus}
+                                  onAutomationObserve={(source = 'auto') => {
+                                    focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                                  }}
+                                  onAutomationReplay={(traceId) => {
+                                    focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                                  }}
+                                />
+                              )}
+                              {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
+                                <FocusedDataProvider value={focusedSnapshot}>
+                                  <FocusedActionsProvider value={focusedActions}>
+                                    <WorkspacePanel
+                                      activeView={workspaceView}
+                                      onActiveViewChange={setWorkspaceView}
+                                      editorGroups={rpEditorGroups}
+                                      activeEditorGroup={rpActiveEditorGroup}
+                                      projectName={currentProject?.name || '未打开项目'}
+                                      onSelectFile={focusedActions.onSelectFileInEditor}
+                                      onCloseFile={focusedActions.onCloseFileInEditor}
+                                      onMoveToGroup={() => {}}
+                                      onSplitEditor={() => {}}
+                                      onCloseSplit={() => {}}
+                                      onSetActiveGroup={() => {}}
+                                      onFileContentChange={focusedActions.onFileContentChange}
+                                      onSaveFile={focusedActions.onSaveFile}
+                                      artifacts={rpArtifacts}
+                                      isRunning={rpIsRunning}
+                                      latestToolCall={rpLatestToolCall}
+                                      automationSnapshots={rpAutomationSnapshots}
+                                      automationActions={rpAutomationActions}
+                                      automationTraces={rpAutomationTraces}
+                                      automationReplayStatus={rpAutomationReplayStatus}
+                                      onAutomationObserve={(source = 'auto') => {
+                                        focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
+                                      }}
+                                      onAutomationReplay={(traceId) => {
+                                        focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
+                                      }}
+                                      previewUrl={previewUrl}
+                                      onAnnotate={(a) => {
+                                        const msg = `[标注] [${a.url || '预览页面'}] 区域(${a.rect.x}%,${a.rect.y}%,${a.rect.w}%x${a.rect.h}%): ${a.note}`;
+                                        focusedActions.sendMessage(msg, a.base64);
+                                      }}
+                                    />
+                                  </FocusedActionsProvider>
+                                </FocusedDataProvider>
+                              )}
+                              {layout.rightZone === 'activity' && (
+                                <FocusedDataProvider value={focusedSnapshot}>
+                                  <FocusedActionsProvider value={focusedActions}>
+                                    <ActivityPanel
+                                      toolCalls={rpTools}
+                                      fileEdits={rpEdits}
+                                      runEvents={rpRuns}
+                                      onOpenFileFromChanges={focusedActions.handleOpenFileFromPanel}
+                                      onOpenFileFromTests={focusedActions.handleOpenFileFromPanel}
+                                      onOpenFileFromProblems={focusedActions.handleOpenFileFromPanelWithLine}
+                                      onOpenWorktree={focusedActions.openRunWorktree}
+                                      onApplyRun={handleApplyRun}
+                                      onMergeRun={handleMergeRun}
+                                      onDiscardRun={handleDiscardRun}
+                                    />
+                                  </FocusedActionsProvider>
+                                </FocusedDataProvider>
+                              )}
+                            </React.Suspense>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="h-full bg-app" />
+                      )}
+                    </div>
+
+                    <div
+                      className="absolute inset-y-3 left-3 z-20 max-w-[calc(100%-1.5rem)]"
+                      style={{ width: chatOverlayWidth, maxWidth: 'calc(100% - 1.5rem)' }}
+                      data-testid="floating-chat-dock"
+                    >
+                      <div className="flex h-full flex-col overflow-hidden rounded-md border border-border bg-app/95 shadow-2xl backdrop-blur-sm">
+                        <div className="min-h-0 flex-1">
+                          {visiblePaneRoot ? (
+                            <PaneRenderer
+                              node={visiblePaneRoot}
+                              focusedLeafId={focusedLeafId}
+                              onFocus={handleFocusLeaf}
+                              onMinimizePane={handleMinimizePane}
+                              onClosePane={handleClosePane}
+                              onSplit={handleSplitPane}
+                              onMoveSession={handleMoveSession}
+                              onSplitResize={handleSplitResize}
+                              teams={teams}
+                              onJoinTeam={handleJoinTeam}
+                              onCreateTeam={handleCreateTeam}
+                              onLeaveTeam={handleLeaveTeam}
+                              sessionViewRefs={sessionViewRefs}
+                              currentProject={currentProject}
+                              currentModel={focusedModel}
+                              currentAgentType={focusedAgentType}
+                              currentRole={roleForAgent(focusedAgentType)}
+                              models={models}
+                              agentProfiles={agentProfiles}
+                              roleDisplayNames={roleDisplayNames}
+                              sessionMetaById={sessionMetaById}
+                              onModelChange={handlePaneModelChange}
+                              onSnapshot={handleSessionSnapshot}
+                              onCommand={handleSlashCommand}
+                              runAction={runAction}
+                              openRunWorktree={openRunWorktree}
+                              handleOpenFileFromPanel={handleOpenFileFromPanel}
+                              handleOpenFileFromPanelWithLine={handleOpenFileFromPanelWithLine}
+                              onRevealWorkspace={handleRevealWorkspaceZone}
+                              onOpenPlanInWorkspace={handleOpenPlanInWorkspace}
+                              onProjectFileEdit={scheduleProjectRefresh}
+                              chrome="floating"
+                            />
+                          ) : (
+                            <div
+                              className="flex h-full items-center justify-center px-4 text-xs text-fg-muted"
+                              data-testid="all-panes-minimized"
+                            >
+                              All session panes are minimized.
+                            </div>
+                          )}
+                        </div>
+                        <MinimizedPaneTray
+                          entries={minimizedPaneEntries}
+                          sessionMetaById={sessionMetaById}
+                          agentProfiles={agentProfiles}
+                          roleDisplayNames={roleDisplayNames}
+                          onRestore={handleRestorePane}
+                          onClose={handleClosePane}
+                        />
+                      </div>
+                      <div
+                        role="separator"
+                        aria-label="Resize floating chat"
+                        aria-orientation="vertical"
+                        aria-valuemin={MIN_CHAT_OVERLAY_WIDTH}
+                        aria-valuemax={Math.round(chatOverlayMaxWidth)}
+                        aria-valuenow={Math.round(chatOverlayWidth)}
+                        title="Resize floating chat"
+                        tabIndex={0}
+                        onPointerDown={handleChatOverlayResizeStart}
+                        onKeyDown={handleChatOverlayResizeKeyDown}
+                        onDoubleClick={() => layout.setChatOverlayWidth(DEFAULT_CHAT_OVERLAY_WIDTH)}
+                        className="group absolute left-full top-0 flex h-full w-4 cursor-col-resize items-center justify-center touch-none"
+                      >
+                        <div className="flex h-16 w-2 items-center justify-center rounded-full border border-border bg-surface/90 text-fg-muted shadow transition-colors group-hover:border-accent/60 group-hover:text-accent">
+                          <GripVertical className="h-3.5 w-3.5" />
+                        </div>
+                      </div>
+                    </div>
+
+                    {!layout.rightPanelVisible && (
+                      <div className="absolute right-0 top-0 z-10 h-full w-9 border-l border-border bg-surface/90 flex flex-col items-center py-2 gap-3">
+                        <button
+                          type="button"
+                          onClick={() => layout.setRightPanelVisible(true)}
+                          className="w-6 h-6 rounded flex items-center justify-center text-fg-muted hover:text-fg hover:bg-surface-hover transition-colors"
+                          title="Expand panel (Ctrl+\)"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { layout.setRightZone('workspace'); layout.setRightPanelVisible(true); }}
+                          className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'workspace' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+                          title="工作区"
+                        >W</button>
+                        <button
+                          type="button"
+                          onClick={() => { layout.setRightZone('activity'); layout.setRightPanelVisible(true); }}
+                          className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'activity' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
+                          title="活动"
+                        >A</button>
+                      </div>
+                    )}
+                  </div>
                 </Panel>
 
                 {/* Terminal (shared) */}
@@ -2743,159 +3341,9 @@ export default function App() {
                   <ChevronUp className="w-3 h-3 text-fg-muted group-hover:text-fg-secondary" />
                 </button>
               )}
-            </div>
-          </Panel>
-
-          {/* Right panel */}
-          <Separator className="bg-border hover:bg-accent/50 active:bg-accent/70 transition-colors cursor-col-resize" style={{ width: 3 }} />
-          <Panel
-            id="right"
-            panelRef={rightPanelRef}
-            minSize="300px"
-            maxSize="70%"
-            collapsible collapsedSize={0}
-            onResize={(size) => {
-              if (size.asPercentage <= 1) layout.setRightPanelVisible(false);
-              else if (!layout.rightPanelVisible) layout.setRightPanelVisible(true);
-            }}
-          >
-            <div className="bg-surface flex flex-col h-full min-w-0">
-              {/* Two-zone tab bar */}
-              <div className="flex border-b border-border shrink-0">
-                <button
-                  type="button"
-                  onClick={() => layout.setRightZone('workspace')}
-                  className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
-                    layout.rightZone === 'workspace' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                  }`}
-                >
-                  <Monitor className="w-3.5 h-3.5" />
-                  工作区
-                </button>
-                <button
-                  type="button"
-                  onClick={() => layout.setRightZone('activity')}
-                  className={`flex items-center gap-1.5 shrink-0 px-3 py-2 text-xs font-medium ${
-                    layout.rightZone === 'activity' ? 'bg-surface-alt text-fg' : 'text-fg-secondary hover:text-fg'
-                  }`}
-                >
-                  <Activity className="w-3.5 h-3.5" />
-                  活动
-                </button>
-              </div>
-              <div className="flex-1 min-h-0 overflow-hidden">
-                {layout.rightZone === 'workspace' && focusedAgentType === 'personal' && (
-                  <PersonalWorkspacePanel
-                    profile={agentProfiles.personal}
-                    onProfileChanged={(profile) => {
-                      setAgentProfiles((prev) => ({ ...prev, personal: profile }));
-                      void loadAgentProfiles();
-                    }}
-                    activeTabHint={personalWorkspaceTab}
-                    focusSignal={personalWorkspaceFocusSignal}
-                    artifacts={rpArtifacts}
-                    isRunning={rpIsRunning}
-                    latestToolCall={rpLatestToolCall}
-                    automationSnapshots={rpAutomationSnapshots}
-                    automationActions={rpAutomationActions}
-                    automationTraces={rpAutomationTraces}
-                    automationReplayStatus={rpAutomationReplayStatus}
-                    onAutomationObserve={(source = 'auto') => {
-                      focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
-                    }}
-                    onAutomationReplay={(traceId) => {
-                      focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
-                    }}
-                  />
-                )}
-                {layout.rightZone === 'workspace' && focusedAgentType !== 'personal' && (
-                  <FocusedDataProvider value={focusedSnapshot}>
-                    <FocusedActionsProvider value={focusedActions}>
-                      <WorkspacePanel
-                        activeView={workspaceView}
-                        onActiveViewChange={setWorkspaceView}
-                        editorGroups={rpEditorGroups}
-                        activeEditorGroup={rpActiveEditorGroup}
-                        projectName={currentProject?.name || '未打开项目'}
-                        onSelectFile={focusedActions.onSelectFileInEditor}
-                        onCloseFile={focusedActions.onCloseFileInEditor}
-                        onMoveToGroup={() => {}}
-                        onSplitEditor={() => {}}
-                        onCloseSplit={() => {}}
-                        onSetActiveGroup={() => {}}
-                        onFileContentChange={focusedActions.onFileContentChange}
-                        onSaveFile={focusedActions.onSaveFile}
-                        artifacts={rpArtifacts}
-                        isRunning={rpIsRunning}
-                        latestToolCall={rpLatestToolCall}
-                        automationSnapshots={rpAutomationSnapshots}
-                        automationActions={rpAutomationActions}
-                        automationTraces={rpAutomationTraces}
-                        automationReplayStatus={rpAutomationReplayStatus}
-                        onAutomationObserve={(source = 'auto') => {
-                          focusedActions.executeToolDirect('automation_observe', { source, include_screenshot: true });
-                        }}
-                        onAutomationReplay={(traceId) => {
-                          focusedActions.executeToolDirect('automation_replay', { trace_id: traceId });
-                        }}
-                        previewUrl={previewUrl}
-                        onAnnotate={(a) => {
-                          const msg = `[标注] [${a.url || '预览页面'}] 区域(${a.rect.x}%,${a.rect.y}%,${a.rect.w}%x${a.rect.h}%): ${a.note}`;
-                          focusedActions.sendMessage(msg, a.base64);
-                        }}
-                      />
-                    </FocusedActionsProvider>
-                  </FocusedDataProvider>
-                )}
-                {layout.rightZone === 'activity' && (
-                  <FocusedDataProvider value={focusedSnapshot}>
-                    <FocusedActionsProvider value={focusedActions}>
-                      <ActivityPanel
-                        toolCalls={rpTools}
-                        fileEdits={rpEdits}
-                        runEvents={rpRuns}
-                        onOpenFileFromChanges={focusedActions.handleOpenFileFromPanel}
-                        onOpenFileFromTests={focusedActions.handleOpenFileFromPanel}
-                        onOpenFileFromProblems={focusedActions.handleOpenFileFromPanelWithLine}
-                        onOpenWorktree={focusedActions.openRunWorktree}
-                        onApplyRun={(runId) => focusedActions.runAction(runId, 'apply')}
-                        onMergeRun={(runId) => focusedActions.runAction(runId, 'merge')}
-                        onDiscardRun={(runId) => focusedActions.runAction(runId, 'discard')}
-                      />
-                    </FocusedActionsProvider>
-                  </FocusedDataProvider>
-                )}
-              </div>
-            </div>
-          </Panel>
-        </Group>
-
-        {/* Right panel expand strip */}
-        {!layout.rightPanelVisible && (
-          <div className="w-9 flex-shrink-0 border-l border-border bg-surface flex flex-col items-center py-2 gap-3">
-            <button
-              type="button"
-              onClick={() => layout.setRightPanelVisible(true)}
-              className="w-6 h-6 rounded flex items-center justify-center text-fg-muted hover:text-fg hover:bg-surface-hover transition-colors"
-              title="Expand panel (Ctrl+\)"
-            >
-              <ChevronLeft className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => { layout.setRightZone('workspace'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'workspace' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="工作区"
-            >W</button>
-            <button
-              type="button"
-              onClick={() => { layout.setRightZone('activity'); layout.setRightPanelVisible(true); }}
-              className={`w-6 h-6 rounded flex items-center justify-center text-xs ${layout.rightZone === 'activity' ? 'text-fg bg-surface-alt' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'} transition-colors`}
-              title="活动"
-            >A</button>
           </div>
-        )}
       </div>
+    </div>
     </div>
   );
 }

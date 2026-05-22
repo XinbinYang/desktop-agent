@@ -6,8 +6,11 @@ import type {
   PlanState,
   ToolCall,
   WorkerEvent,
+  ImageAttachment,
+  ArtifactPayload,
 } from '../types';
 import { isInternalToolName } from './internalTools';
+import { imageAttachmentFromBlock } from './imageAttachments';
 
 export type PersonalConversationRole = 'user' | 'assistant' | 'system';
 export type PersonalActivityKind = 'thinking' | 'tool' | 'knowledge' | 'file_edit' | 'plan';
@@ -43,7 +46,8 @@ export interface PersonalConversationItem {
   role: PersonalConversationRole;
   authorName: string;
   text: string;
-  images: string[];
+  images: ImageAttachment[];
+  artifacts: ArtifactPayload[];
   activities: PersonalActivityItem[];
   createdAt?: number;
   messageId?: string;
@@ -119,12 +123,84 @@ function latestTimestamp(values: Array<number | undefined>): number | undefined 
   return valid.length > 0 ? Math.max(...valid) : undefined;
 }
 
+function sortActivities(activities: PersonalActivityItem[]): PersonalActivityItem[] {
+  return activities.sort((a, b) => {
+    if (a.timestamp === undefined || b.timestamp === undefined) return 0;
+    return a.timestamp - b.timestamp;
+  });
+}
+
+function findAssistantItemForTimestamp(
+  items: PersonalConversationItem[],
+  timestamp?: number,
+): PersonalConversationItem | null {
+  const assistants = items.filter((item) => item.role === 'assistant');
+  if (assistants.length === 0) return null;
+  if (timestamp === undefined) return assistants[assistants.length - 1];
+
+  let undatedFallback: PersonalConversationItem | null = null;
+  for (let index = assistants.length - 1; index >= 0; index -= 1) {
+    const createdAt = assistants[index].createdAt;
+    if (createdAt === undefined) {
+      undatedFallback = undatedFallback || assistants[index];
+      continue;
+    }
+    if (createdAt <= timestamp) return assistants[index];
+  }
+  return undatedFallback || assistants[0];
+}
+
 function firstStringArg(args: Record<string, any>, keys: string[]): string {
   for (const key of keys) {
     const value = args?.[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
   return '';
+}
+
+function normalizeForKey(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeForKey);
+  if (value && typeof value === 'object') {
+    return Object.keys(value as Record<string, unknown>)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, key) => {
+        acc[key] = normalizeForKey((value as Record<string, unknown>)[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function stableStringify(value: unknown): string {
+  try {
+    return JSON.stringify(normalizeForKey(value));
+  } catch {
+    return String(value);
+  }
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function toolActivityKey(tool: {
+  name: string;
+  args?: Record<string, any>;
+  result?: string;
+  toolCallId?: string;
+}): string {
+  const toolCallId = tool.toolCallId?.trim();
+  if (toolCallId) return `id:${toolCallId}`;
+  return `fallback:${hashString(stableStringify({
+    name: tool.name || '',
+    args: tool.args || {},
+    result: tool.result || '',
+  }))}`;
 }
 
 function toolLabel(name: string, args: Record<string, any>): string {
@@ -283,7 +359,7 @@ function buildAssistantSignature(
         break;
       case 'tool_call':
         blockParts.push(
-          `t:${block.toolCallId || ''}:${block.status}:${(block.result || '').length}:${block.durationMs || 0}`,
+          `t:${block.toolCallId || ''}:${block.name}:${stableStringify(block.args || {})}:${block.status}:${(block.result || '').length}:${block.durationMs || 0}`,
         );
         break;
       case 'file_edit':
@@ -293,7 +369,7 @@ function buildAssistantSignature(
         blockParts.push(`g:${block.sources.length}`);
         break;
       case 'image':
-        blockParts.push(`i:${block.base64?.length || 0}`);
+        blockParts.push(`i:${block.url || block.base64?.length || block.image?.url || block.image?.base64?.length || 0}`);
         break;
       case 'plan_execution':
       case 'plan_draft':
@@ -364,7 +440,8 @@ function buildAssistantItemUncached(
   claimedEdits: string[],
 ): PersonalConversationItem | null {
   const textParts: string[] = [];
-  const images: string[] = [];
+  const images: ImageAttachment[] = [];
+  const artifacts: ArtifactPayload[] = [];
   const activities: PersonalActivityItem[] = [];
   const tools: PersonalActivityTool[] = [];
   const blocks = message.blocks || [];
@@ -419,11 +496,13 @@ function buildAssistantItemUncached(
       case 'tool_call':
         if (!isInternalToolName(block.name)) {
           const tool = toActivityTool(block, blockIndex);
-          if (tool.toolCallId) {
-            seenToolIds.add(tool.toolCallId);
-            claimedTools.push(tool.toolCallId);
-          }
+          const key = toolActivityKey(tool);
+          seenToolIds.add(key);
+          claimedTools.push(key);
           tools.push(tool);
+          for (const artifact of block.artifacts || []) {
+            if (artifact.type !== 'image') artifacts.push(artifact);
+          }
         }
         break;
       case 'file_edit':
@@ -441,7 +520,10 @@ function buildAssistantItemUncached(
         });
         break;
       case 'image':
-        images.push(block.base64);
+        {
+          const image = imageAttachmentFromBlock(block);
+          if (image) images.push(image);
+        }
         break;
       case 'plan_execution':
         activities.push({
@@ -474,7 +556,7 @@ function buildAssistantItemUncached(
 
   const fallbackText = message.content?.trim() ? message.content : '';
   const text = textParts.length > 0 ? textParts.join('\n\n') : fallbackText;
-  if (!text.trim() && images.length === 0 && activities.length === 0) return null;
+  if (!text.trim() && images.length === 0 && artifacts.length === 0 && activities.length === 0) return null;
 
   return {
     id: `personal:${message.id}`,
@@ -482,10 +564,8 @@ function buildAssistantItemUncached(
     authorName: roleAuthor('assistant', assistantDisplayName),
     text,
     images,
-    activities: activities.sort((a, b) => {
-      if (a.timestamp === undefined || b.timestamp === undefined) return 0;
-      return a.timestamp - b.timestamp;
-    }),
+    artifacts,
+    activities: sortActivities(activities),
     createdAt: messageTimestamp(message) ?? firstBlockTimestamp(message),
     messageId: message.messageId,
     checkpointId: message.checkpointId,
@@ -501,28 +581,55 @@ function appendFallbackToolActivity(
   assistantDisplayName?: string,
 ) {
   const unseen = toolCalls
-    .filter((call) => !call.toolCallId || !seenToolIds.has(call.toolCallId))
-    .map(toolCallToActivityTool);
+    .map(toolCallToActivityTool)
+    .filter((tool) => !seenToolIds.has(toolActivityKey(tool)));
   if (unseen.length === 0) return;
-  const latestAssistant = [...items].reverse().find((item) => item.role === 'assistant');
-  const target = latestAssistant || {
-    id: `personal:fallback-tools:${unseen.map((tool) => tool.id).join('|') || 'untracked'}`,
+
+  const fallbackTools: PersonalActivityTool[] = [];
+  const toolsByTarget = new Map<PersonalConversationItem, PersonalActivityTool[]>();
+  for (const tool of unseen) {
+    const target = findAssistantItemForTimestamp(items, tool.timestamp);
+    if (!target) {
+      fallbackTools.push(tool);
+      continue;
+    }
+    const bucket = toolsByTarget.get(target) || [];
+    bucket.push(tool);
+    toolsByTarget.set(target, bucket);
+  }
+
+  for (const [target, tools] of toolsByTarget) {
+    const activity = summarizeToolActivity(
+      `tools:fallback:${target.id}:${tools.map((tool) => tool.id).join('|')}`,
+      tools,
+      latestTimestamp(tools.map((tool) => tool.timestamp)),
+    );
+    if (activity) {
+      target.activities.push(activity);
+      target.activities = sortActivities(target.activities);
+    }
+  }
+
+  if (fallbackTools.length === 0) return;
+  const target = {
+    id: `personal:fallback-tools:${fallbackTools.map((tool) => tool.id).join('|') || 'untracked'}`,
     role: 'assistant' as const,
     authorName: roleAuthor('assistant', assistantDisplayName),
     text: '',
     images: [],
+    artifacts: [],
     activities: [],
-    createdAt: firstDefinedTimestamp(unseen.map((tool) => tool.timestamp)),
+    createdAt: firstDefinedTimestamp(fallbackTools.map((tool) => tool.timestamp)),
     turnComplete: true,
     isStreaming: false,
   };
   const activity = summarizeToolActivity(
-    `tools:fallback:${unseen.map((tool) => tool.id).join('|')}`,
-    unseen,
-    latestTimestamp(unseen.map((tool) => tool.timestamp)),
+    `tools:fallback:${fallbackTools.map((tool) => tool.id).join('|')}`,
+    fallbackTools,
+    latestTimestamp(fallbackTools.map((tool) => tool.timestamp)),
   );
   if (activity) target.activities.push(activity);
-  if (!latestAssistant) items.push(target);
+  items.push(target);
 }
 
 function appendFallbackFileEdits(
@@ -533,20 +640,22 @@ function appendFallbackFileEdits(
 ) {
   const unseen = fileEdits.filter((edit) => !edit.tool_call_id || !seenEditIds.has(edit.tool_call_id));
   if (unseen.length === 0) return;
-  const latestAssistant = [...items].reverse().find((item) => item.role === 'assistant');
-  const editTimestamps = unseen.map((edit) => normalizeTimestamp(edit.timestamp));
-  const target = latestAssistant || {
-    id: `personal:fallback-edits:${unseen.map((edit) => edit.tool_call_id || edit.path).join('|') || 'untracked'}`,
-    role: 'assistant' as const,
-    authorName: roleAuthor('assistant', assistantDisplayName),
-    text: '',
-    images: [],
-    activities: [],
-    createdAt: firstDefinedTimestamp(editTimestamps),
-    turnComplete: true,
-    isStreaming: false,
-  };
-  unseen.forEach((edit, index) => {
+
+  const fallbackEdits: FileEdit[] = [];
+  const editsByTarget = new Map<PersonalConversationItem, FileEdit[]>();
+  for (const edit of unseen) {
+    const timestamp = normalizeTimestamp(edit.timestamp);
+    const target = findAssistantItemForTimestamp(items, timestamp);
+    if (!target) {
+      fallbackEdits.push(edit);
+      continue;
+    }
+    const bucket = editsByTarget.get(target) || [];
+    bucket.push(edit);
+    editsByTarget.set(target, bucket);
+  }
+
+  const appendEditActivity = (target: PersonalConversationItem, edit: FileEdit, index: number) => {
     const timestamp = normalizeTimestamp(edit.timestamp);
     target.activities.push({
       id: `edit:${edit.tool_call_id || `${edit.path}:${edit.timestamp || index}`}`,
@@ -556,8 +665,29 @@ function appendFallbackFileEdits(
       timestamp,
       edit,
     });
-  });
-  if (!latestAssistant) items.push(target);
+  };
+
+  for (const [target, edits] of editsByTarget) {
+    edits.forEach((edit, index) => appendEditActivity(target, edit, index));
+    target.activities = sortActivities(target.activities);
+  }
+
+  if (fallbackEdits.length === 0) return;
+  const editTimestamps = fallbackEdits.map((edit) => normalizeTimestamp(edit.timestamp));
+  const target = {
+    id: `personal:fallback-edits:${fallbackEdits.map((edit) => edit.tool_call_id || edit.path).join('|') || 'untracked'}`,
+    role: 'assistant' as const,
+    authorName: roleAuthor('assistant', assistantDisplayName),
+    text: '',
+    images: [],
+    artifacts: [],
+    activities: [],
+    createdAt: firstDefinedTimestamp(editTimestamps),
+    turnComplete: true,
+    isStreaming: false,
+  };
+  fallbackEdits.forEach((edit, index) => appendEditActivity(target, edit, index));
+  items.push(target);
 }
 
 function groupItems(items: PersonalConversationItem[]): PersonalMessageGroup[] {
@@ -605,7 +735,8 @@ export function buildPersonalConversation({
         role: 'user',
         authorName: roleAuthor('user'),
         text: message.content,
-        images: message.imageBase64 ? [message.imageBase64] : [],
+        images: message.imageBase64 ? [{ base64: message.imageBase64, mimeType: 'image/png' }] : [],
+        artifacts: [],
         activities: [],
         createdAt: messageTimestamp(message),
         messageId: message.messageId,
@@ -626,6 +757,7 @@ export function buildPersonalConversation({
         authorName: roleAuthor('system'),
         text: message.content,
         images: [],
+        artifacts: [],
         activities: [],
         createdAt: messageTimestamp(message),
         messageId: message.messageId,
