@@ -345,6 +345,9 @@ export interface RunEvent {
     | 'verification_start'
     | 'verification_result'
     | 'review_finding'
+    | 'tool_call'
+    | 'worker_tool_call'
+    | 'file_edit'
     | 'collaboration_run_created'
     | 'collaboration_task_update'
     | 'agent_message'
@@ -549,6 +552,9 @@ export interface CollaborationState {
     options?: string[];
     context?: string;
     recommendation?: string;
+    answered_by?: string;
+    reason?: string;
+    confidence?: number;
     task_id?: string;
   } | null;
 }

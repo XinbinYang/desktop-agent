@@ -9,8 +9,8 @@ from typing import Any, Callable, Dict, List, Optional
 from app.tools.base import BaseTool, ToolResult
 from app.worker import WorkerSession, WORKER_PROFILES, format_worker_exception
 
-_worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
-    "worker_event_callback",
+_runtime_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
+    "runtime_event_callback",
     default=None,
 )
 _active_workers: Dict[str, Dict[str, tuple[WorkerSession, Optional[Callable[[Dict[str, Any]], Any]]]]] = {}
@@ -27,18 +27,32 @@ PROFILE_TO_ROLE: dict[str, str] = {
 }
 
 
+def set_runtime_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
+    return _runtime_event_callback_var.set(cb)
+
+
+def reset_runtime_event_callback(token: Token) -> None:
+    _runtime_event_callback_var.reset(token)
+
+
+def emit_runtime_event(event: Dict[str, Any]) -> bool:
+    cb = _runtime_event_callback_var.get()
+    if not cb:
+        return False
+    cb(event)
+    return True
+
+
 def set_worker_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
-    return _worker_event_callback_var.set(cb)
+    return set_runtime_event_callback(cb)
 
 
 def reset_worker_event_callback(token: Token) -> None:
-    _worker_event_callback_var.reset(token)
+    reset_runtime_event_callback(token)
 
 
 def _emit_worker_event(event: Dict[str, Any]) -> None:
-    cb = _worker_event_callback_var.get()
-    if cb:
-        cb(event)
+    emit_runtime_event(event)
 
 
 def _worker_completed_successfully(status: str, result: str) -> bool:
@@ -88,7 +102,7 @@ def _register_worker(session_id: str, worker: WorkerSession) -> None:
         return
     _active_workers.setdefault(session_id, {})[worker.worker_id] = (
         worker,
-        _worker_event_callback_var.get(),
+        _runtime_event_callback_var.get(),
     )
 
 

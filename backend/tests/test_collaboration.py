@@ -1,3 +1,4 @@
+import asyncio
 import threading
 
 import pytest
@@ -250,3 +251,107 @@ async def test_consult_coding_tool_project_path_overrides_current_project(monkey
 
     assert not result.error
     assert seen["project_path"] == str(target.resolve())
+
+
+@pytest.mark.asyncio
+async def test_delegate_coding_tool_live_publishes_clarification_events(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
+    from app import agent as agent_module
+    import app.collaboration.executor as executor
+    import app.tools.collaboration_tool as collaboration_tool
+    from app.collaboration.bus import clear_clarification_answers, submit_clarification_answer
+    from app.collaboration.clarification import ClarificationResolution
+    from app.tools.collaboration_tool import DelegateToCodingAgentTool
+    from app.tools.worker_tool import reset_runtime_event_callback, set_runtime_event_callback
+
+    project = tmp_path / "delegate-project"
+    project.mkdir()
+
+    class PlanState:
+        phase = "idle"
+        approved = False
+        todos = []
+
+    class FakeCodingSession:
+        last_instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.plan_state = PlanState()
+            self.inputs = []
+            self.collaboration_run_id = ""
+            self.collaboration_task_id = ""
+            FakeCodingSession.last_instance = self
+
+        def _save(self):
+            pass
+
+        def plan_event_payload(self):
+            return {"phase": self.plan_state.phase, "approved": self.plan_state.approved}
+
+        def build_plan(self):
+            return False
+
+        async def run(self, user_input, image_base64=None, *, chat_mode=None, thinking_intensity=None):
+            self.inputs.append(user_input)
+            if len(self.inputs) == 1:
+                yield {
+                    "type": "collaboration_clarification_request",
+                    "data": {
+                        "request_id": "clar_tool",
+                        "question": "Use simple_return or log_return?",
+                        "options": ["log_return", "simple_return"],
+                    },
+                }
+                yield {"type": "run_completed", "data": {"status": "waiting_clarification"}}
+                return
+            yield {"type": "tool_call", "data": {"name": "verify_project", "args": {}, "result": "exit_code: 0\nok"}}
+            yield {"type": "tool_call", "data": {"name": "run_review", "args": {}, "result": "No blocking findings."}}
+            yield {"type": "content", "data": {"text": "Used user answer. ACCEPTANCE: PASS"}}
+            yield {
+                "type": "run_completed",
+                "data": {"status": "completed", "verification_passed": True, "review_passed": True},
+            }
+
+    async def ask_user_resolver(clarification, packet):
+        return ClarificationResolution(action="ask_user", reason="Needs user preference.", confidence=0.2)
+
+    monkeypatch.setattr(agent_module, "AgentSession", FakeCodingSession)
+    monkeypatch.setattr(executor, "get_model_for_agent", lambda agent_type: "test-model")
+    monkeypatch.setattr(collaboration_tool, "resolve_personal_clarification", ask_user_resolver)
+    clear_clarification_answers("unused")
+
+    live_events = []
+    answer_tasks = []
+
+    def runtime_callback(event):
+        live_events.append(event)
+        if event.get("type") == "collaboration_clarification_request":
+            data = event.get("data") or {}
+            answer_tasks.append(
+                asyncio.create_task(
+                    submit_clarification_answer(
+                        data["run_id"],
+                        "Use log_return",
+                        request_id=data.get("request_id", ""),
+                    )
+                )
+            )
+
+    token = set_runtime_event_callback(runtime_callback)
+    try:
+        result = await DelegateToCodingAgentTool().execute(
+            goal="implement returns",
+            project_path=str(project),
+            session_id="tool_live_clarification",
+            session_model_id="personal-test-model",
+        )
+        if answer_tasks:
+            await asyncio.gather(*answer_tasks)
+    finally:
+        reset_runtime_event_callback(token)
+
+    assert not result.error
+    assert result.metadata["collaboration_events_realtime"] is True
+    assert any(event["type"] == "collaboration_clarification_request" for event in live_events)
+    assert any(event["type"] == "decision_required" for event in live_events)
+    assert any(event["type"] == "collaboration_clarification_answer" for event in live_events)
+    assert "Use log_return" in FakeCodingSession.last_instance.inputs[1]

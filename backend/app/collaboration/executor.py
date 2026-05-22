@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+import time
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from app.collaboration.models import ArtifactRef, EvidenceEntry, ResultPacket, TaskPacket
 from app.config import get_model_for_agent
@@ -35,6 +36,7 @@ RELAYED_CHILD_EVENT_TYPES: frozenset[str] = frozenset({
     "review_finding",
     "artifact_ready",
     "file_edit",
+    "decision_required",
     "collab_directive_applied",
     "collaboration_clarification_request",
     "collaboration_clarification_answer",
@@ -65,6 +67,8 @@ _BLOCKING_REVIEW_SEVERITIES: frozenset[str] = frozenset({
     "error",
 })
 
+ClarificationResolver = Callable[[Dict[str, Any], TaskPacket], Awaitable[Any]]
+
 
 def record_delegated_child_event(run_id: str, task_id: str, event: Dict[str, Any]) -> None:
     """Persist important child-agent events into the collaboration journal."""
@@ -79,6 +83,12 @@ def record_delegated_child_event(run_id: str, task_id: str, event: Dict[str, Any
     from app.collaboration.manager import record_event
 
     record_event(run_id, event_type, data, task_id)
+
+
+def _resolution_get(resolution: Any, key: str, default: Any = None) -> Any:
+    if isinstance(resolution, dict):
+        return resolution.get(key, default)
+    return getattr(resolution, key, default)
 
 
 def _task_text(packet: TaskPacket) -> str:
@@ -178,6 +188,7 @@ async def run_execute_agent_events(
     task_id: str = "",
     project_path: str = "",
     auto_build_plans: bool = True,
+    clarification_resolver: Optional[ClarificationResolver] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Run a full delegated Coding Agent session and yield its native events.
 
@@ -215,6 +226,9 @@ async def run_execute_agent_events(
                 if task_id:
                     clarification_request.setdefault("task_id", task_id)
                     clarification_request.setdefault("collaboration_task_id", task_id)
+                continue
+            if event.get("type") == "run_completed" and (event.get("data") or {}).get("status") == "waiting_clarification":
+                continue
             yield event
 
         if clarification_request is not None:
@@ -222,7 +236,43 @@ async def run_execute_agent_events(
             from app.collaboration.manager import update_task
 
             request_id = str(clarification_request.get("request_id") or "")
+            if clarification_resolver is not None:
+                try:
+                    resolution = await clarification_resolver(clarification_request, packet)
+                except Exception as exc:
+                    resolution = {
+                        "action": "ask_user",
+                        "reason": f"Personal Agent arbitration failed: {exc}",
+                        "confidence": 0.0,
+                    }
+                if str(_resolution_get(resolution, "action", "")).lower() == "answer":
+                    answer_text = str(_resolution_get(resolution, "answer", "") or "").strip()
+                    if answer_text:
+                        answer = {
+                            "run_id": run_id,
+                            "request_id": request_id,
+                            "answer": answer_text,
+                            "answered_by": str(_resolution_get(resolution, "answered_by", "personal_auto") or "personal_auto"),
+                            "reason": str(_resolution_get(resolution, "reason", "") or ""),
+                            "confidence": float(_resolution_get(resolution, "confidence", 0.0) or 0.0),
+                            "question": clarification_request.get("question") or "",
+                            "timestamp": time.time(),
+                        }
+                        yield {"type": "collaboration_clarification_answer", "data": answer}
+                        next_input = (
+                            "[Personal Agent clarification answer]\n"
+                            f"Question: {clarification_request.get('question') or ''}\n"
+                            f"Answer: {answer.get('answer') or ''}\n\n"
+                            "Continue the delegated coding task using this answer. Do not ask the same question again "
+                            "unless the answer is unusable."
+                        )
+                        continue
+
             update_task(task_id, status="waiting_clarification") if task_id else None
+            yield {
+                "type": "collaboration_clarification_request",
+                "data": clarification_request,
+            }
             yield {
                 "type": "decision_required",
                 "data": {
@@ -531,6 +581,7 @@ async def run_plan_then_execute_events(
     run_id: str,
     task_id: str,
     project_path: str = "",
+    clarification_resolver: Optional[ClarificationResolver] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Two-phase mode: consult to draft a plan, then execute it.
 
@@ -585,7 +636,12 @@ async def run_plan_then_execute_events(
         ],
     })
     async for event in run_execute_agent_events(
-        exec_packet, session_id=session_id, run_id=run_id, task_id=task_id, project_path=project_path
+        exec_packet,
+        session_id=session_id,
+        run_id=run_id,
+        task_id=task_id,
+        project_path=project_path,
+        clarification_resolver=clarification_resolver,
     ):
         yield event
 
@@ -597,6 +653,7 @@ async def run_critic_loop_events(
     run_id: str,
     task_id: str,
     project_path: str = "",
+    clarification_resolver: Optional[ClarificationResolver] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Execute first, then run an independent read-only critic pass.
 
@@ -607,7 +664,12 @@ async def run_critic_loop_events(
     # Phase 1: execute
     execute_events: List[Dict[str, Any]] = []
     async for event in run_execute_agent_events(
-        packet, session_id=session_id, run_id=run_id, task_id=task_id, project_path=project_path
+        packet,
+        session_id=session_id,
+        run_id=run_id,
+        task_id=task_id,
+        project_path=project_path,
+        clarification_resolver=clarification_resolver,
     ):
         execute_events.append(event)
         yield event

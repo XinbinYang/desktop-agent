@@ -1679,6 +1679,81 @@ describe('useChatSession', () => {
     expect(result.current.collaborationState.artifacts?.[0]).toMatchObject({ title: 'analysis_report.md' })
   })
 
+  it('tracks collaboration clarification answers and child run events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+      messageHandler?.({
+        type: 'collaboration_clarification_request',
+        data: {
+          run_id: 'collab_1',
+          request_id: 'clar_1',
+          question: 'Use simple_return or log_return?',
+          options: ['log_return', 'simple_return'],
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.pendingClarification?.request_id).toBe('clar_1')
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_clarification_answer',
+        data: {
+          run_id: 'collab_1',
+          request_id: 'clar_1',
+          answer: 'log_return',
+          answered_by: 'personal_auto',
+          reason: 'Safe technical default.',
+          confidence: 0.9,
+        },
+      })
+      messageHandler?.({
+        type: 'tool_call',
+        data: {
+          run_id: 'outer_run',
+          collaboration_run_id: 'collab_1',
+          name: 'verify_project',
+          args: {},
+          result: 'exit_code: 0\nok',
+          tool_call_id: 'tool_1',
+        },
+      })
+      messageHandler?.({
+        type: 'file_edit',
+        data: {
+          run_id: 'outer_run',
+          collaboration_run_id: 'collab_1',
+          path: 'src/returns.ts',
+          operation: 'modify',
+          stats: { added: 2, removed: 1 },
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.pendingClarification).toBeNull()
+    expect(result.current.runEvents.some((event) =>
+      event.type === 'collaboration_clarification_answer' &&
+      event.data.answered_by === 'personal_auto'
+    )).toBe(true)
+    expect(result.current.runEvents.filter((event) => event.runId === 'collab_1').map((event) => event.type))
+      .toEqual(expect.arrayContaining(['tool_call', 'file_edit']))
+  })
+
   it('sends reset, compact, and rewind session control messages', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 

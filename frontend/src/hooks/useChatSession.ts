@@ -41,6 +41,7 @@ import {
   normalizeArtifactPayloads,
   normalizeImageAttachment,
 } from '../lib/imageAttachments';
+import { getCollaborationRunId } from '../lib/collaborationTimeline';
 
 function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1005,12 +1006,20 @@ export function useChatSession(
   }, []);
 
   const recordRunEvent = useCallback((event: WS_EVENT) => {
-    const runEvent: RunEvent = {
-      id: `${event.type}_${event.data?.run_id || 'run'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    const eventData = event.data || {};
+    const normalizedEvent = {
+      id: '',
       type: event.type as RunEvent['type'],
-      runId: event.data?.run_id,
-      timestamp: event.data?.timestamp ? event.data.timestamp * 1000 : Date.now(),
-      data: event.data || {},
+      timestamp: 0,
+      data: eventData,
+    };
+    const runId = getCollaborationRunId(normalizedEvent) || eventData.run_id;
+    const runEvent: RunEvent = {
+      id: `${event.type}_${runId || 'run'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: event.type as RunEvent['type'],
+      runId,
+      timestamp: eventData.timestamp ? eventData.timestamp * 1000 : Date.now(),
+      data: eventData,
     };
     setRunEvents((prev) => [...prev.slice(-300), runEvent]);
   }, []);
@@ -1222,6 +1231,9 @@ export function useChatSession(
         case 'worker_done': {
           const workerEvent = toWorkerEvent(event);
           attachWorkerEvent(workerEvent);
+          if (event.type === 'worker_tool_call' && event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           if (event.type === 'worker_tool_call') {
             addTerminalLog(`[Worker:${event.data.worker_id}] ${event.data.name}: ${event.data.result}`);
           } else if (event.type === 'worker_done') {
@@ -1231,6 +1243,9 @@ export function useChatSession(
         }
 
         case 'tool_call': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           const isError = (event.data.result || '').startsWith('[ERROR]');
           const workerEvents = isDispatchTool(event.data.name)
             ? takePendingWorkerEvents(event.data.tool_call_id)
@@ -1387,6 +1402,9 @@ export function useChatSession(
         }
 
         case 'file_edit': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           recordFileEdit(event.data as FileEdit, true);
           break;
         }
@@ -1519,6 +1537,9 @@ export function useChatSession(
                   options: Array.isArray(event.data?.options) ? event.data.options : [],
                   context: event.data?.context || '',
                   recommendation: event.data?.recommendation || '',
+                  answered_by: event.data?.answered_by || '',
+                  reason: event.data?.reason || '',
+                  confidence: typeof event.data?.confidence === 'number' ? event.data.confidence : undefined,
                   task_id: event.data?.task_id || event.data?.collaboration_task_id || '',
                 },
               }));

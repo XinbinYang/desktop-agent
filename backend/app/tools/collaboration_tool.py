@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from app.collaboration.clarification import resolve_personal_clarification
 from app.collaboration.executor import (
     record_delegated_child_event,
     result_from_execute_events,
@@ -20,9 +21,32 @@ from app.collaboration.models import ResultPacket, TaskPacket
 from app.collaboration.targeting import resolve_collaboration_target
 from app.runtime_paths import runtime_file
 from app.tools.base import BaseTool, ToolResult
+from app.tools.worker_tool import emit_runtime_event
 
 def _event_payloads(run_id: str) -> List[Dict[str, Any]]:
     return [event.model_dump() for event in list_events(run_id)]
+
+
+def _collaboration_ws_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(event.get("data") or {})
+    collab_run_id = event.get("run_id") or data.get("run_id") or ""
+    collab_task_id = event.get("task_id") or data.get("task_id") or ""
+    if collab_run_id:
+        data.setdefault("run_id", collab_run_id)
+        data.setdefault("collaboration_run_id", collab_run_id)
+    if collab_task_id:
+        data.setdefault("task_id", collab_task_id)
+        data.setdefault("collaboration_task_id", collab_task_id)
+    data.setdefault("timestamp", event.get("timestamp") or time.time())
+    return {"type": event.get("type", "collaboration_task_update"), "data": data}
+
+
+def _publish_new_collaboration_events(run_id: str, emitted_count: int) -> tuple[int, bool]:
+    events = _event_payloads(run_id)
+    published = False
+    for event in events[emitted_count:]:
+        published = emit_runtime_event(_collaboration_ws_event(event)) or published
+    return len(events), published
 
 
 def _format_result_output(result: ResultPacket, *, run_id: str) -> str:
@@ -177,6 +201,7 @@ class DelegateToCodingAgentTool(BaseTool):
         session_id: str = "",
         run_id: str = "",
         tool_call_id: str = "",
+        session_model_id: str = "",
     ) -> ToolResult:
         if mode not in {"execute", "plan_then_execute", "critic", "verify_only"}:
             mode = "execute"
@@ -205,6 +230,18 @@ class DelegateToCodingAgentTool(BaseTool):
         )
         task = add_task(collab.run_id, packet)
         update_task(task.task_id, status="running")
+        emitted = 0
+        live_events_published = False
+        emitted, published = _publish_new_collaboration_events(collab.run_id, emitted)
+        live_events_published = live_events_published or published
+
+        async def clarification_resolver(clarification: Dict[str, Any], active_packet: TaskPacket):
+            return await resolve_personal_clarification(
+                clarification,
+                active_packet,
+                model_id=session_model_id,
+            )
+
         events: List[Dict[str, Any]] = []
         if mode == "plan_then_execute":
             iterator = run_plan_then_execute_events(
@@ -213,6 +250,7 @@ class DelegateToCodingAgentTool(BaseTool):
                 run_id=collab.run_id,
                 task_id=task.task_id,
                 project_path=resolved_project_path,
+                clarification_resolver=clarification_resolver,
             )
         elif mode == "critic":
             iterator = run_critic_loop_events(
@@ -221,6 +259,7 @@ class DelegateToCodingAgentTool(BaseTool):
                 run_id=collab.run_id,
                 task_id=task.task_id,
                 project_path=resolved_project_path,
+                clarification_resolver=clarification_resolver,
             )
         elif mode == "verify_only":
             iterator = run_verify_only_events(
@@ -236,10 +275,13 @@ class DelegateToCodingAgentTool(BaseTool):
                 run_id=collab.run_id,
                 task_id=task.task_id,
                 project_path=resolved_project_path,
-        )
+                clarification_resolver=clarification_resolver,
+            )
         async for event in iterator:
             events.append(event)
             record_delegated_child_event(collab.run_id, task.task_id, event)
+            emitted, published = _publish_new_collaboration_events(collab.run_id, emitted)
+            live_events_published = live_events_published or published
         result = result_from_execute_events(events)
         task_status = "completed" if result.status == "pass" else ("blocked" if result.status == "blocked" else "failed")
         update_task(task.task_id, status=task_status, result=result)
@@ -249,12 +291,15 @@ class DelegateToCodingAgentTool(BaseTool):
             result.summary,
             artifacts=result.artifacts,
         )
+        emitted, published = _publish_new_collaboration_events(collab.run_id, emitted)
+        live_events_published = live_events_published or published
         return ToolResult(
             output=_format_result_output(result, run_id=collab.run_id),
             metadata={
                 "collaboration_run_id": collab.run_id,
                 "collaboration_task_id": task.task_id,
                 "collaboration_events": _event_payloads(collab.run_id),
+                "collaboration_events_realtime": live_events_published,
             },
         )
 

@@ -109,4 +109,43 @@ describe('RunSummaryPanel', () => {
     expect(onDiscardRun).toHaveBeenCalledWith('run-1')
     expect(onOpenWorktree).toHaveBeenCalledWith('run-1')
   })
+
+  it('renders collaboration timeline and raw events', () => {
+    const collabEvents: RunEvent[] = [
+      {
+        id: 'collab-created',
+        type: 'collaboration_run_created',
+        runId: 'collab_1',
+        timestamp: 1000,
+        data: { run_id: 'collab_1', goal: 'fix returns' },
+      },
+      {
+        id: 'collab-answer',
+        type: 'collaboration_clarification_answer',
+        runId: 'collab_1',
+        timestamp: 1100,
+        data: {
+          run_id: 'collab_1',
+          answer: 'log_return',
+          answered_by: 'personal_auto',
+          confidence: 0.88,
+        },
+      },
+      {
+        id: 'collab-tool',
+        type: 'tool_call',
+        runId: 'collab_1',
+        timestamp: 1200,
+        data: { collaboration_run_id: 'collab_1', name: 'verify_project', result: 'ok' },
+      },
+    ]
+
+    render(<RunSummaryPanel events={collabEvents} />)
+
+    expect(screen.getByText('Collaboration Timeline')).toBeInTheDocument()
+    expect(screen.getByText('Personal delegated to Coding')).toBeInTheDocument()
+    expect(screen.getByText('Personal auto-answered (88%)')).toBeInTheDocument()
+    expect(screen.getByText(/Coding ran verify_project/)).toBeInTheDocument()
+    expect(screen.getByText('Raw events')).toBeInTheDocument()
+  })
 })

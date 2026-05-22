@@ -1,9 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import {
   ChevronDown, ChevronRight, CheckCircle2, AlertCircle, Loader2, Circle, X,
-  FileCode, Terminal, TestTube, GitCompare, FileSearch,
+  FileCode, Terminal, TestTube, GitCompare, FileSearch, Bot, Code2,
+  UserRound, Sparkles, Wrench, MessageSquare,
 } from 'lucide-react';
-import type { EvidenceEntry, CollaborationRecap as RunRecap, TeamProgressEntry as TeamProgressEvent } from '../types';
+import type { EvidenceEntry, CollaborationRecap as RunRecap, RunEvent, TeamProgressEntry as TeamProgressEvent } from '../types';
+import {
+  buildCollaborationTimeline,
+  type CollaborationTimelineItem,
+} from '../lib/collaborationTimeline';
 
 const ROLE_LABELS: Record<string, string> = {
   explorer: 'Explorer',
@@ -26,6 +31,27 @@ const EvidenceIcon: React.FC<{ kind: EvidenceEntry['kind'] }> = ({ kind }) => {
   }
 };
 
+const TimelineIcon: React.FC<{ item: CollaborationTimelineItem }> = ({ item }) => {
+  if (item.kind === 'clarification') return <MessageSquare className="w-3.5 h-3.5 text-amber-400" />;
+  if (item.kind === 'answer' && item.actor === 'personal') return <Sparkles className="w-3.5 h-3.5 text-accent" />;
+  if (item.kind === 'answer') return <UserRound className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.kind === 'tool') return <Wrench className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.kind === 'verification') return <TestTube className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.kind === 'review') return <FileSearch className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.kind === 'edit' || item.kind === 'artifact') return <FileCode className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.actor === 'personal') return <Bot className="w-3.5 h-3.5 text-accent" />;
+  if (item.actor === 'coding') return <Code2 className="w-3.5 h-3.5 text-fg-muted" />;
+  return <Circle className="w-3.5 h-3.5 text-fg-muted" />;
+};
+
+const statusDotClass = (status: CollaborationTimelineItem['status']) => {
+  if (status === 'done') return 'bg-success';
+  if (status === 'failed') return 'bg-danger';
+  if (status === 'waiting') return 'bg-amber-400';
+  if (status === 'running') return 'bg-accent animate-pulse';
+  return 'bg-fg-muted';
+};
+
 /**
  * CollaborationTrack — a compact, collapsible card showing the status of
  * a collaboration run between Personal Agent and Coding Agent (or its
@@ -40,6 +66,7 @@ const CollaborationTrack: React.FC<{
   teamProgress?: TeamProgressEvent[];
   evidence?: EvidenceEntry[];
   artifacts?: unknown[];
+  events?: RunEvent[];
   status?: string;
   pendingClarification?: {
     request_id?: string;
@@ -47,6 +74,9 @@ const CollaborationTrack: React.FC<{
     options?: string[];
     context?: string;
     recommendation?: string;
+    answered_by?: string;
+    reason?: string;
+    confidence?: number;
   } | null;
   onPause?: () => void;
   onCancel?: () => void;
@@ -56,6 +86,7 @@ const CollaborationTrack: React.FC<{
   teamProgress = [],
   evidence = [],
   artifacts = [],
+  events = [],
   status = '',
   pendingClarification = null,
   onPause,
@@ -64,6 +95,12 @@ const CollaborationTrack: React.FC<{
 }) => {
   const [expanded, setExpanded] = useState(true);
   const [clarificationAnswer, setClarificationAnswer] = useState('');
+  const timelineItems = buildCollaborationTimeline(events);
+  const recentTimeline = timelineItems.slice(-5);
+  const currentTimelineItem = timelineItems[timelineItems.length - 1] || null;
+  const latestAutoAnswer = [...timelineItems].reverse().find(
+    (item) => item.kind === 'answer' && item.rawEvent.data?.answered_by === 'personal_auto',
+  );
 
   useEffect(() => {
     setClarificationAnswer('');
@@ -103,18 +140,27 @@ const CollaborationTrack: React.FC<{
             ? <ChevronDown className="w-3.5 h-3.5 text-fg-muted shrink-0" />
             : <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />}
           <span className="chat-text-sm font-semibold text-fg-secondary shrink-0">
-            {isWaiting ? 'Coding needs input' : isRunning ? 'Coding Team' : hasFailed ? 'Coding (failed)' : 'Coding Team'}
+            {isWaiting ? 'Coding needs input' : hasFailed ? 'Collaboration failed' : 'Personal ↔ Coding'}
           </span>
-          {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent shrink-0" />}
+          {(isRunning || status === 'running') && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent shrink-0" />}
           {hasFailed && <AlertCircle className="w-3.5 h-3.5 text-danger shrink-0" />}
-          {!isRunning && !hasFailed && completedCount > 0 && (
+          {!isRunning && !hasFailed && (completedCount > 0 || status === 'completed') && (
             <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
           )}
           <span className="chat-text-xs text-fg-muted truncate">
-            {pendingClarification?.question || recaps[0]?.one_liner || status || `${activeCount} roles`}
+            {pendingClarification?.question || currentTimelineItem?.title || recaps[0]?.one_liner || status || `${activeCount} roles`}
           </span>
         </button>
         <div className="flex items-center gap-1.5 shrink-0">
+          {latestAutoAnswer && (
+            <span
+              className="hidden sm:inline-flex items-center gap-1 rounded border border-accent/30 bg-accent/10 px-1.5 py-0.5 chat-text-xs text-accent"
+              title={latestAutoAnswer.rawEvent.data?.reason || 'Personal Agent answered automatically'}
+            >
+              <Sparkles className="w-3 h-3" />
+              Auto
+            </span>
+          )}
           {activeCount > 0 && (
             <span className="chat-text-xs text-fg-muted tabular-nums px-1">
               {completedCount}/{activeCount}
@@ -146,7 +192,27 @@ const CollaborationTrack: React.FC<{
 
       {expanded && (
         <div className="px-3 py-2 space-y-2 max-h-80 overflow-y-auto">
-          {/* Team roles */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded border border-border-subtle bg-surface px-2 py-1.5">
+              <div className="flex items-center gap-1.5 chat-text-xs text-fg-muted">
+                <Bot className="w-3.5 h-3.5 text-accent" />
+                Personal
+              </div>
+              <div className="mt-1 chat-text-xs text-fg-secondary truncate">
+                {latestAutoAnswer ? 'Auto arbitration ready' : 'Delegating and coordinating'}
+              </div>
+            </div>
+            <div className="rounded border border-border-subtle bg-surface px-2 py-1.5">
+              <div className="flex items-center gap-1.5 chat-text-xs text-fg-muted">
+                <Code2 className="w-3.5 h-3.5 text-fg-secondary" />
+                Coding
+              </div>
+              <div className="mt-1 chat-text-xs text-fg-secondary truncate">
+                {isWaiting ? 'Waiting for clarification' : hasFailed ? 'Needs attention' : status === 'completed' ? 'Finished' : 'Working'}
+              </div>
+            </div>
+          </div>
+
           {pendingClarification && (
             <div className="rounded border border-accent/30 bg-accent/10 px-2.5 py-2 space-y-2">
               <div className="chat-text-sm font-medium text-fg">
@@ -198,6 +264,43 @@ const CollaborationTrack: React.FC<{
                   Send
                 </button>
               </div>
+            </div>
+          )}
+
+          {recentTimeline.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="chat-text-xs text-fg-muted font-medium">Live collaboration</div>
+              {recentTimeline.map((item) => (
+                <div key={item.id} className="flex gap-2 rounded border border-border-subtle bg-surface px-2 py-1.5">
+                  <div className="relative mt-0.5 shrink-0">
+                    <TimelineIcon item={item} />
+                    <span className={`absolute -right-0.5 -bottom-0.5 h-1.5 w-1.5 rounded-full ${statusDotClass(item.status)}`} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="chat-text-xs font-medium text-fg-secondary truncate">{item.title}</span>
+                      {item.rawEvent.data?.answered_by === 'personal_auto' && (
+                        <span className="shrink-0 rounded border border-accent/30 bg-accent/10 px-1 py-0.5 text-[10px] leading-none text-accent">
+                          personal_auto
+                        </span>
+                      )}
+                    </div>
+                    {item.detail && (
+                      <div className="mt-0.5 chat-text-xs text-fg-muted truncate" title={item.detail}>
+                        {item.detail}
+                      </div>
+                    )}
+                    {item.rawEvent.data?.reason && (
+                      <div className="mt-0.5 chat-text-xs text-fg-muted truncate" title={item.rawEvent.data.reason}>
+                        Reason: {item.rawEvent.data.reason}
+                        {typeof item.rawEvent.data?.confidence === 'number'
+                          ? ` · ${Math.round(item.rawEvent.data.confidence * 100)}%`
+                          : ''}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 

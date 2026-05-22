@@ -35,6 +35,7 @@ import { RewindModal } from './RewindModal';
 import { PersonalChatSurface } from './chat/PersonalChatSurface';
 import { AgentRunningStatus } from './chat/AgentRunningStatus';
 import { CollaborationTrack } from './CollaborationTrack';
+import { collaborationEventsForRun } from '../lib/collaborationTimeline';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
 import { RevealableInlineCode } from './RevealPathAction';
 import {
@@ -2522,6 +2523,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       mode: timelineMode,
     }).filter((event) => !(event.kind === 'todo' && event.source === 'execution'));
   }, [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode, usePersonalChatV2]);
+  const collaborationRunEvents = useMemo(() => (
+    collaborationEventsForRun(runEvents || [], collaborationState?.run_id || '')
+  ), [runEvents, collaborationState?.run_id]);
 
   // Markdown 自定义渲染
   // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
@@ -3044,6 +3048,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               teamProgress={collaborationState.teamProgress}
               evidence={collaborationState.evidence || []}
               artifacts={collaborationState.artifacts || []}
+              events={collaborationRunEvents}
               status={collaborationState.status || collaborationState.currentPhase || ''}
               pendingClarification={collaborationState.pendingClarification || null}
               onPause={onPauseCollaboration}

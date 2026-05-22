@@ -1423,6 +1423,15 @@ class AgentSession:
         task = collab_add_task(collab_run.run_id, packet)
         emitted = 0
 
+        async def clarification_resolver(clarification: Dict[str, Any], active_packet: TaskPacket):
+            from app.collaboration.clarification import resolve_personal_clarification
+
+            return await resolve_personal_clarification(
+                clarification,
+                active_packet,
+                model_id=self.model_id,
+            )
+
         def new_collab_events() -> List[Dict[str, Any]]:
             nonlocal emitted
             events = collab_list_events(collab_run.run_id)
@@ -1468,6 +1477,7 @@ class AgentSession:
                 run_id=collab_run.run_id,
                 task_id=task.task_id,
                 project_path=project_path,
+                clarification_resolver=clarification_resolver,
             ):
                 child_events.append(event)
                 record_delegated_child_event(collab_run.run_id, task.task_id, event)
@@ -1481,6 +1491,7 @@ class AgentSession:
                 run_id=collab_run.run_id,
                 task_id=task.task_id,
                 project_path=project_path,
+                clarification_resolver=clarification_resolver,
             ):
                 child_events.append(event)
                 record_delegated_child_event(collab_run.run_id, task.task_id, event)
@@ -1507,6 +1518,7 @@ class AgentSession:
                 run_id=collab_run.run_id,
                 task_id=task.task_id,
                 project_path=project_path,
+                clarification_resolver=clarification_resolver,
             ):
                 child_events.append(event)
                 record_delegated_child_event(collab_run.run_id, task.task_id, event)
@@ -3828,7 +3840,10 @@ class AgentSession:
                     run_id,
                 )
 
-                for collaboration_event in tc_result.metadata.get("collaboration_events", []) or []:
+                collaboration_events = []
+                if not tc_result.metadata.get("collaboration_events_realtime"):
+                    collaboration_events = tc_result.metadata.get("collaboration_events", []) or []
+                for collaboration_event in collaboration_events:
                     if not isinstance(collaboration_event, dict):
                         continue
                     event_data = dict(collaboration_event.get("data") or {})

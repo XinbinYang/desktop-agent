@@ -360,3 +360,168 @@ async def test_delegated_execute_waits_for_personal_clarification(monkeypatch):
     result = result_from_execute_events(events, require_verification=True, require_review=False)
     assert result.status == "pass"
     clear_clarification_answers("r_clarify")
+
+
+@pytest.mark.asyncio
+async def test_delegated_execute_personal_auto_answers_clarification(monkeypatch):
+    import app.agent as agent_module
+    import app.collaboration.executor as executor
+    from app.collaboration.clarification import ClarificationResolution
+
+    class PlanState:
+        phase = "idle"
+        approved = False
+        todos = []
+
+    class FakeCodingSession:
+        last_instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.plan_state = PlanState()
+            self.inputs = []
+            self.collaboration_run_id = ""
+            self.collaboration_task_id = ""
+            FakeCodingSession.last_instance = self
+
+        def _save(self):
+            pass
+
+        def plan_event_payload(self):
+            return {"phase": self.plan_state.phase, "approved": self.plan_state.approved}
+
+        def build_plan(self):
+            return False
+
+        async def run(self, user_input, image_base64=None, *, chat_mode=None, thinking_intensity=None):
+            self.inputs.append(user_input)
+            if len(self.inputs) == 1:
+                yield {
+                    "type": "collaboration_clarification_request",
+                    "data": {
+                        "request_id": "clar_auto",
+                        "question": "Use simple_return or log_return?",
+                        "options": ["log_return", "simple_return"],
+                    },
+                }
+                yield {"type": "run_completed", "data": {"status": "waiting_clarification"}}
+                return
+            yield {"type": "tool_call", "data": {"name": "verify_project", "args": {}, "result": "exit_code: 0\nok"}}
+            yield {"type": "tool_call", "data": {"name": "run_review", "args": {}, "result": "No blocking findings."}}
+            yield {"type": "content", "data": {"text": "Used log_return. ACCEPTANCE: PASS"}}
+            yield {
+                "type": "run_completed",
+                "data": {"status": "completed", "verification_passed": True, "review_passed": True},
+            }
+
+    async def resolver(clarification, packet):
+        return ClarificationResolution(
+            action="answer",
+            answer="log_return",
+            reason="Safe technical default for this task.",
+            confidence=0.92,
+        )
+
+    monkeypatch.setattr(agent_module, "AgentSession", FakeCodingSession)
+    monkeypatch.setattr(executor, "get_model_for_agent", lambda agent_type: "test-model")
+
+    events = [
+        event
+        async for event in run_execute_agent_events(
+            TaskPacket(goal="implement"),
+            session_id="s1",
+            run_id="r_auto_clarify",
+            task_id="ctask_auto_clarify",
+            project_path="",
+            clarification_resolver=resolver,
+        )
+    ]
+
+    assert not any(event["type"] == "decision_required" for event in events)
+    assert not any(event["type"] == "collaboration_clarification_request" for event in events)
+    answer_events = [event for event in events if event["type"] == "collaboration_clarification_answer"]
+    assert answer_events
+    assert answer_events[0]["data"]["answered_by"] == "personal_auto"
+    assert answer_events[0]["data"]["answer"] == "log_return"
+    assert "log_return" in FakeCodingSession.last_instance.inputs[1]
+    result = result_from_execute_events(events, require_verification=True, require_review=False)
+    assert result.status == "pass"
+
+
+@pytest.mark.asyncio
+async def test_delegated_execute_resolver_failure_falls_back_to_user_clarification(monkeypatch):
+    import app.agent as agent_module
+    import app.collaboration.executor as executor
+    from app.collaboration.bus import clear_clarification_answers, submit_clarification_answer
+
+    class PlanState:
+        phase = "idle"
+        approved = False
+        todos = []
+
+    class FakeCodingSession:
+        last_instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.plan_state = PlanState()
+            self.inputs = []
+            self.collaboration_run_id = ""
+            self.collaboration_task_id = ""
+            FakeCodingSession.last_instance = self
+
+        def _save(self):
+            pass
+
+        def plan_event_payload(self):
+            return {"phase": self.plan_state.phase, "approved": self.plan_state.approved}
+
+        def build_plan(self):
+            return False
+
+        async def run(self, user_input, image_base64=None, *, chat_mode=None, thinking_intensity=None):
+            self.inputs.append(user_input)
+            if len(self.inputs) == 1:
+                yield {
+                    "type": "collaboration_clarification_request",
+                    "data": {
+                        "request_id": "clar_failover",
+                        "question": "Use simple_return or log_return?",
+                        "options": ["log_return", "simple_return"],
+                    },
+                }
+                yield {"type": "run_completed", "data": {"status": "waiting_clarification"}}
+                return
+            yield {"type": "tool_call", "data": {"name": "verify_project", "args": {}, "result": "exit_code: 0\nok"}}
+            yield {"type": "tool_call", "data": {"name": "run_review", "args": {}, "result": "No blocking findings."}}
+            yield {"type": "content", "data": {"text": "Used manual answer. ACCEPTANCE: PASS"}}
+            yield {
+                "type": "run_completed",
+                "data": {"status": "completed", "verification_passed": True, "review_passed": True},
+            }
+
+    async def failing_resolver(clarification, packet):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(agent_module, "AgentSession", FakeCodingSession)
+    monkeypatch.setattr(executor, "get_model_for_agent", lambda agent_type: "test-model")
+    clear_clarification_answers("r_failover_clarify")
+    await submit_clarification_answer("r_failover_clarify", "Use log_return", request_id="clar_failover")
+
+    events = [
+        event
+        async for event in run_execute_agent_events(
+            TaskPacket(goal="implement"),
+            session_id="s1",
+            run_id="r_failover_clarify",
+            task_id="ctask_failover_clarify",
+            project_path="",
+            clarification_resolver=failing_resolver,
+        )
+    ]
+
+    assert any(event["type"] == "collaboration_clarification_request" for event in events)
+    assert any(event["type"] == "decision_required" for event in events)
+    assert any(event["type"] == "collaboration_clarification_answer" for event in events)
+    assert "Use log_return" in FakeCodingSession.last_instance.inputs[1]
+    result = result_from_execute_events(events, require_verification=True, require_review=False)
+    assert result.status == "pass"
+    clear_clarification_answers("r_failover_clarify")
