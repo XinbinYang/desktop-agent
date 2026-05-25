@@ -38,6 +38,7 @@ const TimelineIcon: React.FC<{ item: CollaborationTimelineItem }> = ({ item }) =
   if (item.kind === 'tool') return <Wrench className="w-3.5 h-3.5 text-fg-muted" />;
   if (item.kind === 'verification') return <TestTube className="w-3.5 h-3.5 text-fg-muted" />;
   if (item.kind === 'review') return <FileSearch className="w-3.5 h-3.5 text-fg-muted" />;
+  if (item.kind === 'phase') return <Circle className="w-3.5 h-3.5 text-accent" />;
   if (item.kind === 'edit' || item.kind === 'artifact') return <FileCode className="w-3.5 h-3.5 text-fg-muted" />;
   if (item.actor === 'personal') return <Bot className="w-3.5 h-3.5 text-accent" />;
   if (item.actor === 'coding') return <Code2 className="w-3.5 h-3.5 text-fg-muted" />;
@@ -120,6 +121,14 @@ const CollaborationTrack: React.FC<{
   const completedCount = ROLE_ORDER.filter((r) => roleStatus[r] === 'done').length;
   const isWaiting = status === 'waiting_clarification' || !!pendingClarification;
   const isRunning = activeCount > 0 && currentRole !== undefined && !isWaiting;
+  const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'max_iterations_reached';
+
+  // Extract the current collaboration phase from phase_update events.
+  const PHASE_ORDER = ['pending', 'analyzing', 'planning', 'awaiting_user', 'executing', 'verifying', 'critiquing', 'completed', 'failed'];
+  const phaseItems = timelineItems.filter((item) => item.kind === 'phase');
+  const currentPhase: string = phaseItems.length > 0
+    ? String(phaseItems[phaseItems.length - 1].rawEvent.data?.phase || '')
+    : 'pending';
 
   // Gather all evidence + changed files from recaps.
   const allEvidence = [...evidence, ...recaps.flatMap((r) => r.evidence_ledger)];
@@ -182,7 +191,7 @@ const CollaborationTrack: React.FC<{
               type="button"
               onClick={onCancel}
               className="inline-flex items-center gap-1 rounded-md border border-danger/35 bg-danger/10 px-2 py-1 chat-text-xs text-danger hover:bg-danger/15"
-              title="Cancel"
+              title={isTerminal ? 'Close collaboration panel' : 'Cancel collaboration'}
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -212,6 +221,39 @@ const CollaborationTrack: React.FC<{
               </div>
             </div>
           </div>
+
+          {/* Phase progress strip */}
+          {phaseItems.length > 0 && (
+            <div className="flex items-center gap-1">
+              <span className="shrink-0 chat-text-xs text-fg-muted w-14">Phase</span>
+              <div className="flex flex-1 gap-0.5">
+                {PHASE_ORDER.filter((p) => p !== 'pending').map((phase) => {
+                  const idx = PHASE_ORDER.indexOf(phase);
+                  const currentIdx = PHASE_ORDER.indexOf(currentPhase);
+                  const isActive = phase === currentPhase;
+                  const isPast = idx < currentIdx;
+                  const isFailed = phase === 'failed' && currentPhase === 'failed';
+                  const colorClass = isFailed
+                    ? 'bg-danger'
+                    : isActive
+                      ? 'bg-accent animate-pulse'
+                      : isPast
+                        ? 'bg-success/50'
+                        : 'bg-border-subtle';
+                  return (
+                    <div
+                      key={phase}
+                      className={`flex-1 h-1.5 rounded-sm ${colorClass}`}
+                      title={`${phase.replace(/_/g, ' ')}${isActive ? ' (active)' : isPast ? ' (done)' : ''}`}
+                    />
+                  );
+                })}
+              </div>
+              <span className="shrink-0 chat-text-xs text-fg-muted min-w-[72px] text-right">
+                {currentPhase.replace(/_/g, ' ')}
+              </span>
+            </div>
+          )}
 
           {pendingClarification && (
             <div className="rounded border border-accent/30 bg-accent/10 px-2.5 py-2 space-y-2">

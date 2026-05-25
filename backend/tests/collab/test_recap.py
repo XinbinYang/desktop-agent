@@ -177,3 +177,69 @@ class TestRecapFromEvents:
         assert len(commands) == 2
         assert any("pytest" in e.command for e in commands)
         assert any("npm test" in e.command for e in commands)
+
+
+class TestWeeklyJournal:
+    """P1-3 regression: weekly journal must use the CURRENT week label,
+    not the cutoff (which is `hours` in the past — for the default 168h
+    window that wrote into *last* week's file)."""
+
+    def test_journal_path_uses_current_week_label(self, tmp_path, monkeypatch):
+        import sqlite3
+        import time
+        from app import runtime_paths
+        from app.collaboration import recap
+
+        # Redirect runtime_file so both the DB read and the journal write
+        # land in the tmp directory — keeps the test hermetic.
+        def fake_runtime_file(*parts):
+            return tmp_path.joinpath(*parts)
+
+        monkeypatch.setattr(runtime_paths, "runtime_file", fake_runtime_file)
+
+        # Seed a fake collaboration_runs.db with one completed run.
+        db_path = tmp_path / "data" / "collaboration_runs.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE collaboration_runs (run_id TEXT, status TEXT, "
+            "mode TEXT, goal TEXT, summary TEXT, updated_at REAL)"
+        )
+        conn.execute(
+            "INSERT INTO collaboration_runs VALUES (?, ?, ?, ?, ?, ?)",
+            ("run_x", "completed", "execute", "test goal", "ok", time.time()),
+        )
+        conn.commit()
+        conn.close()
+
+        path = recap.write_weekly_journal(hours=24)
+
+        assert path is not None, "expected a journal file to be written"
+        expected_week = time.strftime("%Y-W%W", time.gmtime())
+        assert expected_week in str(path), (
+            f"journal path {path!r} should contain current week label "
+            f"{expected_week!r} (not the cutoff's week)"
+        )
+
+    def test_journal_returns_none_when_no_runs(self, tmp_path, monkeypatch):
+        """Empty DB → returns None, no file written."""
+        import sqlite3
+        from app import runtime_paths
+        from app.collaboration import recap
+
+        monkeypatch.setattr(
+            runtime_paths, "runtime_file",
+            lambda *parts: tmp_path.joinpath(*parts),
+        )
+
+        db_path = tmp_path / "data" / "collaboration_runs.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE collaboration_runs (run_id TEXT, status TEXT, "
+            "mode TEXT, goal TEXT, summary TEXT, updated_at REAL)"
+        )
+        conn.commit()
+        conn.close()
+
+        assert recap.write_weekly_journal(hours=24) is None

@@ -81,7 +81,7 @@ class Settings(BaseModel):
     max_parallel_agents: int = 3
     collaboration_enabled: bool = True
     default_collaboration_mode: str = "hybrid"
-    auto_delegate_coding: str = "policy_v2"
+    auto_delegate_coding: str = "off"
     review_gate_enabled: bool = True
     auto_approve_rules: List[AutoApproveRule] = []
 

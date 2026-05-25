@@ -124,12 +124,36 @@ async def lifespan(app: FastAPI):
 
     connector_start_task.add_done_callback(_log_connector_start_failure)
 
+    # Sprint 5.3: lightweight 24h journal cron. We avoid pulling in
+    # apscheduler — a single asyncio task is enough for "best-effort daily".
+    journal_interval_seconds = 24 * 3600
+
+    async def _journal_loop():
+        while True:
+            try:
+                await asyncio.sleep(journal_interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            try:
+                from app.collaboration.recap import write_weekly_journal
+                path = write_weekly_journal()
+                if path:
+                    print(f"[Desktop Agent] Collaboration journal written: {path}")
+            except Exception as exc:
+                print(f"[Desktop Agent] Collaboration journal write failed: {exc}")
+
+    journal_task = asyncio.create_task(_journal_loop())
+
     yield
     print("[Desktop Agent] Backend shutting down...")
     if not connector_start_task.done():
         connector_start_task.cancel()
         with suppress(asyncio.CancelledError):
             await connector_start_task
+    if not journal_task.done():
+        journal_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await journal_task
     get_plugin_manager().unload_all()
     await connector_manager.shutdown()
     await get_mcp_manager().disconnect_all()
@@ -1314,6 +1338,102 @@ def update_skill_preferences(req: SkillPreferencesRequest):
     }
 
 
+# ====== Collaboration Health API ======
+
+@app.get("/api/collaboration/health")
+def collaboration_health(last_n: int = 20):
+    """Return aggregate health stats for recent collaboration runs."""
+    import sqlite3
+    from collections import Counter
+
+    from app.runtime_paths import runtime_file
+
+    db_path = runtime_file("data", "collaboration_runs.db")
+    if not db_path.exists():
+        return {"status": "ok", "runs": 0, "message": "No collaboration data yet."}
+
+    try:
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+
+        # Recent runs
+        runs = conn.execute(
+            "SELECT run_id, status, mode, goal, summary, updated_at "
+            "FROM collaboration_runs ORDER BY updated_at DESC LIMIT ?",
+            (max(1, min(last_n, 200)),),
+        ).fetchall()
+
+        if not runs:
+            conn.close()
+            return {"status": "ok", "runs": 0, "message": "No completed runs yet."}
+
+        statuses = Counter(r["status"] for r in runs)
+        modes = Counter(r["mode"] for r in runs)
+
+        # Phase distribution from phase table — parameterized IN clause to avoid
+        # SQL injection if run_id ever sources from non-trusted input.
+        run_ids = [r["run_id"] for r in runs]
+        placeholders = ",".join("?" * len(run_ids))
+        phase_rows = conn.execute(
+            f"SELECT phase FROM collab_run_phases WHERE run_id IN ({placeholders}) ORDER BY id",
+            run_ids,
+        ).fetchall()
+        phases = Counter(r["phase"] for r in phase_rows)
+
+        # Clarification count
+        clarifications = sum(
+            1 for r in runs if "waiting_clarification" in (r["status"] or "")
+        ) + int(phases.get("awaiting_user", 0))
+
+        # Avg duration from phase timestamps (approximate: first to last phase per run)
+        durations: list[float] = []
+        for r in runs:
+            ts_rows = conn.execute(
+                "SELECT ts FROM collab_run_phases WHERE run_id = ? ORDER BY id",
+                (r["run_id"],),
+            ).fetchall()
+            if len(ts_rows) >= 2:
+                durations.append(ts_rows[-1]["ts"] - ts_rows[0]["ts"])
+
+        conn.close()
+
+        # Top failure reasons (from summaries)
+        failure_reasons: list[str] = []
+        for r in runs:
+            if r["status"] in ("failed", "cancelled") and r["summary"]:
+                failure_reasons.append(r["summary"][:120])
+
+        return {
+            "status": "ok",
+            "runs": len(runs),
+            "status_distribution": dict(statuses),
+            "mode_distribution": dict(modes),
+            "phase_distribution": dict(phases),
+            "clarification_count": clarifications,
+            "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+            "recent_failure_reasons": failure_reasons[:5],
+        }
+    except Exception as exc:
+        conn.close() if "conn" in locals() else None
+        return {"status": "error", "message": str(exc)}
+
+
+@app.post("/api/collaboration/journal/write")
+def collaboration_journal_write(hours: int = 168):
+    """Manually trigger weekly collaboration journal aggregation.
+
+    Companion to the 24h cron in `lifespan`. Useful for on-demand archival,
+    integration tests, and one-shot regeneration after a journal got lost.
+    """
+    from app.collaboration.recap import write_weekly_journal
+
+    try:
+        path = write_weekly_journal(hours=max(1, min(hours, 24 * 365)))
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+    return {"status": "ok", "path": path or "(no runs in window)"}
+
+
 # ====== Commands API ======
 
 @app.get("/api/commands")
@@ -1513,6 +1633,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 image_b64 = msg.get("image_base64")
                 requested_chat_mode = msg.get("chat_mode")
+                requested_collab_mode = msg.get("collab_mode", "execute")
                 thinking_intensity = msg.get("thinking_intensity")
                 current_model = model_id
                 current_role_id = role_id
@@ -1525,7 +1646,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     continue
                 chat_mode = (
                     requested_chat_mode
-                    if requested_chat_mode in ("agent", "plan")
+                    if requested_chat_mode in ("agent", "plan", "collaboration")
                     else session.chat_mode
                 )
                 if runtime.accepts_task_guidance:
@@ -1565,14 +1686,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     image_b64=image_b64,
                     chat_mode=chat_mode,
                     thinking_intensity=thinking_intensity,
+                    collab_mode=requested_collab_mode,
                 ):
                     async for event in session.run(
                         user_text,
                         image_b64,
-                        chat_mode=chat_mode if chat_mode in ("agent", "plan") else None,
+                        chat_mode=chat_mode if chat_mode in ("agent", "plan", "collaboration") else None,
                         thinking_intensity=thinking_intensity
                         if thinking_intensity in ("low", "medium", "high")
                         else None,
+                        collab_mode=collab_mode,
                     ):
                         yield event
 

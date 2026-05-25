@@ -7,7 +7,39 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optiona
 
 from app.collaboration.models import ArtifactRef, EvidenceEntry, ResultPacket, TaskPacket
 from app.config import get_model_for_agent
-from app.worker import WorkerSession
+
+
+COLLAB_PHASE_EVENT_TYPE = "collaboration_phase_update"
+
+
+def _try_transition(run_id: str, new_phase: str, note: str = "") -> Optional[Dict[str, Any]]:
+    """Attempt a state-machine transition for *run_id*.
+
+    Returns a ``collaboration_phase_update`` event dict if the transition
+    succeeded, or ``None`` if it was illegal (logged but not raised — the
+    state machine is observational, not a critical-path gate).
+    """
+    from app.collaboration.state_machine import CollaborationStateMachine
+
+    sm = CollaborationStateMachine(run_id)
+    previous = sm.phase()
+    try:
+        sm.transition(new_phase, note)
+    except ValueError as exc:
+        logger = __import__("logging").getLogger("collab.state_machine")
+        logger.warning("Phase transition skipped for %s: %s", run_id, exc)
+        return None
+    return {
+        "type": COLLAB_PHASE_EVENT_TYPE,
+        "data": {
+            "run_id": run_id,
+            "phase": new_phase,
+            "previous_phase": previous,
+            "note": note,
+            "timestamp": time.time(),
+        },
+    }
+
 
 # Read-only tool set for critic and verify_only modes
 CRITIC_ALLOWED_TOOLS: frozenset[str] = frozenset({
@@ -36,6 +68,7 @@ RELAYED_CHILD_EVENT_TYPES: frozenset[str] = frozenset({
     "review_finding",
     "artifact_ready",
     "file_edit",
+    "error",
     "decision_required",
     "collab_directive_applied",
     "collaboration_clarification_request",
@@ -137,22 +170,38 @@ async def run_consult_worker(
     run_id: str,
     task_id: str,
     project_path: str = "",
+    read_only: bool = True,
 ) -> Tuple[ResultPacket, List[Dict[str, Any]]]:
-    """Run a read-only Coding specialist using the architect worker profile."""
+    """Run a read-only Coding specialist via AgentSession(coding).
+
+    Uses the unified AgentSession so that the Coding Agent identity is
+    consistent across consult and execute paths. The ``read_only`` flag
+    sets ``AgentSession.collaboration_read_only``, which surfaces a
+    read-only constraint in the system prompt Active Collaboration segment.
+    """
+    from app.agent import AgentSession
+    from app.agents.manager import AgentManager
+
     model_id = get_model_for_agent("coding")
-    worker = WorkerSession(
-        worker_id=f"coding_consult_{task_id[-6:]}",
-        task=_task_text(packet),
-        profile_name="architect",
+    session = AgentSession(
         model_id=model_id,
-        run_id=run_id,
-        parent_tool_call_id=task_id,
+        session_id=f"coding_consult_{task_id[-8:]}",
+        role_id=AgentManager.get_default_role("coding"),
         agent_type="coding",
-        tool_allowlist=packet.allowed_tools or None,
+        project_path=project_path or None,
     )
+    session.collaboration_run_id = run_id
+    session.collaboration_task_id = task_id
+    session.collaboration_mode = packet.mode
+    session.collaboration_read_only = read_only
+    # Persist but archive so the delegated session is referenceable without
+    # polluting the user's session list.
+    session.archived_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     events: List[Dict[str, Any]] = []
     final = ""
     status = "pass"
+
     token = None
     if project_path:
         try:
@@ -161,13 +210,27 @@ async def run_consult_worker(
         except Exception:
             token = None
     try:
-        async for event in worker.run():
+        async for event in session.run(_task_text(packet), None, chat_mode="agent"):
+            event_data = dict(event.get("data") or {})
+            event_data.setdefault("collaboration_run_id", run_id)
+            if task_id:
+                event_data.setdefault("collaboration_task_id", task_id)
+            event = {**event, "data": event_data}
             events.append(event)
-            if event.get("type") == "worker_done":
+            if event.get("type") == "run_completed":
                 data = event.get("data") or {}
-                final = data.get("result", "")
-                if data.get("status") not in ("completed", "max_iterations_reached"):
+                messages = data.get("messages") or []
+                if messages:
+                    # Last assistant message is the final answer
+                    last_assistant = next(
+                        (m for m in reversed(messages) if m.get("role") == "assistant"),
+                        None,
+                    )
+                    if last_assistant:
+                        final = "\n".join([c.get("text", "") for c in last_assistant.get("content", [])])
+                if data.get("status", "completed") not in ("completed", "max_iterations_reached"):
                     status = "fail"
+                break
     finally:
         if token is not None:
             try:
@@ -175,6 +238,7 @@ async def run_consult_worker(
                 reset_session_project(token)
             except Exception:
                 pass
+
     if "ACCEPTANCE: FAIL" in final:
         status = "fail"
     return ResultPacket(status=status, summary=final[:4000], details=final), events
@@ -211,15 +275,49 @@ async def run_execute_agent_events(
     )
     coding_session.collaboration_run_id = run_id
     coding_session.collaboration_task_id = task_id
-    # Keep delegated specialist sessions out of the user's visible session list.
-    coding_session._save = lambda: None  # type: ignore[method-assign]
+    coding_session.collaboration_mode = packet.mode
+    # Persist the delegated session so resume and recap can reference it later.
+    # Mark as archived so it does not pollute the default session list in the UI.
+    coding_session.archived_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     next_input = _task_text(packet)
+
+    # State machine: entry
+    phase_event = _try_transition(run_id, "analyzing", f"Task mode={packet.mode}")
+    if phase_event:
+        yield phase_event
+
     auto_builds = 0
     max_auto_builds = 3
     while True:
         clarification_request: Optional[Dict[str, Any]] = None
+        phase_seen = False
         async for event in coding_session.run(next_input, None, chat_mode="agent"):
+            event_data = dict(event.get("data") or {})
+            event_data.setdefault("collaboration_run_id", run_id)
+            if task_id:
+                event_data.setdefault("collaboration_task_id", task_id)
+            event = {**event, "data": event_data}
+
+            # Phase transitions driven by Coding Agent events
+            event_type = event.get("type", "")
+            if event_type == "plan_status" and not phase_seen:
+                phase_seen = True
+                pe = _try_transition(run_id, "planning", "Plan produced by Coding Agent")
+                if pe:
+                    yield pe
+            elif event_type == "verification_result":
+                pe = _try_transition(run_id, "verifying", "Verification result received")
+                if pe:
+                    yield pe
+            elif event_type == "collab_critic_result":
+                pe = _try_transition(run_id, "critiquing", "Critic review received")
+                if pe:
+                    yield pe
+
             if event.get("type") == "collaboration_clarification_request":
+                pe = _try_transition(run_id, "awaiting_user", "Clarification requested by Coding Agent")
+                if pe:
+                    yield pe
                 clarification_request = dict(event.get("data") or {})
                 clarification_request.setdefault("run_id", run_id)
                 clarification_request.setdefault("collaboration_run_id", run_id)
@@ -227,8 +325,14 @@ async def run_execute_agent_events(
                     clarification_request.setdefault("task_id", task_id)
                     clarification_request.setdefault("collaboration_task_id", task_id)
                 continue
-            if event.get("type") == "run_completed" and (event.get("data") or {}).get("status") == "waiting_clarification":
-                continue
+            if event.get("type") == "run_completed":
+                status = (event.get("data") or {}).get("status", "")
+                if status == "waiting_clarification":
+                    continue
+                final_phase = "completed" if status in ("completed", "max_iterations_reached") else "failed"
+                pe = _try_transition(run_id, final_phase, f"Run finished: {status}")
+                if pe:
+                    yield pe
             yield event
 
         if clarification_request is not None:
@@ -259,6 +363,9 @@ async def run_execute_agent_events(
                             "timestamp": time.time(),
                         }
                         yield {"type": "collaboration_clarification_answer", "data": answer}
+                        pe = _try_transition(run_id, "executing", "Clarification auto-resolved by Personal Agent")
+                        if pe:
+                            yield pe
                         next_input = (
                             "[Personal Agent clarification answer]\n"
                             f"Question: {clarification_request.get('question') or ''}\n"
@@ -288,16 +395,32 @@ async def run_execute_agent_events(
                 timeout=timeout,
             )
             if answer is None:
+                pe = _try_transition(run_id, "awaiting_user", "Clarification timed out — run blocked awaiting user")
+                if pe:
+                    yield pe
+                yield {
+                    "type": "decision_required",
+                    "data": {
+                        "run_id": run_id,
+                        "kind": "clarification_timeout",
+                        "reason": "Coding Agent clarification timed out. The run is blocked but can be resumed once the user answers.",
+                        "question": clarification_request.get("question") or "Unresolved clarification",
+                    },
+                }
                 yield {
                     "type": "run_completed",
                     "data": {
-                        "status": "failed",
-                        "summary": "Timed out waiting for Personal Agent clarification.",
+                        "status": "blocked",
+                        "summary": "Timed out waiting for Personal Agent clarification. Run is salvageable.",
+                        "clarification_request_id": request_id,
                     },
                 }
                 return
             update_task(task_id, status="running") if task_id else None
             yield {"type": "collaboration_clarification_answer", "data": answer}
+            pe = _try_transition(run_id, "executing", "Clarification answered by Personal Agent")
+            if pe:
+                yield pe
             next_input = (
                 "[Personal Agent clarification answer]\n"
                 f"Question: {clarification_request.get('question') or ''}\n"
@@ -327,6 +450,9 @@ async def run_execute_agent_events(
             break
 
         auto_builds += 1
+        pe = _try_transition(run_id, "executing", "Plan auto-approved — proceeding to execution")
+        if pe:
+            yield pe
         yield {
             "type": "collaboration_plan_auto_approved",
             "data": {
@@ -593,6 +719,9 @@ async def run_plan_then_execute_events(
     will be layered on top when CollaborationStateMachine is available.
     """
     # Phase 1: produce a plan via read-only consult
+    pe = _try_transition(run_id, "analyzing", "plan_then_execute: entering analysis")
+    if pe:
+        yield pe
     plan_packet = copy.copy(packet)
     plan_packet = plan_packet.model_copy(update={
         "mode": "consult",
@@ -611,6 +740,10 @@ async def run_plan_then_execute_events(
     for event in plan_events:
         yield event
 
+    pe = _try_transition(run_id, "planning", "Plan draft produced")
+    if pe:
+        yield pe
+
     # Emit a structured plan-draft event for the frontend
     yield {
         "type": "collab_plan_draft",
@@ -622,6 +755,9 @@ async def run_plan_then_execute_events(
     }
 
     if plan_result.status == "fail":
+        pe = _try_transition(run_id, "failed", "Planning phase failed")
+        if pe:
+            yield pe
         yield {
             "type": "run_completed",
             "data": {"status": "failed", "summary": "Planning phase failed; aborting execution."},
@@ -629,6 +765,9 @@ async def run_plan_then_execute_events(
         return
 
     # Phase 2: execute with the plan injected as prior context
+    pe = _try_transition(run_id, "executing", "plan_then_execute: starting execution phase")
+    if pe:
+        yield pe
     exec_packet = packet.model_copy(update={
         "mode": "execute",
         "prior_attempts": list(packet.prior_attempts) + [
@@ -683,6 +822,9 @@ async def run_critic_loop_events(
         return
 
     # Phase 2: critic — independent read-only review of the diff
+    pe = _try_transition(run_id, "critiquing", "Critic loop: starting independent review pass")
+    if pe:
+        yield pe
     critic_goal = (
         f"Independently review the code changes just made for goal: {packet.goal!r}.\n"
         "Read the git diff, check test results, inspect changed files.\n"
@@ -740,6 +882,12 @@ async def run_verify_only_events(
     project_path: str = "",
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Verify-only mode: run tests/build/review without writing any code."""
+    pe = _try_transition(run_id, "analyzing", "verify_only: starting verification check")
+    if pe:
+        yield pe
+    pe = _try_transition(run_id, "verifying", "verify_only: running verification tools")
+    if pe:
+        yield pe
     verify_packet = packet.model_copy(update={
         "mode": "consult",
         "allowed_tools": list(VERIFY_ONLY_ALLOWED_TOOLS),
@@ -758,6 +906,10 @@ async def run_verify_only_events(
     for event in events:
         yield event
     verification_ok = _has_verification_evidence(events, _extract_evidence(events), None)
+    final_status = "completed" if result.status == "pass" and verification_ok else "failed"
+    pe = _try_transition(run_id, final_status, f"Verification-only finished: {final_status}")
+    if pe:
+        yield pe
     yield {
         "type": "content",
         "data": {"text": result.summary or result.details},
@@ -765,7 +917,7 @@ async def run_verify_only_events(
     yield {
         "type": "run_completed",
         "data": {
-            "status": "completed" if result.status == "pass" and verification_ok else "failed",
+            "status": final_status,
             "summary": result.summary or result.details,
             "verification_passed": verification_ok,
             "review_passed": None,
@@ -851,6 +1003,39 @@ def result_from_execute_events(
     if require_review and changed_files and not review_ok:
         status = "fail"
         blockers.append("Review evidence is required for file changes but was not observed.")
+
+    # Quality gate: evidence minimum
+    quality_config: dict = {}
+    try:
+        from app.config import load_config
+        coding_cfg = load_config().coding_agent
+        quality_config = dict(getattr(coding_cfg, "quality_gate", {}) or {})
+    except Exception:
+        pass
+    evidence_min = int(quality_config.get("evidence_min_count") or 2)
+    forbid_no_evidence = quality_config.get("forbid_acceptance_without_evidence", True)
+    forbid_silent_skip = quality_config.get("forbid_silent_test_skip", True)
+
+    if forbid_no_evidence and not evidence:
+        status = "fail"
+        blockers.append("No evidence entries were produced by the Coding Agent. At least one command or test output is required.")
+    elif changed_files and len(evidence) < evidence_min and evidence_min > 1:
+        # Evidence minimum only enforced when files were actually changed
+        blockers.append(
+            f"Evidence count ({len(evidence)}) is below minimum ({evidence_min}). "
+            "The result may be incomplete."
+        )
+        if status == "pass":
+            status = "blocked"
+
+    if forbid_silent_skip and not changed_files and not verification_ok:
+        if any("no tests" in (e.command or "").lower() or "0 test" in (e.output_excerpt or "").lower() for e in evidence):
+            status = "fail"
+            blockers.append(
+                "Coding Agent reported zero tests but made no file changes. "
+                "This appears to be a silent skip — the task was not actually attempted."
+            )
+
     return ResultPacket(
         status=status,
         summary=summary_text,

@@ -630,6 +630,12 @@ describe('ChatPanel', () => {
     expect(within(welcome).getByText('Plan')).toBeInTheDocument()
   })
 
+  it('renders collaboration mode in the empty welcome', () => {
+    render(<ChatPanel {...defaultProps} chatMode="collaboration" />)
+    const welcome = screen.getByTestId('empty-chat-welcome')
+    expect(within(welcome).getByText('Collab')).toBeInTheDocument()
+  })
+
   it('renders user message', () => {
     const messages: ChatMessage[] = [
       { id: '1', role: 'user', content: 'Hello', isTool: false },
@@ -894,6 +900,11 @@ describe('ChatPanel', () => {
   it('Plan mode control marks aria-pressed when plan is selected', () => {
     render(<ChatPanel {...defaultProps} chatMode="plan" />)
     expect(screen.getByLabelText('Plan mode')).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('Collaboration mode control marks aria-pressed when collaboration is selected', () => {
+    render(<ChatPanel {...defaultProps} chatMode="collaboration" />)
+    expect(screen.getByLabelText('Collaboration mode')).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('switches to plan mode when pressing Shift+Tab in the chat input', () => {

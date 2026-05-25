@@ -62,6 +62,43 @@ describe('collaborationTimeline', () => {
     expect(timeline.find((item) => item.kind === 'answer')?.actor).toBe('personal')
   })
 
+  it('distinguishes child coding completion from parent collaboration completion', () => {
+    const timeline = buildCollaborationTimeline([
+      event('run_completed', {
+        run_id: 'coding_child',
+        collaboration_run_id: 'collab_1',
+        status: 'completed',
+        summary: 'Run completed after 2 iteration(s).',
+      }, 1000),
+      event('collaboration_run_completed', {
+        run_id: 'collab_1',
+        status: 'failed',
+        summary: 'Verification evidence is required.',
+      }, 1100),
+    ])
+
+    expect(timeline.map((item) => item.title)).toEqual([
+      'Coding run completed',
+      'Collaboration failed',
+    ])
+  })
+
+  it('maps collaboration model errors as failed timeline items', () => {
+    const timeline = buildCollaborationTimeline([
+      event('error', {
+        run_id: 'coding_child',
+        collaboration_run_id: 'collab_1',
+        message: 'Model call failed: [Errno 11001] getaddrinfo failed',
+      }, 1000),
+    ])
+
+    expect(timeline[0]).toMatchObject({
+      actor: 'system',
+      title: 'Model call failed',
+      status: 'failed',
+    })
+  })
+
   it('filters events by collaboration_run_id before run_id', () => {
     const events: RunEvent[] = [
       event('tool_call', { run_id: 'outer_run', collaboration_run_id: 'collab_1', name: 'pytest' }),

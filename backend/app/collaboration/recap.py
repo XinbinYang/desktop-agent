@@ -114,3 +114,77 @@ def recap_from_events(run_id: str, events: List[Dict[str, Any]]) -> RunRecap:
         failure_summary=failure_summary,
         trace_anchor=run_id,
     )
+
+
+def write_weekly_journal(*, hours: int = 168) -> Optional[str]:
+    """Aggregate runs from the last *hours* into a journal file.
+
+    Returns the file path written, or None if no runs are available.
+    """
+    import sqlite3
+    import time
+    from pathlib import Path
+
+    from app.runtime_paths import runtime_file
+
+    db_path = runtime_file("data", "collaboration_runs.db")
+    if not db_path.exists():
+        return None
+
+    cutoff = time.time() - hours * 3600
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = conn.execute(
+            "SELECT run_id, status, mode, goal, summary, updated_at "
+            "FROM collaboration_runs WHERE updated_at >= ? "
+            "ORDER BY updated_at DESC",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # collaboration_runs table not yet provisioned (DB exists but only
+        # state_machine's collab_run_phases table was created). Treat the
+        # same as "no data yet" rather than surfacing a 500 to the caller.
+        conn.close()
+        return None
+    conn.close()
+
+    if not rows:
+        return None
+
+    # Label by the current week (when the journal is generated), not the
+    # cutoff (which is `hours` in the past — for the default 168h window that
+    # would put the journal in *last* week's file).
+    week_label = time.strftime("%Y-W%W", time.gmtime())
+    journal_path = runtime_file(
+        "..", "AGENTS", "_shared", f"collab_journal_{week_label}.md"
+    ).resolve()
+
+    lines = [
+        f"# Collaboration Journal — Week {week_label}",
+        f"Generated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        f"Runs in window: {len(rows)}",
+        "",
+        "| Run ID | Status | Mode | Goal |",
+        "|--------|--------|------|------|",
+    ]
+    for r in rows:
+        goal_short = (r["goal"] or "")[:60].replace("|", "\\|")
+        lines.append(f"| {r['run_id']} | {r['status']} | {r['mode']} | {goal_short} |")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## Summaries",
+        "",
+    ])
+    for r in rows:
+        if r["summary"]:
+            lines.append(f"### {r['run_id']} ({r['status']})")
+            lines.append(f"\n{r['summary'][:2000]}\n")
+
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("\n".join(lines), encoding="utf-8")
+    return str(journal_path)

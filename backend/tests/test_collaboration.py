@@ -129,6 +129,16 @@ def test_collaboration_rest_run_lifecycle(isolated_collaboration_db, client):
     assert cancelled.json()["run"]["status"] == "cancelled"
 
 
+def test_collaboration_journal_write_endpoint(client):
+    """P1-3: manual trigger for the weekly journal aggregation. Empty DB
+    is fine — endpoint must still return ok shape."""
+    response = client.post("/api/collaboration/journal/write?hours=1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok", f"expected ok, got {body!r}"
+    assert "path" in body
+
+
 @pytest.mark.asyncio
 async def test_personal_explicit_coding_mention_triggers_collaboration(monkeypatch, isolated_collaboration_db, isolate_projects, tmp_path):
     from app import agent as agent_module

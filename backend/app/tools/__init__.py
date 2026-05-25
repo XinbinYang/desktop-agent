@@ -78,11 +78,15 @@ from app.tools.memory_tool import (
     MemoryRebuildTool,
 )
 from app.tools.collaboration_tool import (
+    CancelCodingRunTool,
     CollabHistorySearchTool,
     ConsultCodingAgentTool,
+    CrossAgentMemoryWriteTool,
     DelegateToCodingAgentTool,
+    PauseCodingRunTool,
     RequestPersonalClarificationTool,
     RequestPersonalContextTool,
+    ResumeCodingRunTool,
 )
 from app.tools.skill_tool import (
     SkillArchiveTool,
@@ -216,9 +220,13 @@ ALL_TOOLS: list[BaseTool] = [
     MemoryListTool(),
     ConsultCodingAgentTool(),
     DelegateToCodingAgentTool(),
+    PauseCodingRunTool(),
+    CancelCodingRunTool(),
+    ResumeCodingRunTool(),
     RequestPersonalContextTool(),
     RequestPersonalClarificationTool(),
     CollabHistorySearchTool(),
+    CrossAgentMemoryWriteTool(),
     SkillDraftSaveTool(),
     SkillValidateTool(),
     SkillPublishTool(),
@@ -253,6 +261,7 @@ CODING_AGENT_TOOLS: frozenset[str] = frozenset({
     "dispatch_worker", "dispatch_parallel",
     # Collaboration
     "request_personal_context", "request_personal_clarification",
+    "cross_agent_memory_write",
     # Skill authoring
     "skill_draft_save", "skill_validate", "skill_publish",
     "skill_list", "skill_read", "skill_archive",
@@ -295,6 +304,8 @@ PERSONAL_AGENT_TOOLS: frozenset[str] = frozenset({
     "knowledge_index", "knowledge_search", "knowledge_list", "knowledge_clear",
     "workflow_record", "workflow_stop", "workflow_list", "workflow_run",
     "consult_coding_agent", "delegate_to_coding_agent",
+    "pause_coding_run", "cancel_coding_run", "resume_coding_run",
+    "cross_agent_memory_write",
     "plan_ask_questions", "plan_write_draft", "plan_update_todos",
     "ocr_read", "ocr_click", "ocr_find",
     "automation_observe", "automation_click", "automation_type",

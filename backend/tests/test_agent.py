@@ -319,6 +319,150 @@ class TestAgentSession:
         assert not any(e["type"] == "error" for e in events)
         assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
 
+    # The injected segment uses this exact header so tests can distinguish the
+    # dynamically-injected block from base AGENTS.md prose that may mention
+    # "Active Collaboration" generically.
+    _INJECTED_HEADER = "## Active Collaboration (Delegated by Personal Agent)"
+
+    def test_active_collaboration_segment_injected_for_delegated_coding(self):
+        """Sprint 1: Coding session with a collaboration_run_id must surface
+        the Active Collaboration contract in its system prompt, including the
+        run/task/mode triple and the two callback tool names."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="delegated_session",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_abc123"
+        coding.collaboration_task_id = "task_xyz789"
+        coding.collaboration_mode = "execute"
+        prompt = coding._build_system_prompt()
+        assert self._INJECTED_HEADER in prompt
+        assert "run_abc123" in prompt
+        assert "task_xyz789" in prompt
+        # Mode is rendered as `Mode: execute` (exact, since `execute` is a common word).
+        assert "Mode: execute" in prompt
+        # Callback tool names must be discoverable in the prompt.
+        assert "request_personal_clarification" in prompt
+        assert "request_personal_context" in prompt
+        # The framing must reinforce that Personal owns the final reply.
+        assert "Personal Agent owns the final reply" in prompt
+        # ACCEPTANCE marker is the stop contract.
+        assert "ACCEPTANCE: PASS" in prompt
+
+    def test_active_collaboration_segment_signals_read_only(self):
+        """Sprint 1: read_only flag must surface a READ-ONLY constraint line."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="consult_session",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_ro"
+        coding.collaboration_task_id = "task_ro"
+        coding.collaboration_mode = "consult"
+        coding.collaboration_read_only = True
+        prompt = coding._build_system_prompt()
+        assert "READ-ONLY consultation" in prompt
+        # The exact executing-mode line that this run must NOT receive
+        # (uses verbatim phrase from agent.py to disambiguate from base text).
+        assert "EXECUTE: implement the smallest safe change, verify it, review it" not in prompt
+
+    def test_active_collaboration_includes_dialogue_and_profile_brief(self):
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="rich_ctx",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_ctx"
+        coding.collaboration_task_id = "task_ctx"
+        coding.collaboration_mode = "execute"
+        coding.collaboration_dialogue_summary = (
+            "[user] Please optimize the SQL query.\n"
+            "[assistant] Will route to coding agent."
+        )
+        coding.collaboration_user_profile_brief = "Prefers TypeScript over JavaScript."
+        prompt = coding._build_system_prompt()
+        assert "Personal Dialogue Summary" in prompt
+        assert "optimize the SQL query" in prompt
+        assert "User Profile Brief" in prompt
+        assert "TypeScript over JavaScript" in prompt
+
+    def test_active_collaboration_truncates_oversize_summary_and_profile(self):
+        """Guard: dialogue summary must be clipped to ~2000 chars and profile
+        brief to ~1000 chars so the system prompt never balloons."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="big_ctx",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_big"
+        coding.collaboration_task_id = "task_big"
+        coding.collaboration_mode = "execute"
+        coding.collaboration_dialogue_summary = "x" * 5000
+        coding.collaboration_user_profile_brief = "y" * 5000
+        prompt = coding._build_system_prompt()
+        # The injected slice (between header and end of section) must respect
+        # the 2KB / 1KB caps documented in the Active Collaboration design.
+        assert "x" * 2001 not in prompt
+        assert "y" * 1001 not in prompt
+        # But the trimmed segments are still present.
+        assert "x" * 1000 in prompt
+        assert "y" * 500 in prompt
+
+    def test_collaboration_segment_absent_for_personal_agent(self):
+        """Personal Agent never gets the delegated-by-Personal preamble even
+        if collaboration_run_id is set — the segment is gated on agent type."""
+        personal = AgentSession(
+            model_id="gpt-4o",
+            session_id="personal_session",
+            agent_type="personal",
+        )
+        personal.collaboration_run_id = "run_should_be_ignored"
+        prompt = personal._build_system_prompt()
+        assert self._INJECTED_HEADER not in prompt
+        # The dialogue summary header is unique to the injected block.
+        assert "Personal Dialogue Summary" not in prompt
+
+    def test_collaboration_segment_absent_when_run_id_missing(self):
+        """A coding session running standalone must not advertise itself as
+        delegated — the segment is the signal Personal is in control."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="standalone_coding",
+            agent_type="coding",
+        )
+        # Explicitly leave collaboration_run_id empty.
+        coding.collaboration_run_id = ""
+        prompt = coding._build_system_prompt()
+        # Use the exact header (matches only when our code injects it) instead
+        # of the generic phrase "Active Collaboration" that AGENTS.md uses.
+        assert self._INJECTED_HEADER not in prompt
+        assert "Personal Agent owns the final reply" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_model_failure_marks_run_completed_failed(self, session):
+        async def failing_stream(*args, **kwargs):
+            yield {"type": "error", "message": "[Errno 11001] getaddrinfo failed"}
+
+        async def failing_non_stream(*args, **kwargs):
+            raise OSError("[Errno 11001] getaddrinfo failed")
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", failing_stream),
+            patch("app.agent.ModelRouter.chat_completion_non_stream", failing_non_stream),
+        ):
+            events = []
+            async for event in session.run("hi"):
+                events.append(event)
+
+        assert any(
+            e["type"] == "error" and "getaddrinfo failed" in e["data"].get("message", "")
+            for e in events
+        )
+        completed = [e for e in events if e["type"] == "run_completed"][-1]
+        assert completed["data"]["status"] == "failed"
+        assert "getaddrinfo failed" in completed["data"]["summary"]
+
     @pytest.mark.asyncio
     async def test_run_with_tool_call(self, session):
         mock_response = {

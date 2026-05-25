@@ -862,7 +862,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div>
                   <label className="text-xs text-fg-secondary block mb-1">Coding auto delegation</label>
                   <select
-                    value={generalForm.auto_delegate_coding || 'policy_v2'}
+                    value={generalForm.auto_delegate_coding || 'off'}
                     onChange={(e) =>
                       setGeneralForm({
                         ...generalForm,
@@ -870,7 +870,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       })}
                     className="w-full text-xs bg-surface-alt border border-border-subtle rounded px-2 py-1.5 outline-none text-fg"
                   >
-                    <option value="policy_v2">Smart auto delegation</option>
+                    <option value="off">Off — manual Collab only</option>
                     <option value="suggest">Suggest only</option>
                     <option value="always_for_code">Simple auto rules</option>
                     <option value="safe_only">Safe consult only</option>

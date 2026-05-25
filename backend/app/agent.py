@@ -60,6 +60,7 @@ from app.tools import build_tools_description, get_tool, get_tool_schemas, list_
 from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
 from app.tools.worker_tool import cancel_workers_for_session
+from app.tools.collaboration_tool import ensure_collab_callbacks
 from app.tools.workflow_tool import get_recorder
 from app.message_utils import trim_messages, parse_tool_args, execute_tool, resolve_mentions, repair_tool_call_messages
 from app.workflow.models import PlanState, PlanTodo, PlanQuestion, PlanQuestionOption, PlanDraft, PlanStep, TaskGuidanceItem
@@ -786,6 +787,7 @@ class AgentSession:
         # something marks it dirty again, e.g. MCP server list changes).
         self._mcp_tools_dirty = True
         self.chat_mode = "agent"
+        self.collab_mode: str = "execute"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
         self.task_guidance_items: List[TaskGuidanceItem] = []
@@ -807,6 +809,10 @@ class AgentSession:
         )
         self.collaboration_run_id: str = ""
         self.collaboration_task_id: str = ""
+        self.collaboration_mode: str = ""
+        self.collaboration_read_only: bool = False
+        self.collaboration_dialogue_summary: str = ""
+        self.collaboration_user_profile_brief: str = ""
         self._setup_system_prompt()
 
     @property
@@ -932,6 +938,44 @@ class AgentSession:
                     )
             except Exception as e:
                 logger.warning("Coding repo map injection failed: %s", e)
+
+        # Active Collaboration: when this Coding session is delegated by Personal Agent,
+        # surface the contract in the system prompt so the model knows its role,
+        # callback tools, and stop conditions. These rules ADD to base instructions.
+        if self._agent_type == "coding" and self.collaboration_run_id:
+            mode_label = self.collaboration_mode or "execute"
+            read_only_line = (
+                "- READ-ONLY consultation: do not edit files, run destructive commands, or mutate state.\n"
+                if self.collaboration_read_only or mode_label in {"consult", "verify_only"}
+                else "- EXECUTE: implement the smallest safe change, verify it, review it, and report evidence.\n"
+            )
+            collab_segment = (
+                "\n\n## Active Collaboration (Delegated by Personal Agent)\n"
+                "These rules ADD to your base instructions; they do not replace them.\n"
+                f"- Run: {self.collaboration_run_id}\n"
+                f"- Task: {self.collaboration_task_id or '(unspecified)'}\n"
+                f"- Mode: {mode_label}\n"
+                "- You are NOT the user-facing agent. The Personal Agent owns the final reply to the user.\n"
+                "- Do not greet, roleplay, or address the user as \"you\"; speak as a technical specialist reporting back.\n"
+                f"{read_only_line}"
+                "- On a product/UX/preference fork you cannot safely infer, call `request_personal_clarification` "
+                "(this pauses the run; Personal will resolve and resume).\n"
+                "- When you need user preferences or project intent, call `request_personal_context` "
+                "instead of reading Personal Agent private memory directly.\n"
+                "- Always end with a structured report including: changed files, verification evidence, review findings, "
+                "remaining blockers, and a final ACCEPTANCE: PASS or ACCEPTANCE: FAIL line.\n"
+            )
+            if self.collaboration_dialogue_summary:
+                collab_segment += (
+                    "\n### Personal Dialogue Summary (do not echo verbatim)\n"
+                    f"{self.collaboration_dialogue_summary[:2000]}\n"
+                )
+            if self.collaboration_user_profile_brief:
+                collab_segment += (
+                    "\n### User Profile Brief (privacy-scoped, do not quote outside this run)\n"
+                    f"{self.collaboration_user_profile_brief[:1000]}\n"
+                )
+            system_msg += collab_segment
 
         if self.chat_mode == "plan" and not self.plan_state.approved:
             try:
@@ -1236,6 +1280,36 @@ class AgentSession:
     ) -> TaskPacket:
         task = mention.task.strip() or "Open or create a Coding Agent session."
         mode = "execute" if mention.mode == "execute" else "consult"
+
+        # Build a privacy-scoped dialogue summary from the current conversation.
+        dialogue_parts: list[str] = []
+        recent = self.messages[-8:] if len(self.messages) > 8 else self.messages
+        for msg in recent:
+            role = str(msg.get("role", ""))
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(c.get("text", "") or "")
+                    for c in content if isinstance(c, dict)
+                )
+            dialogue_parts.append(f"[{role}] {str(content)[:300]}")
+        dialogue_summary = "\n".join(dialogue_parts)[:2000]
+
+        # Try to load a user profile brief from the workspace.
+        profile_brief = ""
+        try:
+            from app.agents.manager import AgentManager
+            raw = AgentManager.load_workspace_file("_shared", "user_preferences.md")
+            if raw:
+                profile_brief = "\n".join(
+                    line.strip() for line in raw.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                )[:1000]
+        except Exception:
+            pass
+
         context: Dict[str, Any] = {
             "requested_via": mention.raw,
             "original_message": original_input,
@@ -1249,7 +1323,7 @@ class AgentSession:
             context["image_attached"] = True
 
         if mode == "consult":
-            return TaskPacket(
+            return ensure_collab_callbacks(TaskPacket(
                 goal=task,
                 mode="consult",
                 user_intent=task,
@@ -1273,9 +1347,11 @@ class AgentSession:
                     "git_status",
                     "git_diff",
                 ],
-            )
+                personal_dialogue_summary=dialogue_summary,
+                user_profile_brief=profile_brief,
+            ))
 
-        return TaskPacket(
+        return ensure_collab_callbacks(TaskPacket(
             goal=task,
             mode="execute",
             user_intent=task,
@@ -1291,7 +1367,9 @@ class AgentSession:
                 "Review findings or residual blockers are reported.",
                 "End with ACCEPTANCE: PASS or ACCEPTANCE: FAIL.",
             ],
-        )
+            personal_dialogue_summary=dialogue_summary,
+            user_profile_brief=profile_brief,
+        ))
 
     async def _handle_coding_mention(
         self,
@@ -1618,6 +1696,29 @@ class AgentSession:
             },
             outer_run_id,
         )
+        # Internal structured report for Personal Agent cross-turn recall.
+        # This appears as context-only (role=user, source=internal) so Personal
+        # can reference changed files, verification results, and blockers in the
+        # next turn without tool calls.
+        internal_report_lines = [
+            "[Coding Agent Internal Report]",
+            f"Run: {collab_run.run_id} · Status: {result.status}",
+            f"Changed files ({len(result.changed_files)}): {', '.join(result.changed_files[:10]) or '(none)'}",
+            f"Verification: {'passed' if result.verification_passed else ('failed' if result.verification_passed is False else 'not run')}",
+        ]
+        if result.tests_run:
+            internal_report_lines.append(f"Tests: {', '.join(result.tests_run[:5])}")
+        if result.review_passed is not None:
+            internal_report_lines.append(f"Review: {'passed' if result.review_passed else 'blocked'}")
+        if result.blockers:
+            internal_report_lines.append(f"Blockers ({len(result.blockers)}): {'; '.join(result.blockers[:5])}")
+        if result.confidence < 1.0:
+            internal_report_lines.append(f"Confidence: {result.confidence:.0%}")
+        internal_report = "\n".join(internal_report_lines)
+        internal_msg = {"role": "user", "content": internal_report, "source": "internal"}
+        self._stamp_message(internal_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+        self.messages.append(internal_msg)
+
         final_text = f"{prefix}（{status_word}）：\n\n{summary}"
         assistant_msg = {"role": "assistant", "content": final_text}
         self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
@@ -2185,8 +2286,8 @@ class AgentSession:
         return self._plan_event_payload()
 
     def set_session_chat_mode(self, mode: str) -> bool:
-        """Persist UI-selected agent/plan mode before the next chat message (WebSocket `set_chat_mode`)."""
-        if mode not in ("agent", "plan"):
+        """Persist UI-selected agent/plan/collaboration mode before the next chat message (WebSocket `set_chat_mode`)."""
+        if mode not in ("agent", "plan", "collaboration"):
             return False
         previous = self.chat_mode
         self.chat_mode = mode
@@ -2196,7 +2297,13 @@ class AgentSession:
                 self._plan_exec_hint_sent = False
             else:
                 self.plan_state.mode = "plan"
-        elif mode == "agent" and previous == "plan":
+        elif mode == "agent" and (previous == "plan" or previous == "collaboration"):
+            if self.plan_state.phase != "executing":
+                self.plan_state = PlanState(mode="agent")
+                self._plan_exec_hint_sent = False
+            else:
+                self.plan_state.mode = "agent"
+        elif mode == "collaboration":
             if self.plan_state.phase != "executing":
                 self.plan_state = PlanState(mode="agent")
                 self._plan_exec_hint_sent = False
@@ -2801,16 +2908,19 @@ class AgentSession:
         *,
         chat_mode: Optional[str] = None,
         thinking_intensity: Optional[str] = None,
+        collab_mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run one agent turn. Empty user_input means retry mode.
 
         ``PLAN_CONTINUE_MARKER`` resumes execution after the user clicks Build (server-gated).
         """
-        if chat_mode in ("agent", "plan"):
+        if chat_mode in ("agent", "plan", "collaboration"):
             if chat_mode != self.chat_mode:
                 self.set_session_chat_mode(chat_mode)
             else:
                 self.chat_mode = chat_mode
+        if collab_mode in ("consult", "execute", "plan_then_execute", "critic", "verify_only"):
+            self.collab_mode = collab_mode
         if thinking_intensity in ("low", "medium", "high"):
             self.set_session_thinking_intensity(thinking_intensity)
 
@@ -2925,7 +3035,56 @@ class AgentSession:
                 close_coding_run("completed", "Explicit Coding Agent delegation handled.")
                 return
 
-            # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
+            # Collaboration mode: user explicitly clicked the Collab button.
+            # Skip Personal Agent's reasoning turn entirely — dispatch to Coding Agent.
+            if (
+                self._agent_type == "personal"
+                and self.chat_mode == "collaboration"
+                and not coding_mention
+                and getattr(settings, "collaboration_enabled", True)
+            ):
+                delegation_target = resolve_collaboration_target(
+                    user_message=user_input, allow_global=True
+                )
+                if not delegation_target.ok:
+                    text = "合作模式需要绑定项目，请在右上角选择项目后重试。"
+                    assistant_msg = {"role": "assistant", "content": text}
+                    self.messages.append(assistant_msg)
+                    yield self._event("content", {"text": text}, run_id)
+                    yield self._event("status", {"status": "completed"}, run_id)
+                    yield self._event("run_completed", {
+                        "status": "completed",
+                        "summary": text,
+                    }, run_id)
+                    close_coding_run("completed", "Collaboration mode: missing project.")
+                    await self._save_async()
+                    return
+                self._last_user_message = user_input
+                collab_project_path = (
+                    resolve_mentions(user_input, delegation_target.project_path)
+                    if delegation_target.project_path
+                    else user_input
+                )
+                synthetic_mention = CodingMention(
+                    raw="@coding agent [collab-mode]",
+                    task=user_input,
+                    mode=self.collab_mode or "execute",
+                )
+                logger.info(
+                    "Collaboration mode dispatch [mention=collab-button] run=%s collab_mode=%s",
+                    run_id, self.collab_mode,
+                )
+                async for event in self._handle_coding_mention(
+                    synthetic_mention,
+                    original_input=user_input,
+                    resolved_input=collab_project_path,
+                    image_base64=image_base64,
+                    outer_run_id=run_id,
+                ):
+                    yield event
+                close_coding_run("completed", f"Collaboration mode dispatch ({self.collab_mode}) handled.")
+                return
+
             # Resolve @mentions in user input (file/folder/git/knowledge context).
             # Personal has no implicit project binding; project mentions are only
             # expanded for Coding turns or explicit Coding delegation above.
@@ -2936,93 +3095,10 @@ class AgentSession:
             if self._agent_type == "personal":
                 delegation_target = resolve_collaboration_target(user_message=user_input, allow_global=True)
                 delegation_project_path = delegation_target.project_path if delegation_target.ok else ""
-            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan":
-                auto_delegate = getattr(settings, "auto_delegate_coding", "suggest") or "suggest"
-                if auto_delegate == "policy_v2" or not getattr(self, "_dispatch_suggested_this_session", False):
-                    auto_delegate = getattr(settings, "auto_delegate_coding", "suggest") or "suggest"
 
-                    # policy_v2: use DelegationPolicy for intelligent mode selection
-                    if auto_delegate == "policy_v2" and getattr(settings, "collaboration_enabled", True):
-                        try:
-                            from app.collaboration.policy import DelegationPolicy
-                            policy = DelegationPolicy()
-                            decision = await policy.decide(
-                                user_input,
-                                {"project_path": delegation_project_path},
-                                model_id=self.model_id,
-                                thinking_intensity="low",
-                            )
-                            if decision.should_delegate and decision.needs_user_confirmation:
-                                self._dispatch_suggested_this_session = True
-                                text = (
-                                    "这个代码操作被识别为高风险或需要你确认的选择。"
-                                    "请明确确认后我再交给 Coding Agent 执行。\n\n"
-                                    f"原因：{decision.reasoning or '需要用户确认。'}"
-                                )
-                                assistant_msg = {"role": "assistant", "content": text}
-                                self.messages.append(assistant_msg)
-                                yield self._event(
-                                    "decision_required",
-                                    {
-                                        "kind": "delegation_confirmation",
-                                        "mode": decision.mode,
-                                        "risk": decision.risk,
-                                        "reason": decision.reasoning,
-                                    },
-                                    run_id,
-                                )
-                                yield self._event("content", {"text": text}, run_id)
-                                yield self._event("status", {"status": "completed"}, run_id)
-                                yield self._event("run_completed", {
-                                    "status": "completed",
-                                    "summary": text[:1000],
-                                    "verification_passed": None,
-                                    "review_passed": None,
-                                }, run_id)
-                                close_coding_run("completed", "Delegation requires confirmation.")
-                                await self._save_async()
-                                return
-                            if decision.should_delegate and decision.confidence >= 0.6:
-                                self._dispatch_suggested_this_session = True
-                                delegation_resolved_input = (
-                                    resolve_mentions(user_input, delegation_project_path)
-                                    if delegation_project_path
-                                    else user_input
-                                )
-                                synthetic_mention = CodingMention(
-                                    raw="@coding agent [auto-policy]",
-                                    task=user_input,
-                                    mode=decision.mode if decision.mode in (
-                                        "consult", "execute", "plan_then_execute",
-                                        "critic", "verify_only",
-                                    ) else "consult",
-                                )
-                                self._last_user_message = user_input
-                                async for event in self._handle_coding_mention(
-                                    synthetic_mention,
-                                    original_input=user_input,
-                                    resolved_input=delegation_resolved_input,
-                                    image_base64=image_base64,
-                                    outer_run_id=run_id,
-                                ):
-                                    yield event
-                                close_coding_run("completed", f"Policy-v2 delegation ({decision.mode}) handled.")
-                                return
-                            elif decision.should_delegate and not getattr(self, "_dispatch_suggested_this_session", False):
-                                # Confidence too low — suggest switch instead of auto-delegating
-                                self._dispatch_suggested_this_session = True
-                                yield self._event(
-                                    "suggest_agent_switch",
-                                    {
-                                        "from": "personal",
-                                        "to": "coding",
-                                        "reason": decision.reasoning or "This task may involve code changes.",
-                                    },
-                                    run_id,
-                                )
-                        except Exception:
-                            pass  # policy failure is non-fatal; fall through to existing logic
-
+            auto_delegate = getattr(settings, "auto_delegate_coding", "off") or "off"
+            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan" and auto_delegate != "off":
+                if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
                         inferred_mode = classify_coding_intent(user_input)
                         should_auto_delegate = (
@@ -3147,6 +3223,7 @@ class AgentSession:
         yield self._event("status", {"status": "thinking"}, run_id)
 
         finished = False
+        terminal_error_message = ""
         plan_turn_done = False
         _files_modified = False
         _verify_called = False
@@ -3312,11 +3389,13 @@ class AgentSession:
                         )
                         stream_error = None
                     except Exception as e2:
-                        yield self._event("error", {"message": f"Model call failed: {e2}"}, run_id)
+                        terminal_error_message = f"Model call failed: {e2}"
+                        yield self._event("error", {"message": terminal_error_message}, run_id)
                         finished = True
                         break
                 else:
-                    yield self._event("error", {"message": f"Model call failed: {stream_error}"}, run_id)
+                    terminal_error_message = f"Model call failed: {stream_error}"
+                    yield self._event("error", {"message": terminal_error_message}, run_id)
                     finished = True
                     break
 
@@ -3330,22 +3409,24 @@ class AgentSession:
                         thinking_intensity=ti,
                     )
                 except Exception as no_response_fallback_error:
+                    terminal_error_message = (
+                        "Model stream ended without a final response and fallback failed: "
+                        f"{no_response_fallback_error}"
+                    )
                     yield self._event(
                         "error",
                         {
-                            "message": (
-                                "Model stream ended without a final response and fallback failed: "
-                                f"{no_response_fallback_error}"
-                            )
+                            "message": terminal_error_message
                         },
                         run_id,
                     )
                     finished = True
                     break
                 if response is None:
+                    terminal_error_message = "Model returned no response. Please retry or switch models."
                     yield self._event(
                         "error",
-                        {"message": "Model returned no response. Please retry or switch models."},
+                        {"message": terminal_error_message},
                         run_id,
                     )
                     finished = True
@@ -3376,9 +3457,10 @@ class AgentSession:
                         and not str(fallback_message.get("reasoning_content") or "").strip()
                     )
                     if fallback_empty:
+                        terminal_error_message = "Model returned an empty response. Please retry or switch models."
                         yield self._event(
                             "error",
-                            {"message": "Model returned an empty response. Please retry or switch models."},
+                            {"message": terminal_error_message},
                             run_id,
                         )
                         finished = True
@@ -3403,9 +3485,10 @@ class AgentSession:
                                 run_id,
                             )
                 except Exception as empty_fallback_error:
+                    terminal_error_message = f"Model returned an empty response and fallback failed: {empty_fallback_error}"
                     yield self._event(
                         "error",
-                        {"message": f"Model returned an empty response and fallback failed: {empty_fallback_error}"},
+                        {"message": terminal_error_message},
                         run_id,
                     )
                     finished = True
@@ -3962,7 +4045,9 @@ class AgentSession:
         if not finished and self.iteration >= self.max_iterations:
             yield self._event("status", {"status": "max_iterations_reached"}, run_id)
         completion_status = "cancelled" if self._cancelled else (
-            "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
+            "failed" if terminal_error_message else (
+                "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
+            )
         )
         stale_guidance = self.mark_applied_task_guidance_stale()
         if stale_guidance:
@@ -3971,7 +4056,7 @@ class AgentSession:
                 {"items": [item.model_dump() for item in stale_guidance]},
                 run_id,
             )
-        completion_summary = f"Run {completion_status} after {self.iteration} iteration(s)."
+        completion_summary = terminal_error_message or f"Run {completion_status} after {self.iteration} iteration(s)."
         completion_quality = _completion_quality_payload(
             files_modified=_files_modified,
             latest_verification=_latest_verification,
@@ -4603,6 +4688,7 @@ class AgentSession:
             "messages": list(self.messages),
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
+            "collab_mode": getattr(self, "collab_mode", "execute"),
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
@@ -4700,7 +4786,8 @@ class AgentSession:
                         session._agent_thinking[at] = stored_agent_thinking[at]
 
             cm = data.get("chat_mode", "agent")
-            session.chat_mode = cm if cm in ("agent", "plan") else "agent"
+            session.chat_mode = cm if cm in ("agent", "plan", "collaboration") else "agent"
+            session.collab_mode = data.get("collab_mode", "execute")
             ti = data.get("thinking_intensity", "medium")
             session.thinking_intensity = ti if ti in ("low", "medium", "high") else "medium"
             session._agent_thinking[session._agent_type] = session.thinking_intensity
@@ -4790,6 +4877,7 @@ class AgentSession:
             "messages": [m for m in self.messages if m.get("source") != "internal"],
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
+            "collab_mode": getattr(self, "collab_mode", "execute"),
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": self.active_task_guidance_items(),

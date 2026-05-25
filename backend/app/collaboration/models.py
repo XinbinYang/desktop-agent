@@ -66,11 +66,17 @@ class TaskPacket(BaseModel):
     created_by: str = "personal"
     # P0 新增：强契约字段（全部有默认值，向后兼容）
     budget: TaskBudget = Field(default_factory=TaskBudget)
+    # True iff the caller explicitly chose a budget; lets template overrides
+    # know they should respect the caller's intent. Avoids brittle default
+    # sniffing (e.g. `budget.max_iterations == 30`) when defaults shift.
+    budget_explicit: bool = False
     invariants: List[TaskInvariant] = Field(default_factory=list)
     expected_output_schema: Optional[Dict[str, Any]] = None
     prior_attempts: List[str] = Field(default_factory=list)
     parent_task_id: Optional[str] = None
     correlation_key: Optional[str] = None
+    personal_dialogue_summary: str = ""
+    user_profile_brief: str = ""
 
 
 class ResultPacket(BaseModel):

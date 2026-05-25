@@ -11,7 +11,8 @@ export type CollaborationTimelineKind =
   | 'verification'
   | 'review'
   | 'artifact'
-  | 'completion';
+  | 'completion'
+  | 'phase';
 export type CollaborationTimelineStatus = 'running' | 'waiting' | 'done' | 'failed' | 'info';
 
 export interface CollaborationTimelineItem {
@@ -104,6 +105,25 @@ export function buildCollaborationTimeline(events: RunEvent[]): CollaborationTim
           detail: compact(data.goal || data.summary || data.project_path),
           status: 'running',
         }];
+
+      case 'collaboration_phase_update': {
+        const phase = String(data.phase || '');
+        if (!phase) return [];
+        return [{
+          ...base,
+          actor: 'system',
+          kind: 'phase',
+          title: `Phase: ${phase.replace(/_/g, ' ')}`,
+          detail: compact(data.note || `${data.previous_phase || 'start'} → ${phase}`),
+          status: phase === 'completed'
+            ? 'done'
+            : phase === 'failed'
+              ? 'failed'
+              : phase === 'awaiting_user'
+                ? 'waiting'
+                : 'running',
+        }];
+      }
 
       case 'collaboration_task_update': {
         const taskStatus = String(data.status || '');
@@ -242,7 +262,6 @@ export function buildCollaborationTimeline(events: RunEvent[]): CollaborationTim
         }];
 
       case 'collaboration_run_completed':
-      case 'run_completed': {
         const status = String(data.status || 'completed');
         return [{
           ...base,
@@ -252,7 +271,28 @@ export function buildCollaborationTimeline(events: RunEvent[]): CollaborationTim
           detail: compact(data.summary || ''),
           status: statusFromTask(status),
         }];
+
+      case 'run_completed': {
+        const status = String(data.status || 'completed');
+        return [{
+          ...base,
+          actor: 'coding',
+          kind: 'completion',
+          title: status === 'completed' ? 'Coding run completed' : `Coding run ${status.replace(/_/g, ' ')}`,
+          detail: compact(data.summary || ''),
+          status: statusFromTask(status),
+        }];
       }
+
+      case 'error':
+        return [{
+          ...base,
+          actor: 'system',
+          kind: 'completion',
+          title: 'Model call failed',
+          detail: compact(data.message || data.error || ''),
+          status: 'failed',
+        }];
 
       default:
         return [];

@@ -75,7 +75,7 @@ export interface AppSettings {
   sandbox_mode: string;
   thinking_intensity_default?: ThinkingIntensity;
   collaboration_mode?: "serial" | "parallel" | "hybrid";
-  auto_delegate_coding?: "policy_v2" | "suggest" | "always_for_code" | "safe_only" | string;
+  auto_delegate_coding?: "off" | "suggest" | "always_for_code" | "safe_only" | string;
   max_parallel_agents?: number;
   review_gate_enabled?: boolean;
 }
@@ -345,11 +345,16 @@ export interface RunEvent {
     | 'verification_start'
     | 'verification_result'
     | 'review_finding'
+    | 'error'
     | 'tool_call'
     | 'worker_tool_call'
     | 'file_edit'
     | 'collaboration_run_created'
     | 'collaboration_task_update'
+    | 'collaboration_plan_auto_approved'
+    | 'collaboration_phase_update'
+    | 'collab_plan_draft'
+    | 'collab_critic_result'
     | 'agent_message'
     | 'artifact_ready'
     | 'decision_required'
@@ -429,7 +434,7 @@ export interface AgentMessage {
   task_id?: string;
 }
 
-export type ClientChatMode = "agent" | "plan";
+export type ClientChatMode = "agent" | "plan" | "collaboration";
 export type ThinkingIntensity = "low" | "medium" | "high";
 
 export interface PlanQuestionOption {

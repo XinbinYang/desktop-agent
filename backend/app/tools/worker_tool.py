@@ -115,9 +115,18 @@ def _unregister_worker(session_id: str, worker_id: str) -> None:
         _active_workers.pop(session_id, None)
 
 
-def cancel_workers_for_session(session_id: str) -> None:
+def cancel_workers_for_session(session_id: str, run_id_filter: str = "") -> None:
+    """Cancel registered workers under *session_id*.
+
+    When ``run_id_filter`` is non-empty, only workers whose ``run_id``
+    matches the filter are cancelled. Use this when cancelling a specific
+    collaboration run so unrelated dispatch_worker / dispatch_parallel tasks
+    in the same Personal session keep running.
+    """
     workers = list(_active_workers.get(session_id, {}).values())
     for worker, cb in workers:
+        if run_id_filter and getattr(worker, "run_id", "") != run_id_filter:
+            continue
         worker.cancel()
         event = worker.cancel_event()
         if event and cb:

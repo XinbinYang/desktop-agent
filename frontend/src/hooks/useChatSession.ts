@@ -50,10 +50,25 @@ function generateId(): string {
 function initialChatModeFromStorage(): ClientChatMode {
   try {
     const v = localStorage.getItem('desktop-agent-chat-mode');
-    return v === 'plan' ? 'plan' : 'agent';
+    if (isClientChatMode(v)) return v;
+    return 'agent';
   } catch {
     return 'agent';
   }
+}
+
+function isClientChatMode(value: unknown): value is ClientChatMode {
+  return value === 'agent' || value === 'plan' || value === 'collaboration';
+}
+
+function mergeServerChatMode(
+  serverMode: ClientChatMode | undefined,
+  currentMode: ClientChatMode,
+): ClientChatMode {
+  if (!serverMode) return currentMode;
+  if (serverMode === 'plan') return 'plan';
+  if (serverMode === 'agent' && currentMode !== 'agent') return currentMode;
+  return serverMode;
 }
 
 function isThinkingIntensity(value: unknown): value is ThinkingIntensity {
@@ -268,6 +283,21 @@ function emptyStreamBuffers(): StreamBuffers {
     reasoningStartedAt: 0,
     contentText: '',
     contentStartedAt: 0,
+  };
+}
+
+function initialCollaborationState(): CollaborationState {
+  return {
+    active: false,
+    run_id: '',
+    status: '',
+    currentTaskStatus: '',
+    currentPhase: '',
+    teamProgress: [],
+    recap: null,
+    evidence: [],
+    artifacts: [],
+    pendingClarification: null,
   };
 }
 
@@ -805,7 +835,7 @@ function sessionSnapshotToState(snapshot: any): {
     }
   }
 
-  const chatMode = snapshot?.chat_mode === 'plan' ? 'plan' : snapshot?.chat_mode === 'agent' ? 'agent' : undefined;
+  const chatMode = isClientChatMode(snapshot?.chat_mode) ? snapshot.chat_mode : undefined;
   const thinkingIntensity =
     isThinkingIntensity(snapshot?.thinking_intensity)
       ? snapshot.thinking_intensity
@@ -890,21 +920,11 @@ export function useChatSession(
   const planStateRef = useRef<PlanState>(planState);
 
   // Collaboration delegation tracking state (P3/P4)
-  const [collaborationState, setCollaborationState] = useState<CollaborationState>({
-    active: false,
-    run_id: '',
-    status: '',
-    currentTaskStatus: '',
-    currentPhase: '',
-    teamProgress: [],
-    recap: null,
-    evidence: [],
-    artifacts: [],
-    pendingClarification: null,
-  });
+  const [collaborationState, setCollaborationState] = useState<CollaborationState>(() => initialCollaborationState());
 
   const onToolCallRef = useRef<((tc: ToolCall) => void) | null>(null);
   const onFileEditRef = useRef<((edit: FileEdit) => void) | null>(null);
+  const dismissedCollaborationRunIdsRef = useRef<Set<string>>(new Set());
   const pendingWorkerEventsRef = useRef<Record<string, WorkerEvent[]>>({});
   const planBufferedContentRef = useRef('');
   const buildRequestInFlightRef = useRef(false);
@@ -1148,21 +1168,12 @@ export function useChatSession(
           setCheckpoints(restored.checkpoints || []);
           setTaskGuidanceItems(restored.taskGuidanceItems || []);
           const fromServer = restored.chatMode;
-          const serverPlanPhase = (event.data as { plan_state?: { phase?: string } })?.plan_state?.phase;
           const prev = chatModeRef.current;
-          let merged: ClientChatMode = prev;
-          if (!fromServer) {
-            merged = prev;
-          } else if (fromServer === 'plan') {
-            merged = 'plan';
-          } else if (prev === 'plan' && fromServer === 'agent') {
-            merged = serverPlanPhase && serverPlanPhase !== 'idle' ? 'plan' : prev;
-          } else {
-            merged = fromServer;
-          }
+          const merged = mergeServerChatMode(fromServer, prev);
+          chatModeRef.current = merged;
           setChatModeState(merged);
-          if (merged === 'plan' && fromServer === 'agent') {
-            sendRef.current({ type: 'set_chat_mode', chat_mode: 'plan' });
+          if (fromServer === 'agent' && merged !== 'agent') {
+            sendRef.current({ type: 'set_chat_mode', chat_mode: merged });
           }
           if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
           if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
@@ -1172,7 +1183,7 @@ export function useChatSession(
 
         case 'chat_mode': {
           const m = event.data?.chat_mode;
-          if (m === 'plan' || m === 'agent') {
+          if (isClientChatMode(m)) {
             chatModeRef.current = m;
             setChatModeState(m);
           }
@@ -1476,109 +1487,140 @@ export function useChatSession(
             });
           }
           const collabId = event.data?.collaboration_run_id || event.data?.run_id || '';
+          if (event.type === 'collaboration_run_created' && collabId) {
+            dismissedCollaborationRunIdsRef.current.delete(collabId);
+          }
           if (event.type === 'collaboration_run_created') {
             addTerminalLog(`[Collab] Coding Agent run created ${collabId}`.trim());
           } else if (event.type === 'collaboration_task_update') {
             addTerminalLog(`[Collab] Task ${event.data?.task_id || ''} ${event.data?.status || ''}`.trim());
             const taskStatus = event.data?.status || '';
-            setCollaborationState((prev) => ({
-              ...prev,
-              active: true,
-              run_id: collabId || prev.run_id,
-              status: taskStatus === 'failed' ? 'failed' : taskStatus === 'cancelled' ? 'cancelled' : prev.status || 'running',
-              currentTaskStatus: taskStatus,
-              currentPhase: taskStatus,
-              teamProgress: [
-                ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
-                {
-                  team_role: 'coding',
-                  phase: taskStatus === 'failed' ? 'failed' : taskStatus === 'completed' ? 'done' : 'running',
-                  summary: event.data?.packet?.goal || event.data?.result?.summary || '',
-                },
-              ],
-              evidence: event.data?.result?.evidence || prev.evidence || [],
-              artifacts: event.data?.result?.artifacts || prev.artifacts || [],
-            }));
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: taskStatus === 'failed' ? 'failed' : taskStatus === 'cancelled' ? 'cancelled' : prev.status || 'running',
+                currentTaskStatus: taskStatus,
+                currentPhase: taskStatus,
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  {
+                    team_role: 'coding',
+                    phase: taskStatus === 'failed' || taskStatus === 'cancelled'
+                      ? 'failed'
+                      : taskStatus === 'completed'
+                        ? 'done'
+                        : 'running',
+                    summary: event.data?.packet?.goal || event.data?.result?.summary || '',
+                  },
+                ],
+                evidence: event.data?.result?.evidence || prev.evidence || [],
+                artifacts: event.data?.result?.artifacts || prev.artifacts || [],
+              };
+            });
           } else if (event.type === 'agent_message') {
             addTerminalLog(`[Collab] ${event.data?.agent_type || 'agent'}: ${(event.data?.text || '').slice(0, 160)}`);
           } else if (event.type === 'collaboration_plan_auto_approved') {
             addTerminalLog(`[Collab] Plan auto-approved ${collabId}`.trim());
-            setCollaborationState((prev) => ({
-              ...prev,
-              active: true,
-              run_id: collabId || prev.run_id,
-              status: 'running',
-              currentPhase: 'executing',
-              teamProgress: [
-                ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
-                { team_role: 'coding', phase: 'running', summary: 'Plan auto-approved; executing' },
-              ],
-            }));
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'running',
+                currentPhase: 'executing',
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  { team_role: 'coding', phase: 'running', summary: 'Plan auto-approved; executing' },
+                ],
+              };
+            });
           } else if (event.type === 'artifact_ready') {
             addTerminalLog(`[Collab] Artifact ready ${event.data?.artifact?.title || collabId}`.trim());
-            setCollaborationState((prev) => ({
-              ...prev,
-              active: true,
-              run_id: collabId || prev.run_id,
-              artifacts: [...(prev.artifacts || []), event.data?.artifact].filter(Boolean),
-            }));
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                artifacts: [...(prev.artifacts || []), event.data?.artifact].filter(Boolean),
+              };
+            });
           } else if (event.type === 'decision_required' || event.type === 'collaboration_clarification_request') {
             addTerminalLog(`[Collab] Decision required ${event.data?.reason || collabId}`.trim());
             if (event.data?.kind === 'clarification' || event.type === 'collaboration_clarification_request') {
-              setCollaborationState((prev) => ({
-                ...prev,
-                active: true,
-                run_id: collabId || prev.run_id,
-                status: 'waiting_clarification',
-                currentPhase: 'waiting_clarification',
-                pendingClarification: {
-                  request_id: event.data?.request_id || '',
-                  question: event.data?.question || event.data?.reason || 'Clarification needed',
-                  options: Array.isArray(event.data?.options) ? event.data.options : [],
-                  context: event.data?.context || '',
-                  recommendation: event.data?.recommendation || '',
-                  answered_by: event.data?.answered_by || '',
-                  reason: event.data?.reason || '',
-                  confidence: typeof event.data?.confidence === 'number' ? event.data.confidence : undefined,
-                  task_id: event.data?.task_id || event.data?.collaboration_task_id || '',
-                },
-              }));
+              setCollaborationState((prev) => {
+                const runId = collabId || prev.run_id;
+                const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+                return {
+                  ...prev,
+                  active: !dismissed,
+                  run_id: runId,
+                  status: 'waiting_clarification',
+                  currentPhase: 'waiting_clarification',
+                  pendingClarification: {
+                    request_id: event.data?.request_id || '',
+                    question: event.data?.question || event.data?.reason || 'Clarification needed',
+                    options: Array.isArray(event.data?.options) ? event.data.options : [],
+                    context: event.data?.context || '',
+                    recommendation: event.data?.recommendation || '',
+                    answered_by: event.data?.answered_by || '',
+                    reason: event.data?.reason || '',
+                    confidence: typeof event.data?.confidence === 'number' ? event.data.confidence : undefined,
+                    task_id: event.data?.task_id || event.data?.collaboration_task_id || '',
+                  },
+                };
+              });
             }
           } else if (event.type === 'collaboration_clarification_answer') {
             addTerminalLog(`[Collab] Clarification answered ${collabId}`.trim());
-            setCollaborationState((prev) => ({
-              ...prev,
-              active: true,
-              run_id: collabId || prev.run_id,
-              status: 'running',
-              currentPhase: 'running',
-              pendingClarification: null,
-            }));
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'running',
+                currentPhase: 'running',
+                pendingClarification: null,
+              };
+            });
           } else {
             addTerminalLog(`[Collab] Run ${event.data?.status || 'completed'} ${collabId}`.trim());
             const status = event.data?.status || 'completed';
-            setCollaborationState((prev) => ({
-              ...prev,
-              active: true,
-              run_id: collabId || prev.run_id,
-              status,
-              currentPhase: status,
-              pendingClarification: status === 'completed' || status === 'failed' || status === 'cancelled'
-                ? null
-                : prev.pendingClarification,
-              teamProgress: [
-                ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
-                {
-                  team_role: 'coding',
-                  phase: status === 'completed'
-                    ? 'done'
-                    : status === 'failed' || status === 'cancelled'
-                      ? 'failed'
-                      : 'running',
-                  summary: event.data?.summary || '',
-                },
-              ],
-            }));
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status,
+                currentPhase: status,
+                pendingClarification: status === 'completed' || status === 'failed' || status === 'cancelled'
+                  ? null
+                  : prev.pendingClarification,
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  {
+                    team_role: 'coding',
+                    phase: status === 'completed'
+                      ? 'done'
+                      : status === 'failed' || status === 'cancelled'
+                        ? 'failed'
+                        : 'running',
+                    summary: event.data?.summary || '',
+                  },
+                ],
+              };
+            });
           }
           break;
         }
@@ -1586,15 +1628,19 @@ export function useChatSession(
         case 'team_progress': {
           recordRunEvent(event);
           const tpData = event.data || {};
-          setCollaborationState((prev) => ({
-            ...prev,
-            active: true,
-            run_id: tpData.run_id || prev.run_id,
-            teamProgress: [
-              ...prev.teamProgress.filter((tp) => tp.team_role !== tpData.team_role),
-              { team_role: tpData.team_role, phase: tpData.phase, summary: tpData.summary },
-            ],
-          }));
+          setCollaborationState((prev) => {
+            const runId = tpData.run_id || prev.run_id;
+            const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+            return {
+              ...prev,
+              active: !dismissed,
+              run_id: runId,
+              teamProgress: [
+                ...prev.teamProgress.filter((tp) => tp.team_role !== tpData.team_role),
+                { team_role: tpData.team_role, phase: tpData.phase, summary: tpData.summary },
+              ],
+            };
+          });
           break;
         }
 
@@ -1602,11 +1648,16 @@ export function useChatSession(
           recordRunEvent(event);
           const recapData = event.data || {};
           const recap = recapData.recap || null;
-          setCollaborationState((prev) => ({
-            ...prev,
-            active: true,
-            recap,
-          }));
+          setCollaborationState((prev) => {
+            const runId = recapData.run_id || recap?.run_id || prev.run_id;
+            const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+            return {
+              ...prev,
+              active: !dismissed,
+              run_id: runId,
+              recap,
+            };
+          });
           break;
         }
 
@@ -1686,7 +1737,7 @@ export function useChatSession(
         }
 
         case 'plan_status':
-          if (event.data.mode === 'agent') {
+          if (event.data.mode === 'agent' && chatModeRef.current !== 'collaboration') {
             chatModeRef.current = event.data.mode;
             setChatModeState(event.data.mode);
           } else if (
@@ -1936,6 +1987,20 @@ export function useChatSession(
           break;
 
         case 'error': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+            setCollaborationState((prev) => {
+              const runId = event.data?.collaboration_run_id || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'failed',
+                currentPhase: 'failed',
+              };
+            });
+          }
           buildRequestInFlightRef.current = false;
           pendingWorkerEventsRef.current = {};
           const msg = errorMessage(event.data);
@@ -2011,6 +2076,7 @@ export function useChatSession(
           buildRequestInFlightRef.current = false;
           discardPlanBufferedContent();
           pendingWorkerEventsRef.current = {};
+          dismissedCollaborationRunIdsRef.current.clear();
           setMessages([]);
           setToolCalls([]);
           setFileEdits([]);
@@ -2023,6 +2089,7 @@ export function useChatSession(
           setCheckpoints([]);
           pendingStaleGuidanceRef.current = [];
           setTaskGuidanceItems([]);
+          setCollaborationState(initialCollaborationState());
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -2046,12 +2113,14 @@ export function useChatSession(
           buildRequestInFlightRef.current = false;
           discardPlanBufferedContent();
           optimisticUserMessageIdsRef.current.clear();
+          dismissedCollaborationRunIdsRef.current.clear();
           if (event.data?.context_usage) {
             setContextUsage(event.data.context_usage as ContextUsage);
           }
           setCheckpoints([]);
           pendingStaleGuidanceRef.current = [];
           setTaskGuidanceItems([]);
+          setCollaborationState(initialCollaborationState());
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -2136,6 +2205,7 @@ export function useChatSession(
     userTouchedRef.current = false;
     optimisticUserMessageIdsRef.current.clear();
     pendingWorkerEventsRef.current = {};
+    dismissedCollaborationRunIdsRef.current.clear();
     buildRequestInFlightRef.current = false;
     clearStreamBuffers();
     discardPlanBufferedContent();
@@ -2155,6 +2225,7 @@ export function useChatSession(
     setTerminalLogs([]);
     setIsRunning(false);
     setChatModeState(initialChatModeFromStorage());
+    setCollaborationState(initialCollaborationState());
     setPlanState({
       mode: 'agent',
       phase: 'idle',
@@ -2191,8 +2262,10 @@ export function useChatSession(
         setToolCalls(clampTail(filterVisibleToolCalls(data.toolCalls || []), MAX_TOOL_CALLS));
         setFileEdits(clampTail(data.fileEdits || [], MAX_FILE_EDITS));
         setTaskGuidanceItems(Array.isArray(data.taskGuidanceItems) ? data.taskGuidanceItems.filter(isActiveTaskGuidanceItem) : []);
-        if (data.chatMode === 'plan' || data.chatMode === 'agent') {
-          setChatModeState(data.chatMode);
+        if (isClientChatMode(data.chatMode)) {
+          const merged = mergeServerChatMode(data.chatMode, chatModeRef.current);
+          chatModeRef.current = merged;
+          setChatModeState(merged);
         }
         if (isThinkingIntensity(data.thinkingIntensity)) {
           setThinkingIntensityState(data.thinkingIntensity);
@@ -2218,7 +2291,11 @@ export function useChatSession(
         );
         setToolCalls(clampTail(restored.toolCalls, MAX_TOOL_CALLS));
         setFileEdits([]);
-        if (restored.chatMode) setChatModeState(restored.chatMode);
+        if (restored.chatMode) {
+          const merged = mergeServerChatMode(restored.chatMode, chatModeRef.current);
+          chatModeRef.current = merged;
+          setChatModeState(merged);
+        }
         if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
         if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
         setContextUsage(restored.contextUsage || null);
@@ -2534,9 +2611,36 @@ export function useChatSession(
   }, [collaborationState.run_id, send]);
 
   const cancelCollaboration = useCallback(() => {
-    if (!collaborationState.run_id) return;
-    send({ type: 'collaboration_cancel', run_id: collaborationState.run_id });
-  }, [collaborationState.run_id, send]);
+    const runId = collaborationState.run_id;
+    if (!runId) {
+      setCollaborationState(initialCollaborationState());
+      return;
+    }
+    const phase = collaborationState.status || collaborationState.currentPhase || collaborationState.currentTaskStatus || '';
+    const terminal = phase === 'completed' || phase === 'failed' || phase === 'cancelled' || phase === 'max_iterations_reached';
+    dismissedCollaborationRunIdsRef.current.add(runId);
+    setCollaborationState((prev) => {
+      if (prev.run_id && prev.run_id !== runId) return prev;
+      return {
+        ...prev,
+        active: false,
+        run_id: prev.run_id || runId,
+        status: terminal ? prev.status : 'cancelled',
+        currentTaskStatus: terminal ? prev.currentTaskStatus : 'cancelled',
+        currentPhase: terminal ? prev.currentPhase : 'cancelled',
+        pendingClarification: null,
+        teamProgress: prev.teamProgress.map((entry) => (
+          !terminal && entry.phase === 'running'
+            ? { ...entry, phase: 'failed' as const, summary: entry.summary || 'Cancelled' }
+            : entry
+        )),
+      };
+    });
+
+    if (!terminal) {
+      send({ type: 'collaboration_cancel', run_id: runId });
+    }
+  }, [collaborationState.currentPhase, collaborationState.currentTaskStatus, collaborationState.run_id, collaborationState.status, send]);
 
   const answerCollaborationClarification = useCallback((answer: string) => {
     const text = answer.trim();

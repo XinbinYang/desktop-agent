@@ -270,7 +270,7 @@ function formatThinkDuration(ms: number): string {
 
 const EmptyStatusChip: React.FC<{
   children: React.ReactNode;
-  tone?: 'accent' | 'success' | 'neutral';
+  tone?: 'accent' | 'success' | 'collab' | 'neutral';
   title?: string;
 }> = ({ children, tone = 'neutral', title }) => {
   const toneClass =
@@ -278,6 +278,8 @@ const EmptyStatusChip: React.FC<{
       ? 'border-success/25 bg-success/10 text-success'
       : tone === 'accent'
         ? 'border-accent/25 bg-accent/10 text-accent'
+        : tone === 'collab'
+          ? 'border-[color:var(--collab-pill-border)] bg-[color-mix(in_srgb,var(--collab-pill-bg)_12%,var(--bg-surface))] text-[color:var(--collab-pill-bg)]'
         : 'border-border-subtle bg-surface text-fg-secondary';
 
   return (
@@ -302,7 +304,16 @@ const EmptyChatWelcome: React.FC<{
   const AgentIcon = isCoding ? Code2 : Bot;
   const typeLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
   const agentLabel = isCoding ? typeLabel : (assistantDisplayName?.trim() || typeLabel);
-  const modeLabel = chatMode === 'plan' ? t('chat.empty.planMode') : t('chat.empty.agentMode');
+  const modeLabel = chatMode === 'plan'
+    ? t('chat.empty.planMode')
+    : chatMode === 'collaboration'
+      ? t('chat.empty.collabMode')
+      : t('chat.empty.agentMode');
+  const modeTone = chatMode === 'plan'
+    ? 'accent'
+    : chatMode === 'collaboration'
+      ? 'collab'
+      : 'neutral';
   const title = visibleProjectName
     ? t('chat.empty.projectReady', { projectName: visibleProjectName })
     : t('chat.empty.ready');
@@ -327,7 +338,7 @@ const EmptyChatWelcome: React.FC<{
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
           <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
           {!isCoding && agentLabel !== typeLabel && <EmptyStatusChip tone="neutral">{typeLabel}</EmptyStatusChip>}
-          <EmptyStatusChip tone={chatMode === 'plan' ? 'accent' : 'neutral'}>{modeLabel}</EmptyStatusChip>
+          <EmptyStatusChip tone={modeTone}>{modeLabel}</EmptyStatusChip>
           {visibleProjectName && (
             <EmptyStatusChip title={visibleProjectName}>
               <span className="inline-flex min-w-0 items-center gap-1.5">
@@ -1692,6 +1703,7 @@ interface ChatComposerProps {
   sandboxMode: SandboxMode;
   chatMode: ClientChatMode;
   isPlanModeActive: boolean;
+  isCollabModeActive: boolean;
   thinkingIntensity: ThinkingIntensity;
   planState: PlanState;
   contextUsage?: ContextUsage | null;
@@ -1737,6 +1749,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
   sandboxMode,
   chatMode,
   isPlanModeActive,
+  isCollabModeActive,
   thinkingIntensity,
   planState,
   contextUsage,
@@ -1961,6 +1974,20 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
           <span className="font-medium pr-0.5">Plan</span>
           <ChevronDown className="w-3 h-3 shrink-0 opacity-60" aria-hidden />
         </button>
+        <button
+          type="button"
+          onClick={() => onChatModeChange('collaboration')}
+          aria-pressed={isCollabModeActive}
+          aria-label="Collaboration mode"
+          className={`chat-text-xs inline-flex items-center gap-1 pl-2 pr-1.5 py-1 rounded-full border transition-colors ${
+            isCollabModeActive
+              ? 'shadow-sm border-[color:var(--collab-pill-border)] bg-[color:var(--collab-pill-bg)] text-[color:var(--collab-pill-fg)]'
+              : 'border-border-subtle text-fg-muted hover:text-fg-secondary bg-surface'
+          }`}
+        >
+          <Bot className="w-3.5 h-3.5 shrink-0 opacity-90" />
+          <span className="font-medium pr-0.5">Collab</span>
+        </button>
       </div>
 
       <div className="flex items-center gap-2 flex-wrap">
@@ -2057,6 +2084,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 }) => {
   const planBlocksChatSend = (chatMode === 'plan' || planState.mode === 'plan') && planState.phase === 'awaiting_decision';
   const isPlanModeActive = chatMode === 'plan';
+  const isCollabModeActive = chatMode === 'collaboration';
   const mentionProjectOpen = agentType === 'coding' && projectOpen;
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
@@ -3122,6 +3150,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           sandboxMode={sandboxMode}
           chatMode={chatMode}
           isPlanModeActive={isPlanModeActive}
+          isCollabModeActive={isCollabModeActive}
           thinkingIntensity={thinkingIntensity}
           planState={planState}
           contextUsage={contextUsage}

@@ -1520,11 +1520,11 @@ describe('useChatSession', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
     act(() => {
-      result.current.setChatMode('plan')
+      result.current.setChatMode('collaboration')
     })
 
-    expect(result.current.chatMode).toBe('plan')
-    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
+    expect(result.current.chatMode).toBe('collaboration')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'collaboration' })
   })
 
   it('sends the next message in plan mode immediately after clicking Plan', () => {
@@ -1679,6 +1679,68 @@ describe('useChatSession', () => {
     expect(result.current.collaborationState.artifacts?.[0]).toMatchObject({ title: 'analysis_report.md' })
   })
 
+  it('dismisses the collaboration panel and keeps cancelled event replays hidden', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+
+    act(() => {
+      result.current.cancelCollaboration()
+    })
+    expect(mockSend).toHaveBeenCalledWith({ type: 'collaboration_cancel', run_id: 'collab_1' })
+    expect(result.current.collaborationState.active).toBe(false)
+    expect(result.current.collaborationState.status).toBe('cancelled')
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_task_update',
+        data: {
+          run_id: 'collab_1',
+          task_id: 'task_1',
+          status: 'cancelled',
+        },
+      })
+      messageHandler?.({
+        type: 'collaboration_run_completed',
+        data: {
+          run_id: 'collab_1',
+          status: 'cancelled',
+          summary: 'Collaboration run cancelled',
+        },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(false)
+    expect(result.current.collaborationState.teamProgress[0]).toMatchObject({
+      team_role: 'coding',
+      phase: 'failed',
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_2', goal: 'new task', status: 'running' },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+    expect(result.current.collaborationState.run_id).toBe('collab_2')
+  })
+
   it('tracks collaboration clarification answers and child run events', () => {
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -1752,6 +1814,42 @@ describe('useChatSession', () => {
     )).toBe(true)
     expect(result.current.runEvents.filter((event) => event.runId === 'collab_1').map((event) => event.type))
       .toEqual(expect.arrayContaining(['tool_call', 'file_edit']))
+  })
+
+  it('records collaboration-scoped model errors in run events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+      messageHandler?.({
+        type: 'error',
+        data: {
+          run_id: 'coding_child',
+          collaboration_run_id: 'collab_1',
+          message: 'Model call failed: [Errno 11001] getaddrinfo failed',
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.status).toBe('failed')
+    expect(result.current.runEvents.some((event) =>
+      event.type === 'error' &&
+      event.runId === 'collab_1' &&
+      event.data.message.includes('getaddrinfo failed')
+    )).toBe(true)
   })
 
   it('sends reset, compact, and rewind session control messages', () => {
@@ -1868,6 +1966,128 @@ describe('useChatSession', () => {
       messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'agent' } })
     })
     expect(result.current.chatMode).toBe('agent')
+
+    act(() => {
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'collaboration' } })
+    })
+    expect(result.current.chatMode).toBe('collaboration')
+  })
+
+  it('restores collaboration chat mode from saved session snapshots', async () => {
+    mockedLoadSession.mockResolvedValueOnce({
+      sessionId: 'session-collab',
+      messages: [{ id: 'cached', role: 'user', content: 'cached', isTool: false }],
+      toolCalls: [],
+      chatMode: 'collaboration',
+      timestamp: Date.now(),
+    } as any)
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        json: () => Promise.resolve({
+          session_id: 'session-collab',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'collaboration',
+          messages: [{ role: 'user', content: 'server collab', message_id: 'm1' }],
+        }),
+      })
+    ))
+
+    const { result } = renderHook(() => useChatSession('session-collab', 'gpt-4o'))
+
+    await waitFor(() => {
+      expect(result.current.chatMode).toBe('collaboration')
+    })
+  })
+
+  it('keeps a freshly selected collaboration mode when stale hydration returns agent', async () => {
+    let resolveFetch: (value: { json: () => Promise<any> }) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => {
+      resolveFetch = resolve
+    })))
+
+    const { result } = renderHook(() => useChatSession('session-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+    })
+    expect(result.current.chatMode).toBe('collaboration')
+
+    await act(async () => {
+      resolveFetch({
+        json: () => Promise.resolve({
+          session_id: 'session-race',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [{ role: 'user', content: 'older server message', message_id: 'm1' }],
+        }),
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
+  })
+
+  it('keeps collaboration mode when a stale history snapshot reports agent', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-ws-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-ws-race',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'collaboration' })
+  })
+
+  it('does not let plan_status agent payload override collaboration mode', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-plan-status-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'collaboration' } })
+      messageHandler?.({
+        type: 'plan_status',
+        data: {
+          mode: 'agent',
+          phase: 'idle',
+          approved: false,
+          questions: [],
+          todos: [],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
   })
 
   it('applies thinking_intensity events from the server', () => {
