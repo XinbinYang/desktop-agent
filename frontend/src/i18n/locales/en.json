@@ -66,7 +66,8 @@
       "personalAgent": "Personal Agent",
       "codingAgent": "Coding Agent",
       "agentMode": "Agent",
-      "planMode": "Plan"
+      "planMode": "Plan",
+      "collabMode": "Collab"
     }
   },
   "terminal": {

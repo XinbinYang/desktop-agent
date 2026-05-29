@@ -59,7 +59,7 @@ settings:
   sandbox_mode: sandbox
   collaboration_enabled: true
   default_collaboration_mode: hybrid
-  auto_delegate_coding: suggest
+  auto_delegate_coding: "off"
   max_parallel_agents: 3
 
 coding_agent:

@@ -141,4 +141,60 @@ describe('buildPersonalConversation', () => {
     expect(item.createdAt).toBe(toolTimestamp);
     expect(activity.timestamp).toBe(toolTimestamp);
   });
+
+  it('does not duplicate global tool calls already represented by assistant blocks without ids', () => {
+    const timestamp = Date.UTC(2026, 4, 20, 10, 0, 0);
+    const toolBlocks = [0, 1, 2].map((index) => ({
+      type: 'tool_call' as const,
+      name: 'memory_search',
+      args: { query: `topic ${index}` },
+      result: `result ${index}`,
+      status: 'success' as const,
+      timestamp: timestamp + index,
+    }));
+    const messages: ChatMessage[] = [{
+      id: 'a1',
+      role: 'assistant',
+      content: '',
+      isTool: false,
+      createdAt: timestamp,
+      turnComplete: true,
+      blocks: toolBlocks,
+    }];
+    const toolCalls: ToolCall[] = toolBlocks.map((block) => ({
+      name: block.name,
+      args: block.args,
+      result: block.result,
+      timestamp: block.timestamp,
+    }));
+
+    const groups = buildPersonalConversation({ messages, toolCalls, planState: idlePlanState });
+    const toolActivities = groups[0].items[0].activities.filter((activity) => activity.kind === 'tool');
+
+    expect(toolActivities).toHaveLength(1);
+    expect(toolActivities[0].label).toBe('Used 3 Search calls');
+  });
+
+  it('keeps older fallback tool calls on their original assistant item', () => {
+    const oldTurn = Date.UTC(2026, 4, 20, 10, 0, 0);
+    const newTurn = Date.UTC(2026, 4, 20, 10, 15, 0);
+    const messages: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'first', isTool: false, createdAt: oldTurn - 1000 },
+      { id: 'a1', role: 'assistant', content: 'old answer', isTool: false, createdAt: oldTurn, turnComplete: true },
+      { id: 'u2', role: 'user', content: 'second', isTool: false, createdAt: newTurn - 1000 },
+      { id: 'a2', role: 'assistant', content: 'new answer', isTool: false, createdAt: newTurn, turnComplete: true },
+    ];
+    const toolCalls: ToolCall[] = [0, 1, 2].map((index) => ({
+      name: 'memory_search',
+      args: { query: `old topic ${index}` },
+      result: `old result ${index}`,
+      timestamp: oldTurn + index,
+    }));
+
+    const groups = buildPersonalConversation({ messages, toolCalls, planState: idlePlanState });
+    const assistantItems = groups.flatMap((group) => group.items).filter((item) => item.role === 'assistant');
+
+    expect(assistantItems[0].activities.filter((activity) => activity.kind === 'tool')).toHaveLength(1);
+    expect(assistantItems[1].activities.filter((activity) => activity.kind === 'tool')).toHaveLength(0);
+  });
 });

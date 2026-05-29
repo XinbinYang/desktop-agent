@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X, Maximize2 } from 'lucide-react';
+import { Send, Image, Loader2, Square, ChevronDown, ChevronRight, RotateCcw, Mic, MicOff, Search, ArrowDown, Shield, ShieldOff, BookOpen, Check, Circle, CheckCircle2, AlertCircle, Bot, Code2, FolderOpen, Pause, Play, X, Maximize2, Zap } from 'lucide-react';
 import { Virtuoso, VirtuosoHandle, type IndexLocationWithAlign, type ListRange, type StateSnapshot } from 'react-virtuoso';
 import { useTranslation } from 'react-i18next';
 import {
@@ -19,13 +19,13 @@ import {
   ContextUsage,
   ConversationCheckpoint,
   TaskGuidanceItem,
+  CollaborationState,
+  ImageAttachment,
 } from '../types';
 import { API_BASE } from '../config';
 import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneLight, vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { ToolCallView } from './ToolCallView';
 import { FileEditView } from './FileEditView';
 import { SlashCommandMenu } from './SlashCommandMenu';
@@ -34,6 +34,8 @@ import { ContextMeter } from './ContextMeter';
 import { RewindModal } from './RewindModal';
 import { PersonalChatSurface } from './chat/PersonalChatSurface';
 import { AgentRunningStatus } from './chat/AgentRunningStatus';
+import { CollaborationTrack } from './CollaborationTrack';
+import { collaborationEventsForRun } from '../lib/collaborationTimeline';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/DropdownMenu';
 import { RevealableInlineCode } from './RevealPathAction';
 import {
@@ -43,6 +45,11 @@ import {
   type TimelineToolEvent,
 } from '../lib/timelineEvents';
 import { isInternalToolName } from '../lib/internalTools';
+import {
+  imageAttachmentFromBlock,
+  imageAttachmentLabel,
+  imageAttachmentSrc,
+} from '../lib/imageAttachments';
 
 interface ChatPanelProps {
   sessionId?: string;
@@ -66,10 +73,14 @@ interface ChatPanelProps {
   thinkingIntensity: ThinkingIntensity;
   onThinkingIntensityChange: (intensity: ThinkingIntensity) => void;
   planState: PlanState;
+  collaborationState?: CollaborationState;
   onApprovePlan: () => void;
   onBuildPlan: () => void;
   onPauseBuild: () => void;
   onEndBuild: () => void;
+  onPauseCollaboration?: () => void;
+  onCancelCollaboration?: () => void;
+  onAnswerCollaborationClarification?: (answer: string) => void;
   onRejectPlan: () => void;
   onUpdatePlanDecision: (questionId: string, selected: string[]) => void;
   onSubmitPlanDecisions: (answers: PlanDecisionAnswer[]) => void;
@@ -78,7 +89,7 @@ interface ChatPanelProps {
   contextUsage?: ContextUsage | null;
   checkpoints?: ConversationCheckpoint[];
   taskGuidanceItems?: TaskGuidanceItem[];
-  onQueueTaskGuidance?: (text: string, imageBase64?: string) => void;
+  onQueueTaskGuidance?: (text: string, imageBase64?: string, options?: { applyNow?: boolean }) => void;
   onApplyTaskGuidance?: () => void;
   onDeleteTaskGuidance?: (id: string) => void;
   onClearTaskGuidance?: () => void;
@@ -259,7 +270,7 @@ function formatThinkDuration(ms: number): string {
 
 const EmptyStatusChip: React.FC<{
   children: React.ReactNode;
-  tone?: 'accent' | 'success' | 'neutral';
+  tone?: 'accent' | 'success' | 'collab' | 'neutral';
   title?: string;
 }> = ({ children, tone = 'neutral', title }) => {
   const toneClass =
@@ -267,6 +278,8 @@ const EmptyStatusChip: React.FC<{
       ? 'border-success/25 bg-success/10 text-success'
       : tone === 'accent'
         ? 'border-accent/25 bg-accent/10 text-accent'
+        : tone === 'collab'
+          ? 'border-[color:var(--collab-pill-border)] bg-[color-mix(in_srgb,var(--collab-pill-bg)_12%,var(--bg-surface))] text-[color:var(--collab-pill-bg)]'
         : 'border-border-subtle bg-surface text-fg-secondary';
 
   return (
@@ -287,11 +300,21 @@ const EmptyChatWelcome: React.FC<{
 }> = ({ agentType, chatMode, projectName, assistantDisplayName }) => {
   const { t } = useTranslation();
   const isCoding = agentType === 'coding';
+  const isSpecialist = agentType.startsWith('specialist:');
   const visibleProjectName = isCoding ? projectName : undefined;
   const AgentIcon = isCoding ? Code2 : Bot;
-  const typeLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
+  const typeLabel = isCoding ? t('chat.empty.codingAgent') : isSpecialist ? 'Specialist Agent' : t('chat.empty.personalAgent');
   const agentLabel = isCoding ? typeLabel : (assistantDisplayName?.trim() || typeLabel);
-  const modeLabel = chatMode === 'plan' ? t('chat.empty.planMode') : t('chat.empty.agentMode');
+  const modeLabel = chatMode === 'plan'
+    ? t('chat.empty.planMode')
+    : chatMode === 'collaboration'
+      ? t('chat.empty.collabMode')
+      : t('chat.empty.agentMode');
+  const modeTone = chatMode === 'plan'
+    ? 'accent'
+    : chatMode === 'collaboration'
+      ? 'collab'
+      : 'neutral';
   const title = visibleProjectName
     ? t('chat.empty.projectReady', { projectName: visibleProjectName })
     : t('chat.empty.ready');
@@ -306,7 +329,9 @@ const EmptyChatWelcome: React.FC<{
           className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl border ${
             isCoding
               ? 'border-success/30 bg-success/10 text-success'
-              : 'border-accent/30 bg-accent/10 text-accent'
+              : isSpecialist
+                ? 'border-warning/30 bg-warning/10 text-warning'
+                : 'border-accent/30 bg-accent/10 text-accent'
           }`}
           aria-hidden
         >
@@ -314,9 +339,9 @@ const EmptyChatWelcome: React.FC<{
         </div>
         <h2 className="chat-text-lg font-semibold text-fg">{title}</h2>
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-          <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
+          <EmptyStatusChip tone={isCoding ? 'success' : isSpecialist ? 'neutral' : 'accent'}>{agentLabel}</EmptyStatusChip>
           {!isCoding && agentLabel !== typeLabel && <EmptyStatusChip tone="neutral">{typeLabel}</EmptyStatusChip>}
-          <EmptyStatusChip tone={chatMode === 'plan' ? 'accent' : 'neutral'}>{modeLabel}</EmptyStatusChip>
+          <EmptyStatusChip tone={modeTone}>{modeLabel}</EmptyStatusChip>
           {visibleProjectName && (
             <EmptyStatusChip title={visibleProjectName}>
               <span className="inline-flex min-w-0 items-center gap-1.5">
@@ -379,9 +404,13 @@ const TaskGuidanceQueueCard: React.FC<{
     <div className="mb-2 rounded-md border border-accent/25 bg-accent/5 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
-          <div className="chat-text-xs font-semibold text-fg">任务引导队列 ({visible.length})</div>
+          <div className="chat-text-xs font-semibold text-fg">任务引导 ({visible.length})</div>
           <div className="chat-text-xs text-fg-muted">
-            {waitingCount > 0 ? `等待 Agent 读取 ${waitingCount} 条` : `${actionableCount} 条待引导`}
+            {waitingCount > 0 && actionableCount > 0
+              ? `${actionableCount} 条已排队，${waitingCount} 条已提交等待读取`
+              : waitingCount > 0
+                ? `已提交，等待 Agent 读取 ${waitingCount} 条`
+                : `${actionableCount} 条已排队`}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
@@ -391,7 +420,7 @@ const TaskGuidanceQueueCard: React.FC<{
             disabled={!isRunning || actionableCount === 0}
             className="chat-text-xs rounded-md bg-accent/85 px-2.5 py-1 font-medium text-fg-on-accent hover:bg-accent disabled:bg-surface-alt disabled:text-fg-muted"
           >
-            任务引导
+            提交排队项
           </button>
           <button
             type="button"
@@ -407,7 +436,7 @@ const TaskGuidanceQueueCard: React.FC<{
         {visible.map((item) => {
           const statusText =
             item.status === 'applied'
-              ? '等待读取'
+              ? '已提交，待读取'
               : '已排队';
           const preview = item.text?.trim() || (item.image_base64 ? 'Image attached' : '');
           return (
@@ -1279,9 +1308,78 @@ const PlanDraftInlineCard: React.FC<{
   );
 };
 
-/** Code block with syntax highlighting and copy button */
+type SyntaxHighlighterComponent = React.ComponentType<{
+  language?: string;
+  style?: unknown;
+  customStyle?: React.CSSProperties;
+  wrapLongLines?: boolean;
+  children?: React.ReactNode;
+}>;
+
+let syntaxHighlighterPromise: Promise<{
+  Component: SyntaxHighlighterComponent;
+  styles: { oneLight: unknown; vscDarkPlus: unknown };
+}> | null = null;
+
+function loadSyntaxHighlighter() {
+  if (!syntaxHighlighterPromise) {
+    syntaxHighlighterPromise = Promise.all([
+      import('react-syntax-highlighter'),
+      import('react-syntax-highlighter/dist/esm/styles/prism'),
+    ]).then(([highlighter, styles]) => ({
+      Component: highlighter.Prism as SyntaxHighlighterComponent,
+      styles: {
+        oneLight: (styles as { oneLight: unknown }).oneLight,
+        vscDarkPlus: (styles as { vscDarkPlus: unknown }).vscDarkPlus,
+      },
+    }));
+  }
+  return syntaxHighlighterPromise;
+}
+
+const LazyHighlightedCode: React.FC<{
+  language: string;
+  value: string;
+  theme: 'dark' | 'light';
+  customStyle: React.CSSProperties;
+}> = ({ language, value, theme, customStyle }) => {
+  const [loaded, setLoaded] = useState<Awaited<ReturnType<typeof loadSyntaxHighlighter>> | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void loadSyntaxHighlighter().then((module) => {
+      if (mounted) setLoaded(module);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  if (!loaded) {
+    return (
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-b px-[var(--chat-space-lg)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary">
+        {value}
+      </pre>
+    );
+  }
+
+  const Highlight = loaded.Component;
+  return (
+    <Highlight
+      language={language || 'text'}
+      style={theme === 'dark' ? loaded.styles.vscDarkPlus : loaded.styles.oneLight}
+      customStyle={customStyle}
+      wrapLongLines
+    >
+      {value}
+    </Highlight>
+  );
+};
+
+/** Code block with lightweight default rendering and optional highlighting. */
 const CodeBlock: React.FC<{ language: string; value: string; theme: 'dark' | 'light' }> = ({ language, value, theme }) => {
   const [copied, setCopied] = useState(false);
+  const [highlighted, setHighlighted] = useState(false);
 
   const handleCopy = async () => {
     try {
@@ -1297,29 +1395,43 @@ const CodeBlock: React.FC<{ language: string; value: string; theme: 'dark' | 'li
     <div className="relative group my-[var(--chat-space-md)]">
       <div className="flex items-center justify-between px-[var(--chat-bubble-px)] py-[var(--chat-space-xs)] bg-surface-alt rounded-t-md border-b border-border-subtle">
         <span className="chat-text-xs text-fg-muted uppercase font-medium tracking-wide">{language || 'text'}</span>
-        <button
-          onClick={handleCopy}
-          type="button"
-          className="chat-text-xs text-fg-muted hover:text-fg-secondary transition-colors"
-          aria-label="Copy code"
-        >
-          {copied ? 'Copied!' : 'Copy'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setHighlighted((value) => !value)}
+            type="button"
+            className="chat-text-xs text-fg-muted hover:text-fg-secondary transition-colors"
+            aria-label={highlighted ? 'Disable syntax highlighting' : 'Enable syntax highlighting'}
+          >
+            {highlighted ? 'Plain' : 'Highlight'}
+          </button>
+          <button
+            onClick={handleCopy}
+            type="button"
+            className="chat-text-xs text-fg-muted hover:text-fg-secondary transition-colors"
+            aria-label="Copy code"
+          >
+            {copied ? 'Copied!' : 'Copy'}
+          </button>
+        </div>
       </div>
-      <SyntaxHighlighter
-        language={language || 'text'}
-        style={theme === 'dark' ? vscDarkPlus : oneLight}
-        customStyle={{
-          margin: 0,
-          borderRadius: '0 0 0.25rem 0.25rem',
-          fontSize: 'var(--chat-font-sm)',
-          lineHeight: 'var(--chat-line-height)',
-          padding: 'var(--chat-space-md) var(--chat-space-lg)',
-        }}
-        wrapLongLines
-      >
-        {value}
-      </SyntaxHighlighter>
+      {highlighted ? (
+        <LazyHighlightedCode
+          language={language}
+          value={value}
+          theme={theme}
+          customStyle={{
+            margin: 0,
+            borderRadius: '0 0 0.25rem 0.25rem',
+            fontSize: 'var(--chat-font-sm)',
+            lineHeight: 'var(--chat-line-height)',
+            padding: 'var(--chat-space-md) var(--chat-space-lg)',
+          }}
+        />
+      ) : (
+        <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-b px-[var(--chat-space-lg)] py-[var(--chat-space-md)] font-mono chat-text-xs text-fg-secondary">
+          {value}
+        </pre>
+      )}
     </div>
   );
 };
@@ -1360,7 +1472,7 @@ const TimelineEventShell = React.memo<{
   totalCount: number;
   children: React.ReactNode;
 }>(({ event, index, totalCount, children }) => (
-  <div className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)]">
+  <div className="px-[var(--chat-space-lg)] pb-[var(--chat-message-gap)] [contain:layout_paint]">
     <div className="relative pl-[var(--chat-timeline-indent)]">
       {index < totalCount - 1 && (
         <div className="absolute left-[5px] top-2.5 bottom-0 w-px bg-border-subtle" />
@@ -1485,16 +1597,16 @@ const TimelineToolGroupRow = React.memo<{
 
 TimelineToolGroupRow.displayName = 'TimelineToolGroupRow';
 
-const imageDataUrl = (base64: string) => `data:image/png;base64,${base64}`;
-
 const ChatImageThumbnail = React.memo<{
-  base64: string;
+  image?: ImageAttachment;
+  base64?: string;
   alt: string;
   ariaLabel: string;
   onOpen: (preview: ImagePreviewState) => void;
   buttonClassName?: string;
   imageClassName?: string;
 }>(({
+  image,
   base64,
   alt,
   ariaLabel,
@@ -1502,18 +1614,22 @@ const ChatImageThumbnail = React.memo<{
   buttonClassName = 'mb-[var(--chat-space-sm)]',
   imageClassName = 'max-w-full max-h-40',
 }) => {
-  const src = imageDataUrl(base64);
+  const attachment = image || (base64 ? { base64, mimeType: 'image/png' } : null);
+  if (!attachment) return null;
+  const src = imageAttachmentSrc(attachment);
+  if (!src) return null;
+  const label = imageAttachmentLabel(attachment, alt);
   return (
     <button
       type="button"
-      onClick={() => onOpen({ src, alt })}
+      onClick={() => onOpen({ src, alt: label })}
       className={`group/image relative block max-w-full cursor-zoom-in rounded border border-border-subtle bg-surface/35 p-0 leading-none overflow-hidden focus:outline-none focus:ring-2 focus:ring-accent/60 ${buttonClassName}`}
       aria-label={ariaLabel}
       title={ariaLabel}
     >
       <img
         src={src}
-        alt={alt}
+        alt={label}
         loading="lazy"
         decoding="async"
         draggable={false}
@@ -1590,6 +1706,7 @@ interface ChatComposerProps {
   sandboxMode: SandboxMode;
   chatMode: ClientChatMode;
   isPlanModeActive: boolean;
+  isCollabModeActive: boolean;
   thinkingIntensity: ThinkingIntensity;
   planState: PlanState;
   contextUsage?: ContextUsage | null;
@@ -1597,6 +1714,7 @@ interface ChatComposerProps {
   textareaRef: React.RefObject<HTMLTextAreaElement>;
   onInputChange: (value: string) => void;
   onSend: () => void;
+  onSubmitGuidance: () => void;
   onStop?: () => void;
   onFileSelect: (event: React.ChangeEvent<HTMLInputElement>) => void;
   onStartRecording: () => void;
@@ -1634,6 +1752,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
   sandboxMode,
   chatMode,
   isPlanModeActive,
+  isCollabModeActive,
   thinkingIntensity,
   planState,
   contextUsage,
@@ -1641,6 +1760,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
   textareaRef,
   onInputChange,
   onSend,
+  onSubmitGuidance,
   onStop,
   onFileSelect,
   onStartRecording,
@@ -1793,13 +1913,25 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
           planBlocksChatSend
             ? 'Send disabled until plan questions are answered'
             : isRunning
-              ? 'Add to task guidance queue'
+              ? '加入任务引导队列'
               : undefined
         }
         className="p-2 rounded-lg transition-colors bg-accent/85 hover:bg-accent text-fg-on-accent disabled:bg-surface-alt disabled:text-fg-muted"
       >
         <Send className="w-5 h-5" />
       </button>
+      {isRunning && (
+        <button
+          type="button"
+          onClick={onSubmitGuidance}
+          disabled={planBlocksChatSend || (!input.trim() && !attachedImage)}
+          aria-label="Submit task guidance now"
+          title="立即提交引导（不中断当前任务）"
+          className="p-2 rounded-lg border border-warning/35 bg-warning/10 text-warning transition-colors hover:bg-warning/20 disabled:border-border-subtle disabled:bg-surface-alt disabled:text-fg-muted"
+        >
+          <Zap className="w-5 h-5" />
+        </button>
+      )}
       {isRunning && (
         <button
           type="button"
@@ -1844,6 +1976,20 @@ const ChatComposer: React.FC<ChatComposerProps> = ({
           <PlanModeIcon className="shrink-0 opacity-90" />
           <span className="font-medium pr-0.5">Plan</span>
           <ChevronDown className="w-3 h-3 shrink-0 opacity-60" aria-hidden />
+        </button>
+        <button
+          type="button"
+          onClick={() => onChatModeChange('collaboration')}
+          aria-pressed={isCollabModeActive}
+          aria-label="Collaboration mode"
+          className={`chat-text-xs inline-flex items-center gap-1 pl-2 pr-1.5 py-1 rounded-full border transition-colors ${
+            isCollabModeActive
+              ? 'shadow-sm border-[color:var(--collab-pill-border)] bg-[color:var(--collab-pill-bg)] text-[color:var(--collab-pill-fg)]'
+              : 'border-border-subtle text-fg-muted hover:text-fg-secondary bg-surface'
+          }`}
+        >
+          <Bot className="w-3.5 h-3.5 shrink-0 opacity-90" />
+          <span className="font-medium pr-0.5">Collab</span>
         </button>
       </div>
 
@@ -1906,10 +2052,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   thinkingIntensity,
   onThinkingIntensityChange,
   planState,
+  collaborationState,
   onApprovePlan,
   onBuildPlan,
   onPauseBuild,
   onEndBuild,
+  onPauseCollaboration,
+  onCancelCollaboration,
+  onAnswerCollaborationClarification,
   onRejectPlan,
   onUpdatePlanDecision,
   onSubmitPlanDecisions,
@@ -1937,6 +2087,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 }) => {
   const planBlocksChatSend = (chatMode === 'plan' || planState.mode === 'plan') && planState.phase === 'awaiting_decision';
   const isPlanModeActive = chatMode === 'plan';
+  const isCollabModeActive = chatMode === 'collaboration';
   const mentionProjectOpen = agentType === 'coding' && projectOpen;
   const { resolved } = useTheme();
   const [input, setInput] = useState('');
@@ -2034,6 +2185,19 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordStreamRef = useRef<MediaStream | null>(null);
+
+  // Release the recording timer and microphone stream if the component unmounts
+  // mid-recording — otherwise the interval keeps firing setState on a dead
+  // component and the audio track stays open.
+  useEffect(() => () => {
+    if (recordTimerRef.current) {
+      clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    recordStreamRef.current?.getTracks().forEach((t) => t.stop());
+    recordStreamRef.current = null;
+  }, []);
 
   if (activeScrollSessionRef.current !== sessionId) {
     activeScrollSessionRef.current = sessionId;
@@ -2128,17 +2292,27 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     rememberScrollMemory({ atBottom });
   }, [rememberScrollMemory]);
 
+  const resetComposer = () => {
+    setInput('');
+    setAttachedImage(null);
+    onDraftClear?.();
+    if (textareaRef.current) {
+      textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
+    }
+  };
+
+  const handleTaskGuidanceSend = (applyNow: boolean) => {
+    if (planBlocksChatSend) return;
+    if (!input.trim() && !attachedImage) return;
+    onQueueTaskGuidance?.(input.trim(), attachedImage || undefined, { applyNow });
+    resetComposer();
+  };
+
   const handleSend = () => {
     if (planBlocksChatSend) return;
     if (!input.trim() && !attachedImage) return;
     if (isRunning) {
-      onQueueTaskGuidance?.(input.trim(), attachedImage || undefined);
-      setInput('');
-      setAttachedImage(null);
-      onDraftClear?.();
-      if (textareaRef.current) {
-        textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
-      }
+      handleTaskGuidanceSend(false);
       return;
     }
     const slashCommand = parseSlashInput(input);
@@ -2160,6 +2334,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     if (textareaRef.current) {
       textareaRef.current.style.height = `${CHAT_INPUT_MIN_HEIGHT}px`;
     }
+  };
+
+  const handleSubmitGuidance = () => {
+    if (!isRunning) {
+      handleSend();
+      return;
+    }
+    handleTaskGuidanceSend(true);
   };
 
   const handleAtMention = useCallback((item: { id: string; label: string; category: string }) => {
@@ -2282,6 +2464,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     if (planBlocksChatSend) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordStreamRef.current = stream;
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -2293,13 +2476,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       mediaRecorder.onstop = () => {
         const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         stream.getTracks().forEach((t) => t.stop());
+        recordStreamRef.current = null;
         transcribeAudio(blob);
       };
 
       mediaRecorder.onerror = () => {
         stream.getTracks().forEach((t) => t.stop());
+        recordStreamRef.current = null;
         setIsRecording(false);
-        if (recordTimerRef.current) clearInterval(recordTimerRef.current);
+        if (recordTimerRef.current) {
+          clearInterval(recordTimerRef.current);
+          recordTimerRef.current = null;
+        }
       };
 
       mediaRecorder.start(200);
@@ -2366,17 +2554,26 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       mode: timelineMode,
     }).filter((event) => !(event.kind === 'todo' && event.source === 'execution'));
   }, [filteredMessages, toolCalls, fileEdits, runEvents, planState, timelineMode, usePersonalChatV2]);
+  const collaborationRunEvents = useMemo(() => (
+    collaborationEventsForRun(runEvents || [], collaborationState?.run_id || '')
+  ), [runEvents, collaborationState?.run_id]);
 
   // Markdown 自定义渲染
   // react-markdown v9 中 fenced code blocks 由 pre 组件包裹，code 组件仅处理 inline code。
   const timelineItemCount = timelineEvents.length;
   const initialTopMostItemIndex = useMemo<IndexLocationWithAlign | number | undefined>(() => {
     const memory = initialScrollMemoryRef.current;
-    if (!memory || timelineItemCount === 0) return undefined;
+    if (timelineItemCount === 0) return undefined;
+    if (!memory) {
+      if (agentType === 'personal' && chatMode === 'plan') {
+        return { index: 'LAST', align: 'end' };
+      }
+      return undefined;
+    }
     if (memory.atBottom) return { index: 'LAST', align: 'end' };
     const index = Math.min(Math.max(memory.range?.startIndex ?? 0, 0), Math.max(timelineItemCount - 1, 0));
     return index > 0 ? { index, align: 'start' } : undefined;
-  }, [timelineItemCount, sessionId]);
+  }, [agentType, chatMode, timelineItemCount, sessionId]);
 
   useEffect(() => {
     if (!sessionId || timelineItemCount === 0 || scrollRestoreAppliedRef.current) return;
@@ -2487,7 +2684,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         return (
           <ChatImageThumbnail
             key={`img-${block.timestamp}`}
-            base64={block.base64}
+            image={imageAttachmentFromBlock(block) || undefined}
             alt="tool screenshot"
             ariaLabel="Open tool screenshot"
             onOpen={openImagePreview}
@@ -2595,7 +2792,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       case 'image':
         content = (
           <ChatImageThumbnail
-            base64={event.base64}
+            image={event.image}
             alt="tool screenshot"
             ariaLabel="Open tool screenshot"
             onOpen={openImagePreview}
@@ -2831,6 +3028,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             atBottomStateChange={handleAtBottomStateChange}
             rangeChanged={handleRangeChanged}
             overscan={200}
+            computeItemKey={(_index, event) => event.id}
             itemContent={itemContent}
             components={virtuosoComponents}
           />
@@ -2871,6 +3069,22 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               onPause={onPauseBuild}
               onEnd={onEndBuild}
               onContinue={onBuildPlan}
+            />
+          </div>
+        )}
+        {collaborationState?.active && (
+          <div className="mb-2">
+            <CollaborationTrack
+              recaps={collaborationState.recap ? [collaborationState.recap] : []}
+              teamProgress={collaborationState.teamProgress}
+              evidence={collaborationState.evidence || []}
+              artifacts={collaborationState.artifacts || []}
+              events={collaborationRunEvents}
+              status={collaborationState.status || collaborationState.currentPhase || ''}
+              pendingClarification={collaborationState.pendingClarification || null}
+              onPause={onPauseCollaboration}
+              onCancel={onCancelCollaboration}
+              onAnswerClarification={onAnswerCollaborationClarification}
             />
           </div>
         )}
@@ -2939,6 +3153,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           sandboxMode={sandboxMode}
           chatMode={chatMode}
           isPlanModeActive={isPlanModeActive}
+          isCollabModeActive={isCollabModeActive}
           thinkingIntensity={thinkingIntensity}
           planState={planState}
           contextUsage={contextUsage}
@@ -2946,6 +3161,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           textareaRef={textareaRef}
           onInputChange={handleInputChange}
           onSend={handleSend}
+          onSubmitGuidance={handleSubmitGuidance}
           onStop={onStop}
           onFileSelect={handleFileSelect}
           onStartRecording={startRecording}

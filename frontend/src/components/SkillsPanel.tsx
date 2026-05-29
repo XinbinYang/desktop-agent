@@ -66,9 +66,20 @@ const emptyPreferences = (): SkillPreferences => ({ personal: {}, coding: {} });
 
 function normalizePreferences(value?: Partial<SkillPreferences>): SkillPreferences {
   return {
+    ...(value || {}),
     personal: { ...(value?.personal || {}) },
     coding: { ...(value?.coding || {}) },
   };
+}
+
+function ensureAgentPreferences(preferences: SkillPreferences, agent: AgentType): SkillPreferences {
+  if (preferences[agent]) return preferences;
+  return { ...preferences, [agent]: {} };
+}
+
+function agentLabel(agent: AgentType): string {
+  if (agent.startsWith('specialist:')) return agent.replace(/^specialist:/, '').replace(/-/g, ' ');
+  return AGENT_LABEL[agent] || agent;
 }
 
 function isEnabled(skill: SkillCatalogItem, preferences: SkillPreferences, agent: AgentType): boolean {
@@ -337,14 +348,14 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({
 
   const updatePreference = (skill: SkillCatalogItem, nextEnabled: boolean) => {
     const previous = preferences;
-    const next = normalizePreferences(previous);
+    const next = ensureAgentPreferences(normalizePreferences(previous), activeAgent);
     next[activeAgent][skill.id] = nextEnabled;
     void savePreferences(next, previous, skill.id);
   };
 
   const updateCategory = (category: SkillCategory, nextEnabled: boolean) => {
     const previous = preferences;
-    const next = normalizePreferences(previous);
+    const next = ensureAgentPreferences(normalizePreferences(previous), activeAgent);
     for (const skill of category.skills) {
       next[activeAgent][skill.id] = nextEnabled;
     }
@@ -353,7 +364,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({
 
   const applyPreset = (preset: SkillPreset) => {
     const previous = preferences;
-    const next = normalizePreferences(previous);
+    const next = ensureAgentPreferences(normalizePreferences(previous), activeAgent);
     for (const skillId of preset.skillIds) {
       next[activeAgent][skillId] = true;
     }
@@ -409,7 +420,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({
               disabled={pending || archivePending}
               onChange={(event) => updatePreference(skill, event.target.checked)}
               className="h-3.5 w-3.5 rounded border-border bg-surface accent-accent"
-              aria-label={`${enabled ? 'Disable' : 'Enable'} ${skill.name} for ${AGENT_LABEL[activeAgent]}`}
+              aria-label={`${enabled ? 'Disable' : 'Enable'} ${skill.name} for ${agentLabel(activeAgent)}`}
             />
             {pending && <Loader2 className="absolute h-3 w-3 animate-spin text-accent" />}
           </span>
@@ -453,7 +464,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({
             checked={allEnabled}
             indeterminate={!allEnabled && !noneEnabled}
             disabled={categoryPending}
-            label={`${allEnabled ? 'Disable' : 'Enable'} all ${category.label} for ${AGENT_LABEL[activeAgent]}`}
+            label={`${allEnabled ? 'Disable' : 'Enable'} all ${category.label} for ${agentLabel(activeAgent)}`}
             onChange={(checked) => updateCategory(category, checked)}
           />
           <button
@@ -552,7 +563,7 @@ export const SkillsPanel: React.FC<SkillsPanelProps> = ({
           Skills
         </div>
         <div className="mt-1 text-[10px] leading-snug text-fg-muted">
-          {AGENT_LABEL[activeAgent]} capability set
+          {agentLabel(activeAgent)} capability set
         </div>
       </div>
 

@@ -9,25 +9,50 @@ from typing import Any, Callable, Dict, List, Optional
 from app.tools.base import BaseTool, ToolResult
 from app.worker import WorkerSession, WORKER_PROFILES, format_worker_exception
 
-_worker_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
-    "worker_event_callback",
+_runtime_event_callback_var: ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = ContextVar(
+    "runtime_event_callback",
     default=None,
 )
 _active_workers: Dict[str, Dict[str, tuple[WorkerSession, Optional[Callable[[Dict[str, Any]], Any]]]]] = {}
 
+# Map worker profile names to team_role labels for frontend visibility.
+PROFILE_TO_ROLE: dict[str, str] = {
+    "explorer": "explorer",
+    "architect": "architect",
+    "code": "editor",
+    "code-expert": "editor",
+    "tdd-worker": "editor",
+    "debugger": "verifier",
+    "code-reviewer": "reviewer",
+}
+
+
+def set_runtime_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
+    return _runtime_event_callback_var.set(cb)
+
+
+def reset_runtime_event_callback(token: Token) -> None:
+    _runtime_event_callback_var.reset(token)
+
+
+def emit_runtime_event(event: Dict[str, Any]) -> bool:
+    cb = _runtime_event_callback_var.get()
+    if not cb:
+        return False
+    cb(event)
+    return True
+
 
 def set_worker_event_callback(cb: Optional[Callable[[Dict[str, Any]], Any]]) -> Token:
-    return _worker_event_callback_var.set(cb)
+    return set_runtime_event_callback(cb)
 
 
 def reset_worker_event_callback(token: Token) -> None:
-    _worker_event_callback_var.reset(token)
+    reset_runtime_event_callback(token)
 
 
 def _emit_worker_event(event: Dict[str, Any]) -> None:
-    cb = _worker_event_callback_var.get()
-    if cb:
-        cb(event)
+    emit_runtime_event(event)
 
 
 def _worker_completed_successfully(status: str, result: str) -> bool:
@@ -77,7 +102,7 @@ def _register_worker(session_id: str, worker: WorkerSession) -> None:
         return
     _active_workers.setdefault(session_id, {})[worker.worker_id] = (
         worker,
-        _worker_event_callback_var.get(),
+        _runtime_event_callback_var.get(),
     )
 
 
@@ -90,9 +115,18 @@ def _unregister_worker(session_id: str, worker_id: str) -> None:
         _active_workers.pop(session_id, None)
 
 
-def cancel_workers_for_session(session_id: str) -> None:
+def cancel_workers_for_session(session_id: str, run_id_filter: str = "") -> None:
+    """Cancel registered workers under *session_id*.
+
+    When ``run_id_filter`` is non-empty, only workers whose ``run_id``
+    matches the filter are cancelled. Use this when cancelling a specific
+    collaboration run so unrelated dispatch_worker / dispatch_parallel tasks
+    in the same Personal session keep running.
+    """
     workers = list(_active_workers.get(session_id, {}).values())
     for worker, cb in workers:
+        if run_id_filter and getattr(worker, "run_id", "") != run_id_filter:
+            continue
         worker.cancel()
         event = worker.cancel_event()
         if event and cb:
@@ -161,6 +195,7 @@ class DispatchWorkerTool(BaseTool):
             full_task = f"## Prior Work Context\n{prior_context[:3000]}\n\n## Your Task\n{task}"
 
         worker_id = f"worker_{uuid.uuid4().hex[:8]}"
+        team_role = PROFILE_TO_ROLE.get(profile, "")
         worker = WorkerSession(
             worker_id=worker_id,
             task=full_task,
@@ -170,6 +205,7 @@ class DispatchWorkerTool(BaseTool):
             run_id=run_id,
             parent_tool_call_id=tool_call_id,
             agent_type=agent_type,
+            team_role=team_role,
         )
 
         started_at = time.time()
@@ -178,6 +214,10 @@ class DispatchWorkerTool(BaseTool):
         final_status = "failed"
         final_iterations = 0
 
+        _emit_worker_event({
+            "type": "team_progress",
+            "data": {"team_role": team_role, "phase": "running", "summary": f"Worker started ({profile})"},
+        })
         _register_worker(session_id, worker)
         try:
             async for event in worker.run():
@@ -190,6 +230,12 @@ class DispatchWorkerTool(BaseTool):
                     final_iterations = data.get("iterations", worker.iteration)
         finally:
             _unregister_worker(session_id, worker.worker_id)
+
+        team_status = "done" if final_status == "completed" else "failed"
+        _emit_worker_event({
+            "type": "team_progress",
+            "data": {"team_role": team_role, "phase": team_status, "summary": f"Worker finished ({final_status})"},
+        })
 
         duration_ms = round((time.time() - started_at) * 1000)
 
@@ -338,6 +384,7 @@ class DispatchParallelTool(BaseTool):
                 run_id=run_id,
                 parent_tool_call_id=tool_call_id,
                 agent_type=agent_type,
+                team_role=PROFILE_TO_ROLE.get(profile_name, ""),
             )
             events: List[Dict[str, Any]] = []
             final = ""

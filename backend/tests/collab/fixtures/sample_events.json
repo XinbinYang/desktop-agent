@@ -1,0 +1,108 @@
+{
+  "execute_with_tools": [
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "shell_execute",
+        "args": {"command": "pytest tests/ -x"},
+        "result": "exit_code: 0\n...\n5 passed in 1.23s",
+        "duration_ms": 1230,
+        "tool_call_id": "tc1"
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "git_diff",
+        "args": {},
+        "result": "diff --git a/auth.py b/auth.py\n+++ b/auth.py\n@@ -10,6 +10,7 @@\n+    return True",
+        "duration_ms": 45,
+        "tool_call_id": "tc2"
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "run_review",
+        "args": {},
+        "result": "No blocking findings.",
+        "duration_ms": 800,
+        "tool_call_id": "tc3"
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "verify_project",
+        "args": {"project_path": "/tmp/project"},
+        "result": "exit_code: 0\nAll checks passed.",
+        "duration_ms": 500,
+        "tool_call_id": "tc4"
+      }
+    },
+    {
+      "type": "content",
+      "data": {"text": "Fixed the login bug. ACCEPTANCE: PASS"}
+    },
+    {
+      "type": "run_completed",
+      "data": {
+        "status": "completed",
+        "verification_passed": true,
+        "review_passed": true,
+        "summary": "Login bug fixed."
+      }
+    }
+  ],
+  "pass_run": [
+    {
+      "type": "content",
+      "data": {"text": "Task done. ACCEPTANCE: PASS"}
+    },
+    {
+      "type": "run_completed",
+      "data": {
+        "status": "completed",
+        "verification_passed": true,
+        "review_passed": true,
+        "summary": "All done."
+      }
+    }
+  ],
+  "fail_run": [
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "shell_execute",
+        "args": {"command": "pytest tests/"},
+        "result": "exit_code: 1\nFAILED tests/test_auth.py::test_login",
+        "duration_ms": 900,
+        "tool_call_id": "tc_fail"
+      }
+    },
+    {
+      "type": "content",
+      "data": {"text": "Tests are failing. ACCEPTANCE: FAIL"}
+    },
+    {
+      "type": "run_completed",
+      "data": {
+        "status": "failed",
+        "verification_passed": false,
+        "review_passed": null,
+        "summary": "Tests failed."
+      }
+    }
+  ],
+  "empty_run": [
+    {
+      "type": "run_completed",
+      "data": {
+        "status": "completed",
+        "verification_passed": null,
+        "review_passed": null,
+        "summary": "No changes needed."
+      }
+    }
+  ]
+}

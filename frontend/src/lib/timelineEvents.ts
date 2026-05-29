@@ -8,8 +8,10 @@ import type {
   RunEvent,
   ToolCall,
   WorkerEvent,
+  ImageAttachment,
 } from '../types';
 import { filterVisibleToolCalls, isInternalToolName } from './internalTools';
+import { imageAttachmentFromBlock } from './imageAttachments';
 
 export type TimelineEventKind =
   | 'user'
@@ -100,7 +102,7 @@ export interface TimelineKnowledgeEvent extends TimelineBaseEvent {
 
 export interface TimelineImageEvent extends TimelineBaseEvent {
   kind: 'image';
-  base64: string;
+  image: ImageAttachment;
 }
 
 export interface TimelineErrorEvent extends TimelineBaseEvent {
@@ -458,13 +460,18 @@ export function buildTimelineEvents({
             break;
           }
           case 'image':
-            events.push({
-              id: idBase,
-              kind: 'image',
-              timestamp,
-              messageId: message.id,
-              base64: block.base64,
-            });
+            {
+              const image = imageAttachmentFromBlock(block);
+              if (image) {
+                events.push({
+                  id: idBase,
+                  kind: 'image',
+                  timestamp,
+                  messageId: message.id,
+                  image,
+                });
+              }
+            }
             break;
           case 'plan_execution':
             events.push({

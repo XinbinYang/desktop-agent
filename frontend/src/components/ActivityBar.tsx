@@ -7,6 +7,7 @@ import {
   PanelLeftOpen,
   User,
   Code,
+  Bot,
   Loader2,
   type LucideIcon,
 } from 'lucide-react';
@@ -25,6 +26,7 @@ interface ActivityBarProps {
   onToggleSidebar: () => void;
   personalRunning?: boolean;
   codingRunning?: boolean;
+  agentRunning?: Partial<Record<AgentType, boolean>>;
 }
 
 interface ActivityItem {
@@ -33,11 +35,6 @@ interface ActivityItem {
   label: string;
   isAgent?: boolean;
 }
-
-const AGENT_ITEMS: ActivityItem[] = [
-  { id: 'personal', icon: User, label: 'Personal', isAgent: true },
-  { id: 'coding', icon: Code, label: 'Coding', isAgent: true },
-];
 
 const SECTION_ITEMS: ActivityItem[] = [
   { id: 'skills', icon: Sparkles, label: 'Skills' },
@@ -55,11 +52,32 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
   onToggleSidebar,
   personalRunning = false,
   codingRunning = false,
+  agentRunning,
 }) => {
-  const agentRunning: Record<AgentType, boolean> = {
+  const runningByAgent: Partial<Record<AgentType, boolean>> = {
     personal: personalRunning,
     coding: codingRunning,
+    ...(agentRunning || {}),
   };
+
+  const agentItems = React.useMemo<ActivityItem[]>(() => {
+    const profiles = agentProfiles || {};
+    const builtins: ActivityItem[] = [
+      { id: 'personal', icon: User, label: displayNameForAgent('personal', profiles), isAgent: true },
+      { id: 'coding', icon: Code, label: displayNameForAgent('coding', profiles), isAgent: true },
+    ];
+    const specialists = Object.values(profiles)
+      .filter((profile) => profile.agent_type.startsWith('specialist:'))
+      .sort((a, b) => a.display_name.localeCompare(b.display_name))
+      .map<ActivityItem>((profile) => ({
+        id: profile.agent_type,
+        icon: Bot,
+        label: profile.display_name,
+        isAgent: true,
+      }));
+    return [...builtins, ...specialists];
+  }, [agentProfiles]);
+
   const handleAgentClick = (agentType: AgentType) => {
     if (!sidebarCollapsed && activeAgent === agentType) {
       onToggleSidebar();
@@ -88,9 +106,11 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
     <div className="w-12 bg-surface border-r border-border flex flex-col items-center py-2 flex-shrink-0 select-none">
       {/* Agent entries — top */}
       <div className="flex flex-col items-center gap-1 mb-2">
-        {AGENT_ITEMS.map((item) => {
+        {agentItems.map((item) => {
           const isActive = activeAgent === item.id;
           const agentName = displayNameForAgent(item.id as AgentType, agentProfiles);
+          const isPersonal = item.id === 'personal';
+          const isCoding = item.id === 'coding';
           return (
             <Tooltip key={item.id} content={<span className="text-[11px]">{agentName}</span>} side="right">
               <button
@@ -99,15 +119,17 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
                 className={cn(
                   'relative w-10 h-10 rounded-full flex items-center justify-center transition-all',
                   isActive
-                    ? item.id === 'personal'
+                    ? isPersonal
                       ? 'bg-accent/10 text-accent ring-1 ring-accent/30'
-                      : 'bg-success/10 text-success ring-1 ring-success/30'
+                      : isCoding
+                        ? 'bg-success/10 text-success ring-1 ring-success/30'
+                        : 'bg-warning/10 text-warning ring-1 ring-warning/30'
                     : 'text-fg-secondary hover:text-fg hover:bg-surface-hover'
                 )}
                 aria-label={agentName}
               >
                 <item.icon className="w-5 h-5" />
-                {agentRunning[item.id as AgentType] && (
+                {runningByAgent[item.id as AgentType] && (
                   <Loader2
                     className="absolute -top-0.5 -right-0.5 w-3 h-3 animate-spin text-success"
                     aria-label={`${agentName} running`}

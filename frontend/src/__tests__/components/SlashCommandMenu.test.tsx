@@ -61,4 +61,19 @@ describe('SlashCommandMenu', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ name: 'skills' }))
   })
+
+  it('anchors inside the composer and keeps keyboard scrolling local', async () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as any
+    const { container } = render(<Harness onSelect={() => {}} />)
+    const input = screen.getByLabelText('command-input')
+
+    await screen.findByText('/help')
+
+    const menu = container.querySelector('.absolute.bottom-full.left-0.right-0') as HTMLElement
+    expect(menu).toBeInTheDocument()
+    expect(menu).not.toHaveStyle({ position: 'fixed' })
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(scrollIntoView).not.toHaveBeenCalled()
+  })
 })

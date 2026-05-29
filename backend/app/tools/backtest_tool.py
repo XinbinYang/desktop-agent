@@ -7,6 +7,7 @@ import pandas as pd
 from app.backtest_engine import generate_report, run_backtest
 from app.runtime_paths import runtime_dir
 from app.strategies import get_strategy_info, list_strategies
+from app.tools.artifact_tool import publish_many_file_artifacts
 from app.tools.base import BaseTool, ToolResult
 from app.tools.wind_runtime import get_wind_client
 
@@ -291,7 +292,15 @@ class BacktestReportTool(BaseTool):
         "required": ["strategy_name", "codes", "start_date"]
     }
 
-    async def execute(self, strategy_name: str, codes: str, start_date: str, session_id: str = "default") -> ToolResult:
+    async def execute(
+        self,
+        strategy_name: str,
+        codes: str,
+        start_date: str,
+        session_id: str = "default",
+        tool_call_id: str = "",
+        agent_type: str = "",
+    ) -> ToolResult:
         result = _load_result(session_id, strategy_name, codes, start_date)
         if not result:
             return ToolResult(error="未找到回测结果，请先运行 backtest_run")
@@ -303,9 +312,20 @@ class BacktestReportTool(BaseTool):
 
         try:
             paths = generate_report(result, output_path)
+            artifacts = publish_many_file_artifacts(
+                [
+                    (paths["chart_path"], f"{strategy_name} {codes} chart", "image"),
+                    (paths["md_path"], f"{strategy_name} {codes} report", "code"),
+                    (paths["csv_path"], f"{strategy_name} {codes} data", "data"),
+                ],
+                session_id=session_id or "default",
+                source_tool=self.name,
+                tool_call_id=tool_call_id,
+                agent_type=agent_type,
+            )
             return ToolResult(
                 output=f"报告已生成:\n- Markdown: {paths['md_path']}\n- 图表: {paths['chart_path']}\n- 数据: {paths['csv_path']}",
-                base64_image=None  # 如有需要可以读取图表返回
+                metadata={"artifacts": artifacts},
             )
         except Exception as e:
             return ToolResult(error=f"报告生成失败: {e}")

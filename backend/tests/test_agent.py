@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pytest
 from unittest.mock import patch, MagicMock
@@ -9,6 +10,7 @@ from app.agent import (
     _completion_quality_payload,
     _shell_command_looks_like_verification,
 )
+from app.message_utils import ToolCallResult
 from .conftest import _make_stream_mock
 
 
@@ -212,6 +214,47 @@ class TestAgentSession:
             assert all("timestamp" in e["data"] for e in events if "data" in e)
 
     @pytest.mark.asyncio
+    async def test_final_answer_completion_events_do_not_wait_for_save(self, session, monkeypatch):
+        mock_response = {
+            "choices": [{
+                "message": {
+                    "content": "Hello user",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        events = asyncio.Queue()
+        save_started = asyncio.Event()
+        release_save = asyncio.Event()
+
+        async def slow_save():
+            save_started.set()
+            await release_save.wait()
+
+        async def collect_events():
+            async for event in session.run("hi"):
+                await events.put(event)
+
+        monkeypatch.setattr(session, "_save_async", slow_save)
+        with patch("app.agent.ModelRouter.chat_completion_stream", _make_stream_mock(mock_response)):
+            task = asyncio.create_task(collect_events())
+            seen = []
+            try:
+                while "run_completed" not in seen:
+                    event = await asyncio.wait_for(events.get(), timeout=0.5)
+                    seen.append(event["type"])
+
+                assert "content" in seen
+                assert "status" in seen
+                assert "run_completed" in seen
+                await asyncio.wait_for(save_started.wait(), timeout=0.5)
+                assert not task.done()
+            finally:
+                release_save.set()
+                await asyncio.wait_for(task, timeout=1)
+
+    @pytest.mark.asyncio
     async def test_empty_stream_response_uses_non_stream_fallback(self, session):
         async def empty_stream(*args, **kwargs):
             yield {"type": "done", "response": {"choices": [{"message": {"content": ""}}]}}
@@ -275,6 +318,150 @@ class TestAgentSession:
         assert streamed_text == "Recovered from stream error"
         assert not any(e["type"] == "error" for e in events)
         assert any(e["type"] == "status" and e["data"]["status"] == "completed" for e in events)
+
+    # The injected segment uses this exact header so tests can distinguish the
+    # dynamically-injected block from base AGENTS.md prose that may mention
+    # "Active Collaboration" generically.
+    _INJECTED_HEADER = "## Active Collaboration (Delegated by Personal Agent)"
+
+    def test_active_collaboration_segment_injected_for_delegated_coding(self):
+        """Sprint 1: Coding session with a collaboration_run_id must surface
+        the Active Collaboration contract in its system prompt, including the
+        run/task/mode triple and the two callback tool names."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="delegated_session",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_abc123"
+        coding.collaboration_task_id = "task_xyz789"
+        coding.collaboration_mode = "execute"
+        prompt = coding._build_system_prompt()
+        assert self._INJECTED_HEADER in prompt
+        assert "run_abc123" in prompt
+        assert "task_xyz789" in prompt
+        # Mode is rendered as `Mode: execute` (exact, since `execute` is a common word).
+        assert "Mode: execute" in prompt
+        # Callback tool names must be discoverable in the prompt.
+        assert "request_personal_clarification" in prompt
+        assert "request_personal_context" in prompt
+        # The framing must reinforce that Personal owns the final reply.
+        assert "Personal Agent owns the final reply" in prompt
+        # ACCEPTANCE marker is the stop contract.
+        assert "ACCEPTANCE: PASS" in prompt
+
+    def test_active_collaboration_segment_signals_read_only(self):
+        """Sprint 1: read_only flag must surface a READ-ONLY constraint line."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="consult_session",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_ro"
+        coding.collaboration_task_id = "task_ro"
+        coding.collaboration_mode = "consult"
+        coding.collaboration_read_only = True
+        prompt = coding._build_system_prompt()
+        assert "READ-ONLY consultation" in prompt
+        # The exact executing-mode line that this run must NOT receive
+        # (uses verbatim phrase from agent.py to disambiguate from base text).
+        assert "EXECUTE: implement the smallest safe change, verify it, review it" not in prompt
+
+    def test_active_collaboration_includes_dialogue_and_profile_brief(self):
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="rich_ctx",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_ctx"
+        coding.collaboration_task_id = "task_ctx"
+        coding.collaboration_mode = "execute"
+        coding.collaboration_dialogue_summary = (
+            "[user] Please optimize the SQL query.\n"
+            "[assistant] Will route to coding agent."
+        )
+        coding.collaboration_user_profile_brief = "Prefers TypeScript over JavaScript."
+        prompt = coding._build_system_prompt()
+        assert "Personal Dialogue Summary" in prompt
+        assert "optimize the SQL query" in prompt
+        assert "User Profile Brief" in prompt
+        assert "TypeScript over JavaScript" in prompt
+
+    def test_active_collaboration_truncates_oversize_summary_and_profile(self):
+        """Guard: dialogue summary must be clipped to ~2000 chars and profile
+        brief to ~1000 chars so the system prompt never balloons."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="big_ctx",
+            agent_type="coding",
+        )
+        coding.collaboration_run_id = "run_big"
+        coding.collaboration_task_id = "task_big"
+        coding.collaboration_mode = "execute"
+        coding.collaboration_dialogue_summary = "x" * 5000
+        coding.collaboration_user_profile_brief = "y" * 5000
+        prompt = coding._build_system_prompt()
+        # The injected slice (between header and end of section) must respect
+        # the 2KB / 1KB caps documented in the Active Collaboration design.
+        assert "x" * 2001 not in prompt
+        assert "y" * 1001 not in prompt
+        # But the trimmed segments are still present.
+        assert "x" * 1000 in prompt
+        assert "y" * 500 in prompt
+
+    def test_collaboration_segment_absent_for_personal_agent(self):
+        """Personal Agent never gets the delegated-by-Personal preamble even
+        if collaboration_run_id is set — the segment is gated on agent type."""
+        personal = AgentSession(
+            model_id="gpt-4o",
+            session_id="personal_session",
+            agent_type="personal",
+        )
+        personal.collaboration_run_id = "run_should_be_ignored"
+        prompt = personal._build_system_prompt()
+        assert self._INJECTED_HEADER not in prompt
+        # The dialogue summary header is unique to the injected block.
+        assert "Personal Dialogue Summary" not in prompt
+
+    def test_collaboration_segment_absent_when_run_id_missing(self):
+        """A coding session running standalone must not advertise itself as
+        delegated — the segment is the signal Personal is in control."""
+        coding = AgentSession(
+            model_id="gpt-4o",
+            session_id="standalone_coding",
+            agent_type="coding",
+        )
+        # Explicitly leave collaboration_run_id empty.
+        coding.collaboration_run_id = ""
+        prompt = coding._build_system_prompt()
+        # Use the exact header (matches only when our code injects it) instead
+        # of the generic phrase "Active Collaboration" that AGENTS.md uses.
+        assert self._INJECTED_HEADER not in prompt
+        assert "Personal Agent owns the final reply" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_model_failure_marks_run_completed_failed(self, session):
+        async def failing_stream(*args, **kwargs):
+            yield {"type": "error", "message": "[Errno 11001] getaddrinfo failed"}
+
+        async def failing_non_stream(*args, **kwargs):
+            raise OSError("[Errno 11001] getaddrinfo failed")
+
+        with (
+            patch("app.agent.ModelRouter.chat_completion_stream", failing_stream),
+            patch("app.agent.ModelRouter.chat_completion_non_stream", failing_non_stream),
+        ):
+            events = []
+            async for event in session.run("hi"):
+                events.append(event)
+
+        assert any(
+            e["type"] == "error" and "getaddrinfo failed" in e["data"].get("message", "")
+            for e in events
+        )
+        completed = [e for e in events if e["type"] == "run_completed"][-1]
+        assert completed["data"]["status"] == "failed"
+        assert "getaddrinfo failed" in completed["data"]["summary"]
 
     @pytest.mark.asyncio
     async def test_run_with_tool_call(self, session):
@@ -702,6 +889,75 @@ class TestAgentSession:
             for e in events
         )
 
+    @pytest.mark.asyncio
+    async def test_tool_artifacts_emit_image_event_and_persist_ui_artifacts(self, session):
+        session.max_iterations = 2
+        artifact = {
+            "id": "chart-1",
+            "type": "image",
+            "title": "Equity curve",
+            "url": "/preview/test_session/chart.png",
+            "mime_type": "image/png",
+        }
+        tool_response = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_chart",
+                        "type": "function",
+                        "function": {
+                            "name": "get_screen_size",
+                            "arguments": "{}",
+                        },
+                    }],
+                }
+            }]
+        }
+        final_response = {
+            "choices": [{
+                "message": {
+                    "content": "Chart published.",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }]
+        }
+        responses = [tool_response, final_response]
+
+        async def stream_sequence(*args, **kwargs):
+            response = responses.pop(0)
+            content = response["choices"][0]["message"].get("content") or ""
+            if content:
+                yield {"type": "text_delta", "text": content}
+            yield {"type": "done", "response": response}
+
+        async def fake_execute_tool(*args, **kwargs):
+            return ToolCallResult(
+                tool_name="get_screen_size",
+                tool_args={},
+                tool_call_id="call_chart",
+                result_text="published",
+                duration_ms=3,
+                metadata={"artifacts": [artifact]},
+            )
+
+        with patch("app.agent.ModelRouter.chat_completion_stream", stream_sequence), \
+             patch("app.agent.execute_tool", fake_execute_tool):
+            events = []
+            async for event in session.run("make a chart"):
+                events.append(event)
+
+        image_events = [e for e in events if e["type"] == "image"]
+        assert image_events
+        assert image_events[0]["data"]["url"] == artifact["url"]
+        tool_event = next(e for e in events if e["type"] == "tool_call" and e["data"].get("tool_call_id") == "call_chart")
+        assert tool_event["data"]["artifacts"][0]["url"] == artifact["url"]
+        tool_msg = next(m for m in session.messages if m.get("role") == "tool" and m.get("tool_call_id") == "call_chart")
+        assert tool_msg["ui_artifacts"][0]["url"] == artifact["url"]
+        assert all("ui_artifacts" not in msg for msg in session._messages_for_llm())
+
     def test_trim_drops_orphan_tool_messages(self, session):
         session.messages.extend([
             {"role": "tool", "tool_call_id": "orphan", "name": "x", "content": "bad"},
@@ -924,7 +1180,7 @@ class TestAgentSession:
         agents_root = tmp_path / "AGENTS"
         monkeypatch.setattr(AgentManager, "AGENTS_DIR", agents_root)
         monkeypatch.setattr(HeartbeatEngine, "_store_auto_memory_items", classmethod(lambda cls, **kwargs: 0))
-        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls: False))
+        monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls, **kwargs: False))
 
         assistant_only = [
             {"role": "user", "content": "archived user request", "context_epoch": 0},

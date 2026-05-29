@@ -99,6 +99,9 @@ try {
         --collect-submodules app `
         --collect-submodules tiktoken_ext `
         --hidden-import numpy._core._exceptions `
+        --hidden-import openpyxl `
+        --hidden-import xlsxwriter `
+        --hidden-import pptx `
         --collect-all sqlite_vec `
         --collect-data litellm `
         --exclude-module pandas.tests `

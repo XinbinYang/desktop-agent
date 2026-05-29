@@ -13,6 +13,7 @@ import importlib.util
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -50,6 +51,11 @@ class MemoryItem:
     updated_at: float
     last_verified_at: float
     metadata: dict[str, Any]
+    dedupe_key: str = ""
+    canonical_key: str = ""
+    superseded_by: str = ""
+    retrieval_count: int = 0
+    last_retrieved_at: Optional[float] = None
     score: float = 0.0
     deleted_at: Optional[float] = None
 
@@ -69,6 +75,11 @@ class MemoryItem:
             "updated_at": self.updated_at,
             "last_verified_at": self.last_verified_at,
             "metadata": self.metadata,
+            "dedupe_key": self.dedupe_key,
+            "canonical_key": self.canonical_key,
+            "superseded_by": self.superseded_by,
+            "retrieval_count": self.retrieval_count,
+            "last_retrieved_at": self.last_retrieved_at,
             "score": round(self.score, 4),
             "deleted_at": self.deleted_at,
         }
@@ -98,6 +109,10 @@ def _content_hash(text: str) -> str:
 def _make_id(source_ref: str, content: str) -> str:
     key = f"{source_ref}\n{_content_hash(content)}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
+def _make_dedupe_id(dedupe_key: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"memory-dedupe:{dedupe_key}"))
 
 
 def _normalize_text(text: str) -> str:
@@ -188,13 +203,26 @@ class MemoryOS:
                     last_verified_at REAL NOT NULL,
                     metadata TEXT NOT NULL DEFAULT '{}',
                     content_hash TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL DEFAULT '',
+                    canonical_key TEXT NOT NULL DEFAULT '',
+                    superseded_by TEXT NOT NULL DEFAULT '',
+                    retrieval_count INTEGER NOT NULL DEFAULT 0,
+                    last_retrieved_at REAL,
                     deleted_at REAL
                 )
             """)
+            self._ensure_column(conn, "memory_items", "dedupe_key", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "memory_items", "canonical_key", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "memory_items", "superseded_by", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "memory_items", "retrieval_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "memory_items", "last_retrieved_at", "REAL")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_type ON memory_items(memory_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_tier ON memory_items(tier)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_source ON memory_items(source)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_hash ON memory_items(content_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_dedupe ON memory_items(dedupe_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_canonical ON memory_items(canonical_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_superseded ON memory_items(superseded_by)")
             conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
                     item_id UNINDEXED,
@@ -230,6 +258,12 @@ class MemoryOS:
         finally:
             conn.close()
         self._init_vector_table()
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _init_vector_table(self) -> None:
         if not _sqlite_vec_available():
@@ -272,8 +306,29 @@ class MemoryOS:
             pending = conn.execute(
                 "SELECT COUNT(*) AS c FROM memory_candidates WHERE status = 'pending'"
             ).fetchone()["c"]
+            duplicate_source_refs = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT source_ref, COUNT(*) AS count
+                    FROM memory_items
+                    WHERE deleted_at IS NULL
+                    GROUP BY source_ref
+                    HAVING COUNT(*) > 1
+                    ORDER BY count DESC, source_ref
+                    LIMIT 20
+                    """
+                )
+            ]
         finally:
             conn.close()
+        diagnostics: dict[str, Any] = {}
+        try:
+            from app.agents.heartbeat import HeartbeatEngine
+            diagnostics = HeartbeatEngine.memory_status_diagnostics()
+        except Exception:
+            diagnostics = {}
+        forgotten_size_mb = diagnostics.get("forgotten_log_size_mb", 0)
         return {
             "status": "ok",
             "db_path": str(self.db_path),
@@ -285,6 +340,13 @@ class MemoryOS:
             "vector_available": _sqlite_vec_available() and not self._vector_error,
             "vector_error": self._vector_error,
             "embedding_model": get_model_name(),
+            "last_heartbeat_at": diagnostics.get("last_heartbeat_at", ""),
+            "last_dream_at": diagnostics.get("last_dream_at", ""),
+            "maintenance_lock_active": bool(diagnostics.get("maintenance_lock_active", False)),
+            "duplicate_source_refs": duplicate_source_refs,
+            "repair_recommended": bool(duplicate_source_refs or forgotten_size_mb >= 5),
+            "pending_diary_kb": diagnostics.get("pending_diary_kb", 0),
+            "forgotten_log_size_mb": forgotten_size_mb,
         }
 
     def list_items(
@@ -358,10 +420,60 @@ class MemoryOS:
             base = scores.get(item.id, 0.45 if query else 0.2)
             age_days = max(0.0, (now - item.updated_at) / 86400.0)
             recency = max(0.0, 0.08 * (1.0 - min(age_days, 30.0) / 30.0))
-            item.score = base + recency + (item.confidence * 0.08) + TIER_BOOST.get(item.tier, 0.0)
+            raw_score = base + recency + (item.confidence * 0.08)
+            superseded_penalty = -0.12 if item.superseded_by else 0.0
+            item.score = (
+                raw_score * self._access_decay_scale(item, now)
+                + TIER_BOOST.get(item.tier, 0.0)
+                + superseded_penalty
+            )
             items.append(item)
         items.sort(key=lambda x: (x.score, x.updated_at), reverse=True)
-        return [i.to_dict() for i in items[:limit]]
+        selected = items[:limit]
+        if query and selected:
+            self._record_retrievals([item.id for item in selected])
+        return [i.to_dict() for i in selected]
+
+    @staticmethod
+    def _access_decay_scale(item: MemoryItem, now: float) -> float:
+        last_touch = item.last_retrieved_at or item.updated_at
+        age_days = max(0.0, (now - last_touch) / 86400.0)
+        if age_days < 0.05:
+            scale = 1.35
+        elif age_days < 1:
+            scale = 1.2
+        elif age_days < 7:
+            scale = 1.0 - (age_days / 7.0) * 0.25
+        elif age_days < 30:
+            scale = 0.75 - ((age_days - 7.0) / 23.0) * 0.25
+        elif age_days < 180:
+            scale = 0.5 - ((age_days - 30.0) / 150.0) * 0.15
+        else:
+            scale = 0.3
+        reinforcement = min(max(item.retrieval_count, 0), 20) * 0.005
+        return max(0.3, min(1.5, scale + reinforcement))
+
+    def _record_retrievals(self, item_ids: list[str]) -> None:
+        ids = [item_id for item_id in dict.fromkeys(item_ids) if item_id]
+        if not ids:
+            return
+        now = _now()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"""
+                    UPDATE memory_items
+                    SET retrieval_count = retrieval_count + 1,
+                        last_retrieved_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [now, *ids],
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def upsert_item(
         self,
@@ -377,6 +489,9 @@ class MemoryOS:
         created_by: str = "indexer",
         metadata: Optional[dict[str, Any]] = None,
         item_id: str = "",
+        dedupe_key: str = "",
+        canonical_key: str = "",
+        superseded_by: str = "",
     ) -> dict[str, Any]:
         content = content.strip()
         if not content:
@@ -384,19 +499,41 @@ class MemoryOS:
         memory_type = _type_or_default(memory_type)
         tier = _tier_or_default(tier)
         confidence = max(0.0, min(float(confidence), 1.0))
-        item_id = item_id or _make_id(source_ref, content)
+        dedupe_key = re.sub(r"\s+", " ", str(dedupe_key or "").strip())
+        metadata = metadata or {}
+        canonical_key = re.sub(
+            r"\s+",
+            " ",
+            str(canonical_key or metadata.get("canonical_key") or "").strip().lower(),
+        )[:200]
+        superseded_by = str(superseded_by or metadata.get("superseded_by") or "").strip()
+        if canonical_key:
+            metadata = {**metadata, "canonical_key": canonical_key}
+        if superseded_by:
+            metadata = {**metadata, "superseded_by": superseded_by}
+        item_id = item_id or (_make_dedupe_id(dedupe_key) if dedupe_key else _make_id(source_ref, content))
         content_hash = _content_hash(content)
         now = _now()
-        metadata = metadata or {}
         summary = summary.strip() or _summary_for(content)
 
         with self._write_lock:
             conn = self._connect()
             try:
-                existing = conn.execute(
-                    "SELECT * FROM memory_items WHERE id = ? OR (content_hash = ? AND deleted_at IS NULL)",
-                    (item_id, content_hash),
-                ).fetchone()
+                if dedupe_key:
+                    existing = conn.execute(
+                        """
+                        SELECT * FROM memory_items
+                        WHERE id = ? OR dedupe_key = ? OR (content_hash = ? AND deleted_at IS NULL)
+                        ORDER BY deleted_at IS NULL DESC, updated_at DESC
+                        LIMIT 1
+                        """,
+                        (item_id, dedupe_key, content_hash),
+                    ).fetchone()
+                else:
+                    existing = conn.execute(
+                        "SELECT * FROM memory_items WHERE id = ? OR (content_hash = ? AND deleted_at IS NULL)",
+                        (item_id, content_hash),
+                    ).fetchone()
                 if existing:
                     item_id = existing["id"]
                     before = self._row_to_item(existing).to_dict()
@@ -406,15 +543,25 @@ class MemoryOS:
                         UPDATE memory_items
                         SET memory_type=?, content=?, summary=?, source=?, source_ref=?, scope=?,
                             tier=?, confidence=?, created_by=?, updated_at=?,
-                            last_verified_at=?, metadata=?, content_hash=?, deleted_at=NULL
+                            last_verified_at=?, metadata=?, content_hash=?, dedupe_key=?,
+                            canonical_key=?, superseded_by=?, deleted_at=NULL
                         WHERE id=?
                         """,
                         (
                             memory_type, content, summary, source, source_ref, scope, tier, confidence,
-                            created_by, now, now, json.dumps(metadata, ensure_ascii=False), content_hash, item_id,
+                            created_by, now, now, json.dumps(metadata, ensure_ascii=False), content_hash,
+                            dedupe_key, canonical_key, superseded_by, item_id,
                         ),
                     )
-                    after = {**before, "content": content, "summary": summary, "updated_at": now}
+                    after = {
+                        **before,
+                        "content": content,
+                        "summary": summary,
+                        "updated_at": now,
+                        "dedupe_key": dedupe_key,
+                        "canonical_key": canonical_key,
+                        "superseded_by": superseded_by,
+                    }
                     self._audit(conn, item_id, "upsert", before, after, created_by)
                 else:
                     created_at = now
@@ -423,22 +570,80 @@ class MemoryOS:
                         INSERT INTO memory_items (
                             id, memory_type, content, summary, source, source_ref, scope, tier,
                             confidence, created_by, created_at, updated_at, last_verified_at,
-                            metadata, content_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            metadata, content_hash, dedupe_key, canonical_key, superseded_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             item_id, memory_type, content, summary, source, source_ref, scope, tier,
                             confidence, created_by, created_at, now, now,
-                            json.dumps(metadata, ensure_ascii=False), content_hash,
+                            json.dumps(metadata, ensure_ascii=False), content_hash, dedupe_key,
+                            canonical_key, superseded_by,
                         ),
                     )
-                    self._audit(conn, item_id, "create", {}, {"content": content, "source_ref": source_ref}, created_by)
+                    self._audit(
+                        conn,
+                        item_id,
+                        "create",
+                        {},
+                        {
+                            "content": content,
+                            "source_ref": source_ref,
+                            "dedupe_key": dedupe_key,
+                            "canonical_key": canonical_key,
+                        },
+                        created_by,
+                    )
+                if canonical_key and not superseded_by:
+                    self._supersede_canonical_peers(conn, canonical_key, item_id, actor=created_by)
                 self._sync_fts(conn, item_id, content, summary, source_ref)
                 conn.commit()
             finally:
                 conn.close()
         self._sync_vector(item_id, f"{summary}\n{content}")
         return self.get_item(item_id) or {}
+
+    def _supersede_canonical_peers(
+        self,
+        conn: sqlite3.Connection,
+        canonical_key: str,
+        active_item_id: str,
+        *,
+        actor: str,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT * FROM memory_items
+            WHERE deleted_at IS NULL
+              AND canonical_key = ?
+              AND id != ?
+              AND superseded_by = ''
+            """,
+            (canonical_key, active_item_id),
+        ).fetchall()
+        now = _now()
+        updated = 0
+        for row in rows:
+            before = self._row_to_item(row).to_dict()
+            metadata = dict(before.get("metadata") or {})
+            metadata["superseded_by"] = active_item_id
+            metadata["superseded_at"] = now
+            conn.execute(
+                """
+                UPDATE memory_items
+                SET tier='archived', superseded_by=?, metadata=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    active_item_id,
+                    json.dumps(metadata, ensure_ascii=False),
+                    now,
+                    row["id"],
+                ),
+            )
+            after = {**before, "tier": "archived", "superseded_by": active_item_id, "metadata": metadata, "updated_at": now}
+            self._audit(conn, row["id"], "supersede", before, after, actor)
+            updated += 1
+        return updated
 
     def get_item(self, item_id: str) -> Optional[dict[str, Any]]:
         conn = self._connect()
@@ -449,7 +654,10 @@ class MemoryOS:
             conn.close()
 
     def patch_item(self, item_id: str, updates: dict[str, Any], actor: str = "user") -> Optional[dict[str, Any]]:
-        allowed = {"memory_type", "content", "summary", "source", "source_ref", "scope", "tier", "confidence", "metadata"}
+        allowed = {
+            "memory_type", "content", "summary", "source", "source_ref", "scope",
+            "tier", "confidence", "metadata", "dedupe_key", "canonical_key", "superseded_by",
+        }
         clean = {k: v for k, v in updates.items() if k in allowed}
         if not clean:
             return self.get_item(item_id)
@@ -466,6 +674,12 @@ class MemoryOS:
             clean["summary"] = str(clean["summary"]).strip()
         if "metadata" in clean:
             clean["metadata"] = json.dumps(clean["metadata"] or {}, ensure_ascii=False)
+        if "dedupe_key" in clean:
+            clean["dedupe_key"] = re.sub(r"\s+", " ", str(clean["dedupe_key"] or "").strip())
+        if "canonical_key" in clean:
+            clean["canonical_key"] = re.sub(r"\s+", " ", str(clean["canonical_key"] or "").strip().lower())[:200]
+        if "superseded_by" in clean:
+            clean["superseded_by"] = str(clean["superseded_by"] or "").strip()
         now = _now()
         clean["updated_at"] = now
         clean["last_verified_at"] = now
@@ -551,8 +765,10 @@ class MemoryOS:
             content = entry.strip()
             if not content:
                 continue
-            score = float(scores.get(entry[:40], scores.get(content, 0.85)))
-            candidate_id = _make_id(f"dream:{int(_now())}", content)
+            score = float(scores.get(content, scores.get(entry[:40], 0.85)))
+            candidate_hash = _content_hash(content)
+            dedupe_key = f"dream:{candidate_hash}"
+            candidate_id = _make_dedupe_id(dedupe_key)
             item = self.upsert_item(
                 content=content,
                 memory_type="semantic",
@@ -561,7 +777,8 @@ class MemoryOS:
                 tier=_tier_from_text(content, "hot"),
                 confidence=max(0.75, min(score, 0.98)),
                 created_by="dream",
-                metadata={"dream_score": score},
+                metadata={"dream_score": score, "candidate_hash": candidate_hash},
+                dedupe_key=dedupe_key,
             )
             conn = self._connect()
             try:
@@ -578,6 +795,298 @@ class MemoryOS:
                 conn.close()
             promoted += 1
         return {"promoted": promoted}
+
+    def repair_runtime_state(self) -> dict[str, Any]:
+        """Back up and compact known memory pollution without deleting user-authored sections."""
+        personal_dir = AgentManager._personal_dir()
+        archive_dir = personal_dir / ".archive" / "memory_repair" / time.strftime("%Y%m%dT%H%M%S")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        backed_up: list[str] = []
+        for path in (
+            personal_dir / "MEMORY.md",
+            personal_dir / "DREAMS.md",
+            personal_dir / "forgotten.log",
+            self.db_path,
+        ):
+            if not path.exists():
+                continue
+            try:
+                shutil.copy2(path, archive_dir / path.name)
+                backed_up.append(str(path))
+            except OSError:
+                continue
+
+        deleted_duplicates = self._soft_delete_duplicate_source_refs(actor="repair")
+        forgotten = self._compact_forgotten_log(personal_dir / "forgotten.log")
+        memory = self._compact_memory_current_section(personal_dir / "MEMORY.md")
+        diaries = self._compact_large_diaries_once(personal_dir, AgentManager._memory_dir())
+        rebuild = self.rebuild_from_workspace()
+        return {
+            "status": "ok",
+            "backup_dir": str(archive_dir),
+            "backed_up": backed_up,
+            "soft_deleted_duplicates": deleted_duplicates,
+            "forgotten_log": forgotten,
+            "memory_md": memory,
+            "diaries": diaries,
+            "rebuild": rebuild,
+        }
+
+    def _soft_delete_duplicate_source_refs(self, actor: str = "repair") -> int:
+        now = _now()
+        deleted = 0
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                refs = [
+                    r["source_ref"]
+                    for r in conn.execute(
+                        """
+                        SELECT source_ref
+                        FROM memory_items
+                        WHERE deleted_at IS NULL
+                        GROUP BY source_ref
+                        HAVING COUNT(*) > 1
+                        """
+                    )
+                ]
+                for source_ref in refs:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM memory_items
+                        WHERE deleted_at IS NULL AND source_ref = ?
+                        ORDER BY updated_at DESC
+                        """,
+                        (source_ref,),
+                    ).fetchall()
+                    if rows and all(row["source"] == "DREAM" for row in rows):
+                        for row in rows:
+                            before = self._row_to_item(row).to_dict()
+                            new_ref = f"{source_ref}:{row['content_hash']}"
+                            conn.execute(
+                                "UPDATE memory_items SET source_ref=?, updated_at=? WHERE id=?",
+                                (new_ref, now, row["id"]),
+                            )
+                            self._sync_fts(conn, row["id"], row["content"], row["summary"], new_ref)
+                            after = {**before, "source_ref": new_ref, "updated_at": now}
+                            self._audit(conn, row["id"], "normalize_source_ref", before, after, actor)
+                        continue
+                    for row in rows[1:]:
+                        item_id = row["id"]
+                        before = self._row_to_item(row).to_dict()
+                        conn.execute("UPDATE memory_items SET deleted_at=?, updated_at=? WHERE id=?", (now, now, item_id))
+                        conn.execute("DELETE FROM memory_items_fts WHERE item_id=?", (item_id,))
+                        self._audit(conn, item_id, "delete_duplicate", before, {"deleted_at": now}, actor)
+                        deleted += 1
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+
+    @staticmethod
+    def _compact_forgotten_log(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {"existing": 0, "kept": 0, "removed": 0}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return {"existing": 0, "kept": 0, "removed": 0}
+        groups: dict[str, dict[str, Any]] = {}
+        reason_counts: dict[str, int] = {}
+        passthrough: list[str] = []
+        pattern = re.compile(r"^\[(?P<ts>[^\]]+)\]\s+REASON:\s+(?P<reason>.*?)\s+\|\s+ENTRY:\s+(?P<entry>.*)$")
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                if line.strip():
+                    passthrough.append(line)
+                continue
+            entry = match.group("entry").strip()
+            reason = match.group("reason").strip()
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            key = _content_hash(entry)
+            if key not in groups:
+                groups[key] = {
+                    "timestamp": match.group("ts"),
+                    "reason": reason,
+                    "entry": entry,
+                    "repeat_count": 0,
+                    "last_seen": match.group("ts"),
+                }
+            groups[key]["repeat_count"] += 1
+            groups[key]["last_seen"] = match.group("ts")
+        compacted = [
+            f"# Forgotten Log compacted {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "## Reason Counts",
+        ]
+        for reason, count in sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:50]:
+            compacted.append(f"- {count}x {reason}")
+        if passthrough:
+            compacted.extend(["", "## Passthrough"])
+            compacted.extend(passthrough[:200])
+        compacted.extend(["", "## Entry Hashes"])
+        ordered = sorted(groups.values(), key=lambda data: (int(data["repeat_count"]), str(data["last_seen"])), reverse=True)
+        max_entries = 2000
+        for data in ordered[:max_entries]:
+            suffix = ""
+            if data["repeat_count"] > 1:
+                suffix = f" | repeat_count={data['repeat_count']} | last_seen={data['last_seen']}"
+            compacted.append(f"[{data['timestamp']}] REASON: {data['reason']} | ENTRY: {data['entry']}{suffix}")
+        omitted = max(0, len(ordered) - max_entries)
+        if omitted:
+            compacted.append(f"... omitted {omitted} low-signal forgotten entries after compaction")
+        try:
+            path.write_text("\n".join(compacted).rstrip() + ("\n" if compacted else ""), encoding="utf-8")
+        except OSError:
+            pass
+        return {
+            "existing": len(lines),
+            "kept": len(compacted),
+            "removed": max(0, len(lines) - len(compacted)),
+            "unique_hashes": len(groups),
+            "omitted": omitted,
+        }
+
+    @staticmethod
+    def _compact_memory_current_section(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {"existing": 0, "kept": 0, "removed": 0}
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return {"existing": 0, "kept": 0, "removed": 0}
+        header = "## 当前记忆"
+        if header not in text:
+            return {"existing": 0, "kept": 0, "removed": 0}
+        before, _, after = text.partition(header)
+        lines = after.splitlines()
+        kept: list[str] = []
+        seen: set[str] = set()
+        existing = 0
+        entry_re = re.compile(r"^\s*-\s+\[(HOT|WARM|COLD|archived|ARCHIVED)\]\s+(?:\[\d{4}-\d{2}-\d{2}\]\s+)?(?P<body>.*)$")
+        for line in lines:
+            match = entry_re.match(line)
+            if not match:
+                kept.append(line)
+                continue
+            existing += 1
+            body = match.group("body").strip()
+            key = _normalize_text(body)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(line)
+        new_text = before.rstrip() + "\n\n" + header + "\n" + "\n".join(kept).rstrip() + "\n"
+        try:
+            path.write_text(new_text, encoding="utf-8")
+        except OSError:
+            pass
+        return {"existing": existing, "kept": len(seen), "removed": max(0, existing - len(seen))}
+
+    @classmethod
+    def _compact_large_diaries_once(cls, personal_dir: Path, memory_dir: Path) -> dict[str, Any]:
+        marker = personal_dir / ".memory-maintenance-v2"
+        if marker.exists():
+            return {"skipped": True, "reason": "already_migrated", "files": 0, "bytes_before": 0, "bytes_after": 0}
+        files = 0
+        before_total = 0
+        after_total = 0
+        if memory_dir.exists():
+            for diary in sorted(memory_dir.glob("*.md")):
+                try:
+                    size = diary.stat().st_size
+                except OSError:
+                    continue
+                if size < 32 * 1024:
+                    continue
+                compacted = cls._compact_diary_file(diary)
+                if compacted.get("compacted"):
+                    files += 1
+                    before_total += int(compacted.get("bytes_before") or 0)
+                    after_total += int(compacted.get("bytes_after") or 0)
+        try:
+            marker.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "migrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "files": files,
+                        "bytes_before": before_total,
+                        "bytes_after": after_total,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return {
+            "skipped": False,
+            "files": files,
+            "bytes_before": before_total,
+            "bytes_after": after_total,
+            "removed": max(0, before_total - after_total),
+        }
+
+    @classmethod
+    def _compact_diary_file(cls, path: Path) -> dict[str, Any]:
+        try:
+            original = path.read_text(encoding="utf-8")
+            before = path.stat().st_size
+        except (OSError, UnicodeDecodeError):
+            return {"compacted": False, "bytes_before": 0, "bytes_after": 0}
+        important_tokens = (
+            "请记住", "记住", "偏好", "喜欢", "不喜欢", "不要", "以后", "决定", "确认",
+            "原则", "纠正", "不对", "错误", "TODO", "Pending TODOs", "Session:",
+            "remember", "prefer", "decision", "correction", "wrong",
+        )
+        kept: list[str] = []
+        seen: set[str] = set()
+        for line in original.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.startswith("<!-- memory-ingestion:"):
+                continue
+            if clean.startswith("# "):
+                continue
+            if clean.startswith("## "):
+                continue
+            if not any(token.lower() in clean.lower() for token in important_tokens):
+                continue
+            clean = re.sub(r"\s+", " ", clean)
+            key = _normalize_text(clean)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(clean[:260])
+            if len(kept) >= 160:
+                break
+
+        date_title = path.stem
+        digest_lines = [
+            f"# {date_title}",
+            "",
+            "<!-- memory-maintenance-v2:compacted:start -->",
+            f"## Daily Digest - {time.strftime('%Y-%m-%d %H:%M')}",
+            "",
+            "This diary was compacted from repeated full-session heartbeat summaries.",
+            "",
+        ]
+        if kept:
+            digest_lines.extend(f"- {line.lstrip('- ').strip()}" for line in kept)
+        else:
+            digest_lines.append("- No durable diary details survived compaction.")
+        digest_lines.extend(["", "<!-- memory-maintenance-v2:compacted:end -->", ""])
+        new_text = "\n".join(digest_lines)
+        try:
+            path.write_text(new_text, encoding="utf-8")
+            after = path.stat().st_size
+        except OSError:
+            return {"compacted": False, "bytes_before": before, "bytes_after": before}
+        return {"compacted": True, "bytes_before": before, "bytes_after": after}
 
     def _filters(
         self,
@@ -722,6 +1231,11 @@ class MemoryOS:
             updated_at=float(row["updated_at"]),
             last_verified_at=float(row["last_verified_at"]),
             metadata=_safe_json_loads(row["metadata"]),
+            dedupe_key=row["dedupe_key"] if "dedupe_key" in row.keys() else "",
+            canonical_key=row["canonical_key"] if "canonical_key" in row.keys() else "",
+            superseded_by=row["superseded_by"] if "superseded_by" in row.keys() else "",
+            retrieval_count=int(row["retrieval_count"]) if "retrieval_count" in row.keys() else 0,
+            last_retrieved_at=float(row["last_retrieved_at"]) if "last_retrieved_at" in row.keys() and row["last_retrieved_at"] is not None else None,
             deleted_at=float(row["deleted_at"]) if row["deleted_at"] is not None else None,
         )
 

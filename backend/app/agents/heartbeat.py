@@ -12,6 +12,7 @@ Reference: OpenClaw Heartbeat + Claude Code Auto Dream trigger conditions.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.agents.memory_ingestion import MemoryIngestionEngine
 from app.agents.manager import AgentManager
 from app.agents.learnings import LearningsEngine
 
@@ -48,25 +50,66 @@ _SENSITIVE_MEMORY_PATTERNS = [
 
 _MAX_AUTO_MEMORY_ITEMS = 8
 _MAX_MEMORY_CONTENT_CHARS = 360
+_SESSION_SIGNATURE_HISTORY_LIMIT = 50
+_DREAM_CHECKPOINT_SIZE_THRESHOLD = 50 * 1024
+_locks_by_loop: dict[int, asyncio.Lock] = {}
 
 
 class HeartbeatEngine:
     """Periodic memory maintenance triggered on session end."""
 
-    DREAM_DIARY_SIZE_THRESHOLD = 5 * 1024  # 5KB
+    DREAM_DIARY_SIZE_THRESHOLD = _DREAM_CHECKPOINT_SIZE_THRESHOLD
     DREAM_SESSION_COUNT_THRESHOLD = 5
 
     @classmethod
-    async def on_session_end(cls, messages: List[Dict[str, Any]], session_id: str) -> Dict[str, Any]:
+    def _maintenance_lock(cls) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        key = id(loop)
+        lock = _locks_by_loop.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _locks_by_loop[key] = lock
+        return lock
+
+    @classmethod
+    async def on_session_end(
+        cls,
+        messages: List[Dict[str, Any]],
+        session_id: str,
+        *,
+        agent_type: str = "personal",
+    ) -> Dict[str, Any]:
         """Execute heartbeat tasks after a session ends.
 
         Returns a summary dict for logging / event emission.
         """
+        if agent_type != "personal" or session_id.startswith("session_coding"):
+            return {
+                "diary_written": False,
+                "handoff_written": False,
+                "skipped_duplicate": False,
+                "skipped_non_personal": True,
+                "memory_items_stored": 0,
+                "learnings_recorded": 0,
+                "feature_requests_recorded": 0,
+                "todos_found": 0,
+                "mood_updated": False,
+                "dream_triggered": False,
+                "dream_result": None,
+                "dream_error": "",
+                "memory_error": "",
+            }
+        async with cls._maintenance_lock():
+            return await cls._on_personal_session_end(messages, session_id)
+
+    @classmethod
+    async def _on_personal_session_end(cls, messages: List[Dict[str, Any]], session_id: str) -> Dict[str, Any]:
         messages = cls._normalize_transcript_messages(messages)
         result: Dict[str, Any] = {
             "diary_written": False,
             "handoff_written": False,
             "skipped_duplicate": False,
+            "skipped_non_personal": False,
             "memory_items_stored": 0,
             "learnings_recorded": 0,
             "feature_requests_recorded": 0,
@@ -82,30 +125,34 @@ class HeartbeatEngine:
         signature = cls._session_signature(messages)
         if not signature:
             return result
-        if cls._is_duplicate_session_signature(signature):
+        state = cls._read_heartbeat_state()
+        if cls._is_duplicate_session_signature(signature, state):
             result["skipped_duplicate"] = True
             return result
+        next_session_count = int(state.get("sessions_since_last_dream") or 0) + 1
 
-        # 1. Extract key info from conversation and write diary
-        diary_content = cls._extract_diary_content(messages)
-        if diary_content:
-            path = AgentManager.write_diary_entry(diary_content)
-            if path:
-                result["diary_written"] = True
-                logger.info("Heartbeat: diary written to %s", path)
-
-        # 2. Write session handoff and auto-promote obvious memory candidates.
+        # 1-2. Process only the new turn delta, then write diary/handoff/memory records.
+        delta_messages: List[Dict[str, Any]] = []
+        diary_content = ""
+        handoff_summary = ""
         try:
-            handoff_summary = cls._build_session_handoff(messages, session_id)
-            if handoff_summary:
-                result["handoff_written"] = cls._write_session_handoff(handoff_summary)
-            result["memory_items_stored"] = cls._store_auto_memory_items(
-                messages=messages,
-                session_id=session_id,
-                diary_content=diary_content,
-                handoff_summary=handoff_summary,
+            ingestion = await MemoryIngestionEngine.ingest_session_delta(
+                messages,
+                session_id,
+                state=state,
             )
-            learning_counts = cls._record_learning_signals(messages)
+            result["diary_written"] = bool(ingestion.get("diary_written"))
+            result["handoff_written"] = bool(ingestion.get("handoff_written"))
+            result["memory_items_stored"] = int(ingestion.get("memory_items_stored") or 0)
+            diary_content = str(ingestion.get("diary_content") or "")
+            handoff_summary = str(ingestion.get("handoff_summary") or "")
+            raw_delta = ingestion.get("delta_messages")
+            if isinstance(raw_delta, list):
+                delta_messages = [m for m in raw_delta if isinstance(m, dict)]
+            state_patch = ingestion.get("state_patch")
+            if isinstance(state_patch, dict) and state_patch:
+                cls._merge_heartbeat_state(state_patch)
+            learning_counts = cls._record_learning_signals(delta_messages)
             result["learnings_recorded"] = learning_counts["learnings"]
             result["feature_requests_recorded"] = learning_counts["feature_requests"]
         except Exception as e:
@@ -113,20 +160,21 @@ class HeartbeatEngine:
             result["memory_error"] = str(e)
 
         # 3. Scan for pending todos
-        todos = cls._scan_todos(messages)
+        todos = cls._scan_todos(delta_messages)
         if todos:
             result["todos_found"] = len(todos)
             todo_entry = "## Pending TODOs\n\n" + "\n".join(f"- [ ] {t}" for t in todos)
-            AgentManager.write_diary_entry(todo_entry)
+            marker = MemoryIngestionEngine._stable_marker_id(session_id, "todos", *(todos[:5]))
+            AgentManager.upsert_diary_entry(todo_entry, marker_id=f"todos:{marker}", heading="Pending TODOs")
 
         # 4. Update mood
-        mood_data = cls._analyze_mood(messages)
+        mood_data = cls._analyze_mood(delta_messages)
         if mood_data:
             AgentManager.update_mood(mood_data)
             result["mood_updated"] = True
 
         # 5. Decide whether to trigger DREAM
-        should_dream = cls._should_trigger_dream()
+        should_dream = cls._should_trigger_dream(state=state, session_count_override=next_session_count)
         if should_dream:
             try:
                 from app.agents.dream import DreamEngine
@@ -139,9 +187,23 @@ class HeartbeatEngine:
 
         # 6. Clean expired memories (entries older than 30 days with no recent references)
         cls._clean_expired_memories()
-        cls._mark_session_signature(signature)
+        cls._mark_session_signature(
+            signature,
+            sessions_since_last_dream=0 if result["dream_triggered"] else next_session_count,
+        )
 
         return result
+
+    @classmethod
+    def _merge_heartbeat_state(cls, patch: Dict[str, Any]) -> None:
+        state = cls._read_heartbeat_state()
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(state.get(key), dict):
+                state[key] = {**state[key], **value}
+            else:
+                state[key] = value
+        state["updated_at"] = datetime.now().isoformat()
+        cls._write_heartbeat_state(state)
 
     @classmethod
     def _message_context_epoch(cls, msg: Dict[str, Any]) -> int:
@@ -195,34 +257,120 @@ class HeartbeatEngine:
         return AgentManager._memory_dir() / "heartbeat_state.json"
 
     @classmethod
-    def _is_duplicate_session_signature(cls, signature: str) -> bool:
+    def _read_heartbeat_state(cls) -> Dict[str, Any]:
         path = cls._heartbeat_state_path()
         try:
             if not path.exists():
-                return False
+                return {}
             data = json.loads(path.read_text(encoding="utf-8"))
-            return data.get("last_session_signature") == signature
+            return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
-            return False
+            return {}
 
     @classmethod
-    def _mark_session_signature(cls, signature: str) -> None:
+    def _write_heartbeat_state(cls, state: Dict[str, Any]) -> None:
         path = cls._heartbeat_state_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "last_session_signature": signature,
-                        "updated_at": datetime.now().isoformat(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as e:
             logger.warning("Heartbeat: failed to write heartbeat state: %s", e)
+
+    @classmethod
+    def _is_duplicate_session_signature(cls, signature: str, state: Optional[Dict[str, Any]] = None) -> bool:
+        state = state if state is not None else cls._read_heartbeat_state()
+        signatures = state.get("last_session_signatures")
+        if isinstance(signatures, list) and signature in signatures:
+            return True
+        return state.get("last_session_signature") == signature
+
+    @classmethod
+    def _mark_session_signature(cls, signature: str, *, sessions_since_last_dream: int) -> None:
+        state = cls._read_heartbeat_state()
+        signatures = state.get("last_session_signatures")
+        if not isinstance(signatures, list):
+            signatures = []
+        signatures = [str(s) for s in signatures if s]
+        if signature in signatures:
+            signatures.remove(signature)
+        signatures.append(signature)
+        state["last_session_signatures"] = signatures[-_SESSION_SIGNATURE_HISTORY_LIMIT:]
+        state["last_session_signature"] = signature
+        state["last_heartbeat_at"] = datetime.now().isoformat()
+        state["updated_at"] = state["last_heartbeat_at"]
+        state["sessions_since_last_dream"] = max(0, int(sessions_since_last_dream))
+        cls._write_heartbeat_state(state)
+
+    @classmethod
+    def dream_pending_stats(cls, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        state = state if state is not None else cls._read_heartbeat_state()
+        checkpoints = state.get("dream_checkpoints")
+        if not isinstance(checkpoints, dict):
+            checkpoints = {}
+        mem_dir = AgentManager._memory_dir()
+        pending_bytes = 0
+        pending_files = 0
+        if mem_dir.exists():
+            for diary in mem_dir.glob("*.md"):
+                try:
+                    stat = diary.stat()
+                except OSError:
+                    continue
+                checkpoint = checkpoints.get(diary.name) if isinstance(checkpoints.get(diary.name), dict) else {}
+                processed_size = int(checkpoint.get("size") or 0)
+                delta = stat.st_size - processed_size
+                if delta > 0:
+                    pending_bytes += delta
+                    pending_files += 1
+        forgotten = AgentManager._personal_dir() / "forgotten.log"
+        forgotten_size = 0
+        try:
+            forgotten_size = forgotten.stat().st_size if forgotten.exists() else 0
+        except OSError:
+            forgotten_size = 0
+        return {
+            "pending_diary_bytes": pending_bytes,
+            "pending_diary_kb": round(pending_bytes / 1024, 1),
+            "pending_diary_files": pending_files,
+            "forgotten_log_size_mb": round(forgotten_size / 1024 / 1024, 2),
+        }
+
+    @classmethod
+    def memory_status_diagnostics(cls) -> Dict[str, Any]:
+        state = cls._read_heartbeat_state()
+        try:
+            lock_active = cls._maintenance_lock().locked()
+        except RuntimeError:
+            lock_active = False
+        return {
+            **cls.dream_pending_stats(state),
+            "last_heartbeat_at": state.get("last_heartbeat_at", ""),
+            "last_dream_at": state.get("last_dream_at", ""),
+            "maintenance_lock_active": lock_active,
+        }
+
+    @classmethod
+    def mark_dream_complete(cls) -> None:
+        state = cls._read_heartbeat_state()
+        checkpoints: Dict[str, Any] = {}
+        mem_dir = AgentManager._memory_dir()
+        if mem_dir.exists():
+            for diary in mem_dir.glob("*.md"):
+                try:
+                    stat = diary.stat()
+                    checkpoints[diary.name] = {
+                        "size": int(stat.st_size),
+                        "mtime": float(stat.st_mtime),
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                except OSError:
+                    continue
+        now = datetime.now().isoformat()
+        state["dream_checkpoints"] = checkpoints
+        state["last_dream_at"] = now
+        state["sessions_since_last_dream"] = 0
+        state["updated_at"] = now
+        cls._write_heartbeat_state(state)
 
     @classmethod
     def _message_text(cls, msg: Dict[str, Any]) -> str:
@@ -311,6 +459,8 @@ class HeartbeatEngine:
 
         memory_os = get_memory_os()
         today = datetime.now().strftime("%Y-%m-%d")
+        context_epoch = max((cls._message_context_epoch(msg) for msg in messages), default=0)
+        source_prefix = f"session_end:{today}:{session_id}:epoch:{context_epoch}"
         stored = 0
         candidates: List[Dict[str, Any]] = []
 
@@ -319,11 +469,12 @@ class HeartbeatEngine:
                 "content": handoff_summary,
                 "memory_type": "working",
                 "source": "heartbeat",
-                "source_ref": f"session_end:{today}:{session_id}:handoff",
+                "source_ref": f"{source_prefix}:handoff",
                 "summary": "Session handoff for continuity",
                 "tier": "hot",
                 "confidence": 0.74,
                 "metadata": {"auto_extracted": True, "kind": "handoff", "session_id": session_id},
+                "dedupe_key": f"heartbeat:{session_id}:{context_epoch}:handoff",
             })
 
         if diary_content:
@@ -331,11 +482,12 @@ class HeartbeatEngine:
                 "content": cls._truncate(diary_content, 900),
                 "memory_type": "episodic",
                 "source": "heartbeat",
-                "source_ref": f"session_end:{today}:{session_id}:summary",
+                "source_ref": f"{source_prefix}:summary",
                 "summary": "Automatic session summary",
                 "tier": "warm",
                 "confidence": 0.68,
                 "metadata": {"auto_extracted": True, "kind": "session_summary", "session_id": session_id},
+                "dedupe_key": f"heartbeat:{session_id}:{context_epoch}:summary",
             })
 
         for idx, msg in enumerate(messages):
@@ -348,11 +500,12 @@ class HeartbeatEngine:
                 "content": cls._clean_memory_content(text),
                 "memory_type": "semantic",
                 "source": "heartbeat",
-                "source_ref": f"session_end:{today}:{session_id}:user:{idx}",
+                "source_ref": f"{source_prefix}:user:{idx}",
                 "summary": "User-stated durable preference or decision",
                 "tier": "hot" if cls._is_explicit_remember(text) else "warm",
                 "confidence": 0.84 if cls._is_explicit_remember(text) else 0.76,
                 "metadata": {"auto_extracted": True, "kind": "user_signal", "session_id": session_id},
+                "dedupe_key": f"heartbeat:{session_id}:{context_epoch}:user:{idx}",
             })
 
         for candidate in candidates[:_MAX_AUTO_MEMORY_ITEMS]:
@@ -469,41 +622,21 @@ class HeartbeatEngine:
         return {"current": mood}
 
     @classmethod
-    def _should_trigger_dream(cls) -> bool:
-        """Check if DREAM should be triggered based on diary size and session count."""
-        mem_dir = AgentManager._memory_dir()
-        if not mem_dir.exists():
+    def _should_trigger_dream(
+        cls,
+        state: Optional[Dict[str, Any]] = None,
+        session_count_override: Optional[int] = None,
+    ) -> bool:
+        """Check whether incremental unprocessed diary content should trigger DREAM."""
+        stats = cls.dream_pending_stats(state)
+        if stats["pending_diary_bytes"] <= 0:
             return False
-
-        # Check diary size
-        dreams_path = AgentManager._personal_dir() / "DREAMS.md"
-        last_dream_mtime = 0.0
-        if dreams_path.exists():
-            try:
-                last_dream_mtime = dreams_path.stat().st_mtime
-            except OSError:
-                last_dream_mtime = 0.0
-
-        total_size = 0
-        diary_count = 0
-        for f in mem_dir.glob("*.md"):
-            try:
-                if f.stat().st_mtime <= last_dream_mtime:
-                    continue
-                total_size += f.stat().st_size
-                diary_count += 1
-            except OSError:
-                pass
-
-        if total_size > cls.DREAM_DIARY_SIZE_THRESHOLD:
+        if stats["pending_diary_bytes"] >= cls.DREAM_DIARY_SIZE_THRESHOLD:
             return True
-
-        # Check session count since last consolidation
-        # (Simplified: if diary_count >= threshold, trigger)
-        if diary_count >= cls.DREAM_SESSION_COUNT_THRESHOLD:
-            return True
-
-        return False
+        if session_count_override is None:
+            state = state if state is not None else cls._read_heartbeat_state()
+            session_count_override = int(state.get("sessions_since_last_dream") or 0)
+        return session_count_override >= cls.DREAM_SESSION_COUNT_THRESHOLD
 
     @classmethod
     def _clean_expired_memories(cls) -> None:

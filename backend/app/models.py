@@ -26,6 +26,8 @@ DEFAULT_REASONING_EFFORTS = {
 }
 KIMI_STREAM_FIRST_EVENT_TIMEOUT_SECONDS = 8
 KIMI_STREAM_IDLE_TIMEOUT_SECONDS = 45
+PROVIDER_STREAM_FIRST_EVENT_TIMEOUT_SECONDS = 20
+PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS = 60
 DEEPSEEK_IMAGE_OMITTED_MARKER = "[image omitted: DeepSeek does not accept image content]"
 
 
@@ -1203,13 +1205,32 @@ class ModelRouter:
                 content_text = ""
                 tool_calls_by_idx: dict[int, dict] = {}
 
-                async for line in resp.aiter_lines():
+                line_iter = resp.aiter_lines().__aiter__()
+                seen_stream_event = False
+                while True:
+                    timeout_seconds = (
+                        PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS
+                        if seen_stream_event
+                        else PROVIDER_STREAM_FIRST_EVENT_TIMEOUT_SECONDS
+                    )
+                    try:
+                        line = await asyncio.wait_for(line_iter.__anext__(), timeout=timeout_seconds)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as exc:
+                        phase = "next event" if seen_stream_event else "first event"
+                        raise httpx.ReadTimeout(
+                            f"DeepSeek stream stalled waiting for {phase} after {timeout_seconds}s",
+                            request=resp.request,
+                        ) from exc
+
                     if not line:
                         continue
                     if line == "data: [DONE]":
                         break
                     if not line.startswith("data: "):
                         continue
+                    seen_stream_event = True
                     data_str = line[len("data: "):]
                     try:
                         chunk = json.loads(data_str)
@@ -1403,7 +1424,25 @@ class ModelRouter:
             else:
                 raise
 
-        async for chunk in stream:
+        stream_iter = stream.__aiter__()
+        seen_stream_chunk = False
+        while True:
+            timeout_seconds = (
+                PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS
+                if seen_stream_chunk
+                else PROVIDER_STREAM_FIRST_EVENT_TIMEOUT_SECONDS
+            )
+            try:
+                chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=timeout_seconds)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as exc:
+                phase = "next chunk" if seen_stream_chunk else "first chunk"
+                raise TimeoutError(
+                    f"LiteLLM stream stalled waiting for {phase} after {timeout_seconds}s"
+                ) from exc
+            seen_stream_chunk = True
+
             choices = chunk.choices if hasattr(chunk, "choices") else []
             if not choices:
                 continue

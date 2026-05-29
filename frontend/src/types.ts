@@ -75,6 +75,7 @@ export interface AppSettings {
   sandbox_mode: string;
   thinking_intensity_default?: ThinkingIntensity;
   collaboration_mode?: "serial" | "parallel" | "hybrid";
+  auto_delegate_coding?: "off" | "suggest" | "always_for_code" | "safe_only" | string;
   max_parallel_agents?: number;
   review_gate_enabled?: boolean;
 }
@@ -122,7 +123,48 @@ export interface SettingsResponse {
   web_search?: WebSearchSettings;
 }
 
-export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video';
+export type ArtifactType = 'web' | 'image' | 'data' | 'code' | 'terminal' | 'video' | 'office' | 'office_package';
+
+export interface ImageAttachment {
+  id?: string;
+  base64?: string;
+  url?: string;
+  title?: string;
+  caption?: string;
+  mimeType?: string;
+  mime_type?: string;
+  path?: string;
+  width?: number;
+  height?: number;
+  source?: string;
+  toolCallId?: string;
+  tool_call_id?: string;
+}
+
+export interface ArtifactPayload extends ImageAttachment {
+  id: string;
+  type: ArtifactType | string;
+  title: string;
+  content?: string;
+  timestamp?: number;
+  sourceTool?: string;
+  source_tool?: string;
+  size?: number;
+  kind?: string;
+  files?: ArtifactPayload[];
+  previews?: ArtifactPayload[];
+  qa_summary?: Record<string, any>;
+  engine?: string;
+  office_manifest_id?: string;
+  manifest_path?: string;
+  manifest_url?: string;
+  viewer_manifest_url?: string;
+  sha256?: string;
+  render_issues?: string[];
+  available_actions?: string[];
+  workbook?: Record<string, any>;
+  presentation?: Record<string, any>;
+}
 
 export interface ArtifactItem {
   id: string;
@@ -131,8 +173,26 @@ export interface ArtifactItem {
   content?: string;
   url?: string;
   base64?: string;
+  mimeType?: string;
+  path?: string;
+  caption?: string;
   timestamp: number;
   sourceTool: string;
+  size?: number;
+  kind?: string;
+  files?: ArtifactPayload[];
+  previews?: ArtifactPayload[];
+  qaSummary?: Record<string, any>;
+  engine?: string;
+  officeManifestId?: string;
+  manifestPath?: string;
+  manifestUrl?: string;
+  viewerManifestUrl?: string;
+  sha256?: string;
+  renderIssues?: string[];
+  availableActions?: string[];
+  workbook?: Record<string, any>;
+  presentation?: Record<string, any>;
 }
 
 export interface AutomationBBox {
@@ -256,6 +316,7 @@ export interface ToolCall {
   toolCallId?: string;
   durationMs?: number;
   workerEvents?: WorkerEvent[];
+  artifacts?: ArtifactPayload[];
 }
 
 export interface ToolSummary {
@@ -284,12 +345,24 @@ export interface RunEvent {
     | 'verification_start'
     | 'verification_result'
     | 'review_finding'
+    | 'error'
+    | 'tool_call'
+    | 'worker_tool_call'
+    | 'file_edit'
     | 'collaboration_run_created'
     | 'collaboration_task_update'
+    | 'collaboration_plan_auto_approved'
+    | 'collaboration_phase_update'
+    | 'collab_plan_draft'
+    | 'collab_critic_result'
     | 'agent_message'
     | 'artifact_ready'
     | 'decision_required'
+    | 'collaboration_clarification_request'
+    | 'collaboration_clarification_answer'
     | 'collaboration_run_completed'
+    | 'collaboration_recap'
+    | 'team_progress'
     | 'run_completed';
   runId?: string;
   timestamp: number;
@@ -361,7 +434,7 @@ export interface AgentMessage {
   task_id?: string;
 }
 
-export type ClientChatMode = "agent" | "plan";
+export type ClientChatMode = "agent" | "plan" | "collaboration";
 export type ThinkingIntensity = "low" | "medium" | "high";
 
 export interface PlanQuestionOption {
@@ -439,6 +512,58 @@ export interface PlanState {
   research_notes?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Collaboration types (P3/P4 — Coding Agent delegation tracking)
+// ---------------------------------------------------------------------------
+
+export interface EvidenceEntry {
+  kind: 'command' | 'test' | 'diff' | 'review' | 'screenshot';
+  label: string;
+  command?: string;
+  exit_code?: number | null;
+  output_excerpt?: string;
+  output_ref?: string | null;
+}
+
+export interface CollaborationRecap {
+  run_id: string;
+  one_liner: string;
+  key_decisions: string[];
+  changed_files: string[];
+  evidence_ledger: EvidenceEntry[];
+  failure_summary: string | null;
+  trace_anchor: string;
+}
+
+export interface TeamProgressEntry {
+  team_role: string;
+  phase: 'running' | 'done' | 'failed';
+  summary?: string;
+}
+
+export interface CollaborationState {
+  active: boolean;
+  run_id: string;
+  status?: 'running' | 'waiting_clarification' | 'paused' | 'completed' | 'failed' | 'cancelled' | '';
+  currentTaskStatus?: string;
+  currentPhase?: string;
+  teamProgress: TeamProgressEntry[];
+  recap: CollaborationRecap | null;
+  evidence?: EvidenceEntry[];
+  artifacts?: unknown[];
+  pendingClarification?: {
+    request_id?: string;
+    question: string;
+    options?: string[];
+    context?: string;
+    recommendation?: string;
+    answered_by?: string;
+    reason?: string;
+    confidence?: number;
+    task_id?: string;
+  } | null;
+}
+
 export type TaskGuidanceStatus = "queued" | "applied" | "consumed" | "stale";
 
 export interface TaskGuidanceItem {
@@ -476,9 +601,10 @@ export type AssistantBlock =
       toolCallId?: string;
       durationMs?: number;
       workerEvents?: WorkerEvent[];
+      artifacts?: ArtifactPayload[];
       timestamp: number;
     }
-  | { type: 'image'; base64: string; timestamp: number }
+  | { type: 'image'; base64?: string; image?: ImageAttachment; url?: string; title?: string; mimeType?: string; timestamp: number }
   | { type: 'plan_questions'; questions: PlanQuestion[]; timestamp: number }
   | { type: 'plan_answers'; questions: PlanQuestion[]; answers: PlanDecisionAnswer[]; timestamp: number }
   | { type: 'plan_execution'; goal: string; todos: PlanTodo[]; timestamp: number }
@@ -542,6 +668,12 @@ export interface OpenFile {
   name: string;
   content: string;
   language: string;
+  viewerType?: 'text' | 'office' | 'image' | 'binary';
+  artifact?: ArtifactItem | ArtifactPayload;
+  absolutePath?: string;
+  mimeType?: string;
+  size?: number;
+  binaryReason?: string;
   isModified?: boolean;
   hasConflict?: boolean;
   isPinned?: boolean;
@@ -555,7 +687,8 @@ export interface EditorGroup {
   openFiles: OpenFile[];
 }
 
-export type AgentType = 'personal' | 'coding';
+export type SpecialistAgentType = `specialist:${string}`;
+export type AgentType = 'personal' | 'coding' | SpecialistAgentType;
 export type SidebarSection = 'personal' | 'coding' | 'skills' | 'workspace' | 'settings';
 
 export interface SessionHistoryItem {
@@ -597,10 +730,10 @@ export interface SessionHistoryResponse {
   standalone_sessions: SessionHistoryItem[];
 }
 
-export interface SkillPreferences {
+export type SkillPreferences = Record<string, Record<string, boolean>> & {
   personal: Record<string, boolean>;
   coding: Record<string, boolean>;
-}
+};
 
 export interface SkillCatalogItem {
   id: string;
@@ -677,6 +810,10 @@ export interface AgentInfo {
   name: string;
   description: string;
   profile?: AgentProfile;
+  default_role?: string;
+  model_id?: string;
+  thinking_intensity?: ThinkingIntensity;
+  specialist?: SpecialistAgentSpec;
 }
 
 export interface AgentProfile {
@@ -687,6 +824,23 @@ export interface AgentProfile {
   subtitle?: string;
   updated_at?: string;
   source?: string;
+}
+
+export interface SpecialistAgentSpec {
+  slug: string;
+  agent_type: SpecialistAgentType;
+  display_name: string;
+  description: string;
+  instructions?: string;
+  trigger_examples?: string[];
+  routing_keywords?: string[];
+  auto_delegate?: 'off' | 'suggest' | 'auto' | string;
+  base_kind?: 'advisory' | 'coding' | 'desktop' | string;
+  allowed_tools?: string[];
+  skill_ids?: string[];
+  model_id?: string;
+  thinking_intensity?: ThinkingIntensity | string;
+  status?: 'draft' | 'published' | 'archived' | string;
 }
 
 export interface KnowledgeDoc {
@@ -719,7 +873,7 @@ export interface ErrorData {
 }
 
 export interface WS_EVENT {
-  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'context_reset' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_run_completed' | 'run_completed' | 'automation_snapshot' | 'automation_action' | 'automation_trace' | 'automation_replay_status' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
+  type: 'content' | 'reasoning' | 'knowledge_context' | 'tool_call' | 'image' | 'file_edit' | 'status' | 'error' | 'done' | 'cleared' | 'context_reset' | 'interrupted' | 'tool_result' | 'history_snapshot' | 'worker_start' | 'worker_content' | 'worker_tool_call' | 'worker_done' | 'plan_status' | 'plan_draft' | 'plan_questions' | 'plan_approved_waiting_build' | 'build_started' | 'build_paused' | 'build_ended' | 'plan_rejected' | 'plan_file_ready' | 'todo_update' | 'task_guidance_queued' | 'task_guidance_applied' | 'task_guidance_consumed' | 'task_guidance_stale' | 'task_guidance_deleted' | 'task_guidance_cleared' | 'run_created' | 'context_pack' | 'skills_matched' | 'skill_draft_ready' | 'guardrail_decision' | 'approval_required' | 'verification_start' | 'verification_result' | 'review_finding' | 'collaboration_run_created' | 'collaboration_task_update' | 'collaboration_plan_auto_approved' | 'agent_message' | 'artifact_ready' | 'decision_required' | 'collaboration_clarification_request' | 'collaboration_clarification_answer' | 'collaboration_run_completed' | 'collaboration_recap' | 'team_progress' | 'run_completed' | 'automation_snapshot' | 'automation_action' | 'automation_trace' | 'automation_replay_status' | 'chat_mode' | 'thinking_intensity' | 'compacted' | 'rewound' | 'context_usage' | 'model_switched' | 'agent_switched' | 'suggest_agent_switch';
   data: any;
 }
 
@@ -746,6 +900,8 @@ export interface ConnectorInfo {
   description: string;
   status: 'stopped' | 'running' | 'error';
   status_message: string;
+  last_error?: string;
+  recent_events?: Array<{ timestamp: string; level: string; message: string; details?: Record<string, any> }>;
   enabled: boolean;
   uptime_seconds: number;
   config: Record<string, any>;

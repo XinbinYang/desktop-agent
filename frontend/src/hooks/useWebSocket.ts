@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { WS_EVENT } from '../types';
-import { ensureApiAuth, getAuthToken, getAuthUnavailableReason, refreshAuthRequirement, WS_BASE, withAuthQuery } from '../config';
+import { ensureApiAuth, getAuthRequirementStatus, getAuthToken, getAuthUnavailableReason, refreshAuthRequirement, WS_BASE, withAuthQuery } from '../config';
 
 const MAX_RECONNECT_DELAY = 30000;
 const INITIAL_CONNECT_DELAY = 0;
@@ -68,6 +68,12 @@ function scheduleReconnect(entry: SharedSocketEntry) {
   entry.reconnectTimer = setTimeout(() => connectEntry(entry), delay);
 }
 
+function canOpenWebSocket(): boolean {
+  if (getAuthToken()) return true;
+  if (getAuthUnavailableReason()) return false;
+  return getAuthRequirementStatus() === 'auth-disabled';
+}
+
 function openWebSocket(entry: SharedSocketEntry) {
   if (sharedSockets.get(entry.sessionId) !== entry) return;
   if (getAuthUnavailableReason()) {
@@ -75,6 +81,10 @@ function openWebSocket(entry: SharedSocketEntry) {
     return;
   }
   if (!entry.shouldReconnect || entry.messageSubscribers.size === 0) return;
+  if (!canOpenWebSocket()) {
+    scheduleReconnect(entry);
+    return;
+  }
   if (
     entry.ws?.readyState === WebSocket.OPEN ||
     entry.ws?.readyState === WebSocket.CONNECTING
@@ -147,6 +157,12 @@ function connectEntry(entry: SharedSocketEntry) {
       if (!getAuthToken() && !getAuthUnavailableReason()) {
         await refreshAuthRequirement();
       }
+      if (!canOpenWebSocket()) {
+        if (!getAuthUnavailableReason()) {
+          scheduleReconnect(entry);
+        }
+        return;
+      }
       openWebSocket(entry);
     } catch (err) {
       console.error('Failed to initialize WebSocket auth:', err);
@@ -158,7 +174,11 @@ function connectEntry(entry: SharedSocketEntry) {
     }
   };
 
-  if (!getAuthToken() && !getAuthUnavailableReason()) {
+  if (!canOpenWebSocket()) {
+    if (getAuthUnavailableReason()) {
+      entry.shouldReconnect = false;
+      return;
+    }
     if (entry.authInFlight) return;
     entry.authInFlight = true;
     void prepareAuthAndOpen();

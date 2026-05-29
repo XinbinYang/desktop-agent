@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import ntpath
@@ -10,7 +11,8 @@ from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from app.config import load_config, get_provider_for_model, get_model_for_agent, get_thinking_intensity_for_agent
 from app.coding_context import build_repo_map, format_repo_map_summary
@@ -24,7 +26,15 @@ from app.coding_runs import (
     set_run_context,
     set_session_project,
 )
-from app.collaboration.executor import result_from_execute_events, run_consult_worker, run_execute_agent_events
+from app.collaboration.executor import (
+    record_delegated_child_event,
+    result_from_execute_events,
+    run_consult_worker,
+    run_critic_loop_events,
+    run_execute_agent_events,
+    run_plan_then_execute_events,
+    run_verify_only_events,
+)
 from app.collaboration.manager import (
     add_task as collab_add_task,
     complete_run as collab_complete_run,
@@ -34,7 +44,9 @@ from app.collaboration.manager import (
     update_task as collab_update_task,
 )
 from app.collaboration.models import ResultPacket, TaskPacket
+from app.collaboration.recap import recap_from_events
 from app.collaboration.parser import CodingMention, classify_coding_intent, parse_coding_mention
+from app.collaboration.targeting import resolve_collaboration_target
 from app.models import ModelRouter
 from app.memory import build_memory_prompt
 from app.project_manager import ProjectManager
@@ -42,11 +54,13 @@ from app.project_rules import build_rules_prompt
 from app.roles import RoleManager  # deprecated — kept for backward compat
 from app.agents.manager import AgentManager
 from app.runtime_paths import runtime_dir, runtime_file, backend_root
+from app import artifact_store
 from app.skills import SkillManager
 from app.tools import build_tools_description, get_tool, get_tool_schemas, list_tool_names, DynamicToolRegistry
 from app.tools.browser_tool import set_browser_session
 from app.tools.desktop_tool import ScreenshotTool
 from app.tools.worker_tool import cancel_workers_for_session
+from app.tools.collaboration_tool import ensure_collab_callbacks
 from app.tools.workflow_tool import get_recorder
 from app.message_utils import trim_messages, parse_tool_args, execute_tool, resolve_mentions, repair_tool_call_messages
 from app.workflow.models import PlanState, PlanTodo, PlanQuestion, PlanQuestionOption, PlanDraft, PlanStep, TaskGuidanceItem
@@ -191,6 +205,82 @@ _VERIFICATION_COMMAND_HINTS: tuple[str, ...] = (
     "gradle test",
     "mvn test",
 )
+
+
+def _normalize_tool_artifacts(raw: Any, source: str = "", tool_call_id: str = "") -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    artifacts: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        artifact = copy.deepcopy(item)
+        artifact_type = str(artifact.get("type") or "").strip()
+        if not artifact_type:
+            continue
+        artifact["type"] = artifact_type
+        artifact.setdefault("id", f"artifact_{tool_call_id or source or 'tool'}_{index}")
+        artifact.setdefault("source", source)
+        artifact.setdefault("tool_call_id", tool_call_id)
+        if "mimeType" in artifact and "mime_type" not in artifact:
+            artifact["mime_type"] = artifact.get("mimeType")
+        artifacts.append(artifact)
+    return artifacts
+
+
+def _base64_image_artifact(base64_image: str, source: str, tool_call_id: str) -> Dict[str, Any]:
+    return {
+        "id": f"image_{tool_call_id or uuid.uuid4().hex[:12]}",
+        "type": "image",
+        "title": source or "Image",
+        "base64": base64_image,
+        "mime_type": "image/png",
+        "source": source,
+        "tool_call_id": tool_call_id,
+    }
+
+
+def _image_event_payload(artifact: Dict[str, Any], source: str, tool_call_id: str) -> Dict[str, Any]:
+    payload = copy.deepcopy(artifact)
+    payload.setdefault("source", source)
+    payload.setdefault("tool_call_id", tool_call_id)
+    if "mimeType" in payload and "mime_type" not in payload:
+        payload["mime_type"] = payload.get("mimeType")
+    return payload
+
+
+def _externalize_artifacts(
+    artifacts: List[Dict[str, Any]],
+    session_id: str,
+) -> List[Dict[str, Any]]:
+    """Spill large base64 artifact payloads to disk, replacing them with refs.
+
+    Returned artifacts carry ``artifact_id``/``url`` instead of ``base64`` so a
+    screenshot no longer stays resident in ``messages`` or in the session JSON.
+    Small payloads and undecodable data are left inline unchanged.
+    """
+    if not artifacts:
+        return artifacts
+    result: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        b64 = artifact.get("base64")
+        if not isinstance(b64, str) or not artifact_store.should_externalize(b64):
+            result.append(artifact)
+            continue
+        artifact_id = str(artifact.get("id") or f"artifact_{uuid.uuid4().hex[:12]}")
+        mime = str(artifact.get("mime_type") or artifact.get("mimeType") or "image/png")
+        stored = artifact_store.store_base64(session_id, artifact_id, b64, mime)
+        if not stored:
+            result.append(artifact)
+            continue
+        lite = {k: v for k, v in artifact.items() if k != "base64"}
+        lite["id"] = artifact_id
+        lite["artifact_id"] = artifact_id
+        lite["url"] = f"/api/sessions/{quote(str(session_id))}/artifacts/{quote(artifact_id)}"
+        lite["size"] = stored["size"]
+        lite["externalized"] = True
+        result.append(lite)
+    return result
 
 
 def _project_key_for_path(project_path: str | None) -> str:
@@ -434,7 +524,7 @@ def _session_has_history(session: "AgentSession") -> bool:
 
 def _resolve_stored_agent_type(data: Dict[str, Any]) -> str:
     raw = data.get("agent_type")
-    if raw in ("personal", "coding"):
+    if raw and AgentManager.is_known_agent_type(str(raw)):
         return raw
     return AgentManager.get_agent_type_for_role(data.get("role_id", "desktop-agent"))
 
@@ -620,10 +710,43 @@ def _completion_quality_payload(
     }
 
 
+def _format_collaboration_delivery(result: ResultPacket) -> str:
+    lines: list[str] = []
+    summary = (result.summary or result.details or "Coding Agent 没有返回可用摘要。").strip()
+    lines.append(summary)
+    if result.changed_files:
+        lines.extend(["", "修改文件：", *[f"- {path}" for path in result.changed_files[:10]]])
+    if result.tests_run:
+        lines.extend(["", "验证证据：", *[f"- {item}" for item in result.tests_run[:8]]])
+    elif result.verification_passed is False:
+        lines.extend(["", "验证证据：", "- 未观察到通过的测试/构建/verify_project 证据。"])
+    if result.review_passed is not None:
+        lines.extend(["", "审查结论：", f"- {'通过' if result.review_passed else '未通过或存在阻塞项'}"])
+    if result.artifacts:
+        lines.extend([
+            "",
+            "产物：",
+            *[
+                f"- {artifact.title or artifact.id}: {artifact.path or artifact.url or artifact.id}"
+                for artifact in result.artifacts[:10]
+            ],
+        ])
+    if result.blockers:
+        lines.extend(["", "未解决问题：", *[f"- {item}" for item in result.blockers[:10]]])
+    return "\n".join(lines).strip()
+
+
 class AgentSession:
     MAX_HISTORY_MESSAGES = 20
 
-    def __init__(self, model_id: str, session_id: str = "default", role_id: str = "desktop-agent", agent_type: str | None = None):
+    def __init__(
+        self,
+        model_id: str,
+        session_id: str = "default",
+        role_id: str = "desktop-agent",
+        agent_type: str | None = None,
+        project_path: str | None = None,
+    ):
         self.session_id = session_id
         # agent_type is the new primary field; role_id kept for backward compat
         self._agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
@@ -636,7 +759,7 @@ class AgentSession:
         # Per-agent model and thinking intensity tracking (config defaults)
         self._agent_models: Dict[str, str] = {}
         self._agent_thinking: Dict[str, str] = {}
-        for at in ("personal", "coding"):
+        for at in ("personal", "coding", self._agent_type):
             self._agent_models[at] = get_model_for_agent(at)
             self._agent_thinking[at] = get_thinking_intensity_for_agent(at)
 
@@ -664,6 +787,7 @@ class AgentSession:
         # something marks it dirty again, e.g. MCP server list changes).
         self._mcp_tools_dirty = True
         self.chat_mode = "agent"
+        self.collab_mode: str = "execute"
         self.thinking_intensity = self._agent_thinking.get(self._agent_type, "medium")
         self.plan_state = PlanState()
         self.task_guidance_items: List[TaskGuidanceItem] = []
@@ -676,10 +800,19 @@ class AgentSession:
         self.team_id: str | None = None
         self.team_name: str = ""
         self.archived_at: str | None = None
+        self._archived_message_count: int = 0  # cumulative count of messages evicted to archive.jsonl
         # Project this session is bound to. Set at resolve time and persisted.
         # Authoritative for this session's execution — independent of the
         # global ProjectManager.get_current() (which is now UI-only).
-        self.project_path: str | None = None
+        self.project_path: str | None = (
+            _canonical_project_path(project_path) if AgentManager.is_project_bound_agent(self._agent_type) and project_path else None
+        )
+        self.collaboration_run_id: str = ""
+        self.collaboration_task_id: str = ""
+        self.collaboration_mode: str = ""
+        self.collaboration_read_only: bool = False
+        self.collaboration_dialogue_summary: str = ""
+        self.collaboration_user_profile_brief: str = ""
         self._setup_system_prompt()
 
     @property
@@ -730,14 +863,14 @@ class AgentSession:
         system_msg = f"You are powered by the model {model_name}.\n\n" + system_msg
 
         project = None
-        if self._agent_type == "coding":
+        if AgentManager.is_project_bound_agent(self._agent_type):
             # Coding sessions are project-bound. Prefer the per-session project
             # binding; fall back to the global UI-selected project only for
             # legacy/unbound Coding sessions.
             project = ProjectManager.project_info_for(self.project_path) or ProjectManager.get_current()
 
         if project:
-            project_ctx = "\n\n## Current Project\n"
+            project_ctx = "\n\n## Current Task Target\n"
             project_ctx += f"- Name: {project['name']}\n"
             project_ctx += f"- Path: {project['path']}\n"
             if project.get("git_branch"):
@@ -766,7 +899,7 @@ class AgentSession:
                 cfg = load_config()
                 coding_cfg = cfg.coding_agent
                 max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
-                if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
+                if self._agent_type == "coding" and coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
                     if self._repo_map_cache is None:
                         self._repo_map_cache = build_repo_map(project["path"])
                     repo_map = self._repo_map_cache
@@ -806,6 +939,44 @@ class AgentSession:
             except Exception as e:
                 logger.warning("Coding repo map injection failed: %s", e)
 
+        # Active Collaboration: when this Coding session is delegated by Personal Agent,
+        # surface the contract in the system prompt so the model knows its role,
+        # callback tools, and stop conditions. These rules ADD to base instructions.
+        if self._agent_type == "coding" and self.collaboration_run_id:
+            mode_label = self.collaboration_mode or "execute"
+            read_only_line = (
+                "- READ-ONLY consultation: do not edit files, run destructive commands, or mutate state.\n"
+                if self.collaboration_read_only or mode_label in {"consult", "verify_only"}
+                else "- EXECUTE: implement the smallest safe change, verify it, review it, and report evidence.\n"
+            )
+            collab_segment = (
+                "\n\n## Active Collaboration (Delegated by Personal Agent)\n"
+                "These rules ADD to your base instructions; they do not replace them.\n"
+                f"- Run: {self.collaboration_run_id}\n"
+                f"- Task: {self.collaboration_task_id or '(unspecified)'}\n"
+                f"- Mode: {mode_label}\n"
+                "- You are NOT the user-facing agent. The Personal Agent owns the final reply to the user.\n"
+                "- Do not greet, roleplay, or address the user as \"you\"; speak as a technical specialist reporting back.\n"
+                f"{read_only_line}"
+                "- On a product/UX/preference fork you cannot safely infer, call `request_personal_clarification` "
+                "(this pauses the run; Personal will resolve and resume).\n"
+                "- When you need user preferences or project intent, call `request_personal_context` "
+                "instead of reading Personal Agent private memory directly.\n"
+                "- Always end with a structured report including: changed files, verification evidence, review findings, "
+                "remaining blockers, and a final ACCEPTANCE: PASS or ACCEPTANCE: FAIL line.\n"
+            )
+            if self.collaboration_dialogue_summary:
+                collab_segment += (
+                    "\n### Personal Dialogue Summary (do not echo verbatim)\n"
+                    f"{self.collaboration_dialogue_summary[:2000]}\n"
+                )
+            if self.collaboration_user_profile_brief:
+                collab_segment += (
+                    "\n### User Profile Brief (privacy-scoped, do not quote outside this run)\n"
+                    f"{self.collaboration_user_profile_brief[:1000]}\n"
+                )
+            system_msg += collab_segment
+
         if self.chat_mode == "plan" and not self.plan_state.approved:
             try:
                 plan_spec_path = backend_root() / "prompts" / "plan_mode.md"
@@ -819,7 +990,7 @@ class AgentSession:
             matched_skills = SkillManager.match_skills(
                 self._last_user_message,
                 self.role_id,
-                self._agent_type == "coding" and project is not None,
+                AgentManager.is_project_bound_agent(self._agent_type) and project is not None,
                 agent_type=self._agent_type,
             )
             if matched_skills:
@@ -1109,10 +1280,41 @@ class AgentSession:
     ) -> TaskPacket:
         task = mention.task.strip() or "Open or create a Coding Agent session."
         mode = "execute" if mention.mode == "execute" else "consult"
+
+        # Build a privacy-scoped dialogue summary from the current conversation.
+        dialogue_parts: list[str] = []
+        recent = self.messages[-8:] if len(self.messages) > 8 else self.messages
+        for msg in recent:
+            role = str(msg.get("role", ""))
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(c.get("text", "") or "")
+                    for c in content if isinstance(c, dict)
+                )
+            dialogue_parts.append(f"[{role}] {str(content)[:300]}")
+        dialogue_summary = "\n".join(dialogue_parts)[:2000]
+
+        # Try to load a user profile brief from the workspace.
+        profile_brief = ""
+        try:
+            from app.agents.manager import AgentManager
+            raw = AgentManager.load_workspace_file("_shared", "user_preferences.md")
+            if raw:
+                profile_brief = "\n".join(
+                    line.strip() for line in raw.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                )[:1000]
+        except Exception:
+            pass
+
         context: Dict[str, Any] = {
             "requested_via": mention.raw,
             "original_message": original_input,
             "project_path": project_path,
+            "target_project_path": project_path,
             "personal_ownership": "Personal Agent owns the final user-facing answer.",
         }
         if resolved_input and resolved_input != original_input:
@@ -1121,7 +1323,7 @@ class AgentSession:
             context["image_attached"] = True
 
         if mode == "consult":
-            return TaskPacket(
+            return ensure_collab_callbacks(TaskPacket(
                 goal=task,
                 mode="consult",
                 user_intent=task,
@@ -1145,9 +1347,11 @@ class AgentSession:
                     "git_status",
                     "git_diff",
                 ],
-            )
+                personal_dialogue_summary=dialogue_summary,
+                user_profile_brief=profile_brief,
+            ))
 
-        return TaskPacket(
+        return ensure_collab_callbacks(TaskPacket(
             goal=task,
             mode="execute",
             user_intent=task,
@@ -1163,7 +1367,9 @@ class AgentSession:
                 "Review findings or residual blockers are reported.",
                 "End with ACCEPTANCE: PASS or ACCEPTANCE: FAIL.",
             ],
-        )
+            personal_dialogue_summary=dialogue_summary,
+            user_profile_brief=profile_brief,
+        ))
 
     async def _handle_coding_mention(
         self,
@@ -1173,8 +1379,16 @@ class AgentSession:
         resolved_input: str,
         image_base64: Optional[str],
         outer_run_id: str,
+        dispatch_async: bool = False,
+        publish_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Handle explicit `@coding agent` delegation before the Personal LLM turn."""
+        """Handle explicit `@coding agent` delegation before the Personal LLM turn.
+
+        When *dispatch_async* is True, yields a ``collab_started`` event immediately
+        and runs the Coding Agent in a background task. The caller should provide
+        *publish_event* so the background task can push events to subscribers.
+        Default (False) preserves the existing synchronous behaviour.
+        """
         active_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         active_checkpoint_id = f"chk_{uuid.uuid4().hex[:12]}"
         user_msg = (
@@ -1186,6 +1400,37 @@ class AgentSession:
         self._stamp_message(user_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
         self.messages.append(user_msg)
         yield self._event("context_usage", self.context_usage(), outer_run_id)
+
+        # Async dispatch mode: fire-and-forget, yield collab_started and return.
+        if dispatch_async:
+            yield self._event(
+                "collab_started",
+                {"mention_mode": mention.mode, "original_input": original_input},
+                outer_run_id,
+            )
+            # Run the full coding agent in a background task; events are pushed
+            # via publish_event callback instead of yielded through the generator.
+            agent = self  # capture for closure
+
+            async def _run_async_collab() -> None:
+                try:
+                    async for event in agent._handle_coding_mention(
+                        mention,
+                        original_input=original_input,
+                        resolved_input=resolved_input,
+                        image_base64=image_base64,
+                        outer_run_id=outer_run_id,
+                        dispatch_async=False,
+                    ):
+                        if publish_event is not None:
+                            publish_event(event)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning("Async collaboration failed: %s", exc)
+
+            asyncio.create_task(_run_async_collab())
+            return
 
         if mention.mode == "handoff":
             text = (
@@ -1213,12 +1458,13 @@ class AgentSession:
                 "verification_passed": None,
                 "review_passed": None,
             }, outer_run_id)
-            self._save()
+            await asyncio.sleep(0)
+            await self._save_async()
             return
 
-        project_path = effective_project_path(allow_global=True)
-        if not project_path:
-            text = "需要先打开一个项目，或在任务里提供明确项目路径，然后我才能把项目代码任务交给 Coding Agent。"
+        target = resolve_collaboration_target(user_message=original_input, allow_global=True)
+        if not target.ok:
+            text = target.error
             assistant_msg = {"role": "assistant", "content": text}
             self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
             self.messages.append(assistant_msg)
@@ -1230,8 +1476,12 @@ class AgentSession:
                 "verification_passed": None,
                 "review_passed": None,
             }, outer_run_id)
-            self._save()
+            await asyncio.sleep(0)
+            await self._save_async()
             return
+        project_path = target.project_path
+        if resolved_input == original_input:
+            resolved_input = resolve_mentions(original_input, project_path)
 
         packet = self._collaboration_packet(
             mention,
@@ -1250,6 +1500,15 @@ class AgentSession:
         )
         task = collab_add_task(collab_run.run_id, packet)
         emitted = 0
+
+        async def clarification_resolver(clarification: Dict[str, Any], active_packet: TaskPacket):
+            from app.collaboration.clarification import resolve_personal_clarification
+
+            return await resolve_personal_clarification(
+                clarification,
+                active_packet,
+                model_id=self.model_id,
+            )
 
         def new_collab_events() -> List[Dict[str, Any]]:
             nonlocal emitted
@@ -1286,15 +1545,62 @@ class AgentSession:
                 project_path=project_path,
             )
             for event in child_events:
+                record_delegated_child_event(collab_run.run_id, task.task_id, event)
+                emitted = len(collab_list_events(collab_run.run_id))
                 yield event
+        elif packet.mode == "plan_then_execute":
+            async for event in run_plan_then_execute_events(
+                packet,
+                session_id=self.session_id,
+                run_id=collab_run.run_id,
+                task_id=task.task_id,
+                project_path=project_path,
+                clarification_resolver=clarification_resolver,
+            ):
+                child_events.append(event)
+                record_delegated_child_event(collab_run.run_id, task.task_id, event)
+                emitted = len(collab_list_events(collab_run.run_id))
+                yield event
+            result = result_from_execute_events(child_events)
+        elif packet.mode == "critic":
+            async for event in run_critic_loop_events(
+                packet,
+                session_id=self.session_id,
+                run_id=collab_run.run_id,
+                task_id=task.task_id,
+                project_path=project_path,
+                clarification_resolver=clarification_resolver,
+            ):
+                child_events.append(event)
+                record_delegated_child_event(collab_run.run_id, task.task_id, event)
+                emitted = len(collab_list_events(collab_run.run_id))
+                yield event
+            result = result_from_execute_events(child_events)
+        elif packet.mode == "verify_only":
+            async for event in run_verify_only_events(
+                packet,
+                run_id=collab_run.run_id,
+                task_id=task.task_id,
+                project_path=project_path,
+            ):
+                child_events.append(event)
+                record_delegated_child_event(collab_run.run_id, task.task_id, event)
+                emitted = len(collab_list_events(collab_run.run_id))
+                yield event
+            result = result_from_execute_events(child_events)
         else:
+            # Default: execute
             async for event in run_execute_agent_events(
                 packet,
                 session_id=self.session_id,
                 run_id=collab_run.run_id,
+                task_id=task.task_id,
                 project_path=project_path,
+                clarification_resolver=clarification_resolver,
             ):
                 child_events.append(event)
+                record_delegated_child_event(collab_run.run_id, task.task_id, event)
+                emitted = len(collab_list_events(collab_run.run_id))
                 yield event
             result = result_from_execute_events(child_events)
 
@@ -1332,13 +1638,57 @@ class AgentSession:
         for event in new_collab_events():
             yield event
 
-        prefix = "Coding Agent 诊断结果" if packet.mode == "consult" else "Coding Agent 执行结果"
+        # Build RunRecap from child events; emit collaboration_recap for large runs (>50 events).
+        recap = recap_from_events(collab_run.run_id, child_events)
+
+        # Store failed collab tasks in Memory OS so Personal Agent can learn from them.
+        if result.status != "pass":
+            try:
+                from app.agents.memory_os import get_memory_os
+                failure_note = recap.failure_summary or (result.summary or result.details or "")[:300]
+                if failure_note:
+                    get_memory_os().upsert_item(
+                        content=f"协作任务失败：{packet.goal[:200]}。原因：{failure_note[:300]}",
+                        memory_type="procedural",
+                        source="collab",
+                        source_ref=collab_run.run_id,
+                        tier="warm",
+                    )
+            except Exception:
+                pass  # Memory OS write failure must not break the response
+
+        if len(child_events) > 50:
+            yield self._event(
+                "collaboration_recap",
+                {
+                    "run_id": collab_run.run_id,
+                    "recap": recap.model_dump(),
+                },
+                outer_run_id,
+            )
+
+        _PREFIX_MAP = {
+            "consult": "Coding Agent 诊断结果",
+            "plan_then_execute": "Coding Agent 计划并执行结果",
+            "critic": "Coding Agent 执行+审查结果",
+            "verify_only": "Coding Agent 验证结果",
+        }
+        prefix = _PREFIX_MAP.get(packet.mode, "Coding Agent 执行结果")
         status_word = "通过" if result.status == "pass" else ("受阻" if result.status == "blocked" else "未通过")
-        summary = (result.summary or result.details or "Coding Agent 没有返回可用摘要。").strip()
+        summary = _format_collaboration_delivery(result)
+        if len(child_events) > 50 and recap.one_liner:
+            summary = (recap.one_liner.strip() + "\n\n" + summary).strip()
+        _TOOL_NAME_MAP = {
+            "consult": "consult_coding_agent",
+            "verify_only": "consult_coding_agent",
+            "plan_then_execute": "delegate_to_coding_agent",
+            "critic": "delegate_to_coding_agent",
+        }
+        tool_name = _TOOL_NAME_MAP.get(packet.mode, "delegate_to_coding_agent")
         yield self._event(
             "tool_call",
             {
-                "name": "consult_coding_agent" if packet.mode == "consult" else "delegate_to_coding_agent",
+                "name": tool_name,
                 "args": {"goal": packet.goal, "mode": packet.mode},
                 "result": summary,
                 "tool_call_id": task.task_id,
@@ -1346,6 +1696,29 @@ class AgentSession:
             },
             outer_run_id,
         )
+        # Internal structured report for Personal Agent cross-turn recall.
+        # This appears as context-only (role=user, source=internal) so Personal
+        # can reference changed files, verification results, and blockers in the
+        # next turn without tool calls.
+        internal_report_lines = [
+            "[Coding Agent Internal Report]",
+            f"Run: {collab_run.run_id} · Status: {result.status}",
+            f"Changed files ({len(result.changed_files)}): {', '.join(result.changed_files[:10]) or '(none)'}",
+            f"Verification: {'passed' if result.verification_passed else ('failed' if result.verification_passed is False else 'not run')}",
+        ]
+        if result.tests_run:
+            internal_report_lines.append(f"Tests: {', '.join(result.tests_run[:5])}")
+        if result.review_passed is not None:
+            internal_report_lines.append(f"Review: {'passed' if result.review_passed else 'blocked'}")
+        if result.blockers:
+            internal_report_lines.append(f"Blockers ({len(result.blockers)}): {'; '.join(result.blockers[:5])}")
+        if result.confidence < 1.0:
+            internal_report_lines.append(f"Confidence: {result.confidence:.0%}")
+        internal_report = "\n".join(internal_report_lines)
+        internal_msg = {"role": "user", "content": internal_report, "source": "internal"}
+        self._stamp_message(internal_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
+        self.messages.append(internal_msg)
+
         final_text = f"{prefix}（{status_word}）：\n\n{summary}"
         assistant_msg = {"role": "assistant", "content": final_text}
         self._stamp_message(assistant_msg, turn_id=active_turn_id, checkpoint_id=active_checkpoint_id)
@@ -1361,7 +1734,8 @@ class AgentSession:
             "collaboration_run_id": collab_run.run_id,
             "collaboration_task_id": task.task_id,
         }, outer_run_id)
-        self._save()
+        await asyncio.sleep(0)
+        await self._save_async()
 
     def _stamp_message(
         self,
@@ -1912,8 +2286,8 @@ class AgentSession:
         return self._plan_event_payload()
 
     def set_session_chat_mode(self, mode: str) -> bool:
-        """Persist UI-selected agent/plan mode before the next chat message (WebSocket `set_chat_mode`)."""
-        if mode not in ("agent", "plan"):
+        """Persist UI-selected agent/plan/collaboration mode before the next chat message (WebSocket `set_chat_mode`)."""
+        if mode not in ("agent", "plan", "collaboration"):
             return False
         previous = self.chat_mode
         self.chat_mode = mode
@@ -1923,7 +2297,13 @@ class AgentSession:
                 self._plan_exec_hint_sent = False
             else:
                 self.plan_state.mode = "plan"
-        elif mode == "agent" and previous == "plan":
+        elif mode == "agent" and (previous == "plan" or previous == "collaboration"):
+            if self.plan_state.phase != "executing":
+                self.plan_state = PlanState(mode="agent")
+                self._plan_exec_hint_sent = False
+            else:
+                self.plan_state.mode = "agent"
+        elif mode == "collaboration":
             if self.plan_state.phase != "executing":
                 self.plan_state = PlanState(mode="agent")
                 self._plan_exec_hint_sent = False
@@ -2528,16 +2908,19 @@ class AgentSession:
         *,
         chat_mode: Optional[str] = None,
         thinking_intensity: Optional[str] = None,
+        collab_mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run one agent turn. Empty user_input means retry mode.
 
         ``PLAN_CONTINUE_MARKER`` resumes execution after the user clicks Build (server-gated).
         """
-        if chat_mode in ("agent", "plan"):
+        if chat_mode in ("agent", "plan", "collaboration"):
             if chat_mode != self.chat_mode:
                 self.set_session_chat_mode(chat_mode)
             else:
                 self.chat_mode = chat_mode
+        if collab_mode in ("consult", "execute", "plan_then_execute", "critic", "verify_only"):
+            self.collab_mode = collab_mode
         if thinking_intensity in ("low", "medium", "high"):
             self.set_session_thinking_intensity(thinking_intensity)
 
@@ -2610,7 +2993,7 @@ class AgentSession:
                 session_project_token = None
 
         if self._repair_incomplete_tool_call_history():
-            self._save()
+            await self._save_async()
 
         if user_input and not is_plan_continue:
             if self.chat_mode == "plan" and self.plan_state.phase == "awaiting_decision":
@@ -2627,7 +3010,8 @@ class AgentSession:
                     "review_passed": None,
                 }, run_id)
                 close_coding_run("completed", "Plan mode is awaiting decisions.")
-                self._save()
+                await asyncio.sleep(0)
+                await self._save_async()
                 return
 
             # Explicit delegation has priority over Personal's normal reasoning turn.
@@ -2639,13 +3023,11 @@ class AgentSession:
                 and getattr(settings, "collaboration_enabled", True)
                 and coding_mention is not None
             ):
-                delegation_project_path = effective_project_path(allow_global=True)
-                resolved_input = resolve_mentions(user_input, delegation_project_path) if delegation_project_path else user_input
                 self._last_user_message = user_input
                 async for event in self._handle_coding_mention(
                     coding_mention,
                     original_input=user_input,
-                    resolved_input=resolved_input,
+                    resolved_input=user_input,
                     image_base64=image_base64,
                     outer_run_id=run_id,
                 ):
@@ -2653,19 +3035,72 @@ class AgentSession:
                 close_coding_run("completed", "Explicit Coding Agent delegation handled.")
                 return
 
-            # Auto-dispatch: Personal Agent detects code intent → suggest switching to Coding
+            # Collaboration mode: user explicitly clicked the Collab button.
+            # Skip Personal Agent's reasoning turn entirely — dispatch to Coding Agent.
+            if (
+                self._agent_type == "personal"
+                and self.chat_mode == "collaboration"
+                and not coding_mention
+                and getattr(settings, "collaboration_enabled", True)
+            ):
+                delegation_target = resolve_collaboration_target(
+                    user_message=user_input, allow_global=True
+                )
+                if not delegation_target.ok:
+                    text = "合作模式需要绑定项目，请在右上角选择项目后重试。"
+                    assistant_msg = {"role": "assistant", "content": text}
+                    self.messages.append(assistant_msg)
+                    yield self._event("content", {"text": text}, run_id)
+                    yield self._event("status", {"status": "completed"}, run_id)
+                    yield self._event("run_completed", {
+                        "status": "completed",
+                        "summary": text,
+                    }, run_id)
+                    close_coding_run("completed", "Collaboration mode: missing project.")
+                    await self._save_async()
+                    return
+                self._last_user_message = user_input
+                collab_project_path = (
+                    resolve_mentions(user_input, delegation_target.project_path)
+                    if delegation_target.project_path
+                    else user_input
+                )
+                synthetic_mention = CodingMention(
+                    raw="@coding agent [collab-mode]",
+                    task=user_input,
+                    mode=self.collab_mode or "execute",
+                )
+                logger.info(
+                    "Collaboration mode dispatch [mention=collab-button] run=%s collab_mode=%s",
+                    run_id, self.collab_mode,
+                )
+                async for event in self._handle_coding_mention(
+                    synthetic_mention,
+                    original_input=user_input,
+                    resolved_input=collab_project_path,
+                    image_base64=image_base64,
+                    outer_run_id=run_id,
+                ):
+                    yield event
+                close_coding_run("completed", f"Collaboration mode dispatch ({self.collab_mode}) handled.")
+                return
+
             # Resolve @mentions in user input (file/folder/git/knowledge context).
             # Personal has no implicit project binding; project mentions are only
             # expanded for Coding turns or explicit Coding delegation above.
             project_path = effective_project_path(allow_global=self._agent_type == "coding")
             resolved_input = resolve_mentions(user_input, project_path) if project_path else user_input
 
-            delegation_project_path = effective_project_path(allow_global=True) if self._agent_type == "personal" else project_path
-            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan":
+            delegation_project_path = project_path
+            if self._agent_type == "personal":
+                delegation_target = resolve_collaboration_target(user_message=user_input, allow_global=True)
+                delegation_project_path = delegation_target.project_path if delegation_target.ok else ""
+
+            auto_delegate = getattr(settings, "auto_delegate_coding", "off") or "off"
+            if self._agent_type == "personal" and delegation_project_path and self.chat_mode != "plan" and auto_delegate != "off":
                 if not getattr(self, "_dispatch_suggested_this_session", False):
                     if AgentSession._detect_code_intent(user_input):
                         inferred_mode = classify_coding_intent(user_input)
-                        auto_delegate = getattr(settings, "auto_delegate_coding", "suggest") or "suggest"
                         should_auto_delegate = (
                             auto_delegate == "always_for_code"
                             or (auto_delegate == "safe_only" and inferred_mode == "consult")
@@ -2680,7 +3115,9 @@ class AgentSession:
                             synthetic_mention = CodingMention(
                                 raw="@coding agent",
                                 task=user_input,
-                                mode="execute" if inferred_mode == "execute" else "consult",
+                                mode=inferred_mode if inferred_mode in (
+                                    "consult", "execute", "plan_then_execute", "critic", "verify_only"
+                                ) else "consult",
                             )
                             self._last_user_message = user_input
                             async for event in self._handle_coding_mention(
@@ -2786,6 +3223,7 @@ class AgentSession:
         yield self._event("status", {"status": "thinking"}, run_id)
 
         finished = False
+        terminal_error_message = ""
         plan_turn_done = False
         _files_modified = False
         _verify_called = False
@@ -2834,6 +3272,42 @@ class AgentSession:
             if consumed_guidance:
                 yield self._event("task_guidance_consumed", {"items": consumed_guidance}, run_id)
                 yield self._event("context_usage", self.context_usage(), run_id)
+
+            collab_directive_run_id = self.collaboration_run_id or ""
+            if collab_directive_run_id:
+                try:
+                    from app.collaboration.bus import poll_directive
+
+                    directive = await poll_directive(collab_directive_run_id)
+                except Exception:
+                    directive = None
+                if directive:
+                    directive_msg = {
+                        "role": "user",
+                        "source": "internal",
+                        "content": (
+                            "[COLLABORATION DIRECTIVE]\n"
+                            "The Personal Agent/user sent this while you were working. "
+                            "Treat it as high-priority guidance for the current delegated task.\n\n"
+                            f"{directive}"
+                        ),
+                    }
+                    self._stamp_message(
+                        directive_msg,
+                        turn_id=active_turn_id,
+                        checkpoint_id=active_checkpoint_id,
+                    )
+                    self.messages.append(directive_msg)
+                    yield self._event(
+                        "collab_directive_applied",
+                        {
+                            "collaboration_run_id": collab_directive_run_id,
+                            "collaboration_task_id": self.collaboration_task_id,
+                            "directive": directive,
+                        },
+                        run_id,
+                    )
+                    yield self._event("context_usage", self.context_usage(), run_id)
 
             if not auto_compaction_attempted:
                 usage_before_call = self.context_usage()
@@ -2915,11 +3389,13 @@ class AgentSession:
                         )
                         stream_error = None
                     except Exception as e2:
-                        yield self._event("error", {"message": f"Model call failed: {e2}"}, run_id)
+                        terminal_error_message = f"Model call failed: {e2}"
+                        yield self._event("error", {"message": terminal_error_message}, run_id)
                         finished = True
                         break
                 else:
-                    yield self._event("error", {"message": f"Model call failed: {stream_error}"}, run_id)
+                    terminal_error_message = f"Model call failed: {stream_error}"
+                    yield self._event("error", {"message": terminal_error_message}, run_id)
                     finished = True
                     break
 
@@ -2933,22 +3409,24 @@ class AgentSession:
                         thinking_intensity=ti,
                     )
                 except Exception as no_response_fallback_error:
+                    terminal_error_message = (
+                        "Model stream ended without a final response and fallback failed: "
+                        f"{no_response_fallback_error}"
+                    )
                     yield self._event(
                         "error",
                         {
-                            "message": (
-                                "Model stream ended without a final response and fallback failed: "
-                                f"{no_response_fallback_error}"
-                            )
+                            "message": terminal_error_message
                         },
                         run_id,
                     )
                     finished = True
                     break
                 if response is None:
+                    terminal_error_message = "Model returned no response. Please retry or switch models."
                     yield self._event(
                         "error",
-                        {"message": "Model returned no response. Please retry or switch models."},
+                        {"message": terminal_error_message},
                         run_id,
                     )
                     finished = True
@@ -2979,9 +3457,10 @@ class AgentSession:
                         and not str(fallback_message.get("reasoning_content") or "").strip()
                     )
                     if fallback_empty:
+                        terminal_error_message = "Model returned an empty response. Please retry or switch models."
                         yield self._event(
                             "error",
-                            {"message": "Model returned an empty response. Please retry or switch models."},
+                            {"message": terminal_error_message},
                             run_id,
                         )
                         finished = True
@@ -3006,9 +3485,10 @@ class AgentSession:
                                 run_id,
                             )
                 except Exception as empty_fallback_error:
+                    terminal_error_message = f"Model returned an empty response and fallback failed: {empty_fallback_error}"
                     yield self._event(
                         "error",
-                        {"message": f"Model returned an empty response and fallback failed: {empty_fallback_error}"},
+                        {"message": terminal_error_message},
                         run_id,
                     )
                     finished = True
@@ -3087,7 +3567,6 @@ class AgentSession:
                             "pending_clarification": self.plan_state.pending_clarification,
                         }, run_id)
                         yield self._event("plan_status", self._plan_event_payload(), run_id)
-                        self._save()
                         yield self._event("context_usage", self.context_usage(), run_id)
                         yield self._event("status", {"status": "completed"}, run_id)
                         plan_turn_done = True
@@ -3125,13 +3604,18 @@ class AgentSession:
                 if self._has_applied_task_guidance():
                     yield self._event("status", {"status": "thinking"}, run_id)
                     continue
-                self._save()
+                # The visible answer has already streamed to the UI. Let the
+                # completion boundary go out first; the final save below runs
+                # after `run_completed`, so a large transcript write cannot make
+                # the next user message wait while the turn still looks active.
                 yield self._event("status", {"status": "completed"}, run_id)
                 finished = True
                 break
 
             tool_results = []
+            pending_visual_reviews: List[Tuple[str, List[str]]] = []
             allowed_names = list_tool_names(self.dynamic_registry, agent_type=self._agent_type)
+            collaboration_clarification_request: Optional[Dict[str, Any]] = None
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
@@ -3204,6 +3688,31 @@ class AgentSession:
                     })
                     continue
 
+                if tool_name == "request_personal_clarification" and not self.collaboration_run_id:
+                    blocked = (
+                        "[COLLABORATION_GATE] request_personal_clarification is only available inside a "
+                        "Personal Agent delegated Coding Agent run. Ask the user directly in the assistant "
+                        "message instead of waiting for a collaboration callback."
+                    )
+                    yield self._event(
+                        "tool_call",
+                        {
+                            "name": tool_name,
+                            "args": tool_args,
+                            "result": blocked,
+                            "tool_call_id": tool_id,
+                            "duration_ms": 0,
+                        },
+                        run_id,
+                    )
+                    tool_results.append({
+                        "tool_call_id": tool_id,
+                        "role": "tool",
+                        "name": tool_name,
+                        "content": blocked,
+                    })
+                    continue
+
                 set_browser_session(self.session_id)
                 tc_result = await execute_tool(
                     tool_name, tool_args, allowed_names, self.session_id,
@@ -3234,8 +3743,33 @@ class AgentSession:
                             run_id,
                         )
 
+                ui_artifacts = _normalize_tool_artifacts(
+                    tc_result.metadata.get("artifacts"),
+                    source=tool_name,
+                    tool_call_id=tool_id,
+                )
                 if tc_result.base64_image:
-                    yield self._event("image", {"base64": tc_result.base64_image, "source": tool_name, "tool_call_id": tool_id}, run_id)
+                    ui_artifacts.append(_base64_image_artifact(tc_result.base64_image, tool_name, tool_id))
+                review_paths = tc_result.metadata.get("review_image_paths") or []
+                if review_paths and not tc_result.error and self._model_supports_vision():
+                    try:
+                        from app.tools.office_tool import _encode_preview_images
+
+                        review_images = _encode_preview_images(review_paths)
+                    except Exception:
+                        review_images = []
+                    if review_images:
+                        pending_visual_reviews.append((tool_name, review_images))
+                # Spill large base64 payloads to disk before they reach the
+                # transcript, the persisted JSON, or the event stream.
+                ui_artifacts = _externalize_artifacts(ui_artifacts, self.session_id)
+                for artifact in ui_artifacts:
+                    if artifact.get("type") == "image":
+                        yield self._event(
+                            "image",
+                            _image_event_payload(artifact, tool_name, tool_id),
+                            run_id,
+                        )
 
                 if tc_result.metadata.get("automation_snapshot"):
                     yield self._event(
@@ -3301,6 +3835,17 @@ class AgentSession:
                     for finding in _latest_review.get("findings", []):
                         yield self._event("review_finding", finding, run_id)
 
+                if tc_result.metadata.get("collaboration_clarification_request"):
+                    clarification = dict(tc_result.metadata["collaboration_clarification_request"])
+                    clarification.setdefault("agent_run_id", run_id)
+                    clarification.setdefault("tool_call_id", tool_id)
+                    if self.collaboration_run_id:
+                        clarification.setdefault("collaboration_run_id", self.collaboration_run_id)
+                    if self.collaboration_task_id:
+                        clarification.setdefault("collaboration_task_id", self.collaboration_task_id)
+                    collaboration_clarification_request = clarification
+                    yield self._event("collaboration_clarification_request", clarification, run_id)
+
                 recorder = get_recorder(self.session_id)
                 if recorder and recorder.is_recording() and not tc_result.error:
                     recorder.record_step(tool_name, tool_args)
@@ -3347,7 +3892,7 @@ class AgentSession:
                     # card ticks item-by-item (do not batch / wait for turn end).
                     self._apply_todo_updates(tc_result.metadata.get("payload") or {})
                     self._auto_advance_pending_todos()
-                    self._save()
+                    await self._save_async()
                     yield self._event("todo_update", {
                         "todos": [t.model_dump() for t in self.plan_state.todos],
                     }, run_id)
@@ -3360,7 +3905,7 @@ class AgentSession:
                         )
                     ):
                         self.plan_state.transition_to("completed")
-                        self._save()
+                        await self._save_async()
                         yield self._event("plan_status", self._plan_event_payload(), run_id)
                     # NOTE: deliberately NOT setting plan_turn_done — execution
                     # must continue to the next todo within the same run.
@@ -3373,11 +3918,15 @@ class AgentSession:
                         "result": tc_result.result_text,
                         "tool_call_id": tool_id,
                         "duration_ms": tc_result.duration_ms,
+                        "artifacts": ui_artifacts,
                     },
                     run_id,
                 )
 
-                for collaboration_event in tc_result.metadata.get("collaboration_events", []) or []:
+                collaboration_events = []
+                if not tc_result.metadata.get("collaboration_events_realtime"):
+                    collaboration_events = tc_result.metadata.get("collaboration_events", []) or []
+                for collaboration_event in collaboration_events:
                     if not isinstance(collaboration_event, dict):
                         continue
                     event_data = dict(collaboration_event.get("data") or {})
@@ -3399,12 +3948,15 @@ class AgentSession:
                 max_tool_result_len = 8000
                 if len(result_text) > max_tool_result_len:
                     result_text = result_text[:max_tool_result_len] + f"\n\n[输出过长，已截断。原长度 {len(tc_result.result_text)} 字符]"
-                tool_results.append({
+                result_msg = {
                     "tool_call_id": tool_id,
                     "role": "tool",
                     "name": tool_name,
                     "content": result_text,
-                })
+                }
+                if ui_artifacts:
+                    result_msg["ui_artifacts"] = ui_artifacts
+                tool_results.append(result_msg)
 
             for result_msg in tool_results:
                 self._stamp_message(
@@ -3413,7 +3965,66 @@ class AgentSession:
                     checkpoint_id=active_checkpoint_id,
                 )
             self.messages.extend(tool_results)
-            self._save()
+
+            if collaboration_clarification_request:
+                await self._save_async()
+                summary = str(collaboration_clarification_request.get("question") or "Waiting for clarification.")
+                yield self._event(
+                    "status",
+                    {
+                        "status": "waiting_clarification",
+                        "clarification": collaboration_clarification_request,
+                    },
+                    run_id,
+                )
+                yield self._event(
+                    "run_completed",
+                    {
+                        "status": "waiting_clarification",
+                        "summary": summary,
+                        "clarification": collaboration_clarification_request,
+                    },
+                    run_id,
+                )
+                close_coding_run(
+                    "waiting_clarification",
+                    summary,
+                    {"clarification": collaboration_clarification_request},
+                )
+                return
+
+            # Visual self-check loop: feed rendered Office previews back to the
+            # model so it can SEE layout defects (overlap, overflow, crowding,
+            # empty slides) and fix them before publishing.
+            for review_tool, review_images in pending_visual_reviews:
+                review_content: List[Dict[str, Any]] = [{
+                    "type": "text",
+                    "text": (
+                        f"[视觉自检] 以下是 {review_tool} 渲染出的成稿预览，逐页查看实际效果。"
+                        "请像人一样检查每一页：文字是否重叠、内容是否溢出单元格或幻灯片边界、"
+                        "是否有空页或排版过于拥挤、表格/图表是否异常。"
+                        "若发现任何问题，必须用 ppt_edit/excel_edit 修正并重新渲染，"
+                        "直到预览完全干净才能进入发布步骤。"
+                    ),
+                }]
+                for image_b64 in review_images[:12]:
+                    review_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    })
+                review_msg = {
+                    "role": "user",
+                    "content": review_content,
+                    "source": "internal",
+                }
+                self._stamp_message(
+                    review_msg,
+                    turn_id=active_turn_id,
+                    checkpoint_id=active_checkpoint_id,
+                )
+                self.messages.append(review_msg)
+
+            await self._save_async()
             yield self._event("context_usage", self.context_usage(), run_id)
             yield self._event("status", {"status": "thinking"}, run_id)
 
@@ -3434,7 +4045,9 @@ class AgentSession:
         if not finished and self.iteration >= self.max_iterations:
             yield self._event("status", {"status": "max_iterations_reached"}, run_id)
         completion_status = "cancelled" if self._cancelled else (
-            "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
+            "failed" if terminal_error_message else (
+                "max_iterations_reached" if not finished and self.iteration >= self.max_iterations else "completed"
+            )
         )
         stale_guidance = self.mark_applied_task_guidance_stale()
         if stale_guidance:
@@ -3443,7 +4056,7 @@ class AgentSession:
                 {"items": [item.model_dump() for item in stale_guidance]},
                 run_id,
             )
-        completion_summary = f"Run {completion_status} after {self.iteration} iteration(s)."
+        completion_summary = terminal_error_message or f"Run {completion_status} after {self.iteration} iteration(s)."
         completion_quality = _completion_quality_payload(
             files_modified=_files_modified,
             latest_verification=_latest_verification,
@@ -3467,8 +4080,23 @@ class AgentSession:
             "summary": completion_summary,
             **completion_quality,
         }, run_id)
+        await asyncio.sleep(0)
         close_coding_run(completion_status, completion_summary, completion_quality)
-        self._save()
+        await self._save_async()
+
+    def _model_supports_vision(self) -> bool:
+        """Whether the active model can interpret image content blocks.
+
+        Used to gate the Office visual self-check loop: text-only models cannot
+        see rendered previews, so sending image blocks would be useless (or an
+        API error). They still get the text-based layout QA from tool results.
+        """
+        try:
+            from app.config import model_supports_vision
+
+            return bool(model_supports_vision(self.model_id))
+        except Exception:
+            return False
 
     def _touch_plan_todo_after_tool(self, tool_name: str, result_text: str = "", tool_error: str = "") -> bool:
         """Best-effort todo progression after worker dispatch tools (plan execution). Returns True if todos changed."""
@@ -3708,13 +4336,13 @@ class AgentSession:
             if not summary or len(summary) < 10:
                 if trigger != "manual":
                     self.compaction_state["last_auto_error"] = "Compaction summary was empty or too short."
-                    self._save()
+                    await self._save_async()
                 return None
         except Exception as e:
             logger.warning("Context compaction failed: %s", e)
             if trigger != "manual":
                 self.compaction_state["last_auto_error"] = str(e)[:500]
-                self._save()
+                await self._save_async()
             return None
 
         last_summarized = to_summarize[-1]
@@ -3736,7 +4364,7 @@ class AgentSession:
             before_count,
             usage.get("context_message_count", after_count),
         )
-        self._save()
+        await self._save_async()
         return {
             "skipped": False,
             "summary": self.compaction_summary,
@@ -3875,7 +4503,7 @@ class AgentSession:
         }
         self._stamp_message(assistant_msg)
         self.messages.append(assistant_msg)
-        self._save()
+        await self._save_async()
         yield self._event("content", {"text": text}, run_id)
         yield self._event("context_usage", self.context_usage(), run_id)
         yield self._event("status", {"status": "completed"}, run_id)
@@ -3904,7 +4532,7 @@ class AgentSession:
 
     def switch_agent(self, agent_type: str):
         """Switch the active agent type, model, thinking intensity, and refresh the system prompt."""
-        if agent_type not in ("personal", "coding"):
+        if not AgentManager.is_known_agent_type(agent_type):
             raise ValueError(f"Unknown agent_type: {agent_type}")
         if agent_type != self._agent_type and _session_has_history(self):
             raise ValueError(
@@ -3995,10 +4623,41 @@ class AgentSession:
             # session can still serve native tools.
             self._mcp_tools_dirty = True
 
-    def _save(self):
+    def _archive_excess_messages(self) -> None:
+        """Evict old messages to an append-only archive file on disk.
+
+        Only messages that are already covered by compaction_summary (i.e.,
+        before the compaction boundary recorded in compaction_state) are safe
+        to evict: the LLM never needs their raw text again because the summary
+        already captures their content.  The boundary message itself is kept
+        resident so _compacted_boundary_index() can still locate it by message_id.
+        """
+        if len(self.messages) <= MAX_RESIDENT_MESSAGES:
+            return
+        boundary_index = self._compacted_boundary_index(self.messages)
+        if boundary_index is None or boundary_index <= 0:
+            # No compaction yet — unsafe to trim (all messages are in active context).
+            return
+        excess = len(self.messages) - MAX_RESIDENT_MESSAGES
+        archive_end = min(boundary_index, excess)  # never evict the boundary msg itself
+        if archive_end <= 0:
+            return
+        to_archive = self.messages[:archive_end]
+        archive_path = SESSIONS_DIR / f"{self.session_id}.archive.jsonl"
+        try:
+            with open(archive_path, "a", encoding="utf-8") as f:
+                for msg in to_archive:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("session %s: could not write transcript archive: %s", self.session_id, exc)
+            return
+        self._archived_message_count += archive_end
+        self.messages = self.messages[archive_end:]
+
+    def _build_save_payload(self) -> Tuple[Dict[str, Any], Path]:
+        self._archive_excess_messages()
         path = SESSIONS_DIR / f"{self.session_id}.json"
         self._ensure_message_metadata()
-        # Extract title from first user message
         title = ""
         for m in self.messages:
             if m.get("role") == "user" and m.get("source") != "internal":
@@ -4013,6 +4672,10 @@ class AgentSession:
         stored_project_path = None if self._agent_type == "personal" else _canonical_project_path(self.project_path)
         self.project_path = stored_project_path
 
+        # Shallow-copy mutable containers so a concurrently-running next turn
+        # (started after this turn's `done` event but before _save_async completes
+        # in its worker thread) cannot mutate the structures while json.dumps
+        # iterates them. Individual message dicts are stable once appended.
         data = {
             "session_id": self.session_id,
             "model_id": self.model_id,
@@ -4020,28 +4683,46 @@ class AgentSession:
             "agent_type": self._agent_type,
             "project_path": self.project_path,
             "context_epoch": self.context_epoch,
-            "agent_models": self._agent_models,
-            "agent_thinking": self._agent_thinking,
-            "messages": self.messages,
+            "agent_models": dict(self._agent_models),
+            "agent_thinking": dict(self._agent_thinking),
+            "messages": list(self.messages),
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
+            "collab_mode": getattr(self, "collab_mode", "execute"),
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": [item.model_dump() for item in self.task_guidance_items],
             "compaction_summary": self.compaction_summary,
             "compaction_state": self._normalize_compaction_state(self.compaction_state),
-            "last_usage": self._last_usage,
-            "last_context_usage": self._last_context_usage,
+            "last_usage": dict(self._last_usage) if isinstance(self._last_usage, dict) else self._last_usage,
+            "last_context_usage": dict(self._last_context_usage) if isinstance(self._last_context_usage, dict) else self._last_context_usage,
             "archived_at": self.archived_at,
+            "archived_message_count": self._archived_message_count,
             "title": title,
             "project_path": stored_project_path,
         }
+        return data, path
+
+    @staticmethod
+    def _write_save_payload(data: Dict[str, Any], path: Path) -> None:
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, path)
         except OSError:
             pass
+
+    def _save(self):
+        # Synchronous path retained for non-coroutine callers (startup, migrations).
+        # In async contexts inside run(), prefer _save_async to avoid blocking the
+        # event loop while serializing/writing potentially large session JSON.
+        data, path = self._build_save_payload()
+        self._write_save_payload(data, path)
+
+    async def _save_async(self) -> None:
+        data, path = self._build_save_payload()
+        await asyncio.to_thread(self._write_save_payload, data, path)
 
     @classmethod
     def load(cls, session_id: str) -> Optional["AgentSession"]:
@@ -4072,6 +4753,7 @@ class AgentSession:
                 if isinstance(msg, dict):
                     msg.setdefault("context_epoch", 0)
             session.iteration = 0
+            session._archived_message_count = int(data.get("archived_message_count") or 0)
             archived_at = data.get("archived_at")
             session.archived_at = str(archived_at) if archived_at else None
             stored_compaction_state = data.get("compaction_state")
@@ -4105,7 +4787,8 @@ class AgentSession:
                         session._agent_thinking[at] = stored_agent_thinking[at]
 
             cm = data.get("chat_mode", "agent")
-            session.chat_mode = cm if cm in ("agent", "plan") else "agent"
+            session.chat_mode = cm if cm in ("agent", "plan", "collaboration") else "agent"
+            session.collab_mode = data.get("collab_mode", "execute")
             ti = data.get("thinking_intensity", "medium")
             session.thinking_intensity = ti if ti in ("low", "medium", "high") else "medium"
             session._agent_thinking[session._agent_type] = session.thinking_intensity
@@ -4195,6 +4878,7 @@ class AgentSession:
             "messages": [m for m in self.messages if m.get("source") != "internal"],
             "iteration": self.iteration,
             "chat_mode": self.chat_mode,
+            "collab_mode": getattr(self, "collab_mode", "execute"),
             "thinking_intensity": self.thinking_intensity,
             "plan_state": self.plan_state.model_dump(),
             "task_guidance_items": self.active_task_guidance_items(),
@@ -4209,8 +4893,44 @@ class AgentSession:
             "context_estimated_tokens": context_usage.get("context_estimated_tokens"),
         }
 
+    def estimated_memory_bytes(self) -> int:
+        """Rough resident-size estimate of this session's transcript.
+
+        Used by the LRU cache to evict by memory footprint, not just count.
+        Cheap and approximate: it sums character lengths of message content
+        and any inline payloads rather than serializing the whole structure.
+        """
+        total = 0
+        for msg in self.messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    total += len(str(block.get("text", "")))
+                    image_url = block.get("image_url")
+                    if isinstance(image_url, dict):
+                        total += len(str(image_url.get("url", "")))
+            ui_artifacts = msg.get("ui_artifacts")
+            if isinstance(ui_artifacts, list):
+                for artifact in ui_artifacts:
+                    if isinstance(artifact, dict):
+                        total += len(str(artifact.get("base64", "")))
+        return total
+
 
 MAX_LIVE_SESSIONS = 32
+# Aggregate cap on resident transcript memory. Even within the count limit a
+# few very large sessions can dominate RSS, so evict LRU idle ones past this.
+MAX_LIVE_TOTAL_BYTES = 512 * 1024 * 1024
+
+# Per-session transcript cap. Messages beyond this threshold that are already
+# covered by compaction_summary are evicted from self.messages to disk. The
+# LLM context window uses at most MAX_HISTORY_MESSAGES = 20 messages, so 600
+# is already extremely conservative.
+MAX_RESIDENT_MESSAGES = 600
 
 # LRU of in-memory sessions. Eviction does NOT delete the on-disk JSON; the
 # next access falls through to AgentSession.load and rehydrates state.
@@ -4221,9 +4941,44 @@ def _touch(session_id: str) -> None:
     _sessions.move_to_end(session_id)
 
 
+def _session_is_running(session_id: str) -> bool:
+    """True when a live agent run currently owns this session."""
+    try:
+        from app.session_runtime import _session_runtimes
+        runtime = _session_runtimes.get(session_id)
+        return bool(runtime and runtime.is_running)
+    except Exception:
+        return False
+
+
+def _evict_oldest_idle() -> bool:
+    """Evict the least-recently-used session that is not mid-run.
+
+    Returns True if a session was evicted. A running session is never dropped
+    so an in-progress turn keeps a single canonical in-memory object; eviction
+    only removes the LRU cache entry (the on-disk JSON is untouched and the
+    next access rehydrates via AgentSession.load).
+    """
+    for session_id in list(_sessions.keys()):  # oldest first
+        if _session_is_running(session_id):
+            continue
+        del _sessions[session_id]
+        return True
+    return False
+
+
 def _evict_if_needed() -> None:
+    # Count-based cap.
     while len(_sessions) > MAX_LIVE_SESSIONS:
-        _sessions.popitem(last=False)
+        if not _evict_oldest_idle():
+            break
+    # Size-based cap: keep aggregate resident transcript memory bounded.
+    while len(_sessions) > 1:
+        total = sum(s.estimated_memory_bytes() for s in _sessions.values())
+        if total <= MAX_LIVE_TOTAL_BYTES:
+            break
+        if not _evict_oldest_idle():
+            break
 
 
 def get_or_create_session(
@@ -4238,6 +4993,8 @@ def get_or_create_session(
     provided_role_id = role_id
     role_id = role_id or (AgentManager.get_default_role(agent_type) if agent_type else "desktop-agent")
     resolved_agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
+    if not AgentManager.is_known_agent_type(resolved_agent_type):
+        raise ValueError(f"Unknown agent_type: {resolved_agent_type}")
     loaded_from_disk = False
     if existing is None:
         loaded = AgentSession.load(session_id)
@@ -4324,7 +5081,7 @@ def _newest_matching_session_id(agent_type: str, project_path: str | None = None
 
 def resolve_agent_session(agent_type: str, policy: str, project_path: str | None = None) -> Dict[str, Any]:
     """Resolve the session identity that should back an agent navigation action."""
-    if agent_type not in ("personal", "coding"):
+    if not AgentManager.is_known_agent_type(agent_type):
         raise ValueError(f"Unknown agent_type: {agent_type}")
     if policy not in ("canonical", "last_or_create", "new"):
         raise ValueError(f"Unknown session resolve policy: {policy}")
@@ -4357,6 +5114,55 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
         personal["primary_session_id"] = session.session_id
         _save_session_registry(registry)
         return _new_session_summary(session, created=created, is_primary=True)
+
+    if agent_type != "coding":
+        specialists = registry.setdefault("specialists", {})
+        if not isinstance(specialists, dict):
+            specialists = {}
+            registry["specialists"] = specialists
+        per_agent = specialists.setdefault(agent_type, {})
+        if not isinstance(per_agent, dict):
+            per_agent = {}
+            specialists[agent_type] = per_agent
+        project_bound = AgentManager.is_project_bound_agent(agent_type)
+        project_key = _normalize_project_key(canonical_project_path) if project_bound else "__global__"
+        last_by_project = per_agent.setdefault("last_session_by_project", {})
+
+        session_id = ""
+        if policy != "new":
+            candidate = last_by_project.get(project_key)
+            if candidate and _session_record_matches(
+                candidate,
+                agent_type=agent_type,
+                project_path=canonical_project_path if project_bound else None,
+            ):
+                session_id = candidate
+            else:
+                session_id = _newest_matching_session_id(
+                    agent_type,
+                    canonical_project_path if project_bound else None,
+                )
+        if not session_id:
+            session_id = f"session_{agent_type.replace(':', '_').replace('-', '_')}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+        created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
+        session = get_or_create_session(
+            session_id,
+            model_id,
+            role_id=role_id,
+            agent_type=agent_type,
+            preserve_existing_model=not created,
+        )
+        bound_path = canonical_project_path if project_bound and canonical_project_path else None
+        binding_changed = session.project_path != bound_path
+        if binding_changed:
+            session.project_path = bound_path
+        if created or binding_changed or not (SESSIONS_DIR / f"{session_id}.json").exists():
+            session._save()
+
+        last_by_project[project_key] = session.session_id
+        _save_session_registry(registry)
+        return _new_session_summary(session, created=created, is_primary=False)
 
     coding = registry.setdefault("coding", {})
     last_by_project = coding.setdefault("last_session_by_project", {})

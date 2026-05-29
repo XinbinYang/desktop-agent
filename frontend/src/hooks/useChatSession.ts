@@ -25,6 +25,9 @@ import {
   AutomationAction,
   AutomationTrace,
   AutomationReplayStatus,
+  CollaborationState,
+  ArtifactPayload,
+  ImageAttachment,
 } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { API_BASE } from '../config';
@@ -34,6 +37,11 @@ import {
   filterVisibleToolCalls,
   isInternalToolName,
 } from '../lib/internalTools';
+import {
+  normalizeArtifactPayloads,
+  normalizeImageAttachment,
+} from '../lib/imageAttachments';
+import { getCollaborationRunId } from '../lib/collaborationTimeline';
 
 function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -42,10 +50,25 @@ function generateId(): string {
 function initialChatModeFromStorage(): ClientChatMode {
   try {
     const v = localStorage.getItem('desktop-agent-chat-mode');
-    return v === 'plan' ? 'plan' : 'agent';
+    if (isClientChatMode(v)) return v;
+    return 'agent';
   } catch {
     return 'agent';
   }
+}
+
+function isClientChatMode(value: unknown): value is ClientChatMode {
+  return value === 'agent' || value === 'plan' || value === 'collaboration';
+}
+
+function mergeServerChatMode(
+  serverMode: ClientChatMode | undefined,
+  currentMode: ClientChatMode,
+): ClientChatMode {
+  if (!serverMode) return currentMode;
+  if (serverMode === 'plan') return 'plan';
+  if (serverMode === 'agent' && currentMode !== 'agent') return currentMode;
+  return serverMode;
 }
 
 function isThinkingIntensity(value: unknown): value is ThinkingIntensity {
@@ -97,7 +120,7 @@ function appendBlock(
       createdAt: Date.now(),
     });
   }
-  return updated;
+  return clampTail(updated, MAX_CHAT_MESSAGES);
 }
 
 function toolBucketLabel(name: string): string {
@@ -182,7 +205,8 @@ function ensureThinkingPlaceholder(messages: ChatMessage[]): ChatMessage[] {
     const hasVisibleBlock = (last.blocks || []).some((block) =>
       block.type !== 'thinking' || block.text !== THINKING_PLACEHOLDER_TEXT
     );
-    return hasVisibleBlock ? messages : last.blocks?.length ? messages : appendBlock(
+    if (hasVisibleBlock || last.blocks?.length) return messages;
+    return appendBlock(
       messages,
       {
         type: 'thinking',
@@ -229,7 +253,22 @@ function mergeBlock(
 }
 
 const THINKING_PLACEHOLDER_TEXT = 'Waiting for model response...';
-const STREAM_FLUSH_MS = 50;
+const STREAM_FLUSH_MS = 80;
+
+// Upper bounds for the in-memory session state. Long-running sessions otherwise
+// grow these arrays without limit, which is the dominant frontend memory leak.
+// runEvents/terminalLogs/automation* are already capped; these three were not.
+const MAX_CHAT_MESSAGES = 400;
+const MAX_TOOL_CALLS = 500;
+const MAX_FILE_EDITS = 300;
+// Per-parent and total caps for buffered worker events that have not yet been
+// claimed by their parent tool call.
+const MAX_PENDING_WORKER_EVENTS_PER_KEY = 100;
+const MAX_PENDING_WORKER_EVENT_KEYS = 50;
+
+function clampTail<T>(items: T[], max: number): T[] {
+  return items.length > max ? items.slice(items.length - max) : items;
+}
 
 interface StreamBuffers {
   reasoningText: string;
@@ -245,6 +284,41 @@ function emptyStreamBuffers(): StreamBuffers {
     contentText: '',
     contentStartedAt: 0,
   };
+}
+
+function initialCollaborationState(): CollaborationState {
+  return {
+    active: false,
+    run_id: '',
+    status: '',
+    currentTaskStatus: '',
+    currentPhase: '',
+    teamProgress: [],
+    recap: null,
+    evidence: [],
+    artifacts: [],
+    pendingClarification: null,
+  };
+}
+
+function imageBlockFromAttachment(image: ImageAttachment, timestamp = Date.now()): AssistantBlock {
+  return {
+    type: 'image',
+    image,
+    base64: image.base64,
+    url: image.url,
+    title: image.title,
+    mimeType: image.mimeType || image.mime_type,
+    timestamp,
+  };
+}
+
+function imageBlocksFromArtifacts(artifacts: ArtifactPayload[], timestamp = Date.now()): AssistantBlock[] {
+  return artifacts
+    .filter((artifact) => artifact.type === 'image')
+    .map((artifact) => normalizeImageAttachment(artifact))
+    .filter((image): image is ImageAttachment => Boolean(image))
+    .map((image) => imageBlockFromAttachment(image, timestamp));
 }
 
 function stripThinkingPlaceholder(text: string): string {
@@ -290,18 +364,37 @@ function sanitizeThinkingPlaceholders(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * Seal the most recent still-open thinking block (frontend-derived
- * completion). Called before appending any non-thinking block and on every
- * turn-ending event, so the live thinking window auto-collapses into a
- * "Thought for Ns" summary and its timer freezes.
+ * Seal every still-open thinking block across all assistant messages
+ * (frontend-derived completion). Called before appending any non-thinking
+ * block and on every turn-ending event, so the live thinking windows
+ * auto-collapse into "Thought for Ns" summaries and their timers freeze.
+ *
+ * A single turn can produce multiple thinking blocks (one per
+ * reason/tool/reason iteration); a naive seal-the-latest would leave earlier
+ * thinking chips stuck on `status: 'running'`, which keeps the activity
+ * drawer summary showing "正在处理 …" forever.
  */
+export function __completeOpenThinkingForTests(messages: ChatMessage[]): ChatMessage[] {
+  return completeOpenThinking(messages);
+}
+
 function completeOpenThinking(messages: ChatMessage[]): ChatMessage[] {
-  const result = mergeBlock(
-    messages,
-    (b) => b.type === 'thinking' && !(b as { complete?: boolean }).complete,
-    (b) => ({ ...b, complete: true, endedAt: Date.now() } as AssistantBlock),
-  );
-  return result ?? messages;
+  const now = Date.now();
+  let changed = false;
+  const updated = messages.map((msg) => {
+    if (msg.role !== 'assistant' || !msg.blocks) return msg;
+    let blocksChanged = false;
+    const blocks = msg.blocks.map((block) => {
+      if (block.type !== 'thinking') return block;
+      if ((block as { complete?: boolean }).complete) return block;
+      blocksChanged = true;
+      return { ...block, complete: true, endedAt: now } as AssistantBlock;
+    });
+    if (!blocksChanged) return msg;
+    changed = true;
+    return { ...msg, blocks };
+  });
+  return changed ? updated : messages;
 }
 
 function isDispatchTool(name?: string): boolean {
@@ -479,7 +572,8 @@ function mergeSnapshotWithOptimistic(
     }
     pending.push(msg);
   }
-  return pending.length > 0 ? [...restored, ...pending] : restored;
+  const merged = pending.length > 0 ? [...restored, ...pending] : restored;
+  return clampTail(merged, MAX_CHAT_MESSAGES);
 }
 
 function isSessionNotFoundSnapshot(snapshot: any): boolean {
@@ -688,6 +782,7 @@ function sessionSnapshotToState(snapshot: any): {
       const toolName = pending?.name || msg.name || '';
       if (isInternalToolName(toolName)) continue;
       const result = contentToText(msg.content);
+      const uiArtifacts = normalizeArtifactPayloads(msg.ui_artifacts);
       if (pending) {
         const target = restoredMessages[pending.messageIndex];
         const blocks = [...(target.blocks || [])];
@@ -697,7 +792,9 @@ function sessionSnapshotToState(snapshot: any): {
             ...block,
             result,
             status: result.startsWith('[ERROR]') ? 'error' : 'success',
+            artifacts: uiArtifacts,
           };
+          blocks.push(...imageBlocksFromArtifacts(uiArtifacts));
           restoredMessages[pending.messageIndex] = {
             ...target,
             blocks,
@@ -710,6 +807,7 @@ function sessionSnapshotToState(snapshot: any): {
           result,
           timestamp: Date.now(),
           toolCallId,
+          artifacts: uiArtifacts,
         });
       } else {
         restoredToolCalls.push({
@@ -718,12 +816,26 @@ function sessionSnapshotToState(snapshot: any): {
           result,
           timestamp: Date.now(),
           toolCallId,
+          artifacts: uiArtifacts,
         });
+        const imageBlocks = imageBlocksFromArtifacts(uiArtifacts);
+        if (imageBlocks.length > 0) {
+          restoredMessages.push({
+            id: msg.message_id || generateId(),
+            role: 'assistant',
+            content: '',
+            messageId: msg.message_id,
+            createdAt: typeof msg.created_at === 'number' ? msg.created_at * 1000 : undefined,
+            isTool: false,
+            blocks: imageBlocks,
+            turnComplete: true,
+          });
+        }
       }
     }
   }
 
-  const chatMode = snapshot?.chat_mode === 'plan' ? 'plan' : snapshot?.chat_mode === 'agent' ? 'agent' : undefined;
+  const chatMode = isClientChatMode(snapshot?.chat_mode) ? snapshot.chat_mode : undefined;
   const thinkingIntensity =
     isThinkingIntensity(snapshot?.thinking_intensity)
       ? snapshot.thinking_intensity
@@ -807,8 +919,12 @@ export function useChatSession(
   });
   const planStateRef = useRef<PlanState>(planState);
 
+  // Collaboration delegation tracking state (P3/P4)
+  const [collaborationState, setCollaborationState] = useState<CollaborationState>(() => initialCollaborationState());
+
   const onToolCallRef = useRef<((tc: ToolCall) => void) | null>(null);
   const onFileEditRef = useRef<((edit: FileEdit) => void) | null>(null);
+  const dismissedCollaborationRunIdsRef = useRef<Set<string>>(new Set());
   const pendingWorkerEventsRef = useRef<Record<string, WorkerEvent[]>>({});
   const planBufferedContentRef = useRef('');
   const buildRequestInFlightRef = useRef(false);
@@ -899,7 +1015,7 @@ export function useChatSession(
     if (!text) return;
     planBufferedContentRef.current = '';
     setMessages((prev) => appendBlock(
-      completeOpenThinking(prev),
+      completeOpenThinking(dropOpenThinkingPlaceholder(prev)),
       { type: 'text', text, timestamp: Date.now() },
       true,
     ));
@@ -910,12 +1026,20 @@ export function useChatSession(
   }, []);
 
   const recordRunEvent = useCallback((event: WS_EVENT) => {
-    const runEvent: RunEvent = {
-      id: `${event.type}_${event.data?.run_id || 'run'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    const eventData = event.data || {};
+    const normalizedEvent = {
+      id: '',
       type: event.type as RunEvent['type'],
-      runId: event.data?.run_id,
-      timestamp: event.data?.timestamp ? event.data.timestamp * 1000 : Date.now(),
-      data: event.data || {},
+      timestamp: 0,
+      data: eventData,
+    };
+    const runId = getCollaborationRunId(normalizedEvent) || eventData.run_id;
+    const runEvent: RunEvent = {
+      id: `${event.type}_${runId || 'run'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: event.type as RunEvent['type'],
+      runId,
+      timestamp: eventData.timestamp ? eventData.timestamp * 1000 : Date.now(),
+      data: eventData,
     };
     setRunEvents((prev) => [...prev.slice(-300), runEvent]);
   }, []);
@@ -990,9 +1114,16 @@ export function useChatSession(
     });
 
     if (!attachedToTool) {
+      const store = pendingWorkerEventsRef.current;
       const key = parentId || '__latest__';
-      const pending = pendingWorkerEventsRef.current[key] || [];
-      pendingWorkerEventsRef.current[key] = [...pending, workerEvent];
+      const pending = store[key] || [];
+      store[key] = clampTail([...pending, workerEvent], MAX_PENDING_WORKER_EVENTS_PER_KEY);
+      const keys = Object.keys(store);
+      if (keys.length > MAX_PENDING_WORKER_EVENT_KEYS) {
+        for (const stale of keys.slice(0, keys.length - MAX_PENDING_WORKER_EVENT_KEYS)) {
+          delete store[stale];
+        }
+      }
     }
   }, []);
 
@@ -1001,7 +1132,7 @@ export function useChatSession(
       ...edit,
       timestamp: edit.timestamp || Date.now(),
     };
-    setFileEdits((prev) => [...prev, normalized]);
+    setFileEdits((prev) => clampTail([...prev, normalized], MAX_FILE_EDITS));
     if (appendToChat) {
       setMessages((prev) =>
         appendBlock(
@@ -1027,7 +1158,7 @@ export function useChatSession(
           setMessages((prev) =>
             mergeSnapshotWithOptimistic(prev, restored.messages, optimisticUserMessageIdsRef.current)
           );
-          setToolCalls(restored.toolCalls);
+          setToolCalls(clampTail(restored.toolCalls, MAX_TOOL_CALLS));
           setFileEdits([]);
           setAutomationSnapshots([]);
           setAutomationActions([]);
@@ -1037,21 +1168,12 @@ export function useChatSession(
           setCheckpoints(restored.checkpoints || []);
           setTaskGuidanceItems(restored.taskGuidanceItems || []);
           const fromServer = restored.chatMode;
-          const serverPlanPhase = (event.data as { plan_state?: { phase?: string } })?.plan_state?.phase;
           const prev = chatModeRef.current;
-          let merged: ClientChatMode = prev;
-          if (!fromServer) {
-            merged = prev;
-          } else if (fromServer === 'plan') {
-            merged = 'plan';
-          } else if (prev === 'plan' && fromServer === 'agent') {
-            merged = serverPlanPhase && serverPlanPhase !== 'idle' ? 'plan' : prev;
-          } else {
-            merged = fromServer;
-          }
+          const merged = mergeServerChatMode(fromServer, prev);
+          chatModeRef.current = merged;
           setChatModeState(merged);
-          if (merged === 'plan' && fromServer === 'agent') {
-            sendRef.current({ type: 'set_chat_mode', chat_mode: 'plan' });
+          if (fromServer === 'agent' && merged !== 'agent') {
+            sendRef.current({ type: 'set_chat_mode', chat_mode: merged });
           }
           if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
           if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
@@ -1061,7 +1183,7 @@ export function useChatSession(
 
         case 'chat_mode': {
           const m = event.data?.chat_mode;
-          if (m === 'plan' || m === 'agent') {
+          if (isClientChatMode(m)) {
             chatModeRef.current = m;
             setChatModeState(m);
           }
@@ -1120,6 +1242,9 @@ export function useChatSession(
         case 'worker_done': {
           const workerEvent = toWorkerEvent(event);
           attachWorkerEvent(workerEvent);
+          if (event.type === 'worker_tool_call' && event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           if (event.type === 'worker_tool_call') {
             addTerminalLog(`[Worker:${event.data.worker_id}] ${event.data.name}: ${event.data.result}`);
           } else if (event.type === 'worker_done') {
@@ -1129,10 +1254,14 @@ export function useChatSession(
         }
 
         case 'tool_call': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           const isError = (event.data.result || '').startsWith('[ERROR]');
           const workerEvents = isDispatchTool(event.data.name)
             ? takePendingWorkerEvents(event.data.tool_call_id)
             : undefined;
+          const artifacts = normalizeArtifactPayloads(event.data.artifacts);
           const tc: ToolCall = {
             name: event.data.name,
             args: event.data.args,
@@ -1142,23 +1271,24 @@ export function useChatSession(
             toolCallId: event.data.tool_call_id,
             durationMs: event.data.duration_ms,
             workerEvents,
+            artifacts,
           };
           if (isInternalToolName(event.data.name)) {
             setMessages((prev) =>
               event.data.name === 'plan_ask_questions'
-                ? dropOpenPlanQuestionNoise(completeOpenThinking(prev))
-                : completeOpenThinking(prev)
+                ? dropOpenPlanQuestionNoise(completeOpenThinking(dropOpenThinkingPlaceholder(prev)))
+                : completeOpenThinking(dropOpenThinkingPlaceholder(prev))
             );
             break;
           }
-          setToolCalls((prev) => [...prev, tc]);
+          setToolCalls((prev) => clampTail([...prev, tc], MAX_TOOL_CALLS));
           addTerminalLog(`[工具] ${event.data.name}: ${event.data.result}`);
           onToolCallRef.current?.(tc);
 
           setMessages((prev0) => {
             // A tool landing seals any open thinking block (covers the case
             // where no status:executing event preceded this result).
-            const prev = completeOpenThinking(prev0);
+            const prev = completeOpenThinking(dropOpenThinkingPlaceholder(prev0));
             // Try to find and update a running placeholder created by status:executing
             const withUpdate = mergeBlock(
               prev,
@@ -1177,6 +1307,7 @@ export function useChatSession(
                   ((b as any).workerEvents as WorkerEvent[] | undefined) || [],
                   workerEvents || [],
                 ),
+                artifacts,
               }),
             );
             if (withUpdate) return refreshLatestAssistantSummary(withUpdate);
@@ -1191,6 +1322,7 @@ export function useChatSession(
                 toolCallId: event.data.tool_call_id,
                 durationMs: event.data.duration_ms,
                 workerEvents,
+                artifacts,
                 timestamp: Date.now(),
               },
               false,
@@ -1204,6 +1336,7 @@ export function useChatSession(
           const resultText = isError
             ? `[ERROR] ${event.data.error}`
             : event.data.output || '';
+          const artifacts = normalizeArtifactPayloads(event.data.artifacts);
           const tc: ToolCall = {
             name: event.data.name,
             args: event.data.args || {},
@@ -1212,22 +1345,23 @@ export function useChatSession(
             runId: event.data.run_id,
             toolCallId: event.data.tool_call_id,
             durationMs: event.data.duration_ms,
+            artifacts,
           };
           if (isInternalToolName(event.data.name)) {
             setMessages((prev) =>
               event.data.name === 'plan_ask_questions'
-                ? dropOpenPlanQuestionNoise(completeOpenThinking(prev))
-                : completeOpenThinking(prev)
+                ? dropOpenPlanQuestionNoise(completeOpenThinking(dropOpenThinkingPlaceholder(prev)))
+                : completeOpenThinking(dropOpenThinkingPlaceholder(prev))
             );
             break;
           }
-          setToolCalls((prev) => [...prev, tc]);
+          setToolCalls((prev) => clampTail([...prev, tc], MAX_TOOL_CALLS));
           addTerminalLog(`[工具] ${event.data.name}: ${resultText}`);
           onToolCallRef.current?.(tc);
 
           setMessages((prev) =>
             refreshLatestAssistantSummary(appendBlock(
-              completeOpenThinking(prev),
+              completeOpenThinking(dropOpenThinkingPlaceholder(prev)),
               {
                 type: 'tool_call',
                 name: event.data.name,
@@ -1236,6 +1370,7 @@ export function useChatSession(
                 status: isError ? 'error' : 'success',
                 toolCallId: event.data.tool_call_id,
                 durationMs: event.data.duration_ms,
+                artifacts,
                 timestamp: Date.now(),
               },
               false,
@@ -1243,10 +1378,33 @@ export function useChatSession(
           );
 
           if (event.data.image) {
+            const image = normalizeImageAttachment(event.data.image);
+            if (image) {
+              setMessages((prev) =>
+                appendBlock(
+                  prev,
+                  imageBlockFromAttachment(image),
+                  false,
+                ),
+              );
+            }
+          }
+          const artifactImageBlocks = imageBlocksFromArtifacts(artifacts);
+          if (artifactImageBlocks.length > 0) {
+            setMessages((prev) =>
+              artifactImageBlocks.reduce((next, block) => appendBlock(next, block, false), prev),
+            );
+          }
+          break;
+        }
+
+        case 'image': {
+          const image = normalizeImageAttachment(event.data);
+          if (image) {
             setMessages((prev) =>
               appendBlock(
                 prev,
-                { type: 'image', base64: event.data.image, timestamp: Date.now() },
+                imageBlockFromAttachment(image),
                 false,
               ),
             );
@@ -1254,17 +1412,10 @@ export function useChatSession(
           break;
         }
 
-        case 'image':
-          setMessages((prev) =>
-            appendBlock(
-              prev,
-              { type: 'image', base64: event.data.base64, timestamp: Date.now() },
-              false,
-            ),
-          );
-          break;
-
         case 'file_edit': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+          }
           recordFileEdit(event.data as FileEdit, true);
           break;
         }
@@ -1312,32 +1463,213 @@ export function useChatSession(
 
         case 'collaboration_run_created':
         case 'collaboration_task_update':
+        case 'collaboration_plan_auto_approved':
         case 'agent_message':
         case 'artifact_ready':
         case 'decision_required':
+        case 'collaboration_clarification_request':
+        case 'collaboration_clarification_answer':
         case 'collaboration_run_completed': {
           recordRunEvent(event);
+          // Reset collaboration state on new run
+          if (event.type === 'collaboration_run_created') {
+            setCollaborationState({
+              active: true,
+              run_id: event.data?.run_id || event.data?.collaboration_run_id || '',
+              status: 'running',
+              currentTaskStatus: 'pending',
+              currentPhase: 'created',
+              teamProgress: [{ team_role: 'coding', phase: 'running', summary: event.data?.goal || '' }],
+              recap: null,
+              evidence: [],
+              artifacts: [],
+              pendingClarification: null,
+            });
+          }
           const collabId = event.data?.collaboration_run_id || event.data?.run_id || '';
+          if (event.type === 'collaboration_run_created' && collabId) {
+            dismissedCollaborationRunIdsRef.current.delete(collabId);
+          }
           if (event.type === 'collaboration_run_created') {
             addTerminalLog(`[Collab] Coding Agent run created ${collabId}`.trim());
           } else if (event.type === 'collaboration_task_update') {
             addTerminalLog(`[Collab] Task ${event.data?.task_id || ''} ${event.data?.status || ''}`.trim());
+            const taskStatus = event.data?.status || '';
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: taskStatus === 'failed' ? 'failed' : taskStatus === 'cancelled' ? 'cancelled' : prev.status || 'running',
+                currentTaskStatus: taskStatus,
+                currentPhase: taskStatus,
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  {
+                    team_role: 'coding',
+                    phase: taskStatus === 'failed' || taskStatus === 'cancelled'
+                      ? 'failed'
+                      : taskStatus === 'completed'
+                        ? 'done'
+                        : 'running',
+                    summary: event.data?.packet?.goal || event.data?.result?.summary || '',
+                  },
+                ],
+                evidence: event.data?.result?.evidence || prev.evidence || [],
+                artifacts: event.data?.result?.artifacts || prev.artifacts || [],
+              };
+            });
           } else if (event.type === 'agent_message') {
             addTerminalLog(`[Collab] ${event.data?.agent_type || 'agent'}: ${(event.data?.text || '').slice(0, 160)}`);
+          } else if (event.type === 'collaboration_plan_auto_approved') {
+            addTerminalLog(`[Collab] Plan auto-approved ${collabId}`.trim());
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'running',
+                currentPhase: 'executing',
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  { team_role: 'coding', phase: 'running', summary: 'Plan auto-approved; executing' },
+                ],
+              };
+            });
           } else if (event.type === 'artifact_ready') {
             addTerminalLog(`[Collab] Artifact ready ${event.data?.artifact?.title || collabId}`.trim());
-          } else if (event.type === 'decision_required') {
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                artifacts: [...(prev.artifacts || []), event.data?.artifact].filter(Boolean),
+              };
+            });
+          } else if (event.type === 'decision_required' || event.type === 'collaboration_clarification_request') {
             addTerminalLog(`[Collab] Decision required ${event.data?.reason || collabId}`.trim());
+            if (event.data?.kind === 'clarification' || event.type === 'collaboration_clarification_request') {
+              setCollaborationState((prev) => {
+                const runId = collabId || prev.run_id;
+                const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+                return {
+                  ...prev,
+                  active: !dismissed,
+                  run_id: runId,
+                  status: 'waiting_clarification',
+                  currentPhase: 'waiting_clarification',
+                  pendingClarification: {
+                    request_id: event.data?.request_id || '',
+                    question: event.data?.question || event.data?.reason || 'Clarification needed',
+                    options: Array.isArray(event.data?.options) ? event.data.options : [],
+                    context: event.data?.context || '',
+                    recommendation: event.data?.recommendation || '',
+                    answered_by: event.data?.answered_by || '',
+                    reason: event.data?.reason || '',
+                    confidence: typeof event.data?.confidence === 'number' ? event.data.confidence : undefined,
+                    task_id: event.data?.task_id || event.data?.collaboration_task_id || '',
+                  },
+                };
+              });
+            }
+          } else if (event.type === 'collaboration_clarification_answer') {
+            addTerminalLog(`[Collab] Clarification answered ${collabId}`.trim());
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'running',
+                currentPhase: 'running',
+                pendingClarification: null,
+              };
+            });
           } else {
             addTerminalLog(`[Collab] Run ${event.data?.status || 'completed'} ${collabId}`.trim());
+            const status = event.data?.status || 'completed';
+            setCollaborationState((prev) => {
+              const runId = collabId || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status,
+                currentPhase: status,
+                pendingClarification: status === 'completed' || status === 'failed' || status === 'cancelled'
+                  ? null
+                  : prev.pendingClarification,
+                teamProgress: [
+                  ...prev.teamProgress.filter((tp) => tp.team_role !== 'coding'),
+                  {
+                    team_role: 'coding',
+                    phase: status === 'completed'
+                      ? 'done'
+                      : status === 'failed' || status === 'cancelled'
+                        ? 'failed'
+                        : 'running',
+                    summary: event.data?.summary || '',
+                  },
+                ],
+              };
+            });
           }
+          break;
+        }
+
+        case 'team_progress': {
+          recordRunEvent(event);
+          const tpData = event.data || {};
+          setCollaborationState((prev) => {
+            const runId = tpData.run_id || prev.run_id;
+            const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+            return {
+              ...prev,
+              active: !dismissed,
+              run_id: runId,
+              teamProgress: [
+                ...prev.teamProgress.filter((tp) => tp.team_role !== tpData.team_role),
+                { team_role: tpData.team_role, phase: tpData.phase, summary: tpData.summary },
+              ],
+            };
+          });
+          break;
+        }
+
+        case 'collaboration_recap': {
+          recordRunEvent(event);
+          const recapData = event.data || {};
+          const recap = recapData.recap || null;
+          setCollaborationState((prev) => {
+            const runId = recapData.run_id || recap?.run_id || prev.run_id;
+            const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+            return {
+              ...prev,
+              active: !dismissed,
+              run_id: runId,
+              recap,
+            };
+          });
           break;
         }
 
         case 'run_completed':
           recordRunEvent(event);
-          isRunningRef.current = false;
-          setIsRunning(false);
+          if (event.data?.status === 'waiting_clarification') {
+            isRunningRef.current = true;
+            setIsRunning(true);
+          } else {
+            isRunningRef.current = false;
+            setIsRunning(false);
+          }
           addTerminalLog(`[Run] ${event.data.status || 'completed'}: ${event.data.summary || ''}`);
           break;
 
@@ -1371,7 +1703,7 @@ export function useChatSession(
             isRunningRef.current = true;
             setIsRunning(true);
           }
-          if (status === 'thinking') {
+          if (status === 'thinking' || status === 'running') {
             setMessages((prev) => ensureThinkingPlaceholder(prev));
           }
           if (status === 'executing') {
@@ -1382,7 +1714,7 @@ export function useChatSession(
             // Push a running placeholder — the matching tool_call event will fill in details
             setMessages((prev) =>
               refreshLatestAssistantSummary(appendBlock(
-                completeOpenThinking(prev),
+                completeOpenThinking(dropOpenThinkingPlaceholder(prev)),
                 {
                   type: 'tool_call',
                   name: event.data.tool || '',
@@ -1405,7 +1737,7 @@ export function useChatSession(
         }
 
         case 'plan_status':
-          if (event.data.mode === 'agent') {
+          if (event.data.mode === 'agent' && chatModeRef.current !== 'collaboration') {
             chatModeRef.current = event.data.mode;
             setChatModeState(event.data.mode);
           } else if (
@@ -1584,7 +1916,9 @@ export function useChatSession(
           const incoming = incomingRaw.filter(isActiveTaskGuidanceItem);
           setTaskGuidanceItems((prev) => mergeTaskGuidanceItems(prev, incoming));
           setMessages((prev) =>
-            removeQueuedOptimisticMessages(prev, incomingRaw, optimisticUserMessageIdsRef.current)
+            dropOpenThinkingPlaceholder(
+              removeQueuedOptimisticMessages(prev, incomingRaw, optimisticUserMessageIdsRef.current)
+            )
           );
           addTerminalLog(`[Guidance] Queued ${event.data?.item?.id || 'message'}`);
           break;
@@ -1653,12 +1987,27 @@ export function useChatSession(
           break;
 
         case 'error': {
+          if (event.data?.collaboration_run_id) {
+            recordRunEvent(event);
+            setCollaborationState((prev) => {
+              const runId = event.data?.collaboration_run_id || prev.run_id;
+              const dismissed = Boolean(runId && dismissedCollaborationRunIdsRef.current.has(runId));
+              return {
+                ...prev,
+                active: !dismissed,
+                run_id: runId,
+                status: 'failed',
+                currentPhase: 'failed',
+              };
+            });
+          }
           buildRequestInFlightRef.current = false;
+          pendingWorkerEventsRef.current = {};
           const msg = errorMessage(event.data);
           const retryable = isRetryableError(event.data);
           setMessages((prev) => {
             const complete = markTurnComplete(completeOpenThinking(dropOpenThinkingPlaceholder(prev)));
-            return [
+            return clampTail([
               ...complete,
               {
                 id: generateId(),
@@ -1666,7 +2015,7 @@ export function useChatSession(
                 content: retryable ? `⚠️ ${msg} (可重试)` : `错误: ${msg}`,
                 isTool: false,
               },
-            ];
+            ], MAX_CHAT_MESSAGES);
           });
           if (!retryable) {
             setIsRunning(false);
@@ -1716,6 +2065,7 @@ export function useChatSession(
 
         case 'done':
           optimisticUserMessageIdsRef.current.clear();
+          pendingWorkerEventsRef.current = {};
           isRunningRef.current = false;
           setIsRunning(false);
           setMessages((prev) => markTurnComplete(completeOpenThinking(dropOpenThinkingPlaceholder(prev))));
@@ -1725,6 +2075,8 @@ export function useChatSession(
         case 'cleared':
           buildRequestInFlightRef.current = false;
           discardPlanBufferedContent();
+          pendingWorkerEventsRef.current = {};
+          dismissedCollaborationRunIdsRef.current.clear();
           setMessages([]);
           setToolCalls([]);
           setFileEdits([]);
@@ -1737,6 +2089,7 @@ export function useChatSession(
           setCheckpoints([]);
           pendingStaleGuidanceRef.current = [];
           setTaskGuidanceItems([]);
+          setCollaborationState(initialCollaborationState());
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -1760,12 +2113,14 @@ export function useChatSession(
           buildRequestInFlightRef.current = false;
           discardPlanBufferedContent();
           optimisticUserMessageIdsRef.current.clear();
+          dismissedCollaborationRunIdsRef.current.clear();
           if (event.data?.context_usage) {
             setContextUsage(event.data.context_usage as ContextUsage);
           }
           setCheckpoints([]);
           pendingStaleGuidanceRef.current = [];
           setTaskGuidanceItems([]);
+          setCollaborationState(initialCollaborationState());
           setChatModeState('agent');
           setPlanState({
             mode: 'agent',
@@ -1792,8 +2147,9 @@ export function useChatSession(
         case 'interrupted':
           buildRequestInFlightRef.current = false;
           optimisticUserMessageIdsRef.current.clear();
+          pendingWorkerEventsRef.current = {};
           setIsRunning(false);
-          setMessages((prev) => markTurnComplete(completeOpenThinking(prev)));
+          setMessages((prev) => markTurnComplete(completeOpenThinking(dropOpenThinkingPlaceholder(prev))));
           addTerminalLog('[系统] 用户中断');
           break;
 
@@ -1848,6 +2204,8 @@ export function useChatSession(
   const resetLocalSessionState = useCallback(() => {
     userTouchedRef.current = false;
     optimisticUserMessageIdsRef.current.clear();
+    pendingWorkerEventsRef.current = {};
+    dismissedCollaborationRunIdsRef.current.clear();
     buildRequestInFlightRef.current = false;
     clearStreamBuffers();
     discardPlanBufferedContent();
@@ -1867,6 +2225,7 @@ export function useChatSession(
     setTerminalLogs([]);
     setIsRunning(false);
     setChatModeState(initialChatModeFromStorage());
+    setCollaborationState(initialCollaborationState());
     setPlanState({
       mode: 'agent',
       phase: 'idle',
@@ -1893,15 +2252,20 @@ export function useChatSession(
       const data = await loadSession(sessionId);
       if (!mounted || userTouchedRef.current) return;
       if (data && ((data.messages || []).length > 0 || (data.toolCalls || []).length > 0)) {
-        const cachedMessages = sanitizeThinkingPlaceholders(sanitizeCachedMessages(data.messages || []));
+        const cachedMessages = clampTail(
+          sanitizeThinkingPlaceholders(sanitizeCachedMessages(data.messages || [])),
+          MAX_CHAT_MESSAGES,
+        );
         if (cachedMessages.length > 0) {
           setMessages(cachedMessages);
         }
-        setToolCalls(filterVisibleToolCalls(data.toolCalls || []));
-        setFileEdits(data.fileEdits || []);
+        setToolCalls(clampTail(filterVisibleToolCalls(data.toolCalls || []), MAX_TOOL_CALLS));
+        setFileEdits(clampTail(data.fileEdits || [], MAX_FILE_EDITS));
         setTaskGuidanceItems(Array.isArray(data.taskGuidanceItems) ? data.taskGuidanceItems.filter(isActiveTaskGuidanceItem) : []);
-        if (data.chatMode === 'plan' || data.chatMode === 'agent') {
-          setChatModeState(data.chatMode);
+        if (isClientChatMode(data.chatMode)) {
+          const merged = mergeServerChatMode(data.chatMode, chatModeRef.current);
+          chatModeRef.current = merged;
+          setChatModeState(merged);
         }
         if (isThinkingIntensity(data.thinkingIntensity)) {
           setThinkingIntensityState(data.thinkingIntensity);
@@ -1925,9 +2289,13 @@ export function useChatSession(
         setMessages((prev) =>
           mergeSnapshotWithOptimistic(prev, restored.messages, optimisticUserMessageIdsRef.current)
         );
-        setToolCalls(restored.toolCalls);
+        setToolCalls(clampTail(restored.toolCalls, MAX_TOOL_CALLS));
         setFileEdits([]);
-        if (restored.chatMode) setChatModeState(restored.chatMode);
+        if (restored.chatMode) {
+          const merged = mergeServerChatMode(restored.chatMode, chatModeRef.current);
+          chatModeRef.current = merged;
+          setChatModeState(merged);
+        }
         if (restored.thinkingIntensity) setThinkingIntensityState(restored.thinkingIntensity);
         if (restored.planState) setPlanState((prev) => ({ ...prev, ...restored.planState }));
         setContextUsage(restored.contextUsage || null);
@@ -2003,12 +2371,13 @@ export function useChatSession(
   }, [sessionId, hydratedSessionId, messages, toolCalls, fileEdits, chatMode, thinkingIntensity, planState, taskGuidanceItems]);
 
   const queueTaskGuidance = useCallback(
-    (text: string, imageBase64?: string) => {
+    (text: string, imageBase64?: string, options?: { applyNow?: boolean }) => {
       if (!text.trim() && !imageBase64) return false;
       const sent = send({
         type: 'queue_task_guidance',
         text: text.trim(),
         image_base64: imageBase64,
+        apply_now: Boolean(options?.applyNow),
       });
       if (sent === false) {
         addTerminalLog('[错误] WebSocket 未连接，引导消息未排队');
@@ -2058,7 +2427,7 @@ export function useChatSession(
       setIsRunning(true);
       const localMessageId = generateId();
       optimisticUserMessageIdsRef.current.add(localMessageId);
-      setMessages((prev) => [
+      setMessages((prev) => clampTail([
         ...prev,
         {
           id: localMessageId,
@@ -2067,7 +2436,7 @@ export function useChatSession(
           imageBase64,
           isTool: false,
         },
-      ]);
+      ], MAX_CHAT_MESSAGES));
       const sent = send({
         type: 'chat',
         text: text.trim(),
@@ -2082,7 +2451,10 @@ export function useChatSession(
         optimisticUserMessageIdsRef.current.delete(localMessageId);
         isRunningRef.current = false;
         setIsRunning(false);
+        setMessages((prev) => dropOpenThinkingPlaceholder(prev));
         addTerminalLog('[错误] WebSocket 未连接，消息未发送');
+      } else {
+        setMessages((prev) => ensureThinkingPlaceholder(prev));
       }
     },
     [send, sessionId, currentModel, agentType, roleId, addTerminalLog, queueTaskGuidance]
@@ -2233,6 +2605,54 @@ export function useChatSession(
     send({ type: 'pause_build' });
   }, [send]);
 
+  const pauseCollaboration = useCallback(() => {
+    if (!collaborationState.run_id) return;
+    send({ type: 'collab_pause', run_id: collaborationState.run_id });
+  }, [collaborationState.run_id, send]);
+
+  const cancelCollaboration = useCallback(() => {
+    const runId = collaborationState.run_id;
+    if (!runId) {
+      setCollaborationState(initialCollaborationState());
+      return;
+    }
+    const phase = collaborationState.status || collaborationState.currentPhase || collaborationState.currentTaskStatus || '';
+    const terminal = phase === 'completed' || phase === 'failed' || phase === 'cancelled' || phase === 'max_iterations_reached';
+    dismissedCollaborationRunIdsRef.current.add(runId);
+    setCollaborationState((prev) => {
+      if (prev.run_id && prev.run_id !== runId) return prev;
+      return {
+        ...prev,
+        active: false,
+        run_id: prev.run_id || runId,
+        status: terminal ? prev.status : 'cancelled',
+        currentTaskStatus: terminal ? prev.currentTaskStatus : 'cancelled',
+        currentPhase: terminal ? prev.currentPhase : 'cancelled',
+        pendingClarification: null,
+        teamProgress: prev.teamProgress.map((entry) => (
+          !terminal && entry.phase === 'running'
+            ? { ...entry, phase: 'failed' as const, summary: entry.summary || 'Cancelled' }
+            : entry
+        )),
+      };
+    });
+
+    if (!terminal) {
+      send({ type: 'collaboration_cancel', run_id: runId });
+    }
+  }, [collaborationState.currentPhase, collaborationState.currentTaskStatus, collaborationState.run_id, collaborationState.status, send]);
+
+  const answerCollaborationClarification = useCallback((answer: string) => {
+    const text = answer.trim();
+    if (!collaborationState.run_id || !text) return;
+    send({
+      type: 'collab_clarification_answer',
+      run_id: collaborationState.run_id,
+      request_id: collaborationState.pendingClarification?.request_id || '',
+      answer: text,
+    });
+  }, [collaborationState.pendingClarification?.request_id, collaborationState.run_id, send]);
+
   const endBuild = useCallback(() => {
     setIsRunning(false);
     setPlanState((prev) => ({
@@ -2364,9 +2784,13 @@ export function useChatSession(
     thinkingIntensity,
     setThinkingIntensity,
     planState,
+    collaborationState,
     approvePlan,
     buildPlan,
     pauseBuild,
+    pauseCollaboration,
+    cancelCollaboration,
+    answerCollaborationClarification,
     endBuild,
     rejectPlan,
     updatePlanDecision,

@@ -94,6 +94,7 @@ describe('App', () => {
     vi.restoreAllMocks()
     vi.clearAllMocks()
     localStorage.clear()
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 1024 })
     delete (globalThis as any).__desktopAgentLastSessionViewProps
     delete (globalThis as any).__desktopAgentOpenFiles
     delete (globalThis as any).__desktopAgentSessionSnapshotOverride
@@ -123,7 +124,7 @@ describe('App', () => {
     terminalLayout: { conversation: 76, terminal: 24 },
   })
 
-  const mockProjectFileFetch = (sessionId = 'session_coding_file') => {
+  const mockProjectFileFetch = (sessionId = 'session_coding_file', openResponse?: any) => {
     const project = {
       path: 'C:/repo',
       name: 'repo',
@@ -133,6 +134,7 @@ describe('App', () => {
     const nodes = [
       { name: 'src', path: 'src', type: 'dir', has_children: false },
       { name: 'README.md', path: 'README.md', type: 'file', extension: 'md' },
+      { name: '交易流水.xlsx', path: '交易流水.xlsx', type: 'file', extension: 'xlsx' },
     ]
     return vi.fn((url: string, _init?: RequestInit) => {
       if (url.endsWith('/api/models')) {
@@ -161,10 +163,13 @@ describe('App', () => {
       if (url.endsWith('/api/projects/refresh')) {
         return Promise.resolve({ json: () => Promise.resolve({ project, nodes }) }) as any
       }
-      if (url.includes('/api/file/read')) {
+      if (url.includes('/api/file/open')) {
+        const payload = typeof openResponse === 'function'
+          ? openResponse(url)
+          : openResponse || { kind: 'text', content: '# Hello\n', path: 'C:/repo/README.md', size: 8 }
         return Promise.resolve({
           ok: true,
-          json: () => Promise.resolve({ content: '# Hello\n', path: 'C:/repo/README.md' }),
+          json: () => Promise.resolve(payload),
         }) as any
       }
       if (url.endsWith('/api/sessions/resolve')) {
@@ -193,6 +198,74 @@ describe('App', () => {
     render(<App />)
     await waitFor(() => {
       expect(screen.getByText('Desktop Agent')).toBeInTheDocument()
+    })
+  })
+
+  it('renders the chat pane as a floating dock over a clickable workbench background', async () => {
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+
+    expect(screen.getByTestId('floating-workbench')).toBeInTheDocument()
+    expect(screen.getByTestId('floating-chat-dock')).toBeInTheDocument()
+    const background = screen.getByTestId('workbench-background')
+
+    fireEvent.click(within(background).getByTestId('workbench-zone-activity'))
+
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.rightZone).toBe('activity')
+    })
+  })
+
+  it('keeps the floating chat resize handle outside the scrollable dock edge', async () => {
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+
+    const resizeHandle = screen.getByRole('separator', { name: 'Resize floating chat' })
+
+    expect(resizeHandle).toHaveClass('left-full')
+    expect(resizeHandle).not.toHaveClass('-right-2')
+  })
+
+  it('resizes the floating chat dock from the keyboard and resets on double click', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({ chatOverlayWidth: 640 }))
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    const resizeHandle = screen.getByRole('separator', { name: 'Resize floating chat' })
+
+    fireEvent.keyDown(resizeHandle, { key: 'ArrowRight' })
+
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.chatOverlayWidth).toBe(496)
+    })
+
+    fireEvent.doubleClick(resizeHandle)
+
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.chatOverlayWidth).toBe(560)
+    })
+  })
+
+  it('persists floating chat drag width only after the pointer drag ends', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({ chatOverlayWidth: 560 }))
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    const resizeHandle = screen.getByRole('separator', { name: 'Resize floating chat' })
+
+    fireEvent.pointerDown(resizeHandle, { button: 0, clientX: 100 })
+    fireEvent.pointerMove(window, { clientX: 180 })
+
+    expect(JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}').chatOverlayWidth).toBe(560)
+
+    fireEvent.pointerUp(window)
+
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.chatOverlayWidth).toBe(496)
     })
   })
 
@@ -577,6 +650,8 @@ describe('App', () => {
   })
 
   it('creates a new coding session in a split pane without replacing the current pane', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 1600 })
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({ chatOverlayWidth: 560 }))
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/api/sessions/resolve')) {
         return Promise.resolve({
@@ -629,6 +704,10 @@ describe('App', () => {
     expect(JSON.parse(String(resolveCall?.[1]?.body))).toMatchObject({
       agent_type: 'coding',
       policy: 'new',
+    })
+    await waitFor(() => {
+      const layout = JSON.parse(localStorage.getItem('desktop-agent-layout') || '{}')
+      expect(layout.chatOverlayWidth).toBe(1072)
     })
   })
 
@@ -722,6 +801,141 @@ describe('App', () => {
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/projects/open'))).toBe(true)
     })
     expect(await screen.findByTestId('session-session_b')).toBeInTheDocument()
+  })
+
+  it('restores an already minimized session from history instead of opening a duplicate pane', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify({
+      activeSection: 'workspace',
+      activeAgent: 'coding',
+      showTerminal: true,
+      rightZone: 'workspace',
+      rightPanelVisible: true,
+      sidebarCollapsed: false,
+      mainLayout: { center: 70, right: 30 },
+      terminalLayout: { conversation: 76, terminal: 24 },
+    }))
+    localStorage.setItem('desktop-agent-pane-tree', JSON.stringify({
+      version: 3,
+      focusedLeafId: 'leaf_a',
+      paneRoot: {
+        type: 'split',
+        id: 'root',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'leaf_a',
+            pane: { id: 'pane_a', sessionId: 'session_a', model: 'gpt-4o', agentType: 'coding', role: 'code-expert' },
+          },
+          {
+            type: 'leaf',
+            id: 'leaf_b',
+            pane: {
+              id: 'pane_b',
+              sessionId: 'session_b',
+              model: 'gpt-4o',
+              agentType: 'coding',
+              role: 'code-expert',
+              title: 'Fix bug',
+              projectPath: 'C:/repo-b',
+              isMinimized: true,
+            },
+          },
+        ],
+      },
+    }))
+    const projectA = {
+      path: 'C:/repo-a',
+      name: 'repo-a',
+      git_branch: 'main',
+      last_opened: '2026-05-18T00:00:00Z',
+    }
+    const projectB = {
+      path: 'C:/repo-b',
+      name: 'repo-b',
+      git_branch: 'main',
+      last_opened: '2026-05-18T01:00:00Z',
+    }
+    const history = {
+      current_project_path: projectA.path,
+      projects: [
+        { ...projectA, is_current: true, has_running: false, sessions: [] },
+        {
+          ...projectB,
+          is_current: false,
+          has_running: false,
+          sessions: [{
+            id: 'session_b',
+            title: 'Fix bug',
+            project_path: projectB.path,
+            model_id: 'gpt-4o',
+            role_id: 'code-expert',
+            agent_type: 'coding',
+            message_count: 2,
+            updated_at: 1779116000,
+            is_primary: false,
+            is_running: false,
+            active_connections: 0,
+            activity_state: 'idle',
+          }],
+        },
+      ],
+      standalone_sessions: [],
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            models: [
+              { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+            ],
+            default: 'gpt-4o',
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      if (url.endsWith('/api/projects/current')) {
+        return Promise.resolve({ json: () => Promise.resolve(projectA) }) as any
+      }
+      if (url.endsWith('/api/projects/refresh')) {
+        return Promise.resolve({ json: () => Promise.resolve({ project: projectA, nodes: [] }) }) as any
+      }
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/projects/open')) {
+        expect(JSON.parse(String(init?.body))).toMatchObject({ path: projectB.path })
+        return Promise.resolve({ json: () => Promise.resolve(projectB) }) as any
+      }
+      if (url.endsWith('/api/projects/tree')) {
+        return Promise.resolve({ json: () => Promise.resolve({ nodes: [] }) }) as any
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    expect(screen.queryByTestId('session-session_b')).not.toBeInTheDocument()
+    expect(within(screen.getByTestId('minimized-pane-tray')).getByText(/Fix bug/)).toBeInTheDocument()
+
+    fireEvent.click(await screen.findByLabelText('Expand project repo-b'))
+    fireEvent.click(await screen.findByLabelText('Open session Fix bug'))
+
+    expect(await screen.findByTestId('session-session_b')).toBeInTheDocument()
+    expect(screen.queryByTestId('minimized-pane-tray')).not.toBeInTheDocument()
+    expect(screen.queryAllByTestId('session-session_b')).toHaveLength(1)
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/sessions/resolve'))).toBe(false)
   })
 
   it('starts a new coding session inside a selected project from the project row', async () => {
@@ -1054,9 +1268,9 @@ describe('App', () => {
     })
   })
 
-  it('stops only the closed pane session and keeps sibling panes mounted', async () => {
+  it('minimizes a pane into the bottom tray without stopping the session', async () => {
     localStorage.setItem('desktop-agent-pane-tree', JSON.stringify({
-      version: 2,
+      version: 3,
       focusedLeafId: 'leaf_a',
       paneRoot: {
         type: 'split',
@@ -1077,12 +1291,142 @@ describe('App', () => {
         ],
       },
     }))
+    const history = {
+      current_project_path: null,
+      projects: [],
+      standalone_sessions: [
+        {
+          id: 'session_a',
+          title: 'Primary',
+          project_path: null,
+          model_id: 'gpt-4o',
+          role_id: 'code-expert',
+          agent_type: 'coding',
+          message_count: 1,
+          is_primary: false,
+          is_running: false,
+          active_connections: 1,
+          activity_state: 'idle',
+        },
+        {
+          id: 'session_b',
+          title: 'Background',
+          project_path: null,
+          model_id: 'gpt-4o',
+          role_id: 'code-expert',
+          agent_type: 'coding',
+          message_count: 1,
+          is_primary: false,
+          is_running: true,
+          active_connections: 1,
+          activity_state: 'running',
+        },
+      ],
+    }
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
+      }
+      if (url.endsWith('/api/settings')) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            providers: { openai: { api_key_configured: true, models: [] } },
+            settings: { default_provider: 'openai' },
+            personal_agent: { model: 'gpt-4o' },
+            coding_agent: { model: 'gpt-4o' },
+          }),
+        }) as any
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          models: [
+            { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', vision: true, context: 128000 },
+          ],
+          default: 'gpt-4o',
+        }),
+      }) as any
+    })
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByTestId('session-session_a')
+    fireEvent.click(screen.getAllByLabelText('Minimize pane')[1])
+
+    expect(screen.getByTestId('session-session_a')).toBeInTheDocument()
+    expect(screen.queryByTestId('session-session_b')).not.toBeInTheDocument()
+    const tray = screen.getByTestId('minimized-pane-tray')
+    expect(within(tray).getByText(/Background/)).toBeInTheDocument()
+    expect(within(tray).getByLabelText(/Background running/)).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/stop'))).toBe(false)
+
+    fireEvent.click(within(tray).getByRole('button', { name: /Restore pane .*Background/ }))
+
+    expect(await screen.findByTestId('session-session_b')).toBeInTheDocument()
+    expect(screen.queryByTestId('minimized-pane-tray')).not.toBeInTheDocument()
+  })
+
+  it('confirms before stopping and closing a running pane', async () => {
+    localStorage.setItem('desktop-agent-pane-tree', JSON.stringify({
+      version: 3,
+      focusedLeafId: 'leaf_a',
+      paneRoot: {
+        type: 'split',
+        id: 'root',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'leaf_a',
+            pane: { id: 'pane_a', sessionId: 'session_a', model: 'gpt-4o', agentType: 'coding', role: 'code-expert' },
+          },
+          {
+            type: 'leaf',
+            id: 'leaf_b',
+            pane: { id: 'pane_b', sessionId: 'session_b', model: 'gpt-4o', agentType: 'coding', role: 'code-expert' },
+          },
+        ],
+      },
+    }))
+    const history = {
+      current_project_path: null,
+      projects: [],
+      standalone_sessions: [
+        {
+          id: 'session_a',
+          title: 'Primary',
+          project_path: null,
+          model_id: 'gpt-4o',
+          role_id: 'code-expert',
+          agent_type: 'coding',
+          message_count: 1,
+          is_primary: false,
+          is_running: false,
+          active_connections: 1,
+          activity_state: 'idle',
+        },
+        {
+          id: 'session_b',
+          title: 'Background',
+          project_path: null,
+          model_id: 'gpt-4o',
+          role_id: 'code-expert',
+          agent_type: 'coding',
+          message_count: 1,
+          is_primary: false,
+          is_running: true,
+          active_connections: 1,
+          activity_state: 'running',
+        },
+      ],
+    }
     const fetchMock = vi.fn((url: string) => {
       if (url.endsWith('/api/sessions/session_b/stop')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'ok', was_running: true }) }) as any
       }
-      if (url.endsWith('/api/sessions') || url.includes('/api/sessions?')) {
-        return Promise.resolve({ json: () => Promise.resolve({ sessions: [] }) }) as any
+      if (url.endsWith('/api/session-history')) {
+        return Promise.resolve({ json: () => Promise.resolve(history) }) as any
       }
       if (url.endsWith('/api/settings')) {
         return Promise.resolve({
@@ -1110,6 +1454,16 @@ describe('App', () => {
     await screen.findByTestId('session-session_a')
     fireEvent.click(screen.getAllByLabelText('Close pane')[1])
 
+    expect(await screen.findByRole('dialog', { name: /Stop running session/ })).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/sessions/session_b/stop'))).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog', { name: /Stop running session/ })).not.toBeInTheDocument()
+    expect(screen.getByTestId('session-session_b')).toBeInTheDocument()
+
+    fireEvent.click(screen.getAllByLabelText('Close pane')[1])
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop and close' }))
+
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([url, init]) =>
         String(url).endsWith('/api/sessions/session_b/stop') &&
@@ -1118,7 +1472,6 @@ describe('App', () => {
     })
     expect(screen.getByTestId('session-session_a')).toBeInTheDocument()
     expect(screen.queryByTestId('session-session_b')).not.toBeInTheDocument()
-    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/sessions/session_a/stop'))).toBe(false)
   })
 
   it('opens settings when the default provider has no configured API key', async () => {
@@ -1371,6 +1724,59 @@ describe('App', () => {
     })
   })
 
+  it('opens an Excel project file as an office preview tab without reading it as text', async () => {
+    localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
+    const excelArtifact = {
+      id: 'artifact_excel',
+      type: 'office',
+      title: '交易流水.xlsx',
+      kind: 'excel',
+      path: 'C:/runtime/preview/交易流水.xlsx',
+      mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      workbook: {
+        sheets: [{ name: '流水', rows: [[{ address: 'A1', value: 'Date' }]] }],
+      },
+      manifest_url: '/api/office/artifact_excel/manifest',
+    }
+    const fetchMock = mockProjectFileFetch('session_coding_file', (url: string) => (
+      url.includes('xlsx')
+        ? {
+            kind: 'office',
+            artifact: excelArtifact,
+            path: 'C:/repo/交易流水.xlsx',
+            size: 4096,
+          }
+        : { kind: 'text', content: '# Hello\n', path: 'C:/repo/README.md', size: 8 }
+    ))
+    global.fetch = fetchMock as any
+
+    render(<App />)
+    await screen.findByText('Desktop Agent')
+    fireEvent.click(screen.getByLabelText('Coding Agent'))
+    fireEvent.click(await screen.findByText('交易流水.xlsx'))
+
+    await waitFor(() => {
+      expect((globalThis as any).__desktopAgentOpenFiles.session_coding_file).toHaveBeenCalledWith(
+        '交易流水.xlsx',
+        '',
+        'excel',
+        expect.objectContaining({
+          viewerType: 'office',
+          readOnly: true,
+          artifact: expect.objectContaining({
+            id: 'artifact_excel',
+            type: 'office',
+            title: '交易流水.xlsx',
+            workbook: excelArtifact.workbook,
+          }),
+          absolutePath: 'C:/repo/交易流水.xlsx',
+          size: 4096,
+        }),
+      )
+    })
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/file/read'))).toBe(false)
+  })
+
   it('switches from Personal to Coding before opening a project file', async () => {
     localStorage.setItem('desktop-agent-layout', JSON.stringify(collapsedProjectLayout()))
     const fetchMock = mockProjectFileFetch('session_coding_from_personal')
@@ -1406,7 +1812,7 @@ describe('App', () => {
     await screen.findByText('Desktop Agent')
     fireEvent.click(await screen.findByText('src'))
 
-    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/file/read'))).toBe(false)
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/file/open'))).toBe(false)
     expect((globalThis as any).__desktopAgentOpenFiles?.session_coding_file).toBeUndefined()
   })
 

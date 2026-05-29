@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
-import { useChatSession } from '../../hooks/useChatSession'
-import type { WS_EVENT } from '../../types'
+import { useChatSession, __completeOpenThinkingForTests } from '../../hooks/useChatSession'
+import type { ChatMessage, WS_EVENT } from '../../types'
 import { loadSession, deleteSessionData } from '../../lib/db'
 
 // Mock useWebSocket
@@ -59,16 +59,23 @@ describe('useChatSession', () => {
     expect(result.current.isRunning).toBe(false)
   })
 
-  it('sends message and adds user message', () => {
+  it('sends message and adds an immediate thinking placeholder', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
     act(() => {
       result.current.sendMessage('hello')
     })
 
-    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages).toHaveLength(2)
     expect(result.current.messages[0].role).toBe('user')
     expect(result.current.messages[0].content).toBe('hello')
+    expect(result.current.messages[1].role).toBe('assistant')
+    expect(result.current.messages[1].blocks).toEqual([
+      expect.objectContaining({
+        type: 'thinking',
+        text: 'Waiting for model response...',
+      }),
+    ])
     expect(result.current.isRunning).toBe(true)
     expect(mockSend).toHaveBeenCalledWith({
       type: 'chat',
@@ -93,6 +100,13 @@ describe('useChatSession', () => {
     })
 
     expect(result.current.isRunning).toBe(false)
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].role).toBe('user')
+    expect(
+      result.current.messages.some((message) => message.blocks?.some((block) =>
+        block.type === 'thinking' && block.text === 'Waiting for model response...'
+      )),
+    ).toBe(false)
     expect(result.current.terminalLogs.some((line) => line.includes('WebSocket'))).toBe(true)
   })
 
@@ -117,8 +131,35 @@ describe('useChatSession', () => {
       type: 'queue_task_guidance',
       text: 'prefer the smaller fix',
       image_base64: undefined,
+      apply_now: false,
     })
     expect(result.current.messages).toHaveLength(0)
+  })
+
+  it('queues or immediately submits task guidance based on applyNow', () => {
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      result.current.queueTaskGuidance('queued note')
+    })
+
+    expect(mockSend).toHaveBeenLastCalledWith({
+      type: 'queue_task_guidance',
+      text: 'queued note',
+      image_base64: undefined,
+      apply_now: false,
+    })
+
+    act(() => {
+      result.current.queueTaskGuidance('submit now', undefined, { applyNow: true })
+    })
+
+    expect(mockSend).toHaveBeenLastCalledWith({
+      type: 'queue_task_guidance',
+      text: 'submit now',
+      image_base64: undefined,
+      apply_now: true,
+    })
   })
 
   it('tracks task guidance websocket events', () => {
@@ -190,6 +231,32 @@ describe('useChatSession', () => {
       messageHandler?.({ type: 'run_completed', data: { status: 'completed', summary: 'ok' } })
     })
     expect(result.current.isRunning).toBe(false)
+  })
+
+  it('keeps running while a delegated coding run waits for clarification', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({ type: 'status', data: { status: 'thinking' } })
+      messageHandler?.({
+        type: 'run_completed',
+        data: {
+          status: 'waiting_clarification',
+          summary: 'Need Personal Agent input',
+        },
+      })
+    })
+
+    expect(result.current.isRunning).toBe(true)
   })
 
   it('falls back to done when no run_completed event arrives', () => {
@@ -273,7 +340,14 @@ describe('useChatSession', () => {
     act(() => {
       result.current.sendMessage('queued note')
     })
-    expect(result.current.messages.map((m) => m.content)).toEqual(['queued note'])
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(result.current.messages[0].content).toBe('queued note')
+    expect(result.current.messages[1].blocks).toEqual([
+      expect.objectContaining({
+        type: 'thinking',
+        text: 'Waiting for model response...',
+      }),
+    ])
 
     act(() => {
       messageHandler?.({
@@ -330,7 +404,13 @@ describe('useChatSession', () => {
     expect(result.current.messages).toHaveLength(0)
 
     act(() => {
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(79)
+    })
+
+    expect(result.current.messages).toHaveLength(0)
+
+    act(() => {
+      vi.advanceTimersByTime(1)
     })
 
     expect(result.current.messages).toHaveLength(1)
@@ -344,7 +424,13 @@ describe('useChatSession', () => {
     })
 
     act(() => {
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(79)
+    })
+
+    expect((result.current.messages[0].blocks![0] as { text: string }).text).toBe('Hello')
+
+    act(() => {
+      vi.advanceTimersByTime(1)
     })
 
     // Re-read blocks from the updated state (not stale reference)
@@ -353,7 +439,36 @@ describe('useChatSession', () => {
     vi.useRealTimers()
   })
 
-  it('creates a replaceable assistant placeholder while waiting for the first streamed token', () => {
+  it('caps messages and toolCalls so long sessions cannot grow without bound', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      for (let i = 0; i < 520; i++) {
+        messageHandler?.({
+          type: 'tool_call',
+          data: { name: 'shell', args: {}, result: `r${i}`, tool_call_id: `tc_${i}` },
+        })
+        messageHandler?.({ type: 'done', data: {} })
+      }
+    })
+
+    expect(result.current.messages.length).toBeLessThanOrEqual(400)
+    expect(result.current.toolCalls.length).toBeLessThanOrEqual(500)
+    // The tail (most recent activity) is retained; oldest entries are dropped.
+    expect(result.current.toolCalls[result.current.toolCalls.length - 1].result).toBe('r519')
+  })
+
+  it('shows a waiting placeholder until the first streamed content token', () => {
     vi.useFakeTimers()
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -373,14 +488,17 @@ describe('useChatSession', () => {
     })
 
     expect(result.current.messages).toHaveLength(2)
-    expect(result.current.messages[1].blocks?.[0]).toMatchObject({
-      type: 'thinking',
-      text: 'Waiting for model response...',
-    })
+    expect(result.current.messages[0].role).toBe('user')
+    expect(result.current.messages[1].blocks).toEqual([
+      expect.objectContaining({
+        type: 'thinking',
+        text: 'Waiting for model response...',
+      }),
+    ])
 
     act(() => {
       messageHandler?.({ type: 'content', data: { text: 'Hello' } })
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(80)
     })
 
     expect(result.current.messages).toHaveLength(2)
@@ -390,7 +508,7 @@ describe('useChatSession', () => {
     vi.useRealTimers()
   })
 
-  it('replaces the waiting placeholder with streamed reasoning', () => {
+  it('renders streamed reasoning as the first assistant block', () => {
     vi.useFakeTimers()
     let messageHandler: ((msg: WS_EVENT) => void) | undefined
     mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
@@ -408,7 +526,7 @@ describe('useChatSession', () => {
       result.current.sendMessage('hello')
       messageHandler?.({ type: 'status', data: { status: 'thinking' } })
       messageHandler?.({ type: 'reasoning', data: { text: 'checking context' } })
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(80)
     })
 
     expect(result.current.messages).toHaveLength(2)
@@ -1000,7 +1118,7 @@ describe('useChatSession', () => {
     })
 
     act(() => {
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(80)
     })
 
     let blocks = result.current.messages[0].blocks!
@@ -1026,7 +1144,7 @@ describe('useChatSession', () => {
     })
 
     act(() => {
-      vi.advanceTimersByTime(60)
+      vi.advanceTimersByTime(80)
     })
 
     blocks = result.current.messages[0].blocks!
@@ -1034,6 +1152,7 @@ describe('useChatSession', () => {
     expect(thinkingBlocks).toHaveLength(2)
     expect(thinkingBlocks[1].text).toBe('second thought')
     expect(thinkingBlocks[1].complete).toBeFalsy()
+    vi.useRealTimers()
   })
 
   it('handles tool_result event', async () => {
@@ -1100,6 +1219,95 @@ describe('useChatSession', () => {
     const imageBlock = blocks!.find((b) => b.type === 'image')
     expect(imageBlock).toBeDefined()
     expect((imageBlock as { type: 'image'; base64: string }).base64).toBe('abc123')
+  })
+
+  it('handles URL image event', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'image',
+        data: {
+          id: 'img-1',
+          url: '/preview/session-1/chart.png',
+          title: 'Equity curve',
+          mime_type: 'image/png',
+          source: 'image_publish',
+          tool_call_id: 'call_img',
+        },
+      })
+    })
+
+    expect(result.current.messages).toHaveLength(1)
+    const imageBlock = result.current.messages[0].blocks!.find((b) => b.type === 'image') as any
+    expect(imageBlock.image.url).toBe('/preview/session-1/chart.png')
+    expect(imageBlock.title).toBe('Equity curve')
+    expect(imageBlock.mimeType).toBe('image/png')
+  })
+
+  it('restores ui_artifacts images from history_snapshot', async () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          messages: [
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                id: 'call_img',
+                type: 'function',
+                function: {
+                  name: 'image_publish',
+                  arguments: '{"path":"chart.png"}',
+                },
+              }],
+            },
+            {
+              role: 'tool',
+              name: 'image_publish',
+              tool_call_id: 'call_img',
+              content: 'Image published',
+              ui_artifacts: [{
+                id: 'img-1',
+                type: 'image',
+                title: 'Chart',
+                url: '/preview/session-1/chart.png',
+                mime_type: 'image/png',
+              }],
+            },
+          ],
+        },
+      })
+    })
+
+    const blocks = result.current.messages[0].blocks || []
+    expect(blocks.some((b) => b.type === 'tool_call' && (b as any).artifacts?.[0]?.url === '/preview/session-1/chart.png')).toBe(true)
+    const imageBlock = blocks.find((b) => b.type === 'image') as any
+    expect(imageBlock.image.url).toBe('/preview/session-1/chart.png')
+    expect(result.current.toolCalls[0].artifacts?.[0].url).toBe('/preview/session-1/chart.png')
   })
 
   it('handles error event and stops running', async () => {
@@ -1312,11 +1520,11 @@ describe('useChatSession', () => {
     const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
 
     act(() => {
-      result.current.setChatMode('plan')
+      result.current.setChatMode('collaboration')
     })
 
-    expect(result.current.chatMode).toBe('plan')
-    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
+    expect(result.current.chatMode).toBe('collaboration')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'collaboration' })
   })
 
   it('sends the next message in plan mode immediately after clicking Plan', () => {
@@ -1411,6 +1619,237 @@ describe('useChatSession', () => {
     }))
     expect(mockSend.mock.calls.filter(([payload]) => payload?.type === 'build_plan')).toHaveLength(1)
     expect(result.current.planState.phase).toBe('approved_waiting_build')
+  })
+
+  it('tracks collaboration state from run and task lifecycle events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+    expect(result.current.collaborationState.run_id).toBe('collab_1')
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_task_update',
+        data: {
+          run_id: 'collab_1',
+          task_id: 'task_1',
+          status: 'running',
+          packet: { goal: 'clean data' },
+        },
+      })
+    })
+    expect(result.current.collaborationState.teamProgress[0]).toMatchObject({
+      team_role: 'coding',
+      phase: 'running',
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_task_update',
+        data: {
+          run_id: 'collab_1',
+          task_id: 'task_1',
+          status: 'completed',
+          result: {
+            summary: 'done',
+            evidence: [{ kind: 'test', label: 'verify_project' }],
+            artifacts: [{ title: 'analysis_report.md', type: 'text' }],
+          },
+        },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+    expect(result.current.collaborationState.evidence?.[0]?.label).toBe('verify_project')
+    expect(result.current.collaborationState.artifacts?.[0]).toMatchObject({ title: 'analysis_report.md' })
+  })
+
+  it('dismisses the collaboration panel and keeps cancelled event replays hidden', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+
+    act(() => {
+      result.current.cancelCollaboration()
+    })
+    expect(mockSend).toHaveBeenCalledWith({ type: 'collaboration_cancel', run_id: 'collab_1' })
+    expect(result.current.collaborationState.active).toBe(false)
+    expect(result.current.collaborationState.status).toBe('cancelled')
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_task_update',
+        data: {
+          run_id: 'collab_1',
+          task_id: 'task_1',
+          status: 'cancelled',
+        },
+      })
+      messageHandler?.({
+        type: 'collaboration_run_completed',
+        data: {
+          run_id: 'collab_1',
+          status: 'cancelled',
+          summary: 'Collaboration run cancelled',
+        },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(false)
+    expect(result.current.collaborationState.teamProgress[0]).toMatchObject({
+      team_role: 'coding',
+      phase: 'failed',
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_2', goal: 'new task', status: 'running' },
+      })
+    })
+    expect(result.current.collaborationState.active).toBe(true)
+    expect(result.current.collaborationState.run_id).toBe('collab_2')
+  })
+
+  it('tracks collaboration clarification answers and child run events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+      messageHandler?.({
+        type: 'collaboration_clarification_request',
+        data: {
+          run_id: 'collab_1',
+          request_id: 'clar_1',
+          question: 'Use simple_return or log_return?',
+          options: ['log_return', 'simple_return'],
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.pendingClarification?.request_id).toBe('clar_1')
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_clarification_answer',
+        data: {
+          run_id: 'collab_1',
+          request_id: 'clar_1',
+          answer: 'log_return',
+          answered_by: 'personal_auto',
+          reason: 'Safe technical default.',
+          confidence: 0.9,
+        },
+      })
+      messageHandler?.({
+        type: 'tool_call',
+        data: {
+          run_id: 'outer_run',
+          collaboration_run_id: 'collab_1',
+          name: 'verify_project',
+          args: {},
+          result: 'exit_code: 0\nok',
+          tool_call_id: 'tool_1',
+        },
+      })
+      messageHandler?.({
+        type: 'file_edit',
+        data: {
+          run_id: 'outer_run',
+          collaboration_run_id: 'collab_1',
+          path: 'src/returns.ts',
+          operation: 'modify',
+          stats: { added: 2, removed: 1 },
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.pendingClarification).toBeNull()
+    expect(result.current.runEvents.some((event) =>
+      event.type === 'collaboration_clarification_answer' &&
+      event.data.answered_by === 'personal_auto'
+    )).toBe(true)
+    expect(result.current.runEvents.filter((event) => event.runId === 'collab_1').map((event) => event.type))
+      .toEqual(expect.arrayContaining(['tool_call', 'file_edit']))
+  })
+
+  it('records collaboration-scoped model errors in run events', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-1', 'gpt-4o'))
+
+    act(() => {
+      messageHandler?.({
+        type: 'collaboration_run_created',
+        data: { run_id: 'collab_1', goal: 'clean data', status: 'running' },
+      })
+      messageHandler?.({
+        type: 'error',
+        data: {
+          run_id: 'coding_child',
+          collaboration_run_id: 'collab_1',
+          message: 'Model call failed: [Errno 11001] getaddrinfo failed',
+        },
+      })
+    })
+
+    expect(result.current.collaborationState.status).toBe('failed')
+    expect(result.current.runEvents.some((event) =>
+      event.type === 'error' &&
+      event.runId === 'collab_1' &&
+      event.data.message.includes('getaddrinfo failed')
+    )).toBe(true)
   })
 
   it('sends reset, compact, and rewind session control messages', () => {
@@ -1527,6 +1966,128 @@ describe('useChatSession', () => {
       messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'agent' } })
     })
     expect(result.current.chatMode).toBe('agent')
+
+    act(() => {
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'collaboration' } })
+    })
+    expect(result.current.chatMode).toBe('collaboration')
+  })
+
+  it('restores collaboration chat mode from saved session snapshots', async () => {
+    mockedLoadSession.mockResolvedValueOnce({
+      sessionId: 'session-collab',
+      messages: [{ id: 'cached', role: 'user', content: 'cached', isTool: false }],
+      toolCalls: [],
+      chatMode: 'collaboration',
+      timestamp: Date.now(),
+    } as any)
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        json: () => Promise.resolve({
+          session_id: 'session-collab',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'collaboration',
+          messages: [{ role: 'user', content: 'server collab', message_id: 'm1' }],
+        }),
+      })
+    ))
+
+    const { result } = renderHook(() => useChatSession('session-collab', 'gpt-4o'))
+
+    await waitFor(() => {
+      expect(result.current.chatMode).toBe('collaboration')
+    })
+  })
+
+  it('keeps a freshly selected collaboration mode when stale hydration returns agent', async () => {
+    let resolveFetch: (value: { json: () => Promise<any> }) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => {
+      resolveFetch = resolve
+    })))
+
+    const { result } = renderHook(() => useChatSession('session-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+    })
+    expect(result.current.chatMode).toBe('collaboration')
+
+    await act(async () => {
+      resolveFetch({
+        json: () => Promise.resolve({
+          session_id: 'session-race',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [{ role: 'user', content: 'older server message', message_id: 'm1' }],
+        }),
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
+  })
+
+  it('keeps collaboration mode when a stale history snapshot reports agent', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-ws-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+      messageHandler?.({
+        type: 'history_snapshot',
+        data: {
+          session_id: 'session-ws-race',
+          model_id: 'gpt-4o',
+          role_id: 'desktop-agent',
+          chat_mode: 'agent',
+          messages: [],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
+    expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'collaboration' })
+  })
+
+  it('does not let plan_status agent payload override collaboration mode', () => {
+    let messageHandler: ((msg: WS_EVENT) => void) | undefined
+    mockedUseWebSocket.mockImplementation((_sessionId, onMessage) => {
+      messageHandler = onMessage
+      return {
+        isConnected: true,
+        send: mockSend,
+        disconnect: vi.fn(),
+      }
+    })
+
+    const { result } = renderHook(() => useChatSession('session-plan-status-race', 'gpt-4o'))
+
+    act(() => {
+      result.current.setChatMode('collaboration')
+      messageHandler?.({ type: 'chat_mode', data: { chat_mode: 'collaboration' } })
+      messageHandler?.({
+        type: 'plan_status',
+        data: {
+          mode: 'agent',
+          phase: 'idle',
+          approved: false,
+          questions: [],
+          todos: [],
+        },
+      })
+    })
+
+    expect(result.current.chatMode).toBe('collaboration')
   })
 
   it('applies thinking_intensity events from the server', () => {
@@ -1593,5 +2154,48 @@ describe('useChatSession', () => {
     expect(result.current.chatMode).toBe('plan')
     expect(mockSend).toHaveBeenCalledWith({ type: 'set_chat_mode', chat_mode: 'plan' })
     localStorage.setItem('desktop-agent-chat-mode', 'agent')
+  })
+})
+
+describe('completeOpenThinking', () => {
+  it('seals every open thinking block across all assistant messages, not just the last', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: '',
+        isTool: false,
+        turnComplete: false,
+        blocks: [
+          { type: 'thinking', text: 'first thought', timestamp: 1, startedAt: 1 },
+          { type: 'tool_call', name: 'list', args: {}, result: 'ok', status: 'success', toolCallId: 'c1', timestamp: 2 },
+          { type: 'thinking', text: 'second thought', timestamp: 3, startedAt: 3 },
+          { type: 'thinking', text: 'third thought', timestamp: 4, startedAt: 4 },
+        ],
+      },
+    ]
+
+    const updated = __completeOpenThinkingForTests(messages)
+    const thinkingBlocks = (updated[0].blocks || []).filter((b) => b.type === 'thinking') as Array<{ complete?: boolean; endedAt?: number }>
+    expect(thinkingBlocks).toHaveLength(3)
+    expect(thinkingBlocks.every((b) => b.complete === true)).toBe(true)
+    expect(thinkingBlocks.every((b) => typeof b.endedAt === 'number')).toBe(true)
+  })
+
+  it('leaves already-complete thinking blocks untouched and returns the same reference when nothing changes', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: 'done',
+        isTool: false,
+        turnComplete: true,
+        blocks: [
+          { type: 'thinking', text: 'thought', timestamp: 1, startedAt: 1, endedAt: 5, complete: true },
+        ],
+      },
+    ]
+    const updated = __completeOpenThinkingForTests(messages)
+    expect(updated).toBe(messages)
   })
 })

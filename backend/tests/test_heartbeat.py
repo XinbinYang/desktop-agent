@@ -25,6 +25,7 @@ async def test_heartbeat_runs_dream_when_threshold_met(tmp_path, monkeypatch):
             "# diary\n\nrepeated preference and project context\n",
             encoding="utf-8",
         )
+    HeartbeatEngine._write_heartbeat_state({"sessions_since_last_dream": HeartbeatEngine.DREAM_SESSION_COUNT_THRESHOLD - 1})
 
     called = {}
 
@@ -86,7 +87,154 @@ async def test_heartbeat_skips_duplicate_session_signature(tmp_path, monkeypatch
     assert first["skipped_duplicate"] is False
     assert second["skipped_duplicate"] is True
     diary = AgentManager._memory_dir() / f"{time.strftime('%Y-%m-%d')}.md"
-    assert diary.read_text(encoding="utf-8").count("Session Summary") == 1
+    assert diary.read_text(encoding="utf-8").count("Session Delta") == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_duplicate_completion_and_disconnect_write_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
+    monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls, **kwargs: False))
+    messages = [
+        {"role": "user", "content": "请记住：重复 heartbeat 不应该重复写入同一轮记忆。"},
+        {"role": "assistant", "content": "我会用 session signature 去重。"},
+    ]
+
+    first = await HeartbeatEngine.on_session_end(messages, "double-fire-test")
+    second = await HeartbeatEngine.on_session_end(messages, "double-fire-test")
+
+    assert first["diary_written"] is True
+    assert second["skipped_duplicate"] is True
+    from app.agents.memory_os import get_memory_os
+
+    memory_os = get_memory_os()
+    assert len(memory_os.search("session signature", memory_type="working")) == 1
+    diary = AgentManager._memory_dir() / f"{time.strftime('%Y-%m-%d')}.md"
+    assert diary.read_text(encoding="utf-8").count("Session Delta") == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_writes_only_new_turn_deltas(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
+    monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls, **kwargs: False))
+
+    messages = []
+    for idx in range(20):
+        messages.extend([
+            {
+                "role": "user",
+                "content": f"è¯·è®°ä½ï¼šç¬¬ {idx} è½® delta è®°å¿†åªå†™æ–°å†…å®¹ã€‚",
+                "message_id": f"user-{idx}",
+                "turn_id": f"turn-{idx}",
+                "context_epoch": 0,
+            },
+            {
+                "role": "assistant",
+                "content": f"æˆ‘ä¼šåªè®°å½•ç¬¬ {idx} è½®æ–°å¢žéƒ¨åˆ†ã€‚",
+                "message_id": f"assistant-{idx}",
+                "turn_id": f"turn-{idx}",
+                "context_epoch": 0,
+            },
+        ])
+        result = await HeartbeatEngine.on_session_end(list(messages), "delta-growth-test")
+        assert result["diary_written"] is True
+
+    diary = AgentManager._memory_dir() / f"{time.strftime('%Y-%m-%d')}.md"
+    text = diary.read_text(encoding="utf-8")
+    assert text.count("Session Delta") == 20
+    assert text.count("ç¬¬ 0 è½® delta") == 1
+    assert diary.stat().st_size < 24 * 1024
+
+
+@pytest.mark.asyncio
+async def test_memory_ingestion_llm_json_validation(monkeypatch):
+    from app.agents.memory_ingestion import MemoryIngestionEngine
+
+    async def fake_extract(cls, texts, *, session_id):
+        return [
+            {
+                "memory_type": "semantic",
+                "content": "User prefers concise memory summaries.",
+                "confidence": 0.88,
+                "canonical_key": "preference:memory-summary-style",
+                "entities": ["memory summaries"],
+                "event_time": "",
+                "ttl_hint": "",
+            },
+            {
+                "memory_type": "identity",
+                "content": "Low confidence identity fact.",
+                "confidence": 0.7,
+                "canonical_key": "identity:test",
+            },
+            {
+                "memory_type": "semantic",
+                "content": "api_key should not be stored",
+                "confidence": 0.95,
+                "canonical_key": "secret:test",
+            },
+            {
+                "memory_type": "semantic",
+                "content": "Skipped item",
+                "confidence": 0.95,
+                "skip_reason": "not durable",
+            },
+        ]
+
+    monkeypatch.setattr(MemoryIngestionEngine, "extract_with_llm", classmethod(fake_extract))
+    items = await MemoryIngestionEngine.extract_memory_candidates(
+        [{"role": "user", "content": "è¯·è®°ä½ï¼šæˆ‘å–œæ¬¢ç®€æ´çš„è®°å¿†æ‘˜è¦ã€‚"}],
+        session_id="extract-test",
+    )
+
+    assert len(items) == 1
+    assert items[0]["canonical_key"] == "preference:memory-summary-style"
+    assert items[0]["from_llm"] is True
+
+
+@pytest.mark.asyncio
+async def test_memory_ingestion_invalid_llm_json_falls_back(monkeypatch):
+    from app.agents.memory_ingestion import MemoryIngestionEngine
+
+    async def fake_extract(cls, texts, *, session_id):
+        return None
+
+    monkeypatch.setattr(MemoryIngestionEngine, "extract_with_llm", classmethod(fake_extract))
+    items = await MemoryIngestionEngine.extract_memory_candidates(
+        [{"role": "user", "content": "è¯·è®°ä½ï¼šä»¥åŽé»˜è®¤å…ˆåŽ»é‡å†å†™è®°å¿†ã€‚"}],
+        session_id="fallback-test",
+    )
+
+    assert len(items) == 1
+    assert items[0]["from_llm"] is False
+    assert items[0]["confidence"] >= 0.8
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_updates_same_session_handoff_instead_of_appending(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentManager, "AGENTS_DIR", tmp_path / "AGENTS")
+    monkeypatch.setattr(HeartbeatEngine, "_should_trigger_dream", classmethod(lambda cls, **kwargs: False))
+
+    await HeartbeatEngine.on_session_end(
+        [
+            {"role": "user", "content": "请记住：第一版 handoff 内容。"},
+            {"role": "assistant", "content": "我会写第一版交接。"},
+        ],
+        "handoff-upsert-test",
+    )
+    await HeartbeatEngine.on_session_end(
+        [
+            {"role": "user", "content": "请记住：第二版 handoff 内容。"},
+            {"role": "assistant", "content": "我会更新交接，不追加重复项。"},
+        ],
+        "handoff-upsert-test",
+    )
+
+    from app.agents.memory_os import get_memory_os
+
+    items = get_memory_os().list_items(memory_type="working", source="heartbeat", limit=20)
+    handoffs = [item for item in items if "handoff-upsert-test" in item["source_ref"]]
+    assert len(handoffs) == 1
+    assert "第二版" in handoffs[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -117,9 +265,10 @@ async def test_session_runtime_runs_heartbeat_after_personal_turn(monkeypatch):
     heartbeat_started = asyncio.Event()
     heartbeat_release = asyncio.Event()
 
-    async def fake_heartbeat(messages, session_id):
+    async def fake_heartbeat(messages, session_id, agent_type="personal"):
         called["session_id"] = session_id
         called["messages"] = messages
+        called["agent_type"] = agent_type
         heartbeat_started.set()
         await heartbeat_release.wait()
         return {"diary_written": True}
@@ -150,6 +299,7 @@ async def test_session_runtime_runs_heartbeat_after_personal_turn(monkeypatch):
     await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
     assert called["session_id"] == "runtime-heartbeat-test"
     assert called["messages"] == session.messages
+    assert called["agent_type"] == "personal"
     heartbeat_release.set()
     await asyncio.sleep(0)
 
@@ -195,5 +345,6 @@ def test_should_trigger_dream_counts_only_diaries_after_last_dream(tmp_path, mon
     new_time = time.time()
     os.utime(diary, (old_time, old_time))
     os.utime(dreams, (new_time, new_time))
+    HeartbeatEngine.mark_dream_complete()
 
     assert HeartbeatEngine._should_trigger_dream() is False

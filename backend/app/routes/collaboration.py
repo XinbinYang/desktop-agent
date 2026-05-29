@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.collaboration.manager import add_task, cancel_run, create_run, get_run, get_task, list_events, update_task
@@ -72,10 +74,24 @@ async def api_resume_collaboration_task(task_id: str, req: ResumeTaskRequest | N
     if not task:
         raise HTTPException(status_code=404, detail=f"Collaboration task not found: {task_id}")
     next_status = (req.status if req else "pending") or "pending"
-    if next_status not in {"pending", "running", "completed", "failed", "blocked", "cancelled"}:
+    if next_status not in {"pending", "running", "waiting_clarification", "completed", "failed", "blocked", "cancelled"}:
         raise HTTPException(status_code=400, detail=f"Invalid collaboration task status: {next_status}")
     updated = update_task(task_id, status=next_status)  # type: ignore[arg-type]
     return {
         "task": updated.model_dump() if updated else None,
         "events": [e.model_dump() for e in list_events(task.run_id)],
     }
+
+
+@router.get("/runs/{run_id}/replay")
+async def api_replay_collaboration_run(run_id: str):
+    """SSE stream replaying all historical events for a collaboration run."""
+    events = list_events(run_id)
+    if not events and get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"Collaboration run not found: {run_id}")
+
+    async def _event_stream():
+        for event in events:
+            yield f"data: {json.dumps(event.model_dump(), ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")

@@ -1,6 +1,6 @@
 import React from 'react';
 import {
-  Globe, Image, Table, Code, Terminal, Video, FileText, Trash2, X
+  Globe, Image, Table, Code, Terminal, Video, FileText, Trash2, X, FileSpreadsheet, Package
 } from 'lucide-react';
 import { ArtifactItem, ArtifactType } from '../../types';
 
@@ -11,6 +11,8 @@ const TYPE_ICONS: Record<ArtifactType, React.ElementType> = {
   code: Code,
   terminal: Terminal,
   video: Video,
+  office: FileSpreadsheet,
+  office_package: Package,
 };
 
 const TYPE_LABELS: Record<ArtifactType, string> = {
@@ -20,6 +22,8 @@ const TYPE_LABELS: Record<ArtifactType, string> = {
   code: '代码',
   terminal: '终端',
   video: '视频',
+  office: 'Office',
+  office_package: 'Office package',
 };
 
 interface ArtifactListProps {

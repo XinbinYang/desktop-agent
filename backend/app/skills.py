@@ -24,6 +24,8 @@ DEFAULT_ENABLED_SKILLS: Dict[str, Set[str]] = {
         "using-superpowers",
         "output-formatting",
         "writing-skills",
+        "office-spreadsheets",
+        "office-presentations",
     },
     "coding": {
         "using-superpowers",
@@ -35,6 +37,8 @@ DEFAULT_ENABLED_SKILLS: Dict[str, Set[str]] = {
         "verification-before-completion",
         "requesting-code-review",
         "writing-skills",
+        "office-spreadsheets",
+        "office-presentations",
     },
 }
 
@@ -116,6 +120,8 @@ SKILL_CATEGORY_BY_ID: Dict[str, str] = {
     "finishing-a-development-branch": "workspace-release",
     "output-formatting": "writing",
     "writing-skills": "writing",
+    "office-spreadsheets": "office",
+    "office-presentations": "office",
 }
 
 SKILL_REASON_BY_ID: Dict[str, str] = {
@@ -135,6 +141,8 @@ SKILL_REASON_BY_ID: Dict[str, str] = {
     "using-git-worktrees": "Task involves branch or git workflow changes.",
     "finishing-a-development-branch": "Task looks like branch completion or release cleanup.",
     "writing-skills": "User asks to create, update, validate, or publish an Agent Skill.",
+    "office-spreadsheets": "Task involves Excel, XLSX, spreadsheets, formulas, tables, or workbook deliverables.",
+    "office-presentations": "Task involves PowerPoint, PPTX, slides, decks, or presentation deliverables.",
 }
 
 MATCH_RULES = [
@@ -192,6 +200,22 @@ MATCH_RULES = [
         "skills": ["dispatching-parallel-agents", "subagent-driven-development"],
     },
     {
+        "patterns": [
+            "excel", "xlsx", "xls", "spreadsheet", "workbook", "sheet",
+            "表格", "工作簿", "公式", "透视表", "数据表",
+        ],
+        "roles": ["code-expert", "desktop-agent", "general-assistant", "quant-analyst"],
+        "skills": ["office-spreadsheets"],
+    },
+    {
+        "patterns": [
+            "ppt", "pptx", "powerpoint", "presentation", "deck", "slides",
+            "幻灯片", "演示文稿", "演示", "简报",
+        ],
+        "roles": ["code-expert", "desktop-agent", "general-assistant", "quant-analyst"],
+        "skills": ["office-presentations"],
+    },
+    {
         "patterns": ["完成", "收尾", "finish", "done", "finalize", "changelog",
                      "release notes", "发布", "合并到主干", "merge to main"],
         "roles": ["code-expert"],
@@ -234,6 +258,8 @@ SKILL_PRIORITY = [
     "receiving-code-review",
     "finishing-a-development-branch",
     "using-git-worktrees",
+    "office-spreadsheets",
+    "office-presentations",
 ]
 
 STOP_WORDS = {

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { File, Folder, GitBranch, BookOpen, Code2 } from 'lucide-react';
-import type { FileNode } from '../types';
+import { File, Folder, GitBranch, BookOpen, Code2, Bot } from 'lucide-react';
+import { API_BASE } from '../config';
+import type { AgentInfo, FileNode } from '../types';
 
 interface MentionItem {
   id: string;
@@ -27,21 +28,50 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
   fileTree,
 }) => {
   const [allItems, setAllItems] = useState<MentionItem[]>([]);
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetch(`${API_BASE}/api/agents`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const list = Array.isArray(data?.agents) ? data.agents : [];
+        setAgents(list);
+      })
+      .catch(() => {
+        if (!cancelled) setAgents([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Build items from project context
   useEffect(() => {
     const items: MentionItem[] = [];
 
-    items.push({
-      id: 'coding agent',
-      label: 'Coding Agent',
-      detail: 'Delegate this message to the engineering specialist',
-      category: 'agent',
-    });
+    const agentEntries = agents.length > 0
+      ? agents
+      : [{ type: 'coding', name: 'Coding Agent', description: 'Delegate this message to the engineering specialist' } as AgentInfo];
+    for (const agent of agentEntries) {
+      if (agent.type === 'personal') continue;
+      const isCoding = agent.type === 'coding';
+      items.push({
+        id: isCoding ? 'coding agent' : agent.type,
+        label: agent.name || agent.profile?.display_name || agent.type,
+        detail: agent.description || agent.profile?.subtitle || (isCoding ? 'Engineering specialist' : 'User-created specialist'),
+        category: isCoding ? 'agent' : 'specialist',
+      });
+    }
 
     if (projectOpen) {
       // Add git reference
@@ -85,7 +115,7 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
     }
 
     setAllItems(items);
-  }, [projectOpen, fileTree]);
+  }, [agents, projectOpen, fileTree]);
 
   const q = query.replace('@', '').toLowerCase();
   const filtered = useMemo(
@@ -159,6 +189,7 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
 
   const categoryIcons: Record<string, React.ReactNode> = {
     agent: <Code2 className="w-3 h-3" />,
+    specialist: <Bot className="w-3 h-3" />,
     file: <File className="w-3 h-3" />,
     folder: <Folder className="w-3 h-3" />,
     git: <GitBranch className="w-3 h-3" />,
@@ -166,6 +197,7 @@ export const AtMentionMenu: React.FC<AtMentionMenuProps> = ({
   };
   const categoryLabels: Record<string, string> = {
     agent: 'Agent',
+    specialist: 'Specialist',
     file: '文件',
     folder: '目录',
     git: 'Git',

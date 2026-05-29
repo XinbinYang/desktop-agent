@@ -10,9 +10,17 @@ import {
   AutomationTrace,
   AutomationReplayStatus,
 } from '../../types';
-import { EditorPanel } from '../EditorPanel/EditorPanel';
-import { ArtifactPanel } from '../ArtifactPanel/ArtifactPanel';
-import { WorkspaceBrowser, type Annotation } from './WorkspaceBrowser';
+import type { Annotation } from './WorkspaceBrowser';
+
+const EditorPanel = React.lazy(() =>
+  import('../EditorPanel/EditorPanel').then((mod) => ({ default: mod.EditorPanel })),
+);
+const ArtifactPanel = React.lazy(() =>
+  import('../ArtifactPanel/ArtifactPanel').then((mod) => ({ default: mod.ArtifactPanel })),
+);
+const WorkspaceBrowser = React.lazy(() =>
+  import('./WorkspaceBrowser').then((mod) => ({ default: mod.WorkspaceBrowser })),
+);
 
 export type WorkspaceView = 'editor' | 'preview' | 'artifacts';
 
@@ -107,6 +115,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
 
       {/* Content */}
       <div className="flex-1 min-h-0 overflow-hidden">
+        <React.Suspense fallback={<div className="h-full flex items-center justify-center text-xs text-fg-muted">Loading workspace...</div>}>
         {activeView === 'editor' && (
           <EditorPanel
             groups={editorGroups}
@@ -138,6 +147,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
             onAutomationReplay={onAutomationReplay}
           />
         )}
+        </React.Suspense>
       </div>
     </div>
   );

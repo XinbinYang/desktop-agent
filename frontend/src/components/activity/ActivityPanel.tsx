@@ -41,7 +41,7 @@ const SECTIONS: { key: ActivitySection; label: string; icon: React.FC<{ classNam
   { key: 'eval', label: '评估', icon: BarChart3 },
 ];
 
-export const ActivityPanel: React.FC<ActivityPanelProps> = ({
+export const ActivityPanel: React.FC<ActivityPanelProps> = React.memo(function ActivityPanel({
   toolCalls,
   fileEdits,
   runEvents,
@@ -52,7 +52,7 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
   onApplyRun,
   onMergeRun,
   onDiscardRun,
-}) => {
+}) {
   const [expanded, setExpanded] = useState<Set<ActivitySection>>(new Set(['skills', 'tools', 'changes']));
   const latestSkillsEvent = [...runEvents].reverse().find((event) => event.type === 'skills_matched');
   const matchedSkills = (latestSkillsEvent?.data?.skills || []) as MatchedSkillTrace[];
@@ -196,4 +196,4 @@ export const ActivityPanel: React.FC<ActivityPanelProps> = ({
       })}
     </div>
   );
-};
+});

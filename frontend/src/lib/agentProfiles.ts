@@ -1,16 +1,19 @@
 import type { AgentInfo, AgentProfile, AgentType } from '../types';
 
-export const AGENT_DEFAULT_ROLE: Record<AgentType, string> = {
+export const AGENT_DEFAULT_ROLE: Record<string, string> = {
   personal: 'desktop-agent',
   coding: 'code-expert',
 };
 
-export const AGENT_LABEL: Record<AgentType, string> = {
+export const AGENT_LABEL: Record<string, string> = {
   personal: 'Personal Agent',
   coding: 'Coding Agent',
 };
 
-export type AgentProfileMap = Record<AgentType, AgentProfile>;
+export type AgentProfileMap = Record<string, AgentProfile> & {
+  personal: AgentProfile;
+  coding: AgentProfile;
+};
 export type RoleDisplayNameMap = Record<string, string>;
 
 export const DEFAULT_AGENT_PROFILES: AgentProfileMap = {
@@ -33,11 +36,11 @@ export const DEFAULT_AGENT_PROFILES: AgentProfileMap = {
 };
 
 export function isAgentType(value: unknown): value is AgentType {
-  return value === 'personal' || value === 'coding';
+  return value === 'personal' || value === 'coding' || (typeof value === 'string' && /^specialist:[a-z0-9][a-z0-9-]*$/.test(value));
 }
 
 export function roleForAgent(agentType: AgentType): string {
-  return AGENT_DEFAULT_ROLE[agentType];
+  return agentType === 'coding' ? 'code-expert' : 'desktop-agent';
 }
 
 export function agentForRole(roleId?: string): AgentType {
@@ -53,14 +56,34 @@ function cleanText(value: unknown, fallback: string): string {
   return text || fallback;
 }
 
+function defaultProfileForAgent(agentType: AgentType): AgentProfile {
+  if (agentType === 'personal' || agentType === 'coding') {
+    return DEFAULT_AGENT_PROFILES[agentType];
+  }
+  const slug = agentType.replace(/^specialist:/, '');
+  const display = slug
+    .split('-')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ') || 'Specialist Agent';
+  return {
+    agent_type: agentType,
+    display_name: display,
+    type_label: 'Specialist Agent',
+    avatar_emoji: '',
+    subtitle: 'User-created specialist',
+    source: 'default',
+  };
+}
+
 export function normalizeAgentProfile(agentType: AgentType, raw?: Partial<AgentProfile> | null, fallbackName?: string): AgentProfile {
-  const fallback = DEFAULT_AGENT_PROFILES[agentType];
+  const fallback = defaultProfileForAgent(agentType);
   return {
     ...fallback,
     ...raw,
     agent_type: agentType,
     display_name: cleanText(raw?.display_name || fallbackName, fallback.display_name),
-    type_label: cleanText(raw?.type_label, AGENT_LABEL[agentType]),
+    type_label: cleanText(raw?.type_label, AGENT_LABEL[agentType] || fallback.type_label),
     avatar_emoji: typeof raw?.avatar_emoji === 'string' ? raw.avatar_emoji.trim() : fallback.avatar_emoji,
     subtitle: cleanText(raw?.subtitle, fallback.subtitle || ''),
   };

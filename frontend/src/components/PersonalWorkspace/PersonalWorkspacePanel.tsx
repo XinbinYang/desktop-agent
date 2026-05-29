@@ -62,7 +62,7 @@ export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
   }, [activeTabHint, focusSignal]);
 
   return (
-    <div className={cn('flex flex-col h-full min-h-0', className)}>
+    <div className={cn('flex h-full min-h-0 min-w-0 flex-col overflow-hidden', className)}>
       <div className="flex border-b border-border shrink-0 overflow-x-auto">
         {TABS.map((tab) => (
           <button
@@ -82,7 +82,7 @@ export const PersonalWorkspacePanel: React.FC<PersonalWorkspacePanelProps> = ({
         ))}
       </div>
 
-      <div className="flex-1 min-h-0 overflow-hidden">
+      <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
         {activeTab === 'persona' && <SoulEditor profile={profile} onProfileChanged={onProfileChanged} />}
         {activeTab === 'memory' && <MemoryManager focusSignal={focusSignal} />}
         {activeTab === 'learnings' && <LearningsPanel />}

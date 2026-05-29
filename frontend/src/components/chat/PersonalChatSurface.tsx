@@ -2,8 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneLight, vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import {
   AlertCircle,
   ArrowDown,
@@ -14,13 +12,18 @@ import {
   ChevronDown,
   ChevronRight,
   ClipboardList,
+  ExternalLink,
+  FileSpreadsheet,
   FileText,
+  FolderOpen,
   Maximize2,
+  Package,
+  Presentation,
   RotateCcw,
   User,
   Wrench,
 } from 'lucide-react';
-import type { ChatMessage, FileEdit, PlanState, ToolCall } from '../../types';
+import type { ArtifactPayload, ChatMessage, FileEdit, PlanState, ToolCall, ImageAttachment } from '../../types';
 import {
   buildPersonalConversation,
   type PersonalActivityItem,
@@ -31,6 +34,7 @@ import { ToolCallView } from '../ToolCallView';
 import { FileEditView } from '../FileEditView';
 import { AgentRunningSpinner } from './AgentRunningStatus';
 import { RevealableInlineCode } from '../RevealPathAction';
+import { imageAttachmentLabel, imageAttachmentSrc } from '../../lib/imageAttachments';
 
 interface ImagePreviewState {
   src: string;
@@ -64,6 +68,79 @@ type PersonalTone = 'user' | 'assistant' | 'system-success' | 'system-error';
 const personalScrollMemoryBySession = new Map<string, PersonalScrollMemory>();
 const LONG_TEXT_LENGTH = 1800;
 const CODE_PREVIEW_LINES = 16;
+
+type SyntaxHighlighterComponent = React.ComponentType<{
+  language?: string;
+  style?: unknown;
+  customStyle?: React.CSSProperties;
+  wrapLongLines?: boolean;
+  children?: React.ReactNode;
+}>;
+
+let syntaxHighlighterPromise: Promise<{
+  Component: SyntaxHighlighterComponent;
+  styles: { oneLight: unknown; vscDarkPlus: unknown };
+}> | null = null;
+
+function loadSyntaxHighlighter() {
+  if (!syntaxHighlighterPromise) {
+    syntaxHighlighterPromise = Promise.all([
+      import('react-syntax-highlighter'),
+      import('react-syntax-highlighter/dist/esm/styles/prism'),
+    ]).then(([highlighter, styles]) => ({
+      Component: highlighter.Prism as SyntaxHighlighterComponent,
+      styles: {
+        oneLight: (styles as { oneLight: unknown }).oneLight,
+        vscDarkPlus: (styles as { vscDarkPlus: unknown }).vscDarkPlus,
+      },
+    }));
+  }
+  return syntaxHighlighterPromise;
+}
+
+const LazyHighlightedCode: React.FC<{
+  language?: string;
+  value: string;
+  theme: 'dark' | 'light';
+}> = ({ language, value, theme }) => {
+  const [loaded, setLoaded] = useState<Awaited<ReturnType<typeof loadSyntaxHighlighter>> | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void loadSyntaxHighlighter().then((module) => {
+      if (mounted) setLoaded(module);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  if (!loaded) {
+    return (
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono chat-text-xs text-fg-secondary">
+        {value}
+      </pre>
+    );
+  }
+
+  const Highlight = loaded.Component;
+  return (
+    <Highlight
+      language={language || 'text'}
+      style={theme === 'dark' ? loaded.styles.vscDarkPlus : loaded.styles.oneLight}
+      customStyle={{
+        margin: 0,
+        borderRadius: 0,
+        fontSize: 'var(--chat-font-sm)',
+        lineHeight: 'var(--chat-line-height)',
+        padding: 'var(--chat-space-md) var(--chat-space-lg)',
+      }}
+      wrapLongLines
+    >
+      {value}
+    </Highlight>
+  );
+};
 
 function formatMessageTime(value?: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '';
@@ -113,22 +190,24 @@ const PersonalAvatar: React.FC<{
 };
 
 const PersonalImageThumbnail: React.FC<{
-  base64: string;
+  image: ImageAttachment;
   alt: string;
   onOpen: (preview: ImagePreviewState) => void;
-}> = ({ base64, alt, onOpen }) => {
-  const src = `data:image/png;base64,${base64}`;
+}> = ({ image, alt, onOpen }) => {
+  const src = imageAttachmentSrc(image);
+  if (!src) return null;
+  const label = imageAttachmentLabel(image, alt);
   return (
     <button
       type="button"
-      onClick={() => onOpen({ src, alt })}
+      onClick={() => onOpen({ src, alt: label })}
       className="group/image relative mt-2 block max-w-full cursor-zoom-in overflow-hidden rounded-md border border-border-subtle bg-surface/45 p-0 leading-none focus:outline-none focus:ring-2 focus:ring-accent/60"
       aria-label={alt}
-      title={alt}
+      title={label}
     >
       <img
         src={src}
-        alt={alt}
+        alt={label}
         loading="lazy"
         decoding="async"
         draggable={false}
@@ -138,6 +217,98 @@ const PersonalImageThumbnail: React.FC<{
         <Maximize2 className="h-3.5 w-3.5" />
       </span>
     </button>
+  );
+};
+
+function artifactKind(artifact: ArtifactPayload): 'excel' | 'ppt' | 'package' | 'office' {
+  if (artifact.type === 'office_package') return 'package';
+  const ext = artifact.title?.split('.').pop()?.toLowerCase();
+  const mime = artifact.mimeType || artifact.mime_type || '';
+  if (artifact.kind === 'excel' || ext === 'xlsx' || ext === 'xls' || mime.includes('spreadsheet')) return 'excel';
+  if (artifact.kind === 'ppt' || ext === 'pptx' || ext === 'ppt' || mime.includes('presentation')) return 'ppt';
+  return 'office';
+}
+
+function artifactLabel(artifact: ArtifactPayload): string {
+  const kind = artifactKind(artifact);
+  if (kind === 'package') return `${artifact.files?.length || 0} Office files`;
+  if (kind === 'excel') return 'Spreadsheet · XLSX';
+  if (kind === 'ppt') return 'Slides · PPTX';
+  return 'Office file';
+}
+
+const PersonalArtifactCard: React.FC<{ artifact: ArtifactPayload }> = ({ artifact }) => {
+  const [status, setStatus] = useState('');
+  const kind = artifactKind(artifact);
+  const Icon = kind === 'package' ? Package : kind === 'ppt' ? Presentation : FileSpreadsheet;
+  const files = kind === 'package' && artifact.files?.length ? artifact.files : [artifact];
+
+  const openInPanel = () => {
+    window.dispatchEvent(new CustomEvent('desktop-agent:open-artifact', { detail: { id: artifact.id } }));
+  };
+
+  const openLocal = async (file: ArtifactPayload) => {
+    if (file.path && window.electronAPI?.openPath) {
+      const error = await window.electronAPI.openPath(file.path);
+      setStatus(error || 'Opened');
+      return;
+    }
+    if (file.url) {
+      window.open(file.url, '_blank', 'noopener,noreferrer');
+      setStatus('Opened preview URL');
+      return;
+    }
+    setStatus('No file path available');
+  };
+
+  const revealLocal = async (file: ArtifactPayload) => {
+    if (!file.path || !window.electronAPI?.revealPath) {
+      setStatus('Reveal unavailable');
+      return;
+    }
+    const error = await window.electronAPI.revealPath(file.path);
+    setStatus(error || 'Shown in folder');
+  };
+
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border border-border-subtle bg-surface/70">
+      <button
+        type="button"
+        onClick={openInPanel}
+        className="flex w-full items-center gap-3 px-3 py-3 text-left hover:bg-surface-hover"
+      >
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-accent/10 text-accent">
+          <Icon className="h-4 w-4" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate chat-text-sm font-semibold text-fg">{artifact.title}</span>
+          <span className="block chat-text-xs text-fg-muted">{artifactLabel(artifact)}</span>
+        </span>
+        <ExternalLink className="h-3.5 w-3.5 shrink-0 text-fg-muted" />
+      </button>
+      <div className="divide-y divide-border-subtle border-t border-border-subtle">
+        {files.map((file) => {
+          const fileKind = artifactKind(file);
+          const FileIcon = fileKind === 'ppt' ? Presentation : FileSpreadsheet;
+          return (
+            <div key={file.id || file.path || file.title} className="flex items-center gap-2 px-3 py-2">
+              <FileIcon className="h-3.5 w-3.5 shrink-0 text-fg-muted" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate chat-text-xs font-medium text-fg-secondary">{file.title}</div>
+                <div className="chat-text-xs text-fg-muted">{artifactLabel(file)}</div>
+              </div>
+              <button type="button" onClick={() => openLocal(file)} className="rounded border border-border px-2 py-1 chat-text-xs text-fg-secondary hover:bg-surface-hover">
+                Open
+              </button>
+              <button type="button" onClick={() => revealLocal(file)} className="rounded border border-border px-2 py-1 text-fg-muted hover:bg-surface-hover" aria-label="Show in folder" title="Show in folder">
+                <FolderOpen className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      {status && <div className="border-t border-border-subtle px-3 py-1.5 chat-text-xs text-fg-muted">{status}</div>}
+    </div>
   );
 };
 
@@ -165,20 +336,7 @@ const PersonalCodeBlock: React.FC<{ language?: string; value: string; theme: 'da
         )}
       </div>
       {expanded ? (
-        <SyntaxHighlighter
-          language={language || 'text'}
-          style={theme === 'dark' ? vscDarkPlus : oneLight}
-          customStyle={{
-            margin: 0,
-            borderRadius: 0,
-            fontSize: 'var(--chat-font-sm)',
-            lineHeight: 'var(--chat-line-height)',
-            padding: 'var(--chat-space-md) var(--chat-space-lg)',
-          }}
-          wrapLongLines
-        >
-          {value}
-        </SyntaxHighlighter>
+        <LazyHighlightedCode language={language} value={value} theme={theme} />
       ) : (
         <pre className="max-h-72 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono chat-text-xs text-fg-secondary">
           {canExpand ? trimCodePreview(value) : value}
@@ -422,14 +580,20 @@ const PersonalActivityDrawer: React.FC<{
   turnComplete?: boolean;
   searchQuery?: string;
   projectPath?: string | null;
-}> = ({ activities, turnComplete, searchQuery = '', projectPath }) => {
+  isLatest?: boolean;
+  isRunning?: boolean;
+}> = ({ activities, turnComplete, searchQuery = '', projectPath, isLatest = false, isRunning = false }) => {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
   const query = searchQuery.trim().toLowerCase();
   const hasRunning = activities.some((activity) => activity.status === 'running');
-  const defaultOpen = hasRunning || turnComplete === false;
+  // "正在处理…" should only show on the latest assistant turn AND while the
+  // global isRunning flag is true. Past turns always read as "我处理了…"
+  // even if a stale activity chip never got its terminal status.
+  const activeRunning = isLatest && isRunning && (hasRunning || turnComplete === false);
+  const defaultOpen = activeRunning;
   const forceOpenForSearch = !!query && activities.some((activity) => activityMatchesSearch(activity, query));
   const open = forceOpenForSearch || (manualOpen ?? defaultOpen);
-  const summary = summarizeActivities(activities, hasRunning || turnComplete === false);
+  const summary = summarizeActivities(activities, activeRunning);
 
   if (activities.length === 0) return null;
 
@@ -488,13 +652,16 @@ const PersonalMessageItem: React.FC<{
       )}
       <div className={item.role === 'system' ? (item.noticeLevel === 'success' ? 'text-success' : 'text-danger') : 'text-fg'}>
         <PersonalMarkdown text={item.text} streaming={item.isStreaming} theme={markdownTheme} projectPath={projectPath} />
-        {item.images.map((base64, index) => (
+        {item.images.map((image, index) => (
           <PersonalImageThumbnail
             key={`${item.id}:image:${index}`}
-            base64={base64}
+            image={image}
             alt={item.role === 'user' ? 'Open attached image' : 'Open assistant image'}
             onOpen={onOpenImage}
           />
+        ))}
+        {item.artifacts.map((artifact) => (
+          <PersonalArtifactCard key={`${item.id}:artifact:${artifact.id}`} artifact={artifact} />
         ))}
         {item.activities.length > 0 && (
           <PersonalActivityDrawer
@@ -502,6 +669,8 @@ const PersonalMessageItem: React.FC<{
             turnComplete={item.turnComplete}
             searchQuery={searchQuery}
             projectPath={projectPath}
+            isLatest={isLastAssistant}
+            isRunning={isRunning}
           />
         )}
       </div>
@@ -524,7 +693,7 @@ const PersonalGroupRow: React.FC<{
 
   return (
     <div
-      className="personal-chat-row px-4 py-1.5 transition-colors"
+      className="personal-chat-row px-4 py-1.5 transition-colors [contain:layout_paint]"
       data-role={group.role}
       data-tone={tone}
     >

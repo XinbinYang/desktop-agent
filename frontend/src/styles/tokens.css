@@ -45,6 +45,11 @@
   --plan-pill-fg: #0d0d0d;
   --plan-pill-border: rgba(255, 200, 100, 0.35);
 
+  /* Collab mode pill (info blue) */
+  --collab-pill-bg: #1a6ec1;
+  --collab-pill-fg: #f0f6ff;
+  --collab-pill-border: rgba(88, 166, 255, 0.40);
+
   /* Scrollbar */
   --scrollbar-track: #161b22;
   --scrollbar-thumb: #484f58;
@@ -94,6 +99,11 @@
   --plan-pill-bg: #c9a227;
   --plan-pill-fg: #1a1a1a;
   --plan-pill-border: rgba(120, 90, 0, 0.35);
+
+  /* Collab mode pill (info blue) */
+  --collab-pill-bg: #1a6ec1;
+  --collab-pill-fg: #ffffff;
+  --collab-pill-border: rgba(9, 105, 218, 0.40);
 
   /* Scrollbar */
   --scrollbar-track: #f3f3f3;

@@ -124,8 +124,8 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
   }, [activeFile, fetchFile]);
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="px-3 py-3 border-b border-border bg-surface">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="shrink-0 border-b border-border bg-surface px-3 py-2">
         <div className="flex items-start gap-3">
           <input
             value={profileForm.avatar_emoji}
@@ -166,21 +166,21 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
         </div>
       </div>
       {/* Philosophy notice */}
-      <div className="px-3 py-2 border-b border-border bg-surface-alt/50">
+      <div className="shrink-0 border-b border-border bg-surface-alt/50 px-3 py-2">
         <p className="text-[10px] text-fg-muted leading-relaxed">
           身份与偏好由 Agent 自动维护。你可以在这里查看并修正明显不准确的内容，保存会覆盖 Agent 的可变工作区文件。
         </p>
       </div>
 
       {/* Sub-tabs */}
-      <div className="flex border-b border-border shrink-0">
+      <div className="flex shrink-0 overflow-x-auto border-b border-border">
         {FILES.map((f) => (
           <button
             key={f.name}
             type="button"
             onClick={() => setActiveFile(f.name)}
             className={cn(
-              'px-3 py-1.5 text-[11px] border-b-2 -mb-px transition-colors',
+              'shrink-0 px-3 py-1.5 text-[11px] border-b-2 -mb-px transition-colors',
               activeFile === f.name
                 ? 'border-accent text-fg'
                 : 'border-transparent text-fg-muted hover:text-fg-secondary'
@@ -193,8 +193,8 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
       </div>
 
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-2 py-1 border-b border-border shrink-0">
-        <span className="text-[10px] text-fg-muted">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
+        <span className="min-w-0 truncate text-[10px] text-fg-muted">
           {FILES.find((f) => f.name === activeFile)?.desc}
           {hasUnsavedChanges ? ' · 未保存更改' : ''}
         </span>
@@ -212,7 +212,7 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
             type="button"
             onClick={handleSave}
             disabled={current.loading || current.saving}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
+            className="flex shrink-0 items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
             title="确认保存手动修正 (Ctrl+S)"
           >
             {current.saving ? (
@@ -226,7 +226,7 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
       </div>
 
       {/* Editor */}
-      <div className="flex-1 min-h-0">
+      <div className="min-h-0 flex-1 overflow-hidden">
         {current.error && (
           <div className="p-2 text-[11px] text-danger bg-danger/5 border-b border-border">
             {current.error}
@@ -246,7 +246,7 @@ export const SoulEditor: React.FC<SoulEditorProps> = ({ profile, onProfileChange
                 [activeFile]: { ...prev[activeFile], content: e.target.value },
               }))
             }
-            className="w-full h-full bg-transparent text-fg text-xs font-mono p-3 resize-none outline-none border-none"
+            className="block h-full w-full resize-none overflow-auto border-none bg-transparent p-3 font-mono text-xs leading-relaxed text-fg outline-none"
             spellCheck={false}
             onKeyDown={(e) => {
               if (e.ctrlKey && e.key === 's') {

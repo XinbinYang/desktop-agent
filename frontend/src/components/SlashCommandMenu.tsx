@@ -118,7 +118,20 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({
   }, [visibleCommands.length]);
 
   useEffect(() => {
-    itemRefs.current[selectedIndex]?.scrollIntoView?.({ block: 'nearest' });
+    const menu = menuRef.current;
+    const item = itemRefs.current[selectedIndex];
+    if (!menu || !item) return;
+
+    const menuTop = menu.scrollTop;
+    const menuBottom = menuTop + menu.clientHeight;
+    const itemTop = item.offsetTop;
+    const itemBottom = itemTop + item.offsetHeight;
+
+    if (itemTop < menuTop) {
+      menu.scrollTop = itemTop;
+    } else if (itemBottom > menuBottom) {
+      menu.scrollTop = itemBottom - menu.clientHeight;
+    }
   }, [selectedIndex]);
 
   useEffect(() => {
@@ -132,11 +145,17 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         e.stopPropagation();
-        setSelectedIndex((i) => Math.min(i + 1, visibleCommands.length - 1));
+        setSelectedIndex((i) => {
+          if (visibleCommands.length === 0) return 0;
+          return Math.min(i + 1, visibleCommands.length - 1);
+        });
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         e.stopPropagation();
-        setSelectedIndex((i) => Math.max(i - 1, 0));
+        setSelectedIndex((i) => {
+          if (visibleCommands.length === 0) return 0;
+          return Math.max(i - 1, 0);
+        });
       } else if (e.key === 'Enter' && visibleCommands.length > 0) {
         e.preventDefault();
         e.stopPropagation();
@@ -154,20 +173,19 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({
 
   if (visibleCommands.length === 0) return null;
 
-  // Calculate position relative to textarea
-  const rect = inputRef.current?.getBoundingClientRect();
-  const style: React.CSSProperties = rect ? {
-    position: 'fixed',
-    left: `${rect.left}px`,
-    bottom: `${window.innerHeight - rect.top + 8}px`,
-    width: `${Math.max(rect.width, 280)}px`,
-    maxHeight: '320px',
-    overflowY: 'auto',
-    zIndex: 100,
-  } : {};
+  const style: React.CSSProperties = {
+    maxHeight: 'min(320px, calc(100vh - 160px))',
+    minWidth: 'min(280px, 100%)',
+    scrollbarGutter: 'stable',
+    overscrollBehavior: 'contain',
+  };
 
   return (
-    <div ref={menuRef} style={style} className="bg-surface border border-border rounded-lg shadow-xl p-1">
+    <div
+      ref={menuRef}
+      style={style}
+      className="absolute bottom-full left-0 right-0 z-50 mb-2 overflow-y-auto rounded-lg border border-border bg-surface p-1 shadow-xl"
+    >
       {groupedEntries.map(([category, cmds]) => (
         <div key={category}>
           <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-fg-muted uppercase tracking-wide">

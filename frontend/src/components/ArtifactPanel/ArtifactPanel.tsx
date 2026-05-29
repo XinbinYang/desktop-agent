@@ -16,6 +16,7 @@ import { DataTable } from './DataTable';
 import { TerminalOutput } from './TerminalOutput';
 import { WebViewer } from './WebViewer';
 import { AIMouseCursor } from './AIMouseCursor';
+import { OfficeViewer } from './OfficeViewer';
 
 interface ArtifactPanelProps {
   artifacts: ArtifactItem[];
@@ -62,8 +63,20 @@ export const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     if (artifacts.length > 0) {
       const latest = artifacts[artifacts.length - 1];
       setActiveId(latest.id);
+      setActiveTab('outputs');
     }
   }, [artifacts.length]);
+
+  useEffect(() => {
+    const handleOpenArtifact = (event: Event) => {
+      const detail = (event as CustomEvent<{ id?: string }>).detail;
+      if (!detail?.id) return;
+      setActiveId(detail.id);
+      setActiveTab('outputs');
+    };
+    window.addEventListener('desktop-agent:open-artifact', handleOpenArtifact as EventListener);
+    return () => window.removeEventListener('desktop-agent:open-artifact', handleOpenArtifact as EventListener);
+  }, []);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -146,6 +159,9 @@ export const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
             <video src={activeItem.url} controls className="max-w-full max-h-full rounded" />
           </div>
         );
+      case 'office':
+      case 'office_package':
+        return <OfficeViewer item={activeItem} />;
       default:
         return <TerminalOutput content={activeItem.content || ''} />;
     }
