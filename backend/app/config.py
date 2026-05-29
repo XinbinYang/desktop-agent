@@ -248,6 +248,19 @@ def get_model_for_agent(agent_type: str) -> str:
     are migrated into agent configs in load_config().
     """
     cfg = load_config()
+    if str(agent_type or "").startswith("specialist:"):
+        try:
+            from app.agents.specialists import SpecialistRegistry
+
+            spec = SpecialistRegistry.get(agent_type)
+            if spec and str(spec.get("model_id") or "").strip():
+                return str(spec.get("model_id") or "").strip()
+            base_kind = str((spec or {}).get("base_kind") or "advisory")
+            if base_kind == "coding":
+                return (cfg.coding_agent.model or "").strip()
+        except Exception:
+            pass
+        return (cfg.personal_agent.model or "").strip()
     if agent_type == "coding":
         return (cfg.coding_agent.model or "").strip()
     if agent_type == "personal":
@@ -258,7 +271,17 @@ def get_thinking_intensity_for_agent(agent_type: str) -> str:
     """Resolve the effective thinking intensity for a given agent type."""
     cfg = load_config()
     default = cfg.settings.thinking_intensity_default or "medium"
-    if agent_type == "coding":
+    if str(agent_type or "").startswith("specialist:"):
+        try:
+            from app.agents.specialists import SpecialistRegistry
+
+            spec = SpecialistRegistry.get(agent_type)
+            override = str((spec or {}).get("thinking_intensity") or "")
+            if not override and str((spec or {}).get("base_kind") or "") == "coding":
+                override = cfg.coding_agent.thinking_intensity
+        except Exception:
+            override = ""
+    elif agent_type == "coding":
         override = cfg.coding_agent.thinking_intensity
     elif agent_type == "personal":
         override = cfg.personal_agent.thinking_intensity

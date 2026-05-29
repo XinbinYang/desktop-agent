@@ -440,7 +440,7 @@ const LeafPane: React.FC<LeafPaneProps> = React.memo(function LeafPane({
   const agentType = pane.agentType || meta?.agent_type || agentForRole(pane.role);
   const roleId = pane.role || meta?.role_id || roleForAgent(agentType);
   const assistantDisplayName = displayNameForAgentRole(agentType, roleId, agentProfiles, roleDisplayNames);
-  const agentLabel = agentType === 'personal' ? assistantDisplayName : 'Coding';
+  const agentLabel = assistantDisplayName;
   const paneTitle = agentType === 'personal' && (pane.isPrimary || meta?.is_primary || pane.sessionId === 'session_personal_main')
     ? 'Main'
     : (meta?.title || pane.title || pane.sessionId.replace(/^session_(coding_)?/, '#'));

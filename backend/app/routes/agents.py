@@ -14,6 +14,16 @@ from app.agents.manager import AgentManager
 from app.agents.dream import DreamEngine
 from app.agents.evolution import EvolutionEngine
 from app.agents.learnings import LearningsEngine
+from app.agents.specialists import (
+    SpecialistAuthoringError,
+    archive_specialist,
+    list_specialists,
+    publish_draft as publish_specialist_draft,
+    read_specialist,
+    save_draft as save_specialist_draft,
+    update_specialist,
+    validate_specialist,
+)
 from app.config import get_model_for_agent, get_thinking_intensity_for_agent, load_config
 from app.project_manager import ProjectManager
 from app.tools import get_tool_schemas
@@ -29,6 +39,43 @@ class AgentProfilePatch(BaseModel):
     display_name: Optional[str] = None
     avatar_emoji: Optional[str] = None
     subtitle: Optional[str] = None
+
+
+class SpecialistDraftRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    slug: str = ""
+    display_name: str
+    description: str
+    instructions: str
+    trigger_examples: List[str] = []
+    routing_keywords: List[str] = []
+    auto_delegate: str = "suggest"
+    base_kind: str = "advisory"
+    allowed_tools: List[str] = []
+    skill_ids: List[str] = []
+    model_id: str = ""
+    thinking_intensity: str = "medium"
+
+
+class SpecialistPatchRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    trigger_examples: Optional[List[str]] = None
+    routing_keywords: Optional[List[str]] = None
+    auto_delegate: Optional[str] = None
+    base_kind: Optional[str] = None
+    allowed_tools: Optional[List[str]] = None
+    skill_ids: Optional[List[str]] = None
+    model_id: Optional[str] = None
+    thinking_intensity: Optional[str] = None
+
+
+class SpecialistPublishRequest(BaseModel):
+    allow_risky: bool = False
 
 
 class MoodUpdate(BaseModel):
@@ -99,6 +146,85 @@ async def list_agents():
     return {"agents": agents}
 
 
+@router.get("/specialists")
+async def list_specialist_agents(include_archived: bool = False):
+    """List user-created Specialist Agents."""
+    return {"specialists": list_specialists(include_archived=include_archived)}
+
+
+@router.post("/specialists/drafts")
+async def create_specialist_draft(req: SpecialistDraftRequest):
+    """Create an inert Specialist Agent draft."""
+    try:
+        draft = save_specialist_draft(
+            slug=req.slug,
+            display_name=req.display_name,
+            description=req.description,
+            instructions=req.instructions,
+            trigger_examples=req.trigger_examples,
+            routing_keywords=req.routing_keywords,
+            auto_delegate=req.auto_delegate,
+            base_kind=req.base_kind,
+            allowed_tools=req.allowed_tools,
+            skill_ids=req.skill_ids,
+            model_id=req.model_id,
+            thinking_intensity=req.thinking_intensity,
+            created_from="api",
+        )
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"draft": draft}
+
+
+@router.post("/specialists/drafts/{draft_id}/validate")
+async def validate_specialist_draft(draft_id: str):
+    """Validate a Specialist Agent draft."""
+    try:
+        validation = validate_specialist(draft_id)
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"validation": validation}
+
+
+@router.post("/specialists/drafts/{draft_id}/publish")
+async def publish_specialist(draft_id: str, req: SpecialistPublishRequest):
+    """Publish a Specialist Agent draft into the runtime registry."""
+    try:
+        specialist = publish_specialist_draft(draft_id, allow_risky=req.allow_risky)
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"specialist": specialist, "specialists": list_specialists()}
+
+
+@router.get("/specialists/{slug}")
+async def get_specialist_agent(slug: str):
+    """Read one published Specialist Agent."""
+    try:
+        return {"specialist": read_specialist(slug)}
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.patch("/specialists/{slug}")
+async def patch_specialist_agent(slug: str, req: SpecialistPatchRequest):
+    """Update a published Specialist Agent."""
+    try:
+        specialist = update_specialist(slug, req.model_dump(exclude_unset=True))
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"specialist": specialist}
+
+
+@router.post("/specialists/{slug}/archive")
+async def archive_specialist_agent(slug: str):
+    """Archive a published Specialist Agent."""
+    try:
+        specialist = archive_specialist(slug)
+    except SpecialistAuthoringError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"specialist": specialist, "specialists": list_specialists()}
+
+
 @router.get("/personal/profile")
 async def get_personal_profile():
     """Return editable Personal Agent display profile metadata."""
@@ -118,7 +244,7 @@ async def update_personal_profile(body: AgentProfilePatch):
 @router.get("/{agent_type}/files")
 async def list_workspace_files(agent_type: str):
     """List all files in an agent's workspace directory."""
-    if agent_type not in AgentManager.BUILTIN_AGENTS and agent_type != "_shared":
+    if not AgentManager.is_known_agent_type(agent_type) and agent_type != "_shared":
         raise HTTPException(status_code=404, detail=f"Agent type not found: {agent_type}")
     return {"files": AgentManager.list_workspace_files(agent_type)}
 
@@ -126,7 +252,7 @@ async def list_workspace_files(agent_type: str):
 @router.get("/{agent_type}/files/{filename:path}")
 async def get_workspace_file(agent_type: str, filename: str):
     """Read a workspace file's content."""
-    if agent_type not in AgentManager.BUILTIN_AGENTS and agent_type != "_shared":
+    if not AgentManager.is_known_agent_type(agent_type) and agent_type != "_shared":
         raise HTTPException(status_code=404, detail=f"Agent type not found: {agent_type}")
     content = AgentManager.load_workspace_file(agent_type, filename)
     if not content and not (AgentManager._resolve_path(agent_type, filename).exists()):
@@ -137,7 +263,7 @@ async def get_workspace_file(agent_type: str, filename: str):
 @router.put("/{agent_type}/files/{filename:path}")
 async def save_workspace_file(agent_type: str, filename: str, body: WorkspaceFileSave):
     """Save content to a workspace file."""
-    if agent_type not in AgentManager.BUILTIN_AGENTS and agent_type != "_shared":
+    if not AgentManager.is_known_agent_type(agent_type) and agent_type != "_shared":
         raise HTTPException(status_code=404, detail=f"Agent type not found: {agent_type}")
     ok = AgentManager.save_workspace_file(agent_type, filename, body.content)
     if not ok:

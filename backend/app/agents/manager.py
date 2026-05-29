@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.runtime_paths import PERSONAL_WORKSPACE_DIRNAME, agents_dir
+from app.agents.specialists import (
+    SpecialistRegistry,
+    is_specialist_agent_type,
+    slug_from_agent_type,
+    update_specialist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +92,13 @@ class AgentManager:
         project: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Assemble the full system prompt for the given agent type."""
+        if agent_type == "personal":
+            return cls._render_personal_prompt(tools_desc, user_message, project)
         if agent_type == "coding":
             return cls._render_coding_prompt(tools_desc, user_message, project)
-        return cls._render_personal_prompt(tools_desc, user_message, project)
+        if is_specialist_agent_type(agent_type):
+            return cls._render_specialist_prompt(agent_type, tools_desc, user_message, project)
+        raise ValueError(f"Unknown agent_type: {agent_type}")
 
     @classmethod
     def _render_personal_prompt(
@@ -196,6 +206,22 @@ class AgentManager:
         )
 
         # 0. Bootstrap detection — highest priority
+        parts.append(
+            "## Specialist Agent Authoring and Delegation\n"
+            "- Skills and Specialist Agents are different tools. Create or update a Skill for a single reusable workflow, "
+            "checklist, prompt pattern, or procedural method that should be injected into an existing agent.\n"
+            "- Create a Specialist Agent only when the user needs an independent identity, durable specialty prompt, "
+            "custom tool boundary, model choice, long-running specialty memory, routing keywords, or an @-mentionable delegate.\n"
+            "- When the user asks to make a durable sub-agent, first call `specialist_agent_draft_save` with purpose, "
+            "routing examples, tool permissions, output expectations, and `auto_delegate` set to `suggest` unless the user explicitly wants automatic delegation.\n"
+            "- Validate drafts with `specialist_agent_validate`. Publish with `specialist_agent_publish` only after explicit user confirmation; "
+            "high-risk tool access requires explicit high-risk confirmation.\n"
+            "- Use `specialist_agent_list` and `specialist_agent_read` before editing or delegating when the available specialists are uncertain. "
+            "Use `specialist_agent_archive` instead of deleting a published specialist.\n"
+            "- Use `delegate_to_specialist_agent` when the user explicitly mentions a published Specialist Agent or when a specialist's routing keywords/examples clearly match. "
+            "For `auto_delegate: suggest`, explain the proposed delegation and wait for the user; only `auto_delegate: auto` may be invoked without another confirmation."
+        )
+
         bootstrap_path = cls._personal_dir() / "BOOTSTRAP.md"
         if bootstrap_path.exists():
             try:
@@ -333,6 +359,70 @@ class AgentManager:
     # ──────────────────────────────────────────────
 
     @classmethod
+    def _render_specialist_prompt(
+        cls,
+        agent_type: str,
+        tools_desc: str,
+        user_message: str = "",
+        project: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Specialist Agent: persistent user-authored expert prompt."""
+        spec = SpecialistRegistry.get(agent_type)
+        if not spec:
+            raise ValueError(f"Unknown agent_type: {agent_type}")
+
+        parts: List[str] = []
+        specialist_home = str(cls._agents_root() / "specialists" / spec["slug"]).replace("\\", "/")
+        parts.append(
+            "## Specialist Agent Runtime\n"
+            f"- Agent type: {agent_type}\n"
+            f"- Specialist home: {specialist_home}\n"
+            f"- Display name: {spec.get('display_name', spec['slug'])}\n"
+            f"- Base kind: {spec.get('base_kind', 'advisory')}\n"
+            "- You are a persistent user-created Specialist Agent. Stay inside your specialty and tool boundary.\n"
+            "- Personal Agent owns private user memory and the user relationship. Do not read or infer access to "
+            "Personal private diaries, USER.md, SOUL.md, or session handoff unless explicitly provided.\n"
+            "- Use only the tools made available in this prompt. If a required capability is missing, report the blocker.\n"
+            "- When delegated by Personal Agent, return concise evidence and a clear result for Personal to relay."
+        )
+        if spec.get("description"):
+            parts.append("## Specialist Purpose\n" + str(spec["description"]).strip())
+        if spec.get("instructions"):
+            parts.append("## Specialist Instructions\n" + str(spec["instructions"]).strip())
+
+        triggers = list(spec.get("trigger_examples") or [])
+        keywords = list(spec.get("routing_keywords") or [])
+        if triggers or keywords:
+            route_lines: List[str] = []
+            route_lines.extend(f"- Example: {item}" for item in triggers[:10])
+            route_lines.extend(f"- Keyword: {item}" for item in keywords[:20])
+            parts.append("## Routing Hints\n" + "\n".join(route_lines))
+
+        shared_prefs = cls._load_workspace_file("_shared", "user_preferences.md")
+        if shared_prefs:
+            parts.append(shared_prefs)
+        cross_agent_memory = cls._load_workspace_file("_shared", "cross_agent_memory.md")
+        if cross_agent_memory:
+            parts.append("## Cross-Agent Memory\n" + _truncate(cross_agent_memory, 2000))
+        base_rules = cls._load_workspace_file("_shared", "base_rules.md")
+        if base_rules:
+            parts.append(base_rules)
+
+        skill_ids = [str(item) for item in (spec.get("skill_ids") or []) if str(item).strip()]
+        if skill_ids:
+            try:
+                from app.skills import SkillManager
+
+                skill_prompt = SkillManager.build_skill_prompt(skill_ids)
+                if skill_prompt:
+                    parts.append("## Bound Skills\n" + skill_prompt)
+            except Exception as exc:
+                logger.warning("Failed to inject specialist skills for %s: %s", agent_type, exc)
+
+        parts.append(tools_desc)
+        return "\n\n".join(p for p in parts if p)
+
+    @classmethod
     def get_agent_type_for_role(cls, role_id: str) -> str:
         """Map legacy role_id to agent_type."""
         return _ROLE_TO_AGENT.get(role_id, "personal")
@@ -340,16 +430,32 @@ class AgentManager:
     @classmethod
     def get_default_role(cls, agent_type: str) -> str:
         """Get the default role_id for an agent type."""
+        if is_specialist_agent_type(agent_type):
+            return "code-expert" if cls.specialist_base_kind(agent_type) == "coding" else "desktop-agent"
         return _AGENT_DEFAULT_ROLE.get(agent_type, "desktop-agent")
 
     @classmethod
     def switch_agent(cls, session: Any, agent_type: str) -> None:
         """Switch the session's agent_type and refresh the system prompt."""
-        if agent_type not in cls.BUILTIN_AGENTS:
+        if not cls.is_known_agent_type(agent_type):
             logger.warning("Unknown agent_type: %s", agent_type)
             return
         session.agent_type = agent_type
         session._refresh_system_prompt()
+
+    @classmethod
+    def is_known_agent_type(cls, agent_type: str) -> bool:
+        return agent_type in cls.BUILTIN_AGENTS or SpecialistRegistry.is_known_agent_type(agent_type)
+
+    @classmethod
+    def specialist_base_kind(cls, agent_type: str) -> str:
+        if is_specialist_agent_type(agent_type):
+            return SpecialistRegistry.base_kind_for_agent(agent_type)
+        return ""
+
+    @classmethod
+    def is_project_bound_agent(cls, agent_type: str) -> bool:
+        return agent_type == "coding" or cls.specialist_base_kind(agent_type) == "coding"
 
     # ──────────────────────────────────────────────
     # Workspace file management
@@ -361,10 +467,14 @@ class AgentManager:
     def _profile_path(cls, agent_type: str) -> Path:
         if agent_type == "personal":
             return cls._personal_workspace_dir() / _PROFILE_FILENAME
+        if is_specialist_agent_type(agent_type):
+            return cls._agents_root() / "specialists" / slug_from_agent_type(agent_type) / _PROFILE_FILENAME
         return cls._agents_root() / agent_type / _PROFILE_FILENAME
 
     @classmethod
     def _type_label(cls, agent_type: str) -> str:
+        if is_specialist_agent_type(agent_type):
+            return "Specialist Agent"
         return _AGENT_TYPE_LABEL.get(agent_type, "Agent")
 
     @classmethod
@@ -500,7 +610,7 @@ class AgentManager:
     @classmethod
     def _write_profile_json(cls, profile: Dict[str, Any]) -> bool:
         agent_type = str(profile.get("agent_type") or "")
-        if agent_type not in cls.BUILTIN_AGENTS:
+        if not cls.is_known_agent_type(agent_type):
             return False
         path = cls._profile_path(agent_type)
         data = {k: profile.get(k, "") for k in (
@@ -523,6 +633,20 @@ class AgentManager:
     @classmethod
     def get_agent_profile(cls, agent_type: str) -> Dict[str, Any]:
         """Return stable UI profile metadata for an agent type."""
+        if is_specialist_agent_type(agent_type):
+            spec = SpecialistRegistry.get(agent_type)
+            if spec:
+                return cls._build_profile(
+                    agent_type,
+                    {
+                        "display_name": spec.get("display_name"),
+                        "subtitle": spec.get("description"),
+                        "avatar_emoji": spec.get("avatar_emoji", ""),
+                        "updated_at": spec.get("updated_at", ""),
+                    },
+                    source="specialist.json",
+                )
+            agent_type = "personal"
         if agent_type not in cls.BUILTIN_AGENTS:
             agent_type = "personal"
 
@@ -549,6 +673,15 @@ class AgentManager:
         sync_identity: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Persist editable profile metadata. Only Personal is user-editable for now."""
+        if is_specialist_agent_type(agent_type):
+            try:
+                spec = update_specialist(slug_from_agent_type(agent_type), {
+                    "display_name": updates.get("display_name"),
+                    "description": updates.get("subtitle"),
+                })
+            except Exception:
+                return None
+            return cls.get_agent_profile(spec["agent_type"])
         if agent_type not in cls.BUILTIN_AGENTS:
             return None
         current = cls.get_agent_profile(agent_type)
@@ -640,6 +773,8 @@ class AgentManager:
             if parts and parts[0] == "base_rules.md":
                 return cls._shared_system_dir() / raw
             return cls._shared_workspace_dir() / raw
+        if is_specialist_agent_type(agent_type):
+            return cls._agents_root() / "specialists" / slug_from_agent_type(agent_type) / filename
         return cls._agents_root() / agent_type / filename
 
     @classmethod
@@ -718,6 +853,10 @@ class AgentManager:
                     size = 0
                 files.append({"name": "base_rules.md", "size": size})
             add_files(cls._shared_workspace_dir())
+            return files
+
+        if is_specialist_agent_type(agent_type):
+            add_files(cls._agents_root() / "specialists" / slug_from_agent_type(agent_type))
             return files
 
         add_files(cls._agents_root() / agent_type)
@@ -1179,7 +1318,7 @@ class AgentManager:
     @classmethod
     def list_agents(cls) -> List[Dict[str, Any]]:
         """List all agent types with status."""
-        return [
+        agents = [
             {
                 "type": "personal",
                 "name": "Personal Agent",
@@ -1191,6 +1330,16 @@ class AgentManager:
                 "description": "专业项目开发工程师 — 严格执行工程规范",
             },
         ]
+        for spec in SpecialistRegistry.all():
+            agent_type = spec["agent_type"]
+            agents.append({
+                "type": agent_type,
+                "name": spec.get("display_name") or spec["slug"],
+                "description": spec.get("description", ""),
+                "profile": cls.get_agent_profile(agent_type),
+                "specialist": spec,
+            })
+        return agents
 
 
 def _truncate(text: str, max_chars: int) -> str:

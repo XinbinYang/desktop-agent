@@ -524,7 +524,7 @@ def _session_has_history(session: "AgentSession") -> bool:
 
 def _resolve_stored_agent_type(data: Dict[str, Any]) -> str:
     raw = data.get("agent_type")
-    if raw in ("personal", "coding"):
+    if raw and AgentManager.is_known_agent_type(str(raw)):
         return raw
     return AgentManager.get_agent_type_for_role(data.get("role_id", "desktop-agent"))
 
@@ -759,7 +759,7 @@ class AgentSession:
         # Per-agent model and thinking intensity tracking (config defaults)
         self._agent_models: Dict[str, str] = {}
         self._agent_thinking: Dict[str, str] = {}
-        for at in ("personal", "coding"):
+        for at in ("personal", "coding", self._agent_type):
             self._agent_models[at] = get_model_for_agent(at)
             self._agent_thinking[at] = get_thinking_intensity_for_agent(at)
 
@@ -805,7 +805,7 @@ class AgentSession:
         # Authoritative for this session's execution — independent of the
         # global ProjectManager.get_current() (which is now UI-only).
         self.project_path: str | None = (
-            _canonical_project_path(project_path) if self._agent_type == "coding" and project_path else None
+            _canonical_project_path(project_path) if AgentManager.is_project_bound_agent(self._agent_type) and project_path else None
         )
         self.collaboration_run_id: str = ""
         self.collaboration_task_id: str = ""
@@ -863,7 +863,7 @@ class AgentSession:
         system_msg = f"You are powered by the model {model_name}.\n\n" + system_msg
 
         project = None
-        if self._agent_type == "coding":
+        if AgentManager.is_project_bound_agent(self._agent_type):
             # Coding sessions are project-bound. Prefer the per-session project
             # binding; fall back to the global UI-selected project only for
             # legacy/unbound Coding sessions.
@@ -899,7 +899,7 @@ class AgentSession:
                 cfg = load_config()
                 coding_cfg = cfg.coding_agent
                 max_parallel_agents = max(1, min(16, int(getattr(cfg.settings, "max_parallel_agents", 3) or 3)))
-                if coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
+                if self._agent_type == "coding" and coding_cfg.enabled and coding_cfg.auto_generate_repo_map:
                     if self._repo_map_cache is None:
                         self._repo_map_cache = build_repo_map(project["path"])
                     repo_map = self._repo_map_cache
@@ -990,7 +990,7 @@ class AgentSession:
             matched_skills = SkillManager.match_skills(
                 self._last_user_message,
                 self.role_id,
-                self._agent_type == "coding" and project is not None,
+                AgentManager.is_project_bound_agent(self._agent_type) and project is not None,
                 agent_type=self._agent_type,
             )
             if matched_skills:
@@ -4532,7 +4532,7 @@ class AgentSession:
 
     def switch_agent(self, agent_type: str):
         """Switch the active agent type, model, thinking intensity, and refresh the system prompt."""
-        if agent_type not in ("personal", "coding"):
+        if not AgentManager.is_known_agent_type(agent_type):
             raise ValueError(f"Unknown agent_type: {agent_type}")
         if agent_type != self._agent_type and _session_has_history(self):
             raise ValueError(
@@ -4706,6 +4706,7 @@ class AgentSession:
     @staticmethod
     def _write_save_payload(data: Dict[str, Any], path: Path) -> None:
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, path)
@@ -4992,6 +4993,8 @@ def get_or_create_session(
     provided_role_id = role_id
     role_id = role_id or (AgentManager.get_default_role(agent_type) if agent_type else "desktop-agent")
     resolved_agent_type = agent_type or AgentManager.get_agent_type_for_role(role_id)
+    if not AgentManager.is_known_agent_type(resolved_agent_type):
+        raise ValueError(f"Unknown agent_type: {resolved_agent_type}")
     loaded_from_disk = False
     if existing is None:
         loaded = AgentSession.load(session_id)
@@ -5078,7 +5081,7 @@ def _newest_matching_session_id(agent_type: str, project_path: str | None = None
 
 def resolve_agent_session(agent_type: str, policy: str, project_path: str | None = None) -> Dict[str, Any]:
     """Resolve the session identity that should back an agent navigation action."""
-    if agent_type not in ("personal", "coding"):
+    if not AgentManager.is_known_agent_type(agent_type):
         raise ValueError(f"Unknown agent_type: {agent_type}")
     if policy not in ("canonical", "last_or_create", "new"):
         raise ValueError(f"Unknown session resolve policy: {policy}")
@@ -5111,6 +5114,55 @@ def resolve_agent_session(agent_type: str, policy: str, project_path: str | None
         personal["primary_session_id"] = session.session_id
         _save_session_registry(registry)
         return _new_session_summary(session, created=created, is_primary=True)
+
+    if agent_type != "coding":
+        specialists = registry.setdefault("specialists", {})
+        if not isinstance(specialists, dict):
+            specialists = {}
+            registry["specialists"] = specialists
+        per_agent = specialists.setdefault(agent_type, {})
+        if not isinstance(per_agent, dict):
+            per_agent = {}
+            specialists[agent_type] = per_agent
+        project_bound = AgentManager.is_project_bound_agent(agent_type)
+        project_key = _normalize_project_key(canonical_project_path) if project_bound else "__global__"
+        last_by_project = per_agent.setdefault("last_session_by_project", {})
+
+        session_id = ""
+        if policy != "new":
+            candidate = last_by_project.get(project_key)
+            if candidate and _session_record_matches(
+                candidate,
+                agent_type=agent_type,
+                project_path=canonical_project_path if project_bound else None,
+            ):
+                session_id = candidate
+            else:
+                session_id = _newest_matching_session_id(
+                    agent_type,
+                    canonical_project_path if project_bound else None,
+                )
+        if not session_id:
+            session_id = f"session_{agent_type.replace(':', '_').replace('-', '_')}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+        created = session_id not in _sessions and not (SESSIONS_DIR / f"{session_id}.json").exists()
+        session = get_or_create_session(
+            session_id,
+            model_id,
+            role_id=role_id,
+            agent_type=agent_type,
+            preserve_existing_model=not created,
+        )
+        bound_path = canonical_project_path if project_bound and canonical_project_path else None
+        binding_changed = session.project_path != bound_path
+        if binding_changed:
+            session.project_path = bound_path
+        if created or binding_changed or not (SESSIONS_DIR / f"{session_id}.json").exists():
+            session._save()
+
+        last_by_project[project_key] = session.session_id
+        _save_session_registry(registry)
+        return _new_session_summary(session, created=created, is_primary=False)
 
     coding = registry.setdefault("coding", {})
     last_by_project = coding.setdefault("last_session_by_project", {})

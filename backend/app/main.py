@@ -265,8 +265,11 @@ class RewindSessionRequest(BaseModel):
 
 
 def _resolve_agent_type(agent_type: Optional[str], role_id: Optional[str]) -> str:
-    if agent_type in ("personal", "coding"):
-        return agent_type
+    if agent_type:
+        normalized = str(agent_type).strip()
+        if AgentManager.is_known_agent_type(normalized):
+            return normalized
+        raise ValueError(f"Unknown agent_type: {normalized}")
     return AgentManager.get_agent_type_for_role(role_id or "desktop-agent")
 
 
@@ -560,7 +563,10 @@ def get_roles():
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """éžæµå¼èŠå¤©ï¼ˆæµ‹è¯•ç”¨ï¼‰"""
-    agent_type = _resolve_agent_type(req.agent_type, req.role_id)
+    try:
+        agent_type = _resolve_agent_type(req.agent_type, req.role_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     model_id = req.model_id or get_model_for_agent(agent_type)
     role_id = req.role_id or AgentManager.get_default_role(agent_type)
     try:
@@ -598,7 +604,7 @@ def get_session_history(
 @app.get("/api/sessions")
 def list_sessions(project_path: str = "", agent_type: str = ""):
     """èŽ·å–æ‰€æœ‰ä¿å­˜çš„ä¼šè¯åˆ—è¡¨ï¼Œå¯æŒ‰é¡¹ç›®è·¯å¾„è¿‡æ»¤"""
-    if agent_type and agent_type not in ("personal", "coding"):
+    if agent_type and not AgentManager.is_known_agent_type(agent_type):
         raise HTTPException(status_code=400, detail=f"Unknown agent_type: {agent_type}")
     return {"sessions": list_session_records(project_path=project_path, agent_type=agent_type)}
 
@@ -1629,7 +1635,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if msg_type == "chat":
                 user_text = msg.get("text", "")
                 model_id = msg.get("model_id", current_model)
-                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                try:
+                    agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 image_b64 = msg.get("image_base64")
                 requested_chat_mode = msg.get("chat_mode")
@@ -1888,7 +1898,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "handoff_agent":
                 target_agent = str(msg.get("agent_type") or msg.get("to") or "coding").strip().lower()
-                if target_agent not in ("personal", "coding"):
+                if not AgentManager.is_known_agent_type(target_agent):
                     await send_event({"type": "error", "data": validation_error(f"Unknown agent_type: {target_agent}")})
                     continue
                 project = ProjectManager.get_current()
@@ -1924,7 +1934,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 if command_name not in ("reset", "new"):
                     command_name = "reset"
                 model_id = msg.get("model_id", current_model)
-                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                try:
+                    agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 current_model = model_id
                 current_role_id = role_id
@@ -1984,7 +1998,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "retry":
                 model_id = msg.get("model_id", current_model)
-                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                try:
+                    agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 chat_mode = msg.get("chat_mode")
                 thinking_intensity = msg.get("thinking_intensity")
@@ -2072,7 +2090,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "rewind":
                 model_id = msg.get("model_id", current_model)
-                agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                try:
+                    agent_type = _resolve_agent_type(msg.get("agent_type", current_agent_type), msg.get("role_id", current_role_id))
+                except ValueError as exc:
+                    await send_event({"type": "error", "data": validation_error(str(exc))})
+                    continue
                 role_id = msg.get("role_id") or AgentManager.get_default_role(agent_type)
                 chat_mode = msg.get("chat_mode")
                 thinking_intensity = msg.get("thinking_intensity")
@@ -2214,7 +2236,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif msg_type == "switch_agent":
                 agent_type = msg.get("agent_type", "personal")
-                if agent_type not in ("personal", "coding"):
+                if not AgentManager.is_known_agent_type(agent_type):
                     await send_event({"type": "error", "data": {"message": f"Unknown agent_type: {agent_type}"}})
                     continue
                 try:

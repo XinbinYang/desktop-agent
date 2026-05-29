@@ -300,9 +300,10 @@ const EmptyChatWelcome: React.FC<{
 }> = ({ agentType, chatMode, projectName, assistantDisplayName }) => {
   const { t } = useTranslation();
   const isCoding = agentType === 'coding';
+  const isSpecialist = agentType.startsWith('specialist:');
   const visibleProjectName = isCoding ? projectName : undefined;
   const AgentIcon = isCoding ? Code2 : Bot;
-  const typeLabel = isCoding ? t('chat.empty.codingAgent') : t('chat.empty.personalAgent');
+  const typeLabel = isCoding ? t('chat.empty.codingAgent') : isSpecialist ? 'Specialist Agent' : t('chat.empty.personalAgent');
   const agentLabel = isCoding ? typeLabel : (assistantDisplayName?.trim() || typeLabel);
   const modeLabel = chatMode === 'plan'
     ? t('chat.empty.planMode')
@@ -328,7 +329,9 @@ const EmptyChatWelcome: React.FC<{
           className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl border ${
             isCoding
               ? 'border-success/30 bg-success/10 text-success'
-              : 'border-accent/30 bg-accent/10 text-accent'
+              : isSpecialist
+                ? 'border-warning/30 bg-warning/10 text-warning'
+                : 'border-accent/30 bg-accent/10 text-accent'
           }`}
           aria-hidden
         >
@@ -336,7 +339,7 @@ const EmptyChatWelcome: React.FC<{
         </div>
         <h2 className="chat-text-lg font-semibold text-fg">{title}</h2>
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-          <EmptyStatusChip tone={isCoding ? 'success' : 'accent'}>{agentLabel}</EmptyStatusChip>
+          <EmptyStatusChip tone={isCoding ? 'success' : isSpecialist ? 'neutral' : 'accent'}>{agentLabel}</EmptyStatusChip>
           {!isCoding && agentLabel !== typeLabel && <EmptyStatusChip tone="neutral">{typeLabel}</EmptyStatusChip>}
           <EmptyStatusChip tone={modeTone}>{modeLabel}</EmptyStatusChip>
           {visibleProjectName && (

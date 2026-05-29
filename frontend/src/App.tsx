@@ -31,7 +31,7 @@ import { TerminalPanel } from './components/TerminalPanel';
 import { SwitchAgentModal } from './components/SwitchAgentModal';
 import type { SessionSnapshot, SessionActions } from './contexts/FocusedSessionContext';
 import { FocusedDataProvider, FocusedActionsProvider } from './contexts/FocusedSessionContext';
-import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentType, type ArtifactItem, type ArtifactPayload, type OpenFile, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
+import { ModelInfo, ProjectInfo, FileNode, SettingsResponse, type AgentInfo, type AgentType, type ArtifactItem, type ArtifactPayload, type OpenFile, type SessionHistoryItem, type SessionHistoryProject, type SessionHistoryResponse } from './types';
 import { API_BASE } from './config';
 import { deleteDraft, deleteSessionData } from './lib/db';
 import {
@@ -224,9 +224,9 @@ function projectArtifactToItem(raw: ArtifactPayload | ArtifactItem | undefined, 
 const PANE_TREE_STORAGE_KEY = 'desktop-agent-pane-tree';
 
 function createDefaultSessionId(agentType: AgentType): string {
-  return agentType === 'personal'
-    ? 'session_personal_main'
-    : `session_coding_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  if (agentType === 'personal') return 'session_personal_main';
+  const prefix = agentType.replace(/^specialist:/, 'specialist_').replace(/[^a-z0-9_]+/gi, '_').toLowerCase();
+  return `session_${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
 function createSessionPane(agentType: AgentType, model: string, sessionId = createDefaultSessionId(agentType)): SessionPane {
@@ -616,6 +616,7 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [agentModels, setAgentModels] = useState<Record<string, string>>({ personal: '', coding: '' });
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileMap>(DEFAULT_AGENT_PROFILES);
+  const [agentCatalog, setAgentCatalog] = useState<AgentInfo[]>([]);
   const [roleDisplayNames, setRoleDisplayNames] = useState<RoleDisplayNameMap>({});
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   // Pane tree — restored from localStorage or fresh default
@@ -684,6 +685,11 @@ export default function App() {
   const focusedAgentType = focusedPane?.agentType || layout.activeAgent;
   const focusedModel = sessionModelForPane(focusedPane, focusedSessionMeta) || agentModels[focusedAgentType] || agentModel;
   const focusedTitle = sessionTitleForDisplay(focusedPane, focusedSessionMeta, agentProfiles, roleDisplayNames);
+  const isProjectBoundAgent = useCallback((agentType: AgentType): boolean => {
+    if (agentType === 'coding') return true;
+    const record = agentCatalog.find((agent) => agent.type === agentType);
+    return record?.specialist?.base_kind === 'coding';
+  }, [agentCatalog]);
 
   // Agent switch suggestion from backend auto-dispatch
   const [switchSuggestion, setSwitchSuggestion] = useState<{
@@ -700,18 +706,16 @@ export default function App() {
   // ActivityBar agent buttons so a backgrounded agent's work stays visible.
   // Server truth (session-history poll) plus the focused pane's live snapshot.
   const agentRunningState = React.useMemo(() => {
-    let personal = false;
-    let coding = false;
+    const running: Partial<Record<AgentType, boolean>> = {};
     for (const s of sessions) {
       if (!s.is_running) continue;
-      if ((s.agent_type || 'personal') === 'coding') coding = true;
-      else personal = true;
+      const agentType = normalizeAgentType(s.agent_type || 'personal', s.role_id);
+      running[agentType] = true;
     }
     if (focusedSnapshot?.isRunning) {
-      if (focusedAgentType === 'coding') coding = true;
-      else personal = true;
+      running[focusedAgentType] = true;
     }
-    return { personal, coding };
+    return running;
   }, [sessions, focusedSnapshot?.isRunning, focusedAgentType]);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('editor');
 
@@ -981,9 +985,21 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/agents`);
       const data = await res.json();
-      setAgentProfiles(profilesFromAgents(data.agents || []));
+      const agents = (Array.isArray(data.agents) ? data.agents : []) as AgentInfo[];
+      setAgentCatalog(agents);
+      setAgentProfiles(profilesFromAgents(agents));
+      setAgentModels((previous) => {
+        const next = { ...previous };
+        for (const agent of agents) {
+          if (agent.type && agent.model_id && !next[agent.type]) {
+            next[agent.type] = agent.model_id;
+          }
+        }
+        return next;
+      });
     } catch (err) {
       console.error('[App] Failed to load agent profiles:', err);
+      setAgentCatalog([]);
       setAgentProfiles(DEFAULT_AGENT_PROFILES);
     }
   }, []);
@@ -1205,12 +1221,13 @@ export default function App() {
           try {
             const settingsRes = await fetch(`${API_BASE}/api/settings`);
             const settingsData = await settingsRes.json();
-            setAgentModels({
+            setAgentModels((previous) => ({
+              ...previous,
               personal: settingsData.personal_agent?.model || '',
               coding: settingsData.coding_agent?.model || '',
-            });
+            }));
           } catch {
-            setAgentModels({ personal: '', coding: '' });
+            setAgentModels((previous) => ({ ...previous, personal: '', coding: '' }));
           }
         }
       } catch (err) {
@@ -1275,7 +1292,7 @@ export default function App() {
     policy: 'canonical' | 'last_or_create' | 'new',
     projectPathOverride?: string | null,
   ): Promise<ResolvedSession> => {
-    const projectPath = agentType === 'coding' ? (projectPathOverride ?? currentProject?.path) : null;
+    const projectPath = isProjectBoundAgent(agentType) ? (projectPathOverride ?? currentProject?.path) : null;
     const res = await fetch(`${API_BASE}/api/sessions/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1290,7 +1307,7 @@ export default function App() {
       throw new Error(body.detail || body.message || `Failed to resolve ${agentType} session`);
     }
     return res.json();
-  }, [currentProject?.path]);
+  }, [currentProject?.path, isProjectBoundAgent]);
 
   const applyResolvedSessionToFocusedPane = useCallback((resolved: ResolvedSession) => {
     const agentType = normalizeAgentType(resolved.agent_type, resolved.role_id);
@@ -2359,7 +2376,7 @@ export default function App() {
 
   const replaceFocusedSessionAfterRemoval = useCallback(async (id: string) => {
     if (focusedSessionId !== id) return;
-    const agentType: AgentType = layout.activeAgent === 'personal' ? 'personal' : 'coding';
+    const agentType: AgentType = layout.activeAgent;
     try {
       const resolved = await resolveAgentSessionClient(agentType, agentType === 'personal' ? 'canonical' : 'new');
       applyResolvedSessionToFocusedPane(resolved);
@@ -2478,11 +2495,11 @@ export default function App() {
         return;
       }
     }
-    const agentType: AgentType = requestedAgent === 'personal' ? 'personal' : 'coding';
+    const agentType: AgentType = requestedAgent;
     let resolvedOptions = options;
-    if (agentType === 'coding' && !options.sessionId) {
+    if (agentType !== 'personal' && !options.sessionId) {
       try {
-        const resolved = await resolveAgentSessionClient('coding', 'new');
+        const resolved = await resolveAgentSessionClient(agentType, 'new');
         resolvedOptions = {
           ...options,
           sessionId: resolved.session_id,
@@ -2883,6 +2900,7 @@ export default function App() {
           onToggleSidebar={layout.toggleSidebar}
           personalRunning={agentRunningState.personal}
           codingRunning={agentRunningState.coding}
+          agentRunning={agentRunningState}
         />
 
         {/* Left sidebar */}
@@ -3022,12 +3040,13 @@ export default function App() {
                   try {
                     const settingsRes = await fetch(`${API_BASE}/api/settings`);
                     const settingsData = await settingsRes.json();
-                    setAgentModels({
+                    setAgentModels((previous) => ({
+                      ...previous,
                       personal: settingsData.personal_agent?.model || '',
                       coding: settingsData.coding_agent?.model || '',
-                    });
+                    }));
                   } catch {
-                    setAgentModels({ personal: '', coding: '' });
+                    setAgentModels((previous) => ({ ...previous, personal: '', coding: '' }));
                   }
                 } catch (err) {
                   console.error('[App] Failed to refresh models after settings change:', err);

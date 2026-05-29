@@ -69,6 +69,7 @@ function formatRelativeTime(timestamp?: number): string {
 }
 
 function agentLabel(agentType?: AgentType): string {
+  if (agentType?.startsWith('specialist:')) return 'Specialist';
   return agentType === 'coding' ? 'Coding' : 'Personal';
 }
 
@@ -100,6 +101,7 @@ const SessionRow = memo(function SessionRow({
   const primary = isPrimaryPersonal(session);
   const label = primary ? `${displayNameForAgent('personal', agentProfiles)} · Main` : formatSessionLabel(session);
   const type: AgentType = session.agent_type || 'personal';
+  const badgeLabel = type.startsWith('specialist:') ? displayNameForAgent(type, agentProfiles) : agentLabel(type);
   const canManageSession = !primary && !session.is_running;
 
   const handleClick = useCallback(() => {
@@ -146,10 +148,14 @@ const SessionRow = memo(function SessionRow({
         <span
           className={cn(
             'shrink-0 rounded px-1 py-0.5 text-[9px]',
-            type === 'coding' ? 'bg-success/10 text-success' : 'bg-accent/10 text-accent',
+            type === 'coding'
+              ? 'bg-success/10 text-success'
+              : type.startsWith('specialist:')
+                ? 'bg-warning/10 text-warning'
+                : 'bg-accent/10 text-accent',
           )}
         >
-          {agentLabel(type)}
+          {badgeLabel}
         </span>
       </button>
       <div className="flex min-w-[42px] items-center justify-end gap-1 text-[10px] text-fg-muted">

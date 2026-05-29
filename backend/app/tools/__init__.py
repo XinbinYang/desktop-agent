@@ -104,6 +104,15 @@ from app.tools.connector_tool import (
     ConnectorTestTool,
     ConnectorUpdateTool,
 )
+from app.tools.specialist_tool import (
+    DelegateToSpecialistAgentTool,
+    SpecialistAgentArchiveTool,
+    SpecialistAgentDraftSaveTool,
+    SpecialistAgentListTool,
+    SpecialistAgentPublishTool,
+    SpecialistAgentReadTool,
+    SpecialistAgentValidateTool,
+)
 
 # 全局工具注册表
 ALL_TOOLS: list[BaseTool] = [
@@ -239,6 +248,13 @@ ALL_TOOLS: list[BaseTool] = [
     ConnectorStopTool(),
     ConnectorTestTool(),
     ConnectorDoctorTool(),
+    SpecialistAgentDraftSaveTool(),
+    SpecialistAgentValidateTool(),
+    SpecialistAgentPublishTool(),
+    SpecialistAgentListTool(),
+    SpecialistAgentReadTool(),
+    SpecialistAgentArchiveTool(),
+    DelegateToSpecialistAgentTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
@@ -316,11 +332,22 @@ PERSONAL_AGENT_TOOLS: frozenset[str] = frozenset({
     "skill_list", "skill_read", "skill_archive",
     "connector_status", "connector_update", "connector_start",
     "connector_stop", "connector_test", "connector_doctor",
+    "specialist_agent_draft_save", "specialist_agent_validate", "specialist_agent_publish",
+    "specialist_agent_list", "specialist_agent_read", "specialist_agent_archive",
+    "delegate_to_specialist_agent",
 })
 
 
 def _filter_tools_by_agent(agent_type: str | None) -> frozenset[str] | None:
     """Return the allowed tool name set for an agent type, or None for all tools."""
+    if str(agent_type or "").startswith("specialist:"):
+        try:
+            from app.agents.specialists import SpecialistRegistry
+
+            allowed = SpecialistRegistry.allowed_tools_for_agent(str(agent_type))
+            return allowed if allowed is not None else frozenset()
+        except Exception:
+            return frozenset()
     if agent_type == "coding":
         return CODING_AGENT_TOOLS
     if agent_type == "personal":
@@ -399,6 +426,15 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "connector_stop",
         "connector_test",
         "connector_doctor",
+    ],
+    "Specialist Agents": [
+        "specialist_agent_draft_save",
+        "specialist_agent_validate",
+        "specialist_agent_publish",
+        "specialist_agent_list",
+        "specialist_agent_read",
+        "specialist_agent_archive",
+        "delegate_to_specialist_agent",
     ],
     "记忆管理": [
         "memory_search",
@@ -480,12 +516,15 @@ class DynamicToolRegistry:
 def get_tool_schemas(dynamic_registry: DynamicToolRegistry | None = None, agent_type: str | None = None) -> list[dict]:
     """获取所有工具的 OpenAI function schema（含动态工具），支持 per-agent 过滤。"""
     allowed = _filter_tools_by_agent(agent_type)
-    if allowed:
+    if allowed is not None:
         schemas = [t.get_openai_schema() for t in ALL_TOOLS if t.name in allowed]
     else:
         schemas = [t.get_openai_schema() for t in ALL_TOOLS]
     if dynamic_registry:
-        schemas.extend(dynamic_registry.get_schemas())
+        dynamic_schemas = dynamic_registry.get_schemas()
+        if allowed is not None:
+            dynamic_schemas = [schema for schema in dynamic_schemas if schema["function"]["name"] in allowed]
+        schemas.extend(dynamic_schemas)
     return schemas
 
 
@@ -503,7 +542,7 @@ def list_tool_names(dynamic_registry: DynamicToolRegistry | None = None, agent_t
     allowed = _filter_tools_by_agent(agent_type)
     names = [name for name in TOOLS_BY_NAME.keys() if allowed is None or name in allowed]
     if dynamic_registry:
-        names.extend(dynamic_registry.list_names())
+        names.extend(name for name in dynamic_registry.list_names() if allowed is None or name in allowed)
     return names
 
 

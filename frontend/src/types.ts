@@ -687,7 +687,8 @@ export interface EditorGroup {
   openFiles: OpenFile[];
 }
 
-export type AgentType = 'personal' | 'coding';
+export type SpecialistAgentType = `specialist:${string}`;
+export type AgentType = 'personal' | 'coding' | SpecialistAgentType;
 export type SidebarSection = 'personal' | 'coding' | 'skills' | 'workspace' | 'settings';
 
 export interface SessionHistoryItem {
@@ -729,10 +730,10 @@ export interface SessionHistoryResponse {
   standalone_sessions: SessionHistoryItem[];
 }
 
-export interface SkillPreferences {
+export type SkillPreferences = Record<string, Record<string, boolean>> & {
   personal: Record<string, boolean>;
   coding: Record<string, boolean>;
-}
+};
 
 export interface SkillCatalogItem {
   id: string;
@@ -809,6 +810,10 @@ export interface AgentInfo {
   name: string;
   description: string;
   profile?: AgentProfile;
+  default_role?: string;
+  model_id?: string;
+  thinking_intensity?: ThinkingIntensity;
+  specialist?: SpecialistAgentSpec;
 }
 
 export interface AgentProfile {
@@ -819,6 +824,23 @@ export interface AgentProfile {
   subtitle?: string;
   updated_at?: string;
   source?: string;
+}
+
+export interface SpecialistAgentSpec {
+  slug: string;
+  agent_type: SpecialistAgentType;
+  display_name: string;
+  description: string;
+  instructions?: string;
+  trigger_examples?: string[];
+  routing_keywords?: string[];
+  auto_delegate?: 'off' | 'suggest' | 'auto' | string;
+  base_kind?: 'advisory' | 'coding' | 'desktop' | string;
+  allowed_tools?: string[];
+  skill_ids?: string[];
+  model_id?: string;
+  thinking_intensity?: ThinkingIntensity | string;
+  status?: 'draft' | 'published' | 'archived' | string;
 }
 
 export interface KnowledgeDoc {

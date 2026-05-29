@@ -10,7 +10,7 @@ import { ProjectInfo, FileNode, SidebarSection, type AgentType, type SessionHist
 import type { FileTreeAction } from './FileTree';
 import { SkillsPanel } from './SkillsPanel';
 import { useTheme } from '../hooks/useTheme';
-import { AGENT_LABEL, displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
+import { displayNameForAgent, type AgentProfileMap } from '../lib/agentProfiles';
 import { type ProjectHistoryAction } from './SessionHistoryPanel';
 import { WorkspacePanel } from './WorkspacePanel';
 import type { PersonalWorkspaceTab } from './PersonalWorkspace/PersonalWorkspacePanel';
@@ -231,7 +231,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <label className="text-xs text-fg-secondary block mb-1.5">Active Agent</label>
               <div className="rounded border border-border bg-surface-alt px-2 py-2">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-fg">{AGENT_LABEL[activeAgent]}</span>
+                  <span className="text-xs font-medium text-fg">{activeDisplayName}</span>
                   <span className="text-[10px] text-fg-muted">ready</span>
                 </div>
                 {agentModel && (
