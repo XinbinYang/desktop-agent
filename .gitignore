@@ -61,3 +61,6 @@ frontend/release-packaged/acceptance/
 .coverage
 backend/.coverage
 htmlcov/
+
+# Test artifacts
+frontend/test-results/

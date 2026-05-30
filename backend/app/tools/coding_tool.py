@@ -1,6 +1,8 @@
 """Coding-agent helper tools: search, outline, patch, verify, review, worktree status."""
 from __future__ import annotations
 
+import asyncio
+
 import difflib
 import json
 import subprocess
@@ -311,7 +313,7 @@ class VerifyProjectTool(BaseTool):
 
         started = time.time()
         try:
-            proc = subprocess.run(command, cwd=str(root), shell=True, capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace")
+            proc = await asyncio.to_thread(subprocess.run, command, cwd=str(root), shell=True, capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace")
             duration_ms = round((time.time() - started) * 1000)
         except subprocess.TimeoutExpired:
             duration_ms = round((time.time() - started) * 1000)
@@ -368,9 +370,9 @@ class RunReviewTool(BaseTool):
         if err:
             return ToolResult(error=err)
         assert root is not None
-        proc = subprocess.run(["git", "diff", "--stat"], cwd=str(root), capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
+        proc = await asyncio.to_thread(subprocess.run, ["git", "diff", "--stat"], cwd=str(root), capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
         stat = proc.stdout.strip()
-        proc2 = subprocess.run(["git", "diff", "--", "."], cwd=str(root), capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
+        proc2 = await asyncio.to_thread(subprocess.run, ["git", "diff", "--", "."], cwd=str(root), capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
         diff = proc2.stdout
         findings = []
         if len(diff) > 200_000:

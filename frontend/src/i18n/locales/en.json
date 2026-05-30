@@ -135,10 +135,13 @@
     "botToken": "Bot Token",
     "discord": "Discord",
     "discordDesc": "Remote control your agent via Discord Bot, with DM and @mention support.",
+    "feishu": "Feishu",
+    "feishuDesc": "Remote control your agent via Feishu Bot, with DM and group @mention support (WebSocket mode).",
     "save": "Save",
     "cancel": "Cancel",
     "remove": "Remove",
-    "confirmRemove": "Are you sure you want to remove this connection?"
+    "confirmRemove": "Are you sure you want to remove this connection?",
+    "configCredentials": "Configure Credentials"
   },
   "errors": {
     "title": "Something went wrong",
